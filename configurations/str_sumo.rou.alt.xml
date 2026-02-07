@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2023-06-16 15:14:37 by Eclipse SUMO duarouter Version 1.17.0
+<!-- generated on Sat Feb  7 10:17:34 2026 by Eclipse SUMO duarouter Version 1.4.0
 <configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/duarouterConfiguration.xsd">
 
     <input>
@@ -10,6 +10,7 @@
 
     <output>
         <output-file value="./configurations/str_sumo.rou.xml"/>
+        <alternatives-output value="./configurations/str_sumo.rou.alt.xml"/>
     </output>
 
     <time>

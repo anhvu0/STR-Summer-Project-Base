@@ -6,9 +6,11 @@ import traci
 
 
 class QLearningPolicy(RouteController):
-    def __init__(self, connection_info, model_file):
+    def __init__(self, vehicles, connection_info, model_file):
         super().__init__(connection_info)
         self.model = load_model(model_file)
+        self.vehicles = vehicles
+
 
     def make_decisions(self, vehicles, connection_info: ConnectionInfo):
         local_targets = {}

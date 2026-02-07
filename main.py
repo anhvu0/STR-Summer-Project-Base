@@ -50,7 +50,7 @@ def get_controlled_vehicles(route_filename, connection_info, \
 
     return vehicle_dict
 
-def test_dijkstra_policy(vehicles):
+def test_dijkstra_policy(vehicles, connection_info):
     print("Testing Dijkstra's Algorithm Route Controller")
     #scheduler = DijkstraPolicy(init_connection_info)
     scheduler = QLearningPolicy(vehicles, connection_info, './core/rl-high-all-fixed-late.h5')
@@ -91,4 +91,4 @@ if __name__ == "__main__":
     for vid, v in vehicles.items():
         print("id: {}, destination: {}, start time:{}, deadline: {};".format(vid, \
             v.destination, v.start_time, v.deadline))
-    test_dijkstra_policy(vehicles)
+    test_dijkstra_policy(vehicles, init_connection_info)
