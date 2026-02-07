@@ -53,7 +53,7 @@ def get_controlled_vehicles(route_filename, connection_info, \
 def test_dijkstra_policy(vehicles, connection_info):
     print("Testing Dijkstra's Algorithm Route Controller")
     #scheduler = DijkstraPolicy(init_connection_info)
-    scheduler = QLearningPolicy(vehicles, connection_info, './core/rl-high-all-fixed-late.h5')
+    scheduler = QLearningPolicy(vehicles, connection_info, './test/rl-high-all-fixed-late.h5') #This file specifies the model already trained.
     run_simulation(scheduler, vehicles)
 
 
@@ -71,7 +71,7 @@ def run_simulation(scheduler, vehicles):
     print(str(deadlines_missed) + ' deadlines missed.')
 
 if __name__ == "__main__":
-    sumo_binary = checkBinary('sumo-gui')
+    sumo_binary = checkBinary('sumo')
     # sumo_binary = checkBinary('sumo')#use this line if you do not want the UI of SUMO
 
     # parse config file for map file name

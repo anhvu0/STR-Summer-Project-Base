@@ -2,14 +2,14 @@
 This test file needs the following files:
 STR_SUMO.py, RouteController.py, Util.py, test.net.xml, test.rou.xml, myconfig.sumocfg and corresponding SUMO libraries.
 '''
+import sys
 from core.STR_SUMO import StrSumo
 import os
-import sys
 from xml.dom.minidom import parse, parseString
 from core.Util import *
 from controller.RouteController import *
 from controller.DijkstraController import DijkstraPolicy
-from QLearningController import QLearningPolicy
+from controller.QLearningController import QLearningPolicy
 
 if 'SUMO_HOME' in os.environ:
     tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
