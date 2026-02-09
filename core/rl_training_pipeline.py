@@ -41,7 +41,7 @@ class ReplayBuffer:
         """      
         Store one transition into the buffer
         """
-        self.buffer.append(state, action, reward, next_state, done)
+        self.buffer.append((state, action, reward, next_state, done))
 
     def sample(self, batch_size):
         return random.sample(self.buffer, batch_size)
@@ -264,6 +264,10 @@ class RLTrainingPipeline:
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
             spawn_interval=self.spawn_interval,
         )
+        if vehicle_list is None:
+            raise RuntimeError(
+                "Failed to generate vehicles. Check randomTrips.py output for errors."
+            )
         return {str(vehicle.vehicle_id): vehicle for vehicle in vehicle_list}
 
     def run(self):
