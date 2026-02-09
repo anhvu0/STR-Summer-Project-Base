@@ -1,5 +1,5 @@
 <?xml version="1.0" ?>
-<!-- generated on Mon Feb  9 08:31:46 2026 by Eclipse SUMO duarouter Version 1.4.0
+<!-- generated on Mon Feb  9 09:05:03 2026 by Eclipse SUMO duarouter Version 1.4.0
 <configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/duarouterConfiguration.xsd">
 
     <input>
@@ -38,7 +38,7 @@
 	
     
 	<vehicle depart="0" id="61">
-		<route edges="422685680#0"/>
+		<route edges="15420484#0"/>
 	</vehicle>
 	<vehicle id="1" depart="0.33">
 		
@@ -95,7 +95,7 @@
 	
     
 	<vehicle depart="2.0" id="62">
-		<route edges="-44884008#1"/>
+		<route edges="422685679#1"/>
 	</vehicle>
 	<vehicle id="7" depart="2.31">
 		
@@ -152,7 +152,7 @@
 	
     
 	<vehicle depart="4.0" id="63">
-		<route edges="-422685675#0"/>
+		<route edges="-44884821#8"/>
 	</vehicle>
 	<vehicle id="13" depart="4.29">
 		
@@ -209,7 +209,7 @@
 	
     
 	<vehicle depart="6.0" id="64">
-		<route edges="-44884821#10"/>
+		<route edges="44884821#5"/>
 	</vehicle>
 	<vehicle id="19" depart="6.27">
 		
@@ -266,7 +266,7 @@
 	
     
 	<vehicle depart="8.0" id="65">
-		<route edges="422685680#0"/>
+		<route edges="44884821#5"/>
 	</vehicle>
 	<vehicle id="25" depart="8.25">
 		
@@ -323,7 +323,7 @@
 	
     
 	<vehicle depart="10.0" id="66">
-		<route edges="-44884821#10"/>
+		<route edges="44884821#7"/>
 	</vehicle>
 	<vehicle id="31" depart="10.23">
 		
@@ -380,7 +380,7 @@
 	
     
 	<vehicle depart="12.0" id="67">
-		<route edges="422685680#0"/>
+		<route edges="-15437095"/>
 	</vehicle>
 	<vehicle id="37" depart="12.21">
 		
@@ -428,7 +428,7 @@
 	
     
 	<vehicle depart="14.0" id="68">
-		<route edges="-44884821#10"/>
+		<route edges="-597602755#0"/>
 	</vehicle>
 	<vehicle id="43" depart="14.19">
 		
@@ -485,7 +485,7 @@
 	
     
 	<vehicle depart="16.0" id="69">
-		<route edges="-597602755#0"/>
+		<route edges="44884821#5"/>
 	</vehicle>
 	<vehicle id="49" depart="16.17">
 		
@@ -533,7 +533,7 @@
 	
     
 	<vehicle depart="18.0" id="70">
-		<route edges="-597602755#0"/>
+		<route edges="-45671819"/>
 	</vehicle>
 	<vehicle id="55" depart="18.15">
 		

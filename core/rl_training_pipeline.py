@@ -119,18 +119,23 @@ class DQNTrainer:
         if len(self.memory) < self.batch_size:
             return
         minibatch = self.memory.sample(self.batch_size)
-        states = np.vstack([sample[0]] for sample in minibatch)
-        targets = self.model.predict(states, verbose = 0)
-        for i, (state, action, reward, next_state, done) in enumerate(minibatch):
-            if done:
-                targets[i][action] = reward
-            else:
-                next_q = self.model.predict(next_state, verbose = 0)[0]
-                targets[i][action] = reward + self.gamma * np.max(next_q)
-        self.model.fit(states, targets, epochs=1, verbose=0)
+        states      = np.vstack([s[0] for s in minibatch])
+        actions     = np.array([s[1] for s in minibatch], dtype=np.int32)
+        rewards     = np.array([s[2] for s in minibatch], dtype=np.float32)
+        next_states = np.vstack([s[3] for s in minibatch])
+        dones       = np.array([s[4] for s in minibatch], dtype=np.bool_)
+
+        q = self.model.predict(states, verbose=0)
+        q_next = self.model.predict(next_states, verbose=0)
+
+        target = q.copy()
+        target[np.arange(self.batch_size), actions] = rewards + (1.0 - dones.astype(np.float32)) * self.gamma * np.max(q_next, axis=1)
+
+        self.model.fit(states, target, epochs=1, verbose=0)
+
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
-
+            
 class RLTrainingPipeline:
     """
     Pipeline for training a routing policy with Deep Q-Learning.
