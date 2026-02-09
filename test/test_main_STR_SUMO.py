@@ -3,6 +3,10 @@ This test file needs the following files:
 STR_SUMO.py, RouteController.py, Util.py, test.net.xml, test.rou.xml, myconfig.sumocfg and corresponding SUMO libraries.
 '''
 import sys
+
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from core.STR_SUMO import StrSumo
 import os
 from xml.dom.minidom import parse, parseString
@@ -20,8 +24,8 @@ else:
 from sumolib import checkBinary
 import traci
 
-sumo_binary = checkBinary('sumo-gui')
-# sumo_binary = checkBinary('sumo')
+sumo_binary = checkBinary('sumo')
+# sumo_binary = checkBinary('-gui')
 
 # parse config file for map file name
 dom = parse("./configurations/myconfig.sumocfg")

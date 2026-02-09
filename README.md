@@ -40,6 +40,8 @@ Includes the core files of STR-SUMO.
 - network_map_data_structure.py: includes the useful operations to get infromation of the current map;
 - target_vehicles_generation_protocols.py: includes functions used to generate vehicles (including controlled vehicles' information and uncontrolled vehicles' routes)
 - STR-SUMO.py: takes in a routing policy and performs the simulation to benchmark the performance of the target policy under a given set of map and vehicle sets.
+- rl_training_pipeline.py: a Deep Q-Learning training pipeline for routing decisions.
+
 
 **controller**
 
@@ -52,6 +54,17 @@ Includes different scheduling policies.
 
 Includes the unit test for different core files.
 The test scripts should be placed in the main repository.
+
+***Reinforcement Learning Training Pipeline***
+
+The repository now includes a DQN-based training pipeline that spawns vehicles at a configurable interval and trains a routing policy to reach destinations efficiently.
+
+To train a model:
+```
+python3 train_rl.py --sumocfg ./test/myconfig.sumocfg --model-output ./test/rl_model.h5 --episodes 10 --spawn-interval 0.0
+```
+
+The resulting model can be used with `QLearningController.py` by pointing it to the saved model file.
 
 ***Contribution Guidance***
 

@@ -1,0 +1,55 @@
+"""
+Entry point for training a reinforcement learning routing policy.
+"""
+import argparse
+
+from core.rl_training_pipeline import RLTrainingPipeline
+
+
+def build_parser():
+    """
+    Build the CLI argument parser.
+    """
+    parser = argparse.ArgumentParser(description="Train a routing policy with DQN.")
+    parser.add_argument(
+        "--sumocfg",
+        default="./configurations/myconfig.sumocfg",
+        help="Path to SUMO .sumocfg file.",
+    )
+    parser.add_argument(
+        "--model-output",
+        default="./configurations/rl_model.h5",
+        help="Path to save the trained model.",
+    )
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=5,
+        help="Number of training episodes.",
+    )
+    parser.add_argument(
+        "--spawn-interval",
+        type=float,
+        default=2.0,
+        help="Interval between vehicle spawns.",
+    )
+    return parser
+
+
+def main():
+    """
+    Run the RL training pipeline.
+    """
+    parser = build_parser()
+    args = parser.parse_args()
+    pipeline = RLTrainingPipeline(
+        sumocfg_path=args.sumocfg,
+        model_output_path=args.model_output,
+        episodes=args.episodes,
+        spawn_interval=args.spawn_interval,
+    )
+    pipeline.run()
+
+
+if __name__ == "__main__":
+    main()

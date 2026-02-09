@@ -359,11 +359,12 @@ class target_vehicles_generator:
         
         target_vehicles_generator.target_vehicles_output_dict[target_xml_file] = 0
 
-    def generate_vehicles(self, num_target_vehicles, num_random_vehicles, pattern, target_xml_file, net_xml_file):
+    def generate_vehicles(self, num_target_vehicles, num_random_vehicles, pattern, target_xml_file, net_xml_file, spawn_interval = None):
         """
             param @num_target_vehicles <int>: The number of target vehicles.
             param @num_random_vehicles <int>: The number of uncontrolled vehicles.
             param @pattern <tuple>: one of three possible patterns. FORMAT:
+            param @spawn_interval: Spawn interval of vehicles in simulation
             -- CASES BEGIN --
                 #1. one start point, one destination for all target vehicles
                 #2. ranged start point, one destination for all target vehicles
@@ -378,6 +379,8 @@ class target_vehicles_generator:
         #set the start time as 0 (by default) and the end time as 50
         #calculate the density of vehicles accordingly
         latest_release_time = 50.0 #a constant number for the latest release time of all vehicles
+        if spawn_interval is not None:
+            latest_release_time = float(spawn_interval) * float(num_target_vehicles)
         num_random_vehicles *= 2 # this is done to compensate the loss when generating using scripts. Need to solve this later.
         density =  latest_release_time / float(num_random_vehicles)
         density = int(density * 100)/100.0
@@ -389,7 +392,7 @@ class target_vehicles_generator:
         #invoke randomTrips.py
         print("net_xml_file:",net_xml_file)
         print("what's our target",target_xml_file)
-        command_str = "python randomTrips.py -n "+net_xml_file+" -e 50 -p "+str(density) +" -r "+target_xml_file
+        command_str = "python randomTrips.py -n "+net_xml_file+" -e "+str(latest_release_time)+" -p "+str(density) +" -r "+target_xml_file
         if os.system(command_str) != 0:
             print("ERROR: Failed to invoke randomTrips.py.")
             return None
@@ -450,6 +453,8 @@ class target_vehicles_generator:
         vehicle_list = []
         release_time = 0
         release_period = latest_release_time/float(num_target_vehicles)
+        if spawn_interval is not None:
+            release_period = float(spawn_interval)
 
         #read the xml file
         doc = xml.dom.minidom.parse(target_xml_file)
