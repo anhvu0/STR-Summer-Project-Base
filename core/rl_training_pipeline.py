@@ -174,7 +174,7 @@ class RLTrainingPipeline:
         self.connection_info = ConnectionInfo(os.path.join(self.sumocfg_dir, self.net_file))
         self.route_helper = TrainingRouteHelper(self.connection_info)
 
-        self.state_size = 1 + 6 + len(self.connection_info.edge_list)
+        self.state_size = 2 + 6 + len(self.connection_info.edge_list)
         self.action_size = 6
         self.trainer = DQNTrainer(self.state_size, self.action_size)
 
@@ -189,12 +189,13 @@ class RLTrainingPipeline:
         route_file = route_file_node[0].attributes['value'].nodeValue
         return net_file, route_file
 
-    def _encode_state(self, edge_id):
+    def _encode_state(self, edge_id, destination_edge):
         """
         Build a state vector for the given edge.
         """
         state = []
         state.append(self.connection_info.edge_index_dict[edge_id])
+        state.append(self.connection_info.edge_index_dict[destination_edge])
         for choice in self.route_helper.direction_choices:
             if choice in self.connection_info.outgoing_edges_dict[edge_id]:
                 state.append(1)
@@ -313,7 +314,7 @@ class RLTrainingPipeline:
                                     reward, done = self._compute_reward(
                                         vehicle, step, current_edge == vehicle.destination
                                     )
-                                    next_state = self._encode_state(current_edge)
+                                    next_state = self._encode_state(current_edge, vehicle.destination)
                                     self.trainer.remember(
                                         prev_state, prev_action, reward, next_state, done
                                     )
@@ -322,7 +323,7 @@ class RLTrainingPipeline:
                             if current_edge == vehicle.destination:
                                 last_state_action.pop(vehicle_id, None)
                                 continue
-                            state = self._encode_state(current_edge)
+                            state = self._encode_state(current_edge, vehicle.destination)
                             action = self.trainer.select_action(
                                 state, self._valid_actions(current_edge)
                             )

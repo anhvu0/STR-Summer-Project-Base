@@ -14,7 +14,7 @@ class QLearningPolicy(RouteController):
     
     #The below function is for verifying whether the shape of the first layer matches the network expected in SUMO config file.
     # def _validate_model_input_shape(self):
-    #     expected_state_size = 1 + 6 + len(self.connection_info.edge_list)
+    #     expected_state_size = 2 + 6 + len(self.connection_info.edge_list)
     #     model_input_shape = self.model.input_shape
     #     if isinstance(model_input_shape, (list, tuple)) and model_input_shape:
     #         model_input_dim = model_input_shape[-1]
@@ -45,7 +45,7 @@ class QLearningPolicy(RouteController):
             #i = 0
 
             while total_length < connection_info.edge_length_dict[vehicle.current_edge]:
-                state = self.getState(start_edge)
+                state = self.getState(start_edge, vehicle.destination)
                 action = self.act(state)
                 action = self.direction_choices[action]
                 if action not in connection_info.outgoing_edges_dict[start_edge]:
@@ -79,8 +79,8 @@ class QLearningPolicy(RouteController):
 
     # this function reacheds the Neural Network trained before and let it make a decision for the situation now
     def act(self, state):
-        act_values = self.model.predict(state)
-        state_vals = state[0][1:7]
+        act_values = self.model.predict(state, verbose=0)
+        state_vals = state[0][2:8]
         state_vals = state_vals.reshape(act_values.shape)
         #print(state)
         mod_values = act_values - 10000 * (1 - state_vals)
@@ -89,10 +89,11 @@ class QLearningPolicy(RouteController):
         return np.argmax(mod_values[0])
 
     # this function gives the current state of the vehicle based on the state size
-    def getState(self, edge_now):
+    def getState(self, edge_now, destination_edge):
         en = edge_now
         state = []
         state.append(self.connection_info.edge_index_dict[en])
+        state.append(self.connection_info.edge_index_dict[destination_edge])
         for c in self.direction_choices:
             if c in self.connection_info.outgoing_edges_dict[en].keys():
                 state.append(1)
