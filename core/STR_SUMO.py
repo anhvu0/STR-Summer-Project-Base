@@ -65,6 +65,7 @@ class StrSumo:
                 self.get_edge_vehicle_counts()
                 #initialize vehicles to be directed
                 vehicles_to_direct = []
+
                 # iterate through vehicles currently in simulation
                 for vehicle_id in vehicle_ids:
 

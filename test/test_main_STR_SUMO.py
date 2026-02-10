@@ -1,6 +1,12 @@
 '''
 This test file needs the following files:
 STR_SUMO.py, RouteController.py, Util.py, test.net.xml, test.rou.xml, myconfig.sumocfg and corresponding SUMO libraries.
+
+
+
+LACK get_controlled_vehicles function like the main.py file
+
+JUST RUN main.py
 '''
 import sys
 
@@ -48,7 +54,7 @@ def test_random_policy():
 
 def test_q_learning():
     print("Testing Q Learning Route Controller")
-    scheduler = QLearningPolicy(init_connection_info, './rl-high-all-fixed-late.h5')
+    scheduler = QLearningPolicy(init_connection_info, './rl_model.h5')
     run_simulation(scheduler)
     print("TEST PASSED!")
     print("************")

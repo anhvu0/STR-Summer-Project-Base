@@ -1,5 +1,5 @@
 <?xml version="1.0" ?>
-<!-- generated on Sat Feb  7 12:03:54 2026 by Eclipse SUMO duarouter Version 1.4.0
+<!-- generated on Mon Feb  9 19:31:19 2026 by Eclipse SUMO duarouter Version 1.4.0
 <configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/duarouterConfiguration.xsd">
 
     <input>
@@ -14,7 +14,7 @@
 
     <time>
         <begin value="0"/>
-        <end value="50"/>
+        <end value="50.0"/>
     </time>
 
     <report>
@@ -38,7 +38,7 @@
 	
     
 	<vehicle depart="0" id="100">
-		<route edges="-gneE18"/>
+		<route edges="gneE14"/>
 	</vehicle>
 	<vehicle id="1" depart="0.50">
 		
@@ -224,7 +224,7 @@
 	
     
 	<vehicle depart="10.0" id="102">
-		<route edges="gneE11"/>
+		<route edges="-gneE14"/>
 	</vehicle>
 	<vehicle id="21" depart="10.50">
 		
@@ -317,7 +317,7 @@
 	
     
 	<vehicle depart="15.0" id="103">
-		<route edges="-gneE12"/>
+		<route edges="-gneE14"/>
 	</vehicle>
 	<vehicle id="31" depart="15.50">
 		
@@ -410,7 +410,7 @@
 	
     
 	<vehicle depart="20.0" id="104">
-		<route edges="-gneE18"/>
+		<route edges="gneE9"/>
 	</vehicle>
 	<vehicle id="41" depart="20.50">
 		
@@ -503,7 +503,7 @@
 	
     
 	<vehicle depart="25.0" id="105">
-		<route edges="gneE22"/>
+		<route edges="gneE12"/>
 	</vehicle>
 	<vehicle id="51" depart="25.50">
 		
@@ -596,7 +596,7 @@
 	
     
 	<vehicle depart="30.0" id="106">
-		<route edges="gneE11"/>
+		<route edges="gneE9"/>
 	</vehicle>
 	<vehicle id="61" depart="30.50">
 		
@@ -689,7 +689,7 @@
 	
     
 	<vehicle depart="35.0" id="107">
-		<route edges="gneE22"/>
+		<route edges="gneE28"/>
 	</vehicle>
 	<vehicle id="71" depart="35.50">
 		
@@ -782,7 +782,7 @@
 	
     
 	<vehicle depart="40.0" id="108">
-		<route edges="-gneE9"/>
+		<route edges="gneE12"/>
 	</vehicle>
 	<vehicle id="81" depart="40.50">
 		
@@ -875,7 +875,7 @@
 	
     
 	<vehicle depart="45.0" id="109">
-		<route edges="-gneE25"/>
+		<route edges="gneE28"/>
 	</vehicle>
 	<vehicle id="91" depart="45.50">
 		

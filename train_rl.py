@@ -1,5 +1,9 @@
 """
 Entry point for training a reinforcement learning routing policy.
+
+RIGHT HERE, DEFAULT SETTINGS USE FILES IN configurations folder. They affect the location of sumocfg file and xml file.
+Files used here and files used in main.py must match. Otherwise -> Wrong dimensions
+
 """
 import argparse
 
@@ -15,7 +19,8 @@ def build_parser():
         "--sumocfg",
         default="./configurations/myconfig.sumocfg",
         help="Path to SUMO .sumocfg file.",
-    )
+    )       #If you change the sumocfg file, you need to retrain the model so it will reflect new files in there. At least for now until we can generalize routes and net
+
     parser.add_argument(
         "--model-output",
         default="./configurations/rl_model.h5",
@@ -39,6 +44,8 @@ def build_parser():
 def main():
     """
     Run the RL training pipeline.
+
+    Better run main.py without arguments to avoid conflicts with files declared in main.py
     """
     parser = build_parser()
     args = parser.parse_args()

@@ -61,7 +61,7 @@ The repository now includes a DQN-based training pipeline that spawns vehicles a
 
 To train a model:
 ```
-python3 train_rl.py --sumocfg ./test/myconfig.sumocfg --model-output ./test/rl_model.h5 --episodes 10 --spawn-interval 0.0
+python3 train_rl.py --sumocfg ./test/myconfig.sumocfg --model-output ./test/rl_model.h5 --episodes 10 --spawn-interval 0.0 (Those are optional arguments. Just use train_rl.py only for default settings)
 ```
 
 The resulting model can be used with `QLearningController.py` by pointing it to the saved model file.

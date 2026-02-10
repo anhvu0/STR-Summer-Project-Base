@@ -11,6 +11,23 @@ class QLearningPolicy(RouteController):
         self.model = load_model(model_file)
         self.vehicles = vehicles
 
+    
+    #The below function is for verifying whether the shape of the first layer matches the network expected in SUMO config file.
+    # def _validate_model_input_shape(self):
+    #     expected_state_size = 1 + 6 + len(self.connection_info.edge_list)
+    #     model_input_shape = self.model.input_shape
+    #     if isinstance(model_input_shape, (list, tuple)) and model_input_shape:
+    #         model_input_dim = model_input_shape[-1]
+    #     else:
+    #         model_input_dim = None
+    #     if model_input_dim != expected_state_size:
+    #         raise ValueError(
+    #             "Model input shape does not match SUMO network state size. "
+    #             f"Expected {expected_state_size}, got {model_input_dim}. "
+    #             "Retrain the model using the current SUMO .sumocfg/.net.xml files "
+    #             "or load a model trained on this network."
+    #         )
+
 
     def make_decisions(self, vehicles, connection_info: ConnectionInfo):
         local_targets = {}

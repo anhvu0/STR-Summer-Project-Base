@@ -289,7 +289,7 @@ class RLTrainingPipeline:
                 "--tripinfo-output",
                 os.path.join(self.sumocfg_dir, "trips.trips.xml"),
                 "--quit-on-end",
-            ])
+            ]) #trips.trips.xml will be saved into the same folder as sumocfg file.
             last_state_action = {}
             try:
                 for step in range(MAX_SIMULATION_STEPS):
