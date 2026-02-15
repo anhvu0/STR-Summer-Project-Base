@@ -85,7 +85,7 @@ class DQNTrainer:
 
     def build_model(self, learning_rate):
         model = Sequential()
-        model.add(Dense(128, input_dim=self.state_size, activation='relu'))
+        model.add(Dense(128, input_dim=self.state_size, activation='relu'))      #May increase Dense for bigger network
         model.add(Dense(128, activation='relu'))
         model.add(Dense(self.action_size, activation='linear'))
         model.compile(loss='mse', optimizer=Adam(learning_rate = learning_rate))
@@ -97,7 +97,7 @@ class DQNTrainer:
         :param valid_actions: List of valid actions at a specific edge
         """
         if not valid_actions:
-            return random.randint(0, self.action_size - 1) # Something has to be returned otherwise it crashes -> no good
+            return None
         if np.random.rand() <= self.epsilon: # Random to see if the agent should choose a new path
             return random.choice(valid_actions)
         q_values = self.model.predict(state, verbose = 0)[0]
@@ -148,7 +148,7 @@ class RLTrainingPipeline:
         episodes=10,
         spawn_interval=2.0,
         decision_horizon=6,
-        destination_reward=200.0,
+        destination_reward=120.0,       #Adjustible
         deadline_penalty=100.0,
     ):
         """
@@ -243,9 +243,9 @@ class RLTrainingPipeline:
         """
         Compute a reward based on travel time, congestion, and deadlines.
         """
-        time_penalty = -1.0
+        time_penalty = -5.0
         congestion = self.connection_info.edge_vehicle_count.get(vehicle.current_edge, 0)
-        congestion_penalty = -(congestion / max(self.connection_info.edge_length_dict[vehicle.current_edge], 1.0))
+        congestion_penalty = -(congestion / max(self.connection_info.edge_length_dict[vehicle.current_edge], 5.0))
         reward = time_penalty + congestion_penalty
         done = False
         if arrived:
@@ -324,9 +324,9 @@ class RLTrainingPipeline:
                                 last_state_action.pop(vehicle_id, None)
                                 continue
                             state = self.encode_state(current_edge, vehicle.destination)
-                            action = self.trainer.select_action(
-                                state, self.valid_actions(current_edge)
-                            )
+                            action = self.trainer.select_action(state, self.valid_actions(current_edge))
+                            if action is None:
+                                continue
                             decision_list = self.build_decision_list(current_edge, action)
                             local_target = self.route_helper.compute_local_target(
                                 decision_list, vehicle

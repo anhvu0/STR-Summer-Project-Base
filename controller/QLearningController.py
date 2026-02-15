@@ -48,9 +48,17 @@ class QLearningPolicy(RouteController):
                 state = self.getState(start_edge, vehicle.destination)
                 action = self.act(state)
                 action = self.direction_choices[action]
-                if action not in connection_info.outgoing_edges_dict[start_edge]:
-                    print("Impossible turns made for vehicle #" + str(vehicle.vehicle_id) + " : " + action + " @ " + str(start_edge))
-                    wrong_decision = True
+                # if action not in connection_info.outgoing_edges_dict[start_edge]:
+                #     print("Impossible turns made for vehicle #" + str(vehicle.vehicle_id) + " : " + action + " @ " + str(start_edge))
+                #     wrong_decision = True
+                #     break
+
+                outgoing = connection_info.outgoing_edges_dict.get(start_edge, {})
+                valid_dirs = list(outgoing.keys())
+
+                if action not in outgoing:
+                    print(f"[IMPOSSIBLE] veh={vehicle.vehicle_id} edge={start_edge} dest={vehicle.destination} "
+                        f"chosen='{action}' valid_dirs={valid_dirs} state_bits={state[0][2:8].tolist()}")               #FOR DEBUGGING WHY THERE ARE IMPOSSIBLE TURNS
                     break
 
                 print("Choice for " + str(start_edge) + " is: " + action)
