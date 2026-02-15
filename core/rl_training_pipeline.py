@@ -1,6 +1,7 @@
 import numpy as np
 import os
 import sys
+import math
 from xml.dom.minidom import parse
 from keras.layers import Dense
 from keras.models import Sequential
@@ -65,7 +66,7 @@ class DQNTrainer:
     Deep Q-Network trainer for routing decisions
     """
 
-    def __init__(self, state_size, action_size, learning_rate = 0.001, gamma = 0.95, epsilon = 1.0, epsilon_decay = 0.995, epsilon_min = 0.05, replay_capacity=10000, batch_size = 64):
+    def __init__(self, state_size, action_size, learning_rate = 0.001, gamma = 0.95, epsilon = 1.0, epsilon_decay = 0.99, epsilon_min = 0.05, replay_capacity=10000, batch_size = 32):
         """
         :param learning_rate: Can be adjusted for further optimization
         :param gamma: Can be adjusted for further optimization
@@ -85,8 +86,8 @@ class DQNTrainer:
 
     def build_model(self, learning_rate):
         model = Sequential()
-        model.add(Dense(128, input_dim=self.state_size, activation='relu'))      #May increase Dense for bigger network
-        model.add(Dense(128, activation='relu'))
+        model.add(Dense(64, input_dim=self.state_size, activation='relu'))      #May increase Dense for bigger network
+        model.add(Dense(64, activation='relu'))
         model.add(Dense(self.action_size, activation='linear'))
         model.compile(loss='mse', optimizer=Adam(learning_rate = learning_rate))
         return model
@@ -131,7 +132,7 @@ class DQNTrainer:
         target = q.copy()
         target[np.arange(self.batch_size), actions] = rewards + (1.0 - dones.astype(np.float32)) * self.gamma * np.max(q_next, axis=1)
 
-        self.model.fit(states, target, epochs=1, verbose=0)
+        self.model.train_on_batch(states, target)
 
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
@@ -150,6 +151,7 @@ class RLTrainingPipeline:
         decision_horizon=6,
         destination_reward=120.0,       #Adjustible
         deadline_penalty=100.0,
+        
     ):
         """
         Args:
@@ -168,6 +170,8 @@ class RLTrainingPipeline:
         self.decision_horizon = decision_horizon
         self.destination_reward = destination_reward
         self.deadline_penalty = deadline_penalty
+        self._distance_cache = {}
+        self.progress_reward_scale = 1.0  # or 0.0 to disable progress term cheaply
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
@@ -191,21 +195,22 @@ class RLTrainingPipeline:
 
     def encode_state(self, edge_id, destination_edge):
         """
-        Build a state vector for the given edge.
+        Build a state vector for the given edge using cached per-step densities.
         """
-        state = []
-        state.append(self.connection_info.edge_index_dict[edge_id])
-        state.append(self.connection_info.edge_index_dict[destination_edge])
-        for choice in self.route_helper.direction_choices:
-            if choice in self.connection_info.outgoing_edges_dict[edge_id]:
-                state.append(1)
-            else:
-                state.append(0)
-        for edge_now in self.connection_info.edge_list:
-            car_num = traci.edge.getLastStepVehicleNumber(edge_now)
-            density = car_num / self.connection_info.edge_length_dict[edge_now]
-            state.append(density)
-        return np.reshape(state, [1, len(state)])
+        state = np.zeros(self.state_size, dtype=np.float32)
+
+        state[0] = self.connection_info.edge_index_dict[edge_id]
+        state[1] = self.connection_info.edge_index_dict[destination_edge]
+
+        outgoing = self.connection_info.outgoing_edges_dict[edge_id]
+        base = 2
+        for i, choice in enumerate(self.route_helper.direction_choices):
+            state[base + i] = 1.0 if choice in outgoing else 0.0
+
+        # densities: cached once per step
+        state[base + 6:] = self._density_vec
+
+        return state.reshape(1, -1)
 
     def valid_actions(self, edge_id):
         """
@@ -238,15 +243,44 @@ class RLTrainingPipeline:
             decision_list.append(direction)
             current_edge = self.connection_info.outgoing_edges_dict[current_edge][direction]
         return decision_list
+    
 
-    def compute_reward(self, vehicle, step, arrived):
+    def get_distance_to_destination(self, edge_id, destination_edge):
+        """
+        Return shortest-path cost from edge_id to destination_edge.
+        Uses a cache because this is called frequently during training.
+        """
+        key = (edge_id, destination_edge)
+        if key in self._distance_cache:
+            return self._distance_cache[key]
+
+        try:
+            from_edge = self.net.getEdge(edge_id)
+            to_edge = self.net.getEdge(destination_edge)
+        except Exception:
+            self._distance_cache[key] = math.inf
+            return math.inf
+
+        path_edges, path_cost = self.net.getShortestPath(from_edge, to_edge)
+        distance = path_cost if path_edges is not None else math.inf
+        self._distance_cache[key] = distance
+        return distance
+
+
+    def compute_reward(self, vehicle, prev_edge, current_edge, step, arrived):
         """
         Compute a reward based on travel time, congestion, and deadlines.
         """
         time_penalty = -5.0
-        congestion = self.connection_info.edge_vehicle_count.get(vehicle.current_edge, 0)
-        congestion_penalty = -(congestion / max(self.connection_info.edge_length_dict[vehicle.current_edge], 5.0))
+        congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
+        congestion_penalty = -(congestion / max(self.connection_info.edge_length_dict[current_edge], 5.0))
         reward = time_penalty + congestion_penalty
+
+        prev_distance = self.get_distance_to_destination(prev_edge, vehicle.destination)
+        curr_distance = self.get_distance_to_destination(current_edge, vehicle.destination)
+        if math.isfinite(prev_distance) and math.isfinite(curr_distance):
+            progress_reward = (prev_distance - curr_distance) * self.progress_reward_scale
+            reward += progress_reward
         done = False
         if arrived:
             reward += self.destination_reward
@@ -312,7 +346,7 @@ class RLTrainingPipeline:
                                 )
                                 if prev_state is not None:
                                     reward, done = self.compute_reward(
-                                        vehicle, step, current_edge == vehicle.destination
+                                        vehicle, vehicle.current_edge, current_edge, step, current_edge == vehicle.destination,
                                     )
                                     next_state = self.encode_state(current_edge, vehicle.destination)
                                     self.trainer.remember(
@@ -325,8 +359,8 @@ class RLTrainingPipeline:
                                 continue
                             state = self.encode_state(current_edge, vehicle.destination)
                             action = self.trainer.select_action(state, self.valid_actions(current_edge))
-                            if action is None:
-                                continue
+                            # if action is None:
+                            #     continue
                             decision_list = self.build_decision_list(current_edge, action)
                             local_target = self.route_helper.compute_local_target(
                                 decision_list, vehicle
@@ -337,11 +371,22 @@ class RLTrainingPipeline:
                     self.trainer.replay()
             finally:
                 traci.close()
-            self.trainer.model.save(self.model_output_path)
+        self.trainer.model.save(self.model_output_path)
 
     def update_edge_vehicle_counts(self):
         """
-        Update edge vehicle counts in connection_info.
+        Update edge vehicle counts in connection_info AND cache a density vector for fast state encoding.
         """
-        for edge in self.connection_info.edge_list:
-            self.connection_info.edge_vehicle_count[edge] = traci.edge.getLastStepVehicleNumber(edge)
+        counts = self.connection_info.edge_vehicle_count
+        edge_list = self.connection_info.edge_list
+        lengths = self.connection_info.edge_length_dict
+
+        # update counts once per step
+        for edge in edge_list:
+            counts[edge] = traci.edge.getLastStepVehicleNumber(edge)
+
+        # cache densities once per step (vector aligned with edge_list)
+        self._density_vec = np.array(
+            [counts[e] / max(lengths[e], 1e-6) for e in edge_list],
+            dtype=np.float32
+        )

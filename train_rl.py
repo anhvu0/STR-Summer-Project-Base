@@ -29,7 +29,7 @@ def build_parser():
     parser.add_argument(
         "--episodes",
         type=int,
-        default=10,
+        default=25,
         help="Number of training episodes.",
     )
     parser.add_argument(

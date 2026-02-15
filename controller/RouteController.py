@@ -53,6 +53,7 @@ class RouteController(ABC):
             #the while is used to make sure the vehicle will not assume it arrives the destination beacuse the target edge is too short.
             while path_length <= max(vehicle.current_speed, 20):
                 if current_target_edge == vehicle.destination:
+                    print("vehicle done!")
                     break
                 if i >= len(decision_list):
                     raise UserWarning(
