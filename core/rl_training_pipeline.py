@@ -170,7 +170,7 @@ class RLTrainingPipeline:
         self.deadline_penalty = deadline_penalty
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
-        self.net_file, self.route_file = self._parse_sumocfg(sumocfg_path)
+        self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
         self.connection_info = ConnectionInfo(os.path.join(self.sumocfg_dir, self.net_file))
         self.route_helper = TrainingRouteHelper(self.connection_info)
 
@@ -178,7 +178,7 @@ class RLTrainingPipeline:
         self.action_size = 6
         self.trainer = DQNTrainer(self.state_size, self.action_size)
 
-    def _parse_sumocfg(self, sumocfg_path):
+    def parse_sumocfg(self, sumocfg_path):
         """
         Parse the SUMO config file and return net and route filenames.
         """
@@ -189,7 +189,7 @@ class RLTrainingPipeline:
         route_file = route_file_node[0].attributes['value'].nodeValue
         return net_file, route_file
 
-    def _encode_state(self, edge_id, destination_edge):
+    def encode_state(self, edge_id, destination_edge):
         """
         Build a state vector for the given edge.
         """
@@ -207,7 +207,7 @@ class RLTrainingPipeline:
             state.append(density)
         return np.reshape(state, [1, len(state)])
 
-    def _valid_actions(self, edge_id):
+    def valid_actions(self, edge_id):
         """
         Return action indices that are valid from the current edge.
         """
@@ -217,7 +217,7 @@ class RLTrainingPipeline:
                 valid.append(idx)
         return valid
 
-    def _build_decision_list(self, edge_id, initial_action):
+    def build_decision_list(self, edge_id, initial_action):
         """
         Build a decision list that starts with the chosen action and is padded
         with random valid actions to ensure a viable local target.
@@ -230,7 +230,7 @@ class RLTrainingPipeline:
             if not decision_list:
                 action = initial_action
             else:
-                valid_actions = self._valid_actions(current_edge)
+                valid_actions = self.valid_actions(current_edge)
                 action = random.choice(valid_actions) if valid_actions else initial_action
             direction = self.route_helper.direction_choices[action]
             if direction not in self.connection_info.outgoing_edges_dict[current_edge]:
@@ -239,7 +239,7 @@ class RLTrainingPipeline:
             current_edge = self.connection_info.outgoing_edges_dict[current_edge][direction]
         return decision_list
 
-    def _compute_reward(self, vehicle, step, arrived):
+    def compute_reward(self, vehicle, step, arrived):
         """
         Compute a reward based on travel time, congestion, and deadlines.
         """
@@ -256,7 +256,7 @@ class RLTrainingPipeline:
             done = True
         return reward, done
 
-    def _generate_episode_vehicles(self):
+    def generate_episode_vehicles(self):
         """
         Generate controlled and uncontrolled vehicles for one training episode.
         """
@@ -282,7 +282,7 @@ class RLTrainingPipeline:
         """
         sumo_binary = checkBinary('sumo')
         for episode in range(self.episodes):
-            vehicles = self._generate_episode_vehicles()
+            vehicles = self.generate_episode_vehicles()
             traci.start([
                 sumo_binary,
                 "-c",
@@ -296,7 +296,7 @@ class RLTrainingPipeline:
                 for step in range(MAX_SIMULATION_STEPS):
                     if traci.simulation.getMinExpectedNumber() <= 0:
                         break
-                    self._update_edge_vehicle_counts()
+                    self.update_edge_vehicle_counts()
                     vehicle_ids = set(traci.vehicle.getIDList())
                     for vehicle_id in vehicle_ids:
                         if vehicle_id not in vehicles:
@@ -311,10 +311,10 @@ class RLTrainingPipeline:
                                     vehicle_id, (None, None)
                                 )
                                 if prev_state is not None:
-                                    reward, done = self._compute_reward(
+                                    reward, done = self.compute_reward(
                                         vehicle, step, current_edge == vehicle.destination
                                     )
-                                    next_state = self._encode_state(current_edge, vehicle.destination)
+                                    next_state = self.encode_state(current_edge, vehicle.destination)
                                     self.trainer.remember(
                                         prev_state, prev_action, reward, next_state, done
                                     )
@@ -323,11 +323,11 @@ class RLTrainingPipeline:
                             if current_edge == vehicle.destination:
                                 last_state_action.pop(vehicle_id, None)
                                 continue
-                            state = self._encode_state(current_edge, vehicle.destination)
+                            state = self.encode_state(current_edge, vehicle.destination)
                             action = self.trainer.select_action(
-                                state, self._valid_actions(current_edge)
+                                state, self.valid_actions(current_edge)
                             )
-                            decision_list = self._build_decision_list(current_edge, action)
+                            decision_list = self.build_decision_list(current_edge, action)
                             local_target = self.route_helper.compute_local_target(
                                 decision_list, vehicle
                             )
@@ -339,7 +339,7 @@ class RLTrainingPipeline:
                 traci.close()
             self.trainer.model.save(self.model_output_path)
 
-    def _update_edge_vehicle_counts(self):
+    def update_edge_vehicle_counts(self):
         """
         Update edge vehicle counts in connection_info.
         """
