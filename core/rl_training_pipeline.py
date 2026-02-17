@@ -275,6 +275,7 @@ class RLTrainingPipeline:
         congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
         congestion_penalty = -(congestion / max(self.connection_info.edge_length_dict[current_edge], 5.0))
         reward = time_penalty + congestion_penalty
+        dead_end_penalty = -10.0
 
         prev_distance = self.get_distance_to_destination(prev_edge, vehicle.destination)
         curr_distance = self.get_distance_to_destination(current_edge, vehicle.destination)
@@ -284,6 +285,9 @@ class RLTrainingPipeline:
         done = False
         if arrived:
             reward += self.destination_reward
+            done = True
+        else:
+            reward -= dead_end_penalty #Penalty for reaching dead_end, but not too strict since some vehicles may go in there
             done = True
         if step > vehicle.deadline:
             reward -= self.deadline_penalty
@@ -370,6 +374,7 @@ class RLTrainingPipeline:
                     traci.simulationStep()
                     self.trainer.replay()
             finally:
+                print(f"\nDone with episode {episode}\n")
                 traci.close()
         self.trainer.model.save(self.model_output_path)
 

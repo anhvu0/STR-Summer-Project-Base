@@ -57,13 +57,13 @@ class RouteController(ABC):
                     break
                 if i >= len(decision_list):
                     raise UserWarning(
-                        "Not enough decisions provided to compute valid local target. TRACI will remove vehicle."
+                        f"At edge {vehicle.current_edge}, Not enough decisions provided to compute valid local target. TRACI will remove vehicle."
                     )
 
                 choice = decision_list[i]
                 if choice not in self.connection_info.outgoing_edges_dict[current_target_edge]:
                     raise UserWarning(
-                            "Invalid direction. TRACI will remove vehicle."
+                            f"At edge {vehicle.current_edge}, Invalid direction. TRACI will remove vehicle."
                         )
                 current_target_edge = self.connection_info.outgoing_edges_dict[current_target_edge][choice]
                 path_length += self.connection_info.edge_length_dict[current_target_edge]
