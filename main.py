@@ -52,7 +52,6 @@ def get_controlled_vehicles(route_filename, connection_info, \
 
 def test_dijkstra_policy(vehicles):
     print("Testing Dijkstra's Algorithm Route Controller")
-    #scheduler = DijkstraPolicy(init_connection_info)
     scheduler = DijkstraPolicy(init_connection_info)
     run_simulation(scheduler, vehicles)
 

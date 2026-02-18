@@ -20,6 +20,7 @@ else:
 
 from sumolib import checkBinary
 import traci
+import sumolib
 
 """
 In this file, we build a DQN network
@@ -175,10 +176,13 @@ class RLTrainingPipeline:
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
+
+        self.net = sumolib.net.readNet(os.path.join(self.sumocfg_dir, self.net_file))
+
         self.connection_info = ConnectionInfo(os.path.join(self.sumocfg_dir, self.net_file))
         self.route_helper = TrainingRouteHelper(self.connection_info)
 
-        self.state_size = 2 + 6 + len(self.connection_info.edge_list)
+        self.state_size = 2 + 6 + 3 + len(self.connection_info.edge_list)
         self.action_size = 6
         self.trainer = DQNTrainer(self.state_size, self.action_size)
 
@@ -212,12 +216,11 @@ class RLTrainingPipeline:
         route_file = route_file_node[0].attributes['value'].nodeValue
         return net_file, route_file
 
-    def encode_state(self, edge_id, destination_edge):
+    def encode_state(self, vehicle_id, edge_id, destination_edge):
         """
         Build a state vector for the given edge using cached per-step densities.
         """
         state = np.zeros(self.state_size, dtype=np.float32)
-
         state[0] = self.connection_info.edge_index_dict[edge_id]
         state[1] = self.connection_info.edge_index_dict[destination_edge]
 
@@ -226,9 +229,20 @@ class RLTrainingPipeline:
         for i, choice in enumerate(self.route_helper.direction_choices):
             state[base + i] = 1.0 if choice in outgoing else 0.0
 
-        # densities: cached once per step
-        state[base + 6:] = self._density_vec
+        # lane features
+        lane_id = traci.vehicle.getLaneID(vehicle_id)
+        lane_idx = traci.vehicle.getLaneIndex(vehicle_id)
+        n_lanes = max(traci.edge.getLaneNumber(edge_id), 1)
+        lane_len = traci.lane.getLength(lane_id)
+        lane_pos = traci.vehicle.getLanePosition(vehicle_id)
+        dist_to_end = max(lane_len - lane_pos, 0.0)
 
+        lane_base = base + 6
+        state[lane_base + 0] = lane_idx / max(n_lanes - 1, 1)
+        state[lane_base + 1] = min(n_lanes, 6) / 6.0
+        state[lane_base + 2] = min(dist_to_end, 200.0) / 200.0
+
+        state[lane_base + 3:] = self._density_vec
         return state.reshape(1, -1)
 
     def valid_actions(self, edge_id):
@@ -240,6 +254,38 @@ class RLTrainingPipeline:
             if choice in self.connection_info.outgoing_edges_dict[edge_id]:
                 valid.append(idx)
         return valid
+    
+    def valid_actions_for_vehicle(self, vehicle_id, edge_id):
+        """
+        Valid actions from the vehicle's CURRENT LANE (not just edge-level).
+        """
+        lane_id = traci.vehicle.getLaneID(vehicle_id)
+        lane_map = self.connection_info.lane_outgoing_edges_dict.get(lane_id, {})
+        valid = []
+        for idx, choice in enumerate(self.route_helper.direction_choices):
+            if choice in lane_map:
+                valid.append(idx)
+        return valid
+    
+    def dist_to_end(self, vehicle_id):
+        """
+        Distance (meters) from the vehicle to the end of its current lane.
+        """
+        lane_id = traci.vehicle.getLaneID(vehicle_id)
+        lane_len = traci.lane.getLength(lane_id)
+        lane_pos = traci.vehicle.getLanePosition(vehicle_id)
+        return max(lane_len - lane_pos, 0.0)
+
+    def is_decision_point(self, edge_id, vehicle_id, dist_threshold=80.0):
+        """
+        Make routing decisions only when it matters:
+        - the edge has > 1 outgoing option (real branch), AND
+        - the vehicle is close enough to the junction (within dist_threshold meters)
+        """
+        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
+        if outgoing is None or len(outgoing) <= 1:
+            return False
+        return self.dist_to_end(vehicle_id) <= dist_threshold
 
     def build_decision_list(self, edge_id, initial_action):
         """
@@ -255,7 +301,11 @@ class RLTrainingPipeline:
                 action = initial_action
             else:
                 valid_actions = self.valid_actions(current_edge)
-                action = random.choice(valid_actions) if valid_actions else initial_action
+                if not valid_actions:
+                    break
+                action = random.choice(valid_actions) if decision_list else initial_action
+                if action not in valid_actions:
+                    action = random.choice(valid_actions)
             direction = self.route_helper.direction_choices[action]
             if direction not in self.connection_info.outgoing_edges_dict[current_edge]:
                 break
@@ -284,6 +334,28 @@ class RLTrainingPipeline:
         distance = path_cost if path_edges is not None else math.inf
         self._distance_cache[key] = distance
         return distance
+    
+    def ensure_lane_for_direction(self, vehicle_id, edge_id, direction, min_dist=40.0, duration=50):
+        """
+        If current lane cannot do 'direction', try to change into a lane that can,
+        as long as we aren't too close to the junction end.
+        """
+        lane_id = traci.vehicle.getLaneID(vehicle_id)
+        lane_pos = traci.vehicle.getLanePosition(vehicle_id)
+        lane_len = traci.lane.getLength(lane_id)
+        dist_to_end = lane_len - lane_pos
+
+        if dist_to_end < min_dist:
+            return  # too late
+
+        lane_ids = self.connection_info.edge_lane_ids.get(edge_id, [])
+        for target_lane_index, ln_id in enumerate(lane_ids):
+            lane_map = self.connection_info.lane_outgoing_edges_dict.get(ln_id, {})
+            if direction in lane_map:
+                curr_idx = traci.vehicle.getLaneIndex(vehicle_id)
+                if curr_idx != target_lane_index:
+                    traci.vehicle.changeLane(vehicle_id, target_lane_index, duration)
+                return
 
 
     def compute_reward(self, vehicle, prev_edge, current_edge, step, arrived):
@@ -383,84 +455,145 @@ class RLTrainingPipeline:
 
     def run(self):
         """
-        Run the full training loop across episodes.
+        Run the full training loop across episodes, with cleaner decision timing:
+        - Decide near junctions (decision points), not on every edge change
+        - Mask actions by lane feasibility
+        - Optionally force lane alignment for chosen direction
+        - Close transitions at the next decision point
         """
         sumo_binary = checkBinary('sumo')
+        TRAIN_EVERY = 10          # try 10–20
+        GRAD_STEPS = 1            # try 1–4
+
         for episode in range(self.episodes):
             vehicles = self.generate_episode_vehicles()
+
             traci.start([
                 sumo_binary,
-                "-c",
-                self.sumocfg_path,
-                "--tripinfo-output",
-                os.path.join(self.sumocfg_dir, "trips.trips.xml"),
+                "-c", self.sumocfg_path,
+                "--tripinfo-output", os.path.join(self.sumocfg_dir, "trips.trips.xml"),
                 "--quit-on-end",
-            ]) #trips.trips.xml will be saved into the same folder as sumocfg file.
+            ])
+
+            # vehicle_id -> (state, action, decision_edge)
             last_state_action = {}
+            # vehicle_id -> edge_id where we last issued a decision (prevents repeat decisions)
+            last_decision_edge = {}
+
             try:
                 for step in range(MAX_SIMULATION_STEPS):
                     if traci.simulation.getMinExpectedNumber() <= 0:
                         break
-                    self.update_edge_vehicle_counts()
-                    vehicle_ids = set(traci.vehicle.getIDList())
+
+                    self.update_edge_vehicle_counts(step, every=10)  # try 10–20
+                    vehicle_ids = list(traci.vehicle.getIDList())
+
                     for vehicle_id in vehicle_ids:
                         if vehicle_id not in vehicles:
                             continue
+
                         current_edge = traci.vehicle.getRoadID(vehicle_id)
                         if current_edge not in self.connection_info.edge_index_dict:
                             continue
+
                         vehicle = vehicles[vehicle_id]
-                        if vehicle.current_edge != current_edge:
-                            if vehicle.current_edge:
-                                prev_state, prev_action = last_state_action.get(
-                                    vehicle_id, (None, None)
-                                )
-                                if prev_state is not None:
-                                    dist = self.get_distance_to_destination(current_edge, vehicle.destination)
-                                    reward, done = self.compute_reward(
-                                        vehicle, vehicle.current_edge, current_edge, step, current_edge == vehicle.destination,
-                                    )
-                                    next_state = self.encode_state(current_edge, vehicle.destination)
-                                    self.trainer.remember(
-                                        prev_state, prev_action, reward, next_state, done
-                                    )
-                            vehicle.current_edge = current_edge
-                            vehicle.current_speed = traci.vehicle.getSpeed(vehicle_id)
-                            if current_edge == vehicle.destination:
-                                last_state_action.pop(vehicle_id, None)
-                                continue
-                            state = self.encode_state(current_edge, vehicle.destination)
-                            action = self.trainer.select_action(state, self.valid_actions(current_edge))
-                            # if action is None:
-                            #     continue
-                            decision_list = self.build_decision_list(current_edge, action)
-                            local_target = self.route_helper.compute_local_target(
-                                decision_list, vehicle
+                        vehicle.current_edge = current_edge
+                        vehicle.current_speed = traci.vehicle.getSpeed(vehicle_id)
+
+                        # arrived
+                        if current_edge == vehicle.destination:
+                            last_state_action.pop(vehicle_id, None)
+                            last_decision_edge.pop(vehicle_id, None)
+                            continue
+
+                        # only decide at decision points
+                        if not self.is_decision_point(current_edge, vehicle_id, dist_threshold=80.0):
+                            continue
+
+                        # avoid repeating decisions multiple steps on same edge
+                        if last_decision_edge.get(vehicle_id) == current_edge:
+                            continue
+
+                        # ---- close previous transition at this decision point ----
+                        if vehicle_id in last_state_action:
+                            prev_state, prev_action, prev_edge = last_state_action[vehicle_id]
+
+                            reward, done = self.compute_reward(
+                                vehicle,
+                                prev_edge,
+                                current_edge,
+                                step,
+                                arrived=False
                             )
-                            traci.vehicle.changeTarget(vehicle_id, local_target)
-                            last_state_action[vehicle_id] = (state, action)
+
+                            next_state = self.encode_state(vehicle_id, current_edge, vehicle.destination)
+                            self.trainer.remember(prev_state, prev_action, reward, next_state, done)
+
+                            if done:
+                                last_state_action.pop(vehicle_id, None)
+                                last_decision_edge[vehicle_id] = current_edge
+                                continue
+
+                        # ---- choose action (lane-feasible) ----
+                        state = self.encode_state(vehicle_id, current_edge, vehicle.destination)
+
+                        valid = self.valid_actions_for_vehicle(vehicle_id, current_edge)
+                        action = self.trainer.select_action(state, valid)
+
+                        if action is None:
+                            # no feasible action from this lane; skip decision (or penalize if you prefer)
+                            last_decision_edge[vehicle_id] = current_edge
+                            continue
+
+                        direction = self.route_helper.direction_choices[action]
+
+                        # optional lane alignment (strongly recommended)
+                        self.ensure_lane_for_direction(
+                            vehicle_id,
+                            current_edge,
+                            direction,
+                            min_dist=60.0,
+                            duration=50
+                        )
+
+                        # compute local target and apply routing
+                        decision_list = self.build_decision_list(current_edge, action)
+                        local_target = self.route_helper.compute_local_target(decision_list, vehicle)
+                        traci.vehicle.changeTarget(vehicle_id, local_target)
+
+                        # store new transition start
+                        last_state_action[vehicle_id] = (state, action, current_edge)
+                        last_decision_edge[vehicle_id] = current_edge
+
                     traci.simulationStep()
-                    self.trainer.replay()
+                    
+                    if step % TRAIN_EVERY == 0:
+                        for _ in range(GRAD_STEPS):
+                            self.trainer.replay()
+
             finally:
-                self.trainer.epsilon = max(self.trainer.epsilon_min, self.trainer.epsilon * self.trainer.epsilon_decay)
+                self.trainer.epsilon = max(
+                    self.trainer.epsilon_min,
+                    self.trainer.epsilon * self.trainer.epsilon_decay
+                )
                 print(f"\n\nDone with episode {episode}\n")
                 traci.close()
+
         self.trainer.model.save(self.model_output_path)
 
-    def update_edge_vehicle_counts(self):
-        """
-        Update edge vehicle counts in connection_info AND cache a density vector for fast state encoding.
-        """
+    def update_edge_vehicle_counts(self, step, every=10):
+        if hasattr(self, "_last_density_step") and (step - self._last_density_step) < every:
+            return  # reuse cached self._density_vec
+
         counts = self.connection_info.edge_vehicle_count
         edge_list = self.connection_info.edge_list
         lengths = self.connection_info.edge_length_dict
 
-        # update counts once per step
         for edge in edge_list:
             counts[edge] = traci.edge.getLastStepVehicleNumber(edge)
 
-        # cache densities once per step (vector aligned with edge_list)
         self._density_vec = np.array(
             [counts[e] / max(lengths[e], 1e-6) for e in edge_list],
             dtype=np.float32
         )
+        self._last_density_step = step

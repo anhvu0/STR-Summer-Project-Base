@@ -46,6 +46,8 @@ class ConnectionInfo:
         self.edge_index_dict = {}
         self.edge_vehicle_count = {}
         self.edge_list = []
+        self.lane_outgoing_edges_dict = {}  # lane_id -> {direction: out_edge_id}
+        self.edge_lane_ids = {}             # edge_id -> [lane_id0, lane_id1, ...]
 
         edge_index = 0
 
@@ -54,6 +56,14 @@ class ConnectionInfo:
         # collect edge information into dictionaries
         for current_edge in edges:
             current_edge_id = current_edge.getID()
+            # store lanes for this edge (passenger edges only)
+            if current_edge.allows("passenger"):
+                lanes = current_edge.getLanes()
+                self.edge_lane_ids[current_edge_id] = [ln.getID() for ln in lanes]
+                for ln in lanes:
+                    lane_id = ln.getID()
+                    if lane_id not in self.lane_outgoing_edges_dict:
+                        self.lane_outgoing_edges_dict[lane_id] = {}
 
             # add edge to edge list if it allows passenger vehicles
             # "passenger" is a SUMO defined vehicle class
@@ -74,12 +84,23 @@ class ConnectionInfo:
             else:
                 self.edge_length_dict[current_edge_id] = current_edge.getLength()
 
-            # collect outgoing edges by direction
+            # collect outgoing edges by direction (ONLY for passenger edges)
+            if not current_edge.allows("passenger"):
+                continue
+
             outgoing_edges = current_edge.getOutgoing()
             for current_outgoing_edge in outgoing_edges:
                 if not current_outgoing_edge.allows("passenger"):
                     continue
+
                 connections = current_edge.getConnections(current_outgoing_edge)
                 for connection in connections:
                     direction = connection.getDirection()
-                    self.outgoing_edges_dict[current_edge_id][direction] = current_outgoing_edge.getID()
+                    to_edge_id = current_outgoing_edge.getID()
+                    self.outgoing_edges_dict[current_edge_id][direction] = to_edge_id
+
+                    from_lane = connection.getFromLane()
+                    if from_lane is not None:
+                        from_lane_id = from_lane.getID()
+                        # safe: lane dict exists because current_edge is passenger
+                        self.lane_outgoing_edges_dict[from_lane_id][direction] = to_edge_id
