@@ -286,6 +286,68 @@ class RLTrainingPipeline:
         if outgoing is None or len(outgoing) <= 1:
             return False
         return self.dist_to_end(vehicle_id) <= dist_threshold
+    
+    def adaptive_dist_threshold(self, edge_id, max_dist=200.0, ratio=0.6, min_dist=30.0):
+        """
+        Adaptive threshold: decide when within min(max_dist, ratio * edge_length),
+        clamped to at least min_dist.
+        """
+        edge_len = self.connection_info.edge_length_dict.get(edge_id, None)
+        if edge_len is None:
+            return max_dist
+        return max(min_dist, min(max_dist, ratio * float(edge_len)))
+
+    def is_decision_point_adaptive(self, edge_id, vehicle_id, max_dist=200.0, ratio=0.6, min_dist=30.0):
+        """
+        Decide near junctions, but adapt threshold based on edge length so short edges are safe.
+        """
+        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
+        if not outgoing or len(outgoing) <= 1:
+            return False
+
+        dist_th = self.adaptive_dist_threshold(edge_id, max_dist=max_dist, ratio=ratio, min_dist=min_dist)
+        return self.dist_to_end(vehicle_id) <= dist_th
+
+    # =========================
+    # Teleport detection helpers
+    # =========================
+    def get_teleport_ids(self):
+        """
+        Return a set of vehicle IDs that teleported this step.
+
+        SUMO/TraCI API differs by version, so we try multiple methods.
+        """
+        teleported = set()
+
+        # Most common in many SUMO versions:
+        try:
+            teleported.update(traci.simulation.getStartingTeleportIDList())
+        except Exception:
+            pass
+        try:
+            teleported.update(traci.simulation.getEndingTeleportIDList())
+        except Exception:
+            pass
+
+        # Some versions expose a vehicle-level list:
+        try:
+            teleported.update(traci.vehicle.getTeleportingList())
+        except Exception:
+            pass
+
+        return teleported
+
+    def make_terminal_next_state(self, vehicle_id, edge_id, destination_edge):
+        """
+        Build a next_state even if the vehicle is in a weird edge after teleport.
+        If edge_id is unknown, fall back to a zero state (safe for training).
+        """
+        try:
+            if edge_id in self.connection_info.edge_index_dict and destination_edge in self.connection_info.edge_index_dict:
+                return self.encode_state(vehicle_id, edge_id, destination_edge)
+        except Exception:
+            pass
+        return np.zeros((1, self.state_size), dtype=np.float32)
 
     def build_decision_list(self, edge_id, initial_action):
         """
@@ -507,7 +569,13 @@ class RLTrainingPipeline:
                             continue
 
                         # only decide at decision points
-                        if not self.is_decision_point(current_edge, vehicle_id, dist_threshold=80.0):
+                        if not self.is_decision_point_adaptive(
+                            current_edge,
+                            vehicle_id,
+                            max_dist=200.0,   # cap for long edges
+                            ratio=0.6,        # 60% of edge length
+                            min_dist=30.0     # don't go too tiny
+                        ):
                             continue
 
                         # avoid repeating decisions multiple steps on same edge
@@ -548,14 +616,18 @@ class RLTrainingPipeline:
                         direction = self.route_helper.direction_choices[action]
 
                         # optional lane alignment (strongly recommended)
+                        align_min_dist = min(
+                            150.0,
+                            0.6 * self.connection_info.edge_length_dict.get(current_edge, 250.0)
+                        )
+
                         self.ensure_lane_for_direction(
                             vehicle_id,
                             current_edge,
                             direction,
-                            min_dist=60.0,
-                            duration=50
+                            min_dist=align_min_dist,
+                            duration=80
                         )
-
                         # compute local target and apply routing
                         decision_list = self.build_decision_list(current_edge, action)
                         local_target = self.route_helper.compute_local_target(decision_list, vehicle)
@@ -566,7 +638,39 @@ class RLTrainingPipeline:
                         last_decision_edge[vehicle_id] = current_edge
 
                     traci.simulationStep()
-                    
+
+                    # =========================
+                    # Teleport detection + terminal penalty
+                    # =========================
+                    teleported_ids = self.get_teleport_ids()
+                    if teleported_ids:
+                        for tid in list(teleported_ids):
+                            if tid not in vehicles:
+                                continue
+
+                            # If we have an open transition for this vehicle, close it as terminal
+                            if tid in last_state_action:
+                                prev_state, prev_action, prev_edge = last_state_action[tid]
+                                v = vehicles[tid]
+
+                                # Try to get where it ended up; may fail if removed, so guard
+                                try:
+                                    tele_edge = traci.vehicle.getRoadID(tid)
+                                except Exception:
+                                    tele_edge = prev_edge
+
+                                # Big penalty so agent learns to avoid situations leading to teleports
+                                teleport_penalty = -200.0
+                                next_state = self.make_terminal_next_state(tid, tele_edge, v.destination)
+
+                                self.trainer.remember(prev_state, prev_action, teleport_penalty, next_state, True)
+
+                                # Clear open transition
+                                last_state_action.pop(tid, None)
+
+                            # Prevent repeated “decision” bookkeeping for teleported cars
+                            last_decision_edge.pop(tid, None)
+
                     if step % TRAIN_EVERY == 0:
                         for _ in range(GRAD_STEPS):
                             self.trainer.replay()

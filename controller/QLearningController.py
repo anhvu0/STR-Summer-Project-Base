@@ -91,7 +91,7 @@ class QLearningPolicy(RouteController):
                     wrong_decision = True
                     break
 
-                state = self.getState(start_edge, vehicle.destination)
+                state = self.getState(vid, start_edge, vehicle.destination)
                 action_idx = self.act(state)
                 action = self.direction_choices[action_idx]
 
@@ -196,7 +196,7 @@ class QLearningPolicy(RouteController):
         return np.argmax(mod_values[0])
 
     # this function gives the current state of the vehicle based on the state size
-    def getState(self, edge_now, destination_edge):
+    def getState(self, vehicle_id, edge_now, destination_edge):
         en = edge_now
         state = []
         state.append(self.connection_info.edge_index_dict[en])
@@ -209,6 +209,27 @@ class QLearningPolicy(RouteController):
                 state.append(0)
                 # 0 means this action cannot be chosen.
         # put the congestion ratio of all edges into the state.
+
+        lane_idx_norm = 0.0
+        lane_count_norm = 0.0
+        dist_to_end_norm = 0.0
+        try:
+            lane_id = traci.vehicle.getLaneID(vehicle_id)
+            lane_idx = traci.vehicle.getLaneIndex(vehicle_id)
+            lane_count = max(traci.edge.getLaneNumber(en), 1)
+            lane_len = traci.lane.getLength(lane_id)
+            lane_pos = traci.vehicle.getLanePosition(vehicle_id)
+            dist_to_end = max(lane_len - lane_pos, 0.0)
+
+            lane_idx_norm = lane_idx / max(lane_count - 1, 1)
+            lane_count_norm = min(lane_count, 6) / 6.0
+            dist_to_end_norm = min(dist_to_end, 200.0) / 200.0
+        except traci.TraCIException:
+            # Vehicle may have arrived/teleported between steps. Keep neutral defaults.
+            pass
+
+        state.extend([lane_idx_norm, lane_count_norm, dist_to_end_norm])
+
         for edge_now in self.connection_info.edge_list:
             car_num = traci.edge.getLastStepVehicleNumber(edge_now)
             density = car_num / self.connection_info.edge_length_dict[edge_now]
