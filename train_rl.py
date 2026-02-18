@@ -23,13 +23,13 @@ def build_parser():
 
     parser.add_argument(
         "--model-output",
-        default="./configurations/rl_model.h5",
+        default="./configurations/rl_model_test.h5",
         help="Path to save the trained model.",
     )
     parser.add_argument(
         "--episodes",
         type=int,
-        default=50,
+        default=25,
         help="Number of training episodes.",
     )
     parser.add_argument(

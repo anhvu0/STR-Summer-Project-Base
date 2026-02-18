@@ -164,7 +164,7 @@ class QLearningPolicy(RouteController):
                     prop_d = best_d
                 #------------------------------------------
 
-                print("Choice for " + str(start_edge) + " is: " + str(action))
+                print(f"For vehicle {vid},Choice for " + str(start_edge) + " is: " + str(action))
 
                 target_edge = outgoing[action]
                 start_edge = target_edge
