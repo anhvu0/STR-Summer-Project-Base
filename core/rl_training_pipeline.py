@@ -182,6 +182,25 @@ class RLTrainingPipeline:
         self.action_size = 6
         self.trainer = DQNTrainer(self.state_size, self.action_size)
 
+    def _deadline_window(self, vehicle):
+        """
+        Return a strictly positive scheduling window based on
+        (deadline - start_time).
+        """
+        return max(float(vehicle.deadline) - float(vehicle.start_time), 1.0)
+
+    def _deadline_urgency(self, vehicle, step):
+        """
+        Convert deadline flexibility into an urgency score in [0, 1].
+
+        Vehicles with smaller (deadline - start_time) or little time left
+        have higher urgency and should be prioritized.
+        """
+        deadline_window = self._deadline_window(vehicle)
+        time_left = max(float(vehicle.deadline) - float(step), 0.0)
+        # 1.0 means no slack left, 0.0 means fully relaxed.
+        return 1.0 - min(time_left / deadline_window, 1.0)
+
     def parse_sumocfg(self, sumocfg_path):
         """
         Parse the SUMO config file and return net and route filenames.
@@ -273,10 +292,17 @@ class RLTrainingPipeline:
         and proper dead-end handling.
         """
 
+        deadline_window = self._deadline_window(vehicle)
+        urgency = self._deadline_urgency(vehicle, step)
+        flexibility = 1.0 - urgency
+
         # ---- Base penalties ----
         time_penalty = -5.0
         congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
         congestion_penalty = -(congestion / max(self.connection_info.edge_length_dict[current_edge], 5.0))
+        # More flexible vehicles (larger deadline - start_time) should yield,
+        # so congestion penalty is stronger for them.
+        congestion_penalty *= (1.0 + flexibility)
 
         reward = time_penalty + congestion_penalty
 
@@ -292,8 +318,16 @@ class RLTrainingPipeline:
         curr_distance = self.get_distance_to_destination(current_edge, vehicle.destination)
 
         if math.isfinite(prev_distance) and math.isfinite(curr_distance):
-            progress_reward = (prev_distance - curr_distance) * self.progress_reward_scale
+            # Prioritize strict-deadline vehicles by giving urgency-dependent
+            # progress shaping. Flexible vehicles receive lower progress reward.
+            progress_scale = self.progress_reward_scale * (0.5 + urgency)
+            progress_reward = (prev_distance - curr_distance) * progress_scale
             reward += progress_reward
+
+            # If a strict vehicle is spending too long without progress,
+            # add extra shaping penalty so it reaches destination sooner.
+            if curr_distance >= prev_distance and urgency > 0.7:
+                reward -= 5.0 * urgency
 
         # If vehicle moved into a region with no path to destination
         elif math.isfinite(prev_distance) and not math.isfinite(curr_distance):
@@ -318,6 +352,12 @@ class RLTrainingPipeline:
         if step > vehicle.deadline:
             reward -= self.deadline_penalty
             done = True
+        else:
+            # Escalate penalty when approaching the deadline, normalized by
+            # (deadline - start_time) so strict deadlines are emphasized.
+            remaining_ratio = max(float(vehicle.deadline) - float(step), 0.0) / deadline_window
+            if remaining_ratio < 0.25:
+                reward -= (0.25 - remaining_ratio) * 20.0
 
         return reward, done
 
