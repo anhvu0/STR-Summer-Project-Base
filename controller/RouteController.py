@@ -50,35 +50,42 @@ class RouteController(ABC):
             path_length = 0
             i = 0
 
-            #the while is used to make sure the vehicle will not assume it arrives the destination beacuse the target edge is too short.
             while path_length <= max(vehicle.current_speed, 20):
                 if current_target_edge == vehicle.destination:
                     print("vehicle done!")
                     break
-                if i >= len(decision_list):
-                    raise UserWarning(
-                        f"At edge {vehicle.current_edge}, Not enough decisions provided to compute valid local target. TRACI will remove vehicle."
-                    )
 
-                choice = decision_list[i]
-                if choice not in self.connection_info.outgoing_edges_dict[current_target_edge]:
-                    raise UserWarning(
-                            f"At edge {vehicle.current_edge}, Invalid direction. TRACI will remove vehicle."
-                        )
-                current_target_edge = self.connection_info.outgoing_edges_dict[current_target_edge][choice]
+                outgoing = self.connection_info.outgoing_edges_dict.get(current_target_edge, {})
+
+                # if there is nowhere to go, return current edge as target (vehicle will stop / be handled by reward)
+                if not outgoing or len(outgoing) == 0:
+                    return current_target_edge
+
+                # if decisions run out, extend behavior with a safe random valid direction
+                if i >= len(decision_list):
+                    # choose any valid direction from this edge
+                    choice = random.choice(list(outgoing.keys()))
+                else:
+                    choice = decision_list[i]
+                    # if invalid direction, fallback to a valid one instead of removing the vehicle
+                    if choice not in outgoing:
+                        choice = random.choice(list(outgoing.keys()))
+
+                current_target_edge = outgoing[choice]
                 path_length += self.connection_info.edge_length_dict[current_target_edge]
 
-                if i > 0:
+                if i > 0 and i < len(decision_list):
                     if decision_list[i - 1] == decision_list[i] and decision_list[i] == 't':
-                        # stuck in a turnaround loop, let TRACI remove vehicle
                         return current_target_edge
 
                 i += 1
 
-        except UserWarning as warning:
-            print(warning)
+            return current_target_edge
 
-        return current_target_edge
+        except Exception as e:
+            # last-resort fallback: don't kill vehicle; keep current edge
+            print("compute_local_target exception:", e)
+            return vehicle.current_edge
 
 
     @abstractmethod

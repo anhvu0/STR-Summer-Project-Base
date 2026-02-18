@@ -134,8 +134,8 @@ class DQNTrainer:
 
         self.model.train_on_batch(states, target)
 
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+        # if self.epsilon > self.epsilon_min:
+        #     self.epsilon *= self.epsilon_decay
             
 class RLTrainingPipeline:
     """
@@ -151,7 +151,6 @@ class RLTrainingPipeline:
         decision_horizon=6,
         destination_reward=120.0,       #Adjustible
         deadline_penalty=100.0,
-        
     ):
         """
         Args:
@@ -172,6 +171,7 @@ class RLTrainingPipeline:
         self.deadline_penalty = deadline_penalty
         self._distance_cache = {}
         self.progress_reward_scale = 1.0  # or 0.0 to disable progress term cheaply
+        self.system_congestion_scale = 0.01  # tune this later
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
@@ -269,29 +269,56 @@ class RLTrainingPipeline:
 
     def compute_reward(self, vehicle, prev_edge, current_edge, step, arrived):
         """
-        Compute a reward based on travel time, congestion, and deadlines.
+        Compute a reward based on travel time, congestion, progress,
+        and proper dead-end handling.
         """
+
+        # ---- Base penalties ----
         time_penalty = -5.0
         congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
         congestion_penalty = -(congestion / max(self.connection_info.edge_length_dict[current_edge], 5.0))
-        reward = time_penalty + congestion_penalty
-        dead_end_penalty = -10.0
 
+        reward = time_penalty + congestion_penalty
+
+        # ---- Global system congestion penalty (selfless term) ----
+        total_vehicles = sum(self.connection_info.edge_vehicle_count.values())
+        system_penalty = -self.system_congestion_scale * total_vehicles
+        reward += system_penalty
+
+        done = False
+
+        # ---- Progress shaping ----
         prev_distance = self.get_distance_to_destination(prev_edge, vehicle.destination)
         curr_distance = self.get_distance_to_destination(current_edge, vehicle.destination)
+
         if math.isfinite(prev_distance) and math.isfinite(curr_distance):
             progress_reward = (prev_distance - curr_distance) * self.progress_reward_scale
             reward += progress_reward
-        done = False
+
+        # If vehicle moved into a region with no path to destination
+        elif math.isfinite(prev_distance) and not math.isfinite(curr_distance):
+            reward -= 100.0
+            done = True
+
+        # ---- Arrival handling ----
         if arrived:
             reward += self.destination_reward
             done = True
-        else:
-            reward -= dead_end_penalty #Penalty for reaching dead_end, but not too strict since some vehicles may go in there
+            return reward, done
+
+        # ---- Dead-end handling ----
+        # If no outgoing edges AND this is not the destination
+        outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
+        if (not outgoing or len(outgoing) == 0) and current_edge != vehicle.destination:
+            dead_end_penalty = -50.0
+            reward += dead_end_penalty
             done = True
+
+        # ---- Deadline handling ----
         if step > vehicle.deadline:
             reward -= self.deadline_penalty
             done = True
+
         return reward, done
 
     def generate_episode_vehicles(self):
@@ -349,6 +376,7 @@ class RLTrainingPipeline:
                                     vehicle_id, (None, None)
                                 )
                                 if prev_state is not None:
+                                    dist = self.get_distance_to_destination(current_edge, vehicle.destination)
                                     reward, done = self.compute_reward(
                                         vehicle, vehicle.current_edge, current_edge, step, current_edge == vehicle.destination,
                                     )
@@ -374,7 +402,8 @@ class RLTrainingPipeline:
                     traci.simulationStep()
                     self.trainer.replay()
             finally:
-                print(f"\nDone with episode {episode}\n")
+                self.trainer.epsilon = max(self.trainer.epsilon_min, self.trainer.epsilon * self.trainer.epsilon_decay)
+                print(f"\n\nDone with episode {episode}\n")
                 traci.close()
         self.trainer.model.save(self.model_output_path)
 

@@ -375,6 +375,9 @@ class target_vehicles_generator:
             Returns None if the generation fails with error infromation output to the console.
             The result will be written into the target_xml_file.
             There is no guaratnee on the contents in target_xml_file if the generation fails, i.e., returns None
+
+            Important: Make sure Vehicle doesn't spawn on in-going dead-end or doesn't finish at out-going dead-end because they can't U-turn
+
         """
         #set the start time as 0 (by default) and the end time as 50
         #calculate the density of vehicles accordingly
@@ -392,6 +395,8 @@ class target_vehicles_generator:
         #invoke randomTrips.py
         print("net_xml_file:",net_xml_file)
         print("what's our target",target_xml_file)
+        spawn_edges = [e for e in self.edge_list if not is_into_deadend(e)] # #Vehicles doesn't spawn on in-going dead-end
+        dest_edges  = [e for e in self.edge_list if not is_out_of_deadend(e)] #Vehicles doesn't finish at out-going dead-end
         command_str = "python randomTrips.py -n "+net_xml_file+" -e "+str(latest_release_time)+" -p "+str(density) +" -r "+target_xml_file
         if os.system(command_str) != 0:
             print("ERROR: Failed to invoke randomTrips.py.")
@@ -404,43 +409,37 @@ class target_vehicles_generator:
         #insert the generated vehicles into the xml file
         #use id to find the vehicles and modify their information directly
         result_dict = None
-        if pattern==1:
-            param_start = random.choice(self.edge_list)
-            param_dest = random.choice(self.edge_list)
+        if pattern == 1:
+            param_start = random.choice(spawn_edges)
+            param_dest = random.choice(dest_edges)
             while not validate_path(self.net, param_start, param_dest):
-                param_start = random.choice(self.edge_list)
-                param_dest = random.choice(self.edge_list)
-                ### UNCOMMENT TO DEBUG ###
-                #print("DEBUG: pattern 1 regenerating.")
-            result_dict = self.generate_target_vehicles(num_target_vehicles, target_xml_file, (param_start, param_dest) )
+                param_start = random.choice(spawn_edges)
+                param_dest = random.choice(dest_edges)
+            result_dict = self.generate_target_vehicles(num_target_vehicles, target_xml_file, (param_start, param_dest))
         elif pattern==2:
-            param_start = __random_choices_with_rp__(self.edge_list, num_target_vehicles*2)
-            param_dest = random.choice(self.edge_list)
-            #all pairs must be valid
+            param_start = __random_choices_with_rp__(spawn_edges, num_target_vehicles * 2)
+            param_dest = random.choice(dest_edges)
+            # all pairs must be valid
             while not validate_path_start_points(self.net, param_start, param_dest):
-                param_start = __random_choices_with_rp__(self.edge_list, num_target_vehicles*2)
-                param_dest = random.choice(self.edge_list)
-                ### UNCOMMENT TO DEBUG ###
-                #print("DEBUG: pattern 2 regenerating.")
-            result_dict = self.generate_target_vehicles(num_target_vehicles, target_xml_file, (param_start, param_dest) )
-        elif pattern==3:
+                param_start = __random_choices_with_rp__(spawn_edges, num_target_vehicles * 2)
+                param_dest = random.choice(dest_edges)
+            result_dict = self.generate_target_vehicles(num_target_vehicles, target_xml_file, (param_start, param_dest))
+        elif pattern == 3:
             param_start = []
             param_dest = []
             x = 0
             while x < num_target_vehicles:
-                #while False:
-                param_start_temp = random.choice(self.edge_list)
-                param_dest_temp = random.choice(self.edge_list)
-                #print(param_start_temp)
+                param_start_temp = random.choice(spawn_edges)
+                param_dest_temp = random.choice(dest_edges)
                 if param_dest_temp == param_start_temp:
                     continue
-                if self.net.getShortestPath(param_start_temp,param_dest_temp) == None:
+                sp = self.net.getShortestPath(param_start_temp, param_dest_temp)
+                if sp is None or sp[0] is None:
                     continue
-                else:
-                    param_start.append(param_start_temp)
-                    param_dest.append(param_dest_temp)
-                    x+=1
-            result_dict = self.generate_target_vehicles(num_target_vehicles, target_xml_file, (param_start, param_dest) )
+                param_start.append(param_start_temp)
+                param_dest.append(param_dest_temp)
+                x += 1
+            result_dict = self.generate_target_vehicles(num_target_vehicles, target_xml_file, (param_start, param_dest))
         else:
             print("ERROR: Unknown pattern type.")
             return None
@@ -549,6 +548,14 @@ def validate_path_starts_ends(net, start_points, destinations):
         if validate_path_start_points(net, start_points, d):
             return True
     return False
+
+def is_into_deadend(edge):
+    # edge leads INTO a dead-end junction (like gneE20, gneE26 in your net)
+    return edge.getToNode().getType() == "dead_end"
+
+def is_out_of_deadend(edge):
+    # edge LEAVES a dead-end junction (like -gneE20, -gneE26 in your net)
+    return edge.getFromNode().getType() == "dead_end"
     
 # Auxiliary Functions:
 def __random_choices_with_rp__(lst, k=1):
