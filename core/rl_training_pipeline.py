@@ -2,6 +2,7 @@ import numpy as np
 import os
 import sys
 import math
+import json
 from xml.dom.minidom import parse
 from keras.layers import Dense
 from keras.models import Sequential
@@ -152,6 +153,8 @@ class RLTrainingPipeline:
         decision_horizon=6,
         destination_reward=120.0,       #Adjustible
         deadline_penalty=100.0,
+        debug_vehicle_ids=None,
+        debug_log_path=None,
     ):
         """
         Args:
@@ -162,6 +165,8 @@ class RLTrainingPipeline:
             decision_horizon: Number of actions to pad a decision list.
             destination_reward: Reward when reaching the destination.
             deadline_penalty: Penalty when missing the deadline.
+            debug_vehicle_ids: Optional list of vehicle IDs to trace in detail.
+            debug_log_path: Optional output path for JSONL debug logs.
         """
         self.sumocfg_path = sumocfg_path
         self.model_output_path = model_output_path
@@ -170,6 +175,9 @@ class RLTrainingPipeline:
         self.decision_horizon = decision_horizon
         self.destination_reward = destination_reward
         self.deadline_penalty = deadline_penalty
+        self.debug_vehicle_ids = {str(vehicle_id) for vehicle_id in (debug_vehicle_ids or [])}
+        self.debug_log_path = debug_log_path
+        self._debug_log_handle = None
         self._distance_cache = {}
         self.progress_reward_scale = 1.0  # or 0.0 to disable progress term cheaply
         self.system_congestion_scale = 0.01  # tune this later
@@ -185,6 +193,57 @@ class RLTrainingPipeline:
         self.state_size = 2 + 6 + 3 + len(self.connection_info.edge_list)
         self.action_size = 6
         self.trainer = DQNTrainer(self.state_size, self.action_size)
+
+    def is_debug_vehicle(self, vehicle_id):
+        """
+        Return True when detailed logs should be emitted for the given vehicle.
+        """
+        return str(vehicle_id) in self.debug_vehicle_ids
+
+    def _open_debug_log(self):
+        """
+        Open the debug log file if one is configured.
+        """
+        if self.debug_log_path is None or self._debug_log_handle is not None:
+            return
+        log_dir = os.path.dirname(self.debug_log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        self._debug_log_handle = open(self.debug_log_path, "a", encoding="utf-8")
+
+    def _close_debug_log(self):
+        """
+        Close the debug log handle safely.
+        """
+        if self._debug_log_handle is not None:
+            self._debug_log_handle.close()
+            self._debug_log_handle = None
+
+    def debug_log_event(self, episode, step, vehicle_id, event, **details):
+        """
+        Emit one JSONL debug event for a tracked vehicle.
+        """
+        if not self.is_debug_vehicle(vehicle_id):
+            return
+
+        payload = {
+            "episode": int(episode),
+            "step": float(step),
+            "vehicle_id": str(vehicle_id),
+            "event": event,
+            "details": details,
+        }
+
+        message = (
+            f"[debug][ep={episode}][step={step}] vehicle={vehicle_id} "
+            f"event={event} details={details}"
+        )
+        print(message)
+
+        if self.debug_log_path is not None:
+            self._open_debug_log()
+            self._debug_log_handle.write(json.dumps(payload) + "\n")
+            self._debug_log_handle.flush()
 
     def _deadline_window(self, vehicle):
         """
@@ -408,7 +467,12 @@ class RLTrainingPipeline:
         dist_to_end = lane_len - lane_pos
 
         if dist_to_end < min_dist:
-            return  # too late
+            return {
+                "status": "too_late",
+                "distance_to_end": dist_to_end,
+                "threshold": min_dist,
+                "lane_id": lane_id,
+            }
 
         lane_ids = self.connection_info.edge_lane_ids.get(edge_id, [])
         for target_lane_index, ln_id in enumerate(lane_ids):
@@ -417,7 +481,26 @@ class RLTrainingPipeline:
                 curr_idx = traci.vehicle.getLaneIndex(vehicle_id)
                 if curr_idx != target_lane_index:
                     traci.vehicle.changeLane(vehicle_id, target_lane_index, duration)
-                return
+                    return {
+                        "status": "lane_change_requested",
+                        "from_lane_index": curr_idx,
+                        "to_lane_index": target_lane_index,
+                        "distance_to_end": dist_to_end,
+                        "lane_id": lane_id,
+                    }
+                return {
+                    "status": "already_on_valid_lane",
+                    "lane_index": curr_idx,
+                    "distance_to_end": dist_to_end,
+                    "lane_id": lane_id,
+                }
+
+        return {
+            "status": "no_lane_supports_direction",
+            "distance_to_end": dist_to_end,
+            "lane_id": lane_id,
+            "direction": direction,
+        }
 
 
     def compute_reward(self, vehicle, prev_edge, current_edge, step, arrived):
@@ -569,13 +652,29 @@ class RLTrainingPipeline:
                             continue
 
                         # only decide at decision points
-                        if not self.is_decision_point_adaptive(
+                        is_decision_step = self.is_decision_point_adaptive(
                             current_edge,
                             vehicle_id,
                             max_dist=200.0,   # cap for long edges
                             ratio=0.6,        # 60% of edge length
                             min_dist=30.0     # don't go too tiny
-                        ):
+                        )
+
+                        if self.is_debug_vehicle(vehicle_id):
+                            self.debug_log_event(
+                                episode,
+                                step,
+                                vehicle_id,
+                                "step_state",
+                                edge=current_edge,
+                                lane=traci.vehicle.getLaneID(vehicle_id),
+                                lane_index=int(traci.vehicle.getLaneIndex(vehicle_id)),
+                                speed=float(vehicle.current_speed),
+                                dist_to_end=float(self.dist_to_end(vehicle_id)),
+                                is_decision_step=is_decision_step,
+                            )
+
+                        if not is_decision_step:
                             continue
 
                         # avoid repeating decisions multiple steps on same edge
@@ -596,6 +695,16 @@ class RLTrainingPipeline:
 
                             next_state = self.encode_state(vehicle_id, current_edge, vehicle.destination)
                             self.trainer.remember(prev_state, prev_action, reward, next_state, done)
+                            self.debug_log_event(
+                                episode,
+                                step,
+                                vehicle_id,
+                                "transition_closed",
+                                from_edge=prev_edge,
+                                to_edge=current_edge,
+                                reward=float(reward),
+                                done=bool(done),
+                            )
 
                             if done:
                                 last_state_action.pop(vehicle_id, None)
@@ -610,6 +719,14 @@ class RLTrainingPipeline:
 
                         if action is None:
                             # no feasible action from this lane; skip decision (or penalize if you prefer)
+                            self.debug_log_event(
+                                episode,
+                                step,
+                                vehicle_id,
+                                "no_valid_action",
+                                edge=current_edge,
+                                lane=traci.vehicle.getLaneID(vehicle_id),
+                            )
                             last_decision_edge[vehicle_id] = current_edge
                             continue
 
@@ -621,7 +738,7 @@ class RLTrainingPipeline:
                             0.6 * self.connection_info.edge_length_dict.get(current_edge, 250.0)
                         )
 
-                        self.ensure_lane_for_direction(
+                        lane_result = self.ensure_lane_for_direction(
                             vehicle_id,
                             current_edge,
                             direction,
@@ -632,6 +749,19 @@ class RLTrainingPipeline:
                         decision_list = self.build_decision_list(current_edge, action)
                         local_target = self.route_helper.compute_local_target(decision_list, vehicle)
                         traci.vehicle.changeTarget(vehicle_id, local_target)
+                        self.debug_log_event(
+                            episode,
+                            step,
+                            vehicle_id,
+                            "decision_applied",
+                            edge=current_edge,
+                            action=int(action),
+                            direction=direction,
+                            valid_actions=[int(a) for a in valid],
+                            decision_list=decision_list,
+                            local_target=local_target,
+                            lane_result=lane_result,
+                        )
 
                         # store new transition start
                         last_state_action[vehicle_id] = (state, action, current_edge)
@@ -664,6 +794,15 @@ class RLTrainingPipeline:
                                 next_state = self.make_terminal_next_state(tid, tele_edge, v.destination)
 
                                 self.trainer.remember(prev_state, prev_action, teleport_penalty, next_state, True)
+                                self.debug_log_event(
+                                    episode,
+                                    step,
+                                    tid,
+                                    "teleport",
+                                    previous_edge=prev_edge,
+                                    current_edge=tele_edge,
+                                    penalty=teleport_penalty,
+                                )
 
                                 # Clear open transition
                                 last_state_action.pop(tid, None)
@@ -682,6 +821,8 @@ class RLTrainingPipeline:
                 )
                 print(f"\n\nDone with episode {episode}\n")
                 traci.close()
+
+        self._close_debug_log()
 
         self.trainer.model.save(self.model_output_path)
 

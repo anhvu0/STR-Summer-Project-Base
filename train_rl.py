@@ -38,6 +38,20 @@ def build_parser():
         default=2.0,
         help="Interval between vehicle spawns.",
     )
+    parser.add_argument(
+        "--debug-vehicle-id",
+        action="append",
+        default=[],
+        help=(
+            "Vehicle ID to trace in detail. Repeat this flag to trace multiple vehicles "
+            "(for example: --debug-vehicle-id 60 --debug-vehicle-id 12)."
+        ),
+    )
+    parser.add_argument(
+        "--debug-log-path",
+        default=None,
+        help="Optional path to a JSONL debug log file for tracked vehicles.",
+    )
     return parser
 
 
@@ -54,6 +68,8 @@ def main():
         model_output_path=args.model_output,
         episodes=args.episodes,
         spawn_interval=args.spawn_interval,
+        debug_vehicle_ids=args.debug_vehicle_id,
+        debug_log_path=args.debug_log_path,
     )
     pipeline.run()
 
