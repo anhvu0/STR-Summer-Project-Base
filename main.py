@@ -11,6 +11,7 @@ from controller.RouteController import *
 from controller.DijkstraController import DijkstraPolicy
 from controller.QLearningController import QLearningPolicy
 from core.target_vehicles_generation_protocols import *
+import copy
 
 if 'SUMO_HOME' in os.environ:
     tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
@@ -72,11 +73,14 @@ def run_simulation(scheduler, vehicles):
     traci.start([sumo_binary, "-c", "./configurations/myconfig.sumocfg", \
                  "--tripinfo-output", "./main_output/trips.trips.xml", \
                  "--fcd-output", "./main_output/testTrace.xml","--quit-on-end"]) #The sumocfg file need to match with the one used in train_rl.py
-
-    total_time, end_number, deadlines_missed = simulation.run()
-    print("Average timespan: {}, total vehicle number: {}".format(str(total_time/end_number),\
-        str(end_number)))
-    print(str(deadlines_missed) + ' deadlines missed.')
+    try:
+        total_time, end_number, deadlines_missed = simulation.run()
+        print("Average timespan: {}, total vehicle number: {}, total vehicles reached destination: {}".format(str(total_time/end_number),\
+            str(len(vehicles)), str(end_number)))
+        print(str(deadlines_missed) + ' deadlines missed.')
+    finally:
+        if traci.isLoaded():
+            traci.close()
 
 if __name__ == "__main__":
     sumo_binary = checkBinary('sumo-gui')
@@ -99,5 +103,5 @@ if __name__ == "__main__":
     for vid, v in vehicles.items():
         print("id: {}, destination: {}, start time:{}, deadline: {};".format(vid, \
             v.destination, v.start_time, v.deadline))
-    # test_dijkstra_policy(vehicles)
-    test_q_learning(vehicles)
+    test_dijkstra_policy(copy.deepcopy(vehicles))
+    test_q_learning(copy.deepcopy(vehicles))

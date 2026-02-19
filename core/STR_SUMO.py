@@ -115,13 +115,13 @@ class StrSumo:
                         arrived_at_destination = False
                         if self.controlled_vehicles[vehicle_id].local_destination == self.controlled_vehicles[vehicle_id].destination:
                             arrived_at_destination = True
+                            end_number += 1
                         time_span = step - self.controlled_vehicles[vehicle_id].start_time
                         total_time += time_span
                         miss = False
                         if step > self.controlled_vehicles[vehicle_id].deadline:
                             deadlines_missed.append(vehicle_id)
                             miss = True
-                        end_number += 1
                         print("Vehicle {} reaches the destination: {}, timespan: {}, deadline missed: {}"\
                             .format(vehicle_id, arrived_at_destination, time_span, miss))
                         #if not arrived_at_destination:
