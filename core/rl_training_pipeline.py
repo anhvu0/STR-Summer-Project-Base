@@ -149,6 +149,7 @@ class RLTrainingPipeline:
         model_output_path,
         episodes=10,
         spawn_interval=2.0,
+        seed_with_episode=True,
         decision_horizon=6,
         destination_reward=120.0,       #Adjustible
         deadline_penalty=100.0,
@@ -159,6 +160,7 @@ class RLTrainingPipeline:
             model_output_path: Path to save the trained model.
             episodes: Number of training episodes.
             spawn_interval: Interval between vehicle spawns.
+            seed_with_episode: Whether to use the episode number as random seed.
             decision_horizon: Number of actions to pad a decision list.
             destination_reward: Reward when reaching the destination.
             deadline_penalty: Penalty when missing the deadline.
@@ -167,6 +169,7 @@ class RLTrainingPipeline:
         self.model_output_path = model_output_path
         self.episodes = episodes
         self.spawn_interval = spawn_interval
+        self.seed_with_episode = seed_with_episode
         self.decision_horizon = decision_horizon
         self.destination_reward = destination_reward
         self.deadline_penalty = deadline_penalty
@@ -495,7 +498,7 @@ class RLTrainingPipeline:
 
         return reward, done
 
-    def generate_episode_vehicles(self):
+    def generate_episode_vehicles(self, episode_seed=None):
         """
         Generate controlled and uncontrolled vehicles for one training episode.
         """
@@ -508,6 +511,7 @@ class RLTrainingPipeline:
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
             spawn_interval=self.spawn_interval,
+            seed=episode_seed,
         )
         if vehicle_list is None:
             raise RuntimeError(
@@ -528,7 +532,12 @@ class RLTrainingPipeline:
         GRAD_STEPS = 1            # try 1–4
 
         for episode in range(self.episodes):
-            vehicles = self.generate_episode_vehicles()
+            episode_seed = episode if self.seed_with_episode else None
+            if episode_seed is not None:
+                random.seed(episode_seed)
+                np.random.seed(episode_seed)
+
+            vehicles = self.generate_episode_vehicles(episode_seed=episode_seed)
 
             traci.start([
                 sumo_binary,

@@ -359,12 +359,13 @@ class target_vehicles_generator:
         
         target_vehicles_generator.target_vehicles_output_dict[target_xml_file] = 0
 
-    def generate_vehicles(self, num_target_vehicles, num_random_vehicles, pattern, target_xml_file, net_xml_file, spawn_interval = None):
+    def generate_vehicles(self, num_target_vehicles, num_random_vehicles, pattern, target_xml_file, net_xml_file, spawn_interval = None, seed = None):
         """
             param @num_target_vehicles <int>: The number of target vehicles.
             param @num_random_vehicles <int>: The number of uncontrolled vehicles.
             param @pattern <tuple>: one of three possible patterns. FORMAT:
             param @spawn_interval: Spawn interval of vehicles in simulation
+            param @seed: Optional random seed used for both randomTrips and local Python random generation.
             -- CASES BEGIN --
                 #1. one start point, one destination for all target vehicles
                 #2. ranged start point, one destination for all target vehicles
@@ -387,6 +388,8 @@ class target_vehicles_generator:
         num_random_vehicles *= 2 # this is done to compensate the loss when generating using scripts. Need to solve this later.
         density =  latest_release_time / float(num_random_vehicles)
         density = int(density * 100)/100.0
+        if seed is not None:
+            random.seed(int(seed))
         #copy the file randomTrips.py to the current directory
         # command_str = "cp $SUMO_HOME/tools/randomTrips.py ./"
         # if os.system(command_str) != 0:
@@ -398,6 +401,8 @@ class target_vehicles_generator:
         spawn_edges = [e for e in self.edge_list if not is_into_deadend(e)] # #Vehicles doesn't spawn on in-going dead-end
         dest_edges  = [e for e in self.edge_list if not is_out_of_deadend(e)] #Vehicles doesn't finish at out-going dead-end
         command_str = "python randomTrips.py -n "+net_xml_file+" -e "+str(latest_release_time)+" -p "+str(density) +" -r "+target_xml_file
+        if seed is not None:
+            command_str += " -s " + str(int(seed))
         if os.system(command_str) != 0:
             print("ERROR: Failed to invoke randomTrips.py.")
             return None
