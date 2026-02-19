@@ -43,6 +43,33 @@ class RouteController(ABC):
     def __init__(self, connection_info: ConnectionInfo):
         self.connection_info = connection_info
         self.direction_choices = [STRAIGHT, TURN_AROUND,  SLIGHT_RIGHT, RIGHT, SLIGHT_LEFT, LEFT]
+        self.net = sumolib.net.readNet(connection_info.net_filename)
+
+    def _dist_to_dest(self, edge_id, dest_id):
+        try:
+            from_edge = self.net.getEdge(edge_id)
+            to_edge = self.net.getEdge(dest_id)
+            _, path_cost = self.net.getShortestPath(from_edge, to_edge)
+            return path_cost if path_cost is not None else float("inf")
+        except Exception:
+            return float("inf")
+
+    def _choose_progress_action(self, current_edge, dest_edge, outgoing):
+        """
+        Choose the outgoing direction that minimizes shortest-path distance to destination.
+        Falls back to any valid outgoing direction if all distances are unreachable.
+        """
+        best_choice = None
+        best_d = float("inf")
+        for direction, next_edge in outgoing.items():
+            d = self._dist_to_dest(next_edge, dest_edge)
+            if d < best_d:
+                best_d = d
+                best_choice = direction
+
+        if best_choice is None:
+            return random.choice(list(outgoing.keys()))
+        return best_choice
 
     def compute_local_target(self, decision_list, vehicle):
         current_target_edge = vehicle.current_edge
@@ -61,15 +88,14 @@ class RouteController(ABC):
                 if not outgoing or len(outgoing) == 0:
                     return current_target_edge
 
-                # if decisions run out, extend behavior with a safe random valid direction
+                # if decisions run out, extend behavior using a destination-progress fallback
                 if i >= len(decision_list):
-                    # choose any valid direction from this edge
-                    choice = random.choice(list(outgoing.keys()))
+                    choice = self._choose_progress_action(current_target_edge, vehicle.destination, outgoing)
                 else:
                     choice = decision_list[i]
-                    # if invalid direction, fallback to a valid one instead of removing the vehicle
+                    # if invalid direction, fallback to a progress-preserving valid one
                     if choice not in outgoing:
-                        choice = random.choice(list(outgoing.keys()))
+                        choice = self._choose_progress_action(current_target_edge, vehicle.destination, outgoing)
 
                 current_target_edge = outgoing[choice]
                 path_length += self.connection_info.edge_length_dict[current_target_edge]
