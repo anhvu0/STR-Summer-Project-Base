@@ -24,6 +24,7 @@ class QLearningPolicy(RouteController):
         self.net = sumolib.net.readNet(net_xml_file)
         self._visit_count = {}
         self._best_dist = {}
+        self._last_edge = {}
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
         # How many actions to plan ahead each time
         self.decision_horizon = 6
@@ -61,11 +62,6 @@ class QLearningPolicy(RouteController):
 
     def make_decisions(self, vehicles, connection_info: ConnectionInfo):
         local_targets = {}
-
-        if not hasattr(self, "_debug_net_checked"):
-            self._debug_net_checked = True
-            print("[DEBUG] has self.net:", hasattr(self, "net"))
-            print("[DEBUG] self.net type:", type(self.net))
 
         for vehicle in vehicles:
             wrong_decision = False
@@ -116,7 +112,13 @@ class QLearningPolicy(RouteController):
                 best_dir = None
                 best_d = float("inf")
                 best_next = None
-                for dch in valid_dirs:
+                previous_edge = self._last_edge.get(vid)
+
+                # Prefer non-backtracking options when at least one exists.
+                non_backtrack_dirs = [dch for dch in valid_dirs if outgoing[dch] != previous_edge]
+                candidate_dirs = non_backtrack_dirs if non_backtrack_dirs else valid_dirs
+
+                for dch in candidate_dirs:
                     d, nxt = score_dir(dch)
                     if d < best_d:
                         best_d = d
@@ -126,7 +128,14 @@ class QLearningPolicy(RouteController):
                 # model-proposed next
                 if action is not None:
                     prop_next = outgoing[action]
-                    prop_d = self._dist_to_dest(prop_next, dest_id)
+                    # If model asks to immediately go back to the previous edge while
+                    # another option exists, treat it as a bad proposal and trigger override.
+                    if prop_next == previous_edge and non_backtrack_dirs:
+                        action = None
+                        prop_next = None
+                        prop_d = float("inf")
+                    else:
+                        prop_d = self._dist_to_dest(prop_next, dest_id)
                 else:
                     prop_next = None
                     prop_d = float("inf")
@@ -167,6 +176,7 @@ class QLearningPolicy(RouteController):
                 print(f"For vehicle {vid},Choice for " + str(start_edge) + " is: " + str(action))
 
                 target_edge = outgoing[action]
+                self._last_edge[vid] = start_edge
                 start_edge = target_edge
                 decision_list.append(action)
 
