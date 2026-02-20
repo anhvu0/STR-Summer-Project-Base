@@ -24,6 +24,7 @@ class QLearningPolicy(RouteController):
         self.net = sumolib.net.readNet(net_xml_file)
         self._visit_count = {}
         self._best_dist = {}
+        self._last_edge_seen = {}
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
         # How many actions to plan ahead each time
         self.decision_horizon = 6
@@ -82,6 +83,7 @@ class QLearningPolicy(RouteController):
                 self._best_dist[vid] = float("inf")
 
             i = 0
+            prev_edge = self._last_edge_seen.get(vid)
             while i < self.decision_horizon:
                 outgoing = connection_info.outgoing_edges_dict.get(start_edge, {})
                 valid_dirs = list(outgoing.keys())
@@ -116,12 +118,19 @@ class QLearningPolicy(RouteController):
                 best_dir = None
                 best_d = float("inf")
                 best_next = None
+                best_non_backtrack_dir = None
+                best_non_backtrack_d = float("inf")
+                best_non_backtrack_next = None
                 for dch in valid_dirs:
                     d, nxt = score_dir(dch)
                     if d < best_d:
                         best_d = d
                         best_dir = dch
                         best_next = nxt
+                    if nxt != prev_edge and d < best_non_backtrack_d:
+                        best_non_backtrack_d = d
+                        best_non_backtrack_dir = dch
+                        best_non_backtrack_next = nxt
 
                 # model-proposed next
                 if action is not None:
@@ -151,6 +160,8 @@ class QLearningPolicy(RouteController):
                     override = True
                 if visit >= 3:
                     override = True
+                if prop_next == prev_edge and len(valid_dirs) > 1:
+                    override = True
                 if prop_d > best_d + 50.0:   # slack threshold (tune this)
                     override = True
 
@@ -159,14 +170,20 @@ class QLearningPolicy(RouteController):
                         f"[OVERRIDE] veh={vid} edge={start_edge} dest={dest_id} "
                         f"chosen='{action}' prop_d={prop_d} best_dir='{best_dir}' best_d={best_d} visit={visit}"
                     )
-                    action = best_dir
-                    prop_next = best_next
-                    prop_d = best_d
+                    if best_next == prev_edge and best_non_backtrack_dir is not None:
+                        action = best_non_backtrack_dir
+                        prop_next = best_non_backtrack_next
+                        prop_d = best_non_backtrack_d
+                    else:
+                        action = best_dir
+                        prop_next = best_next
+                        prop_d = best_d
                 #------------------------------------------
 
                 print(f"For vehicle {vid},Choice for " + str(start_edge) + " is: " + str(action))
 
                 target_edge = outgoing[action]
+                prev_edge = start_edge
                 start_edge = target_edge
                 decision_list.append(action)
 
@@ -177,6 +194,7 @@ class QLearningPolicy(RouteController):
             if wrong_decision:
                 continue
 
+            self._last_edge_seen[vid] = vehicle.current_edge
             local_targets[vehicle.vehicle_id] = self.compute_local_target(decision_list, vehicle)
 
         return local_targets
