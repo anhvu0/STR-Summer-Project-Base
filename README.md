@@ -61,8 +61,13 @@ The repository now includes a DQN-based training pipeline that spawns vehicles a
 
 To train a model:
 ```
-python3 train_rl.py --sumocfg ./test/myconfig.sumocfg --model-output ./test/rl_model.h5 --episodes 10 --spawn-interval 0.0 (Those are optional arguments. Just use train_rl.py only for default settings)
+python3 train_rl.py --sumocfg ./test/myconfig.sumocfg --model-output ./test/rl_model.h5 --episodes 10 --spawn-interval 2.0 --target-vehicles 10 --random-vehicles 30
 ```
+
+If you observe frequent SUMO warnings such as `Teleporting vehicle ... waited too long (jam/wrong lane)`, reduce traffic pressure by increasing `--spawn-interval` and/or lowering `--random-vehicles`.
+You can also control SUMO teleport behavior with `--teleport-time` (for example `--teleport-time 600` to allow longer waiting, or `--teleport-time -1` to disable teleports).
+For training diagnostics, use `--stuck-wait-time-limit` to detect controlled vehicles that remain stopped too long; the pipeline logs edge/lane/action context and applies terminal penalty (`--stuck-terminal-penalty`) so those stalls are visible to learning instead of silently hanging.
+`--wait-time-penalty-scale` adds continuous waiting-time reward shaping so Q-learning is discouraged from decisions that lead to long queues, even without teleports.
 
 The resulting model can be used with `QLearningController.py` by pointing it to the saved model file.
 

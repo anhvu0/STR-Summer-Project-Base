@@ -38,6 +38,48 @@ def build_parser():
         default=2.0,
         help="Interval between vehicle spawns.",
     )
+    parser.add_argument(
+        "--target-vehicles",
+        type=int,
+        default=10,
+        help="Number of controlled vehicles per episode.",
+    )
+    parser.add_argument(
+        "--random-vehicles",
+        type=int,
+        default=30,
+        help="Number of uncontrolled background vehicles per episode.",
+    )
+    parser.add_argument(
+        "--random-vehicle-multiplier",
+        type=float,
+        default=1.0,
+        help="Multiplier for background traffic demand during route generation.",
+    )
+    parser.add_argument(
+        "--teleport-time",
+        type=int,
+        default=300,
+        help="SUMO teleport timeout in seconds (-1 disables teleporting).",
+    )
+    parser.add_argument(
+        "--stuck-wait-time-limit",
+        type=float,
+        default=120.0,
+        help="Waiting-time threshold (s) to mark a controlled vehicle as stuck.",
+    )
+    parser.add_argument(
+        "--stuck-terminal-penalty",
+        type=float,
+        default=-120.0,
+        help="Terminal reward applied when a controlled vehicle is removed for being stuck.",
+    )
+    parser.add_argument(
+        "--wait-time-penalty-scale",
+        type=float,
+        default=0.05,
+        help="Per-second waiting-time penalty scale used in reward shaping.",
+    )
     return parser
 
 
@@ -54,6 +96,13 @@ def main():
         model_output_path=args.model_output,
         episodes=args.episodes,
         spawn_interval=args.spawn_interval,
+        num_target_vehicles=args.target_vehicles,
+        num_random_vehicles=args.random_vehicles,
+        random_vehicle_multiplier=args.random_vehicle_multiplier,
+        teleport_time=args.teleport_time,
+        stuck_wait_time_limit=args.stuck_wait_time_limit,
+        stuck_terminal_penalty=args.stuck_terminal_penalty,
+        wait_time_penalty_scale=args.wait_time_penalty_scale,
     )
     pipeline.run()
 

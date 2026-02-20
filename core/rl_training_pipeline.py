@@ -149,6 +149,14 @@ class RLTrainingPipeline:
         model_output_path,
         episodes=10,
         spawn_interval=2.0,
+        num_target_vehicles=10,
+        num_random_vehicles=30,
+        random_vehicle_multiplier=1.0,
+        teleport_time=300,
+        stuck_wait_time_limit=120.0,
+        stuck_speed_threshold=0.1,
+        stuck_terminal_penalty=-120.0,
+        wait_time_penalty_scale=0.05,
         seed_with_episode=True,
         decision_horizon=6,
         destination_reward=120.0,       #Adjustible
@@ -160,6 +168,14 @@ class RLTrainingPipeline:
             model_output_path: Path to save the trained model.
             episodes: Number of training episodes.
             spawn_interval: Interval between vehicle spawns.
+            num_target_vehicles: Number of controlled vehicles to generate each episode.
+            num_random_vehicles: Number of background vehicles to generate each episode.
+            random_vehicle_multiplier: Multiplier applied to background vehicle generation load.
+            teleport_time: SUMO --time-to-teleport value in seconds (-1 disables teleports).
+            stuck_wait_time_limit: Consecutive waiting-time threshold (seconds) before forced terminal handling.
+            stuck_speed_threshold: Speed threshold used to identify a stationary vehicle.
+            stuck_terminal_penalty: Penalty assigned when a controlled vehicle is terminated for being stuck.
+            wait_time_penalty_scale: Reward shaping weight for waiting time at decision transitions.
             seed_with_episode: Whether to use the episode number as random seed.
             decision_horizon: Number of actions to pad a decision list.
             destination_reward: Reward when reaching the destination.
@@ -169,6 +185,14 @@ class RLTrainingPipeline:
         self.model_output_path = model_output_path
         self.episodes = episodes
         self.spawn_interval = spawn_interval
+        self.num_target_vehicles = num_target_vehicles
+        self.num_random_vehicles = num_random_vehicles
+        self.random_vehicle_multiplier = random_vehicle_multiplier
+        self.teleport_time = teleport_time
+        self.stuck_wait_time_limit = float(stuck_wait_time_limit)
+        self.stuck_speed_threshold = float(stuck_speed_threshold)
+        self.stuck_terminal_penalty = float(stuck_terminal_penalty)
+        self.wait_time_penalty_scale = float(wait_time_penalty_scale)
         self.seed_with_episode = seed_with_episode
         self.decision_horizon = decision_horizon
         self.destination_reward = destination_reward
@@ -423,7 +447,39 @@ class RLTrainingPipeline:
                 return
 
 
-    def compute_reward(self, vehicle, prev_edge, current_edge, step, arrived):
+
+    def should_mark_vehicle_stuck(self, vehicle_id):
+        """
+        Return True when a vehicle has been waiting too long at near-zero speed.
+        """
+        try:
+            speed = traci.vehicle.getSpeed(vehicle_id)
+            waiting_time = traci.vehicle.getWaitingTime(vehicle_id)
+        except Exception:
+            return False
+        return speed <= self.stuck_speed_threshold and waiting_time >= self.stuck_wait_time_limit
+
+    def log_stuck_vehicle_debug(self, vehicle_id):
+        """
+        Print a compact debug line to explain why a controlled vehicle is considered stuck.
+        """
+        try:
+            edge_id = traci.vehicle.getRoadID(vehicle_id)
+            lane_id = traci.vehicle.getLaneID(vehicle_id)
+            lane_idx = traci.vehicle.getLaneIndex(vehicle_id)
+            speed = traci.vehicle.getSpeed(vehicle_id)
+            waiting_time = traci.vehicle.getWaitingTime(vehicle_id)
+            valid_lane_actions = list(self.connection_info.lane_outgoing_edges_dict.get(lane_id, {}).keys())
+            valid_edge_actions = list(self.connection_info.outgoing_edges_dict.get(edge_id, {}).keys())
+            print(
+                f"[STUCK] vehicle={vehicle_id} edge={edge_id} lane={lane_id} lane_idx={lane_idx} "
+                f"speed={speed:.3f} waiting={waiting_time:.1f}s lane_actions={valid_lane_actions} "
+                f"edge_actions={valid_edge_actions}"
+            )
+        except Exception as exc:
+            print(f"[STUCK] vehicle={vehicle_id} debug unavailable: {exc}")
+
+    def compute_reward(self, vehicle, prev_edge, current_edge, step, arrived, waiting_time=0.0):
         """
         Compute a reward based on travel time, congestion, progress,
         and proper dead-end handling.
@@ -442,6 +498,9 @@ class RLTrainingPipeline:
         congestion_penalty *= (1.0 + flexibility)
 
         reward = time_penalty + congestion_penalty
+
+        # Waiting-time shaping to discourage long queueing/jam behavior
+        reward -= self.wait_time_penalty_scale * min(float(waiting_time), 120.0)
 
         # ---- Global system congestion penalty (selfless term) ----
         total_vehicles = sum(self.connection_info.edge_vehicle_count.values())
@@ -505,12 +564,13 @@ class RLTrainingPipeline:
         generator = target_vehicles_generator(os.path.join(self.sumocfg_dir, self.net_file))
         route_path = os.path.join(self.sumocfg_dir, self.route_file)
         vehicle_list = generator.generate_vehicles(
-            num_target_vehicles=10,
-            num_random_vehicles=30,
+            num_target_vehicles=self.num_target_vehicles,
+            num_random_vehicles=self.num_random_vehicles,
             pattern=3,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
             spawn_interval=self.spawn_interval,
+            random_vehicle_multiplier=self.random_vehicle_multiplier,
             seed=episode_seed,
         )
         if vehicle_list is None:
@@ -543,6 +603,7 @@ class RLTrainingPipeline:
                 sumo_binary,
                 "-c", self.sumocfg_path,
                 "--tripinfo-output", os.path.join(self.sumocfg_dir, "trips.trips.xml"),
+                "--time-to-teleport", str(self.teleport_time),
                 "--quit-on-end",
             ])
 
@@ -577,6 +638,30 @@ class RLTrainingPipeline:
                             last_decision_edge.pop(vehicle_id, None)
                             continue
 
+                        # long-wait stuck handling (independent from SUMO teleport)
+                        if self.should_mark_vehicle_stuck(vehicle_id):
+                            self.log_stuck_vehicle_debug(vehicle_id)
+
+                            if vehicle_id in last_state_action:
+                                prev_state, prev_action, prev_edge = last_state_action[vehicle_id]
+                                next_state = self.make_terminal_next_state(vehicle_id, current_edge, vehicle.destination)
+                                self.trainer.remember(
+                                    prev_state,
+                                    prev_action,
+                                    self.stuck_terminal_penalty,
+                                    next_state,
+                                    True,
+                                )
+
+                            last_state_action.pop(vehicle_id, None)
+                            last_decision_edge.pop(vehicle_id, None)
+
+                            try:
+                                traci.vehicle.remove(vehicle_id)
+                            except Exception:
+                                pass
+                            continue
+
                         # only decide at decision points
                         if not self.is_decision_point_adaptive(
                             current_edge,
@@ -595,12 +680,18 @@ class RLTrainingPipeline:
                         if vehicle_id in last_state_action:
                             prev_state, prev_action, prev_edge = last_state_action[vehicle_id]
 
+                            try:
+                                waiting_time = traci.vehicle.getWaitingTime(vehicle_id)
+                            except Exception:
+                                waiting_time = 0.0
+
                             reward, done = self.compute_reward(
                                 vehicle,
                                 prev_edge,
                                 current_edge,
                                 step,
-                                arrived=False
+                                arrived=False,
+                                waiting_time=waiting_time,
                             )
 
                             next_state = self.encode_state(vehicle_id, current_edge, vehicle.destination)
