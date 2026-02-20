@@ -359,12 +359,23 @@ class target_vehicles_generator:
         
         target_vehicles_generator.target_vehicles_output_dict[target_xml_file] = 0
 
-    def generate_vehicles(self, num_target_vehicles, num_random_vehicles, pattern, target_xml_file, net_xml_file, spawn_interval = None, seed = None):
+    def generate_vehicles(
+        self,
+        num_target_vehicles,
+        num_random_vehicles,
+        pattern,
+        target_xml_file,
+        net_xml_file,
+        spawn_interval=None,
+        random_vehicle_multiplier=1.0,
+        seed=None,
+    ):
         """
             param @num_target_vehicles <int>: The number of target vehicles.
             param @num_random_vehicles <int>: The number of uncontrolled vehicles.
             param @pattern <tuple>: one of three possible patterns. FORMAT:
             param @spawn_interval: Spawn interval of vehicles in simulation
+            param @random_vehicle_multiplier: multiplier applied to uncontrolled-vehicle generation.
             param @seed: Optional random seed used for both randomTrips and local Python random generation.
             -- CASES BEGIN --
                 #1. one start point, one destination for all target vehicles
@@ -384,8 +395,9 @@ class target_vehicles_generator:
         #calculate the density of vehicles accordingly
         latest_release_time = 50.0 #a constant number for the latest release time of all vehicles
         if spawn_interval is not None:
-            latest_release_time = float(spawn_interval) * float(num_target_vehicles)
-        num_random_vehicles *= 2 # this is done to compensate the loss when generating using scripts. Need to solve this later.
+            latest_release_time = float(spawn_interval) * float(num_target_vehicles + num_random_vehicles)
+
+        num_random_vehicles = max(1, int(round(float(num_random_vehicles) * float(random_vehicle_multiplier))))
         density =  latest_release_time / float(num_random_vehicles)
         density = int(density * 100)/100.0
         if seed is not None:
