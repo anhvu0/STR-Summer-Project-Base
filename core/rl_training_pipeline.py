@@ -762,8 +762,24 @@ class RLTrainingPipeline:
                             recent_edge_history[vehicle_id],
                         )
                         local_target = self.route_helper.compute_local_target(decision_list, vehicle)
-                        traci.vehicle.changeTarget(vehicle_id, local_target)
-                        last_target_by_vehicle[vehicle_id] = local_target
+                        applied_target = None
+
+                        try:
+                            traci.vehicle.changeTarget(vehicle_id, local_target)
+                            applied_target = local_target
+                        except traci.exceptions.TraCIException:
+                            # Some local targets become infeasible from the vehicle's current
+                            # route/lane context. Try falling back to the global destination
+                            # instead of crashing the whole training run.
+                            try:
+                                traci.vehicle.changeTarget(vehicle_id, vehicle.destination)
+                                applied_target = vehicle.destination
+                            except traci.exceptions.TraCIException:
+                                # Keep episode running and retry next decision point.
+                                last_decision_edge[vehicle_id] = current_edge
+                                continue
+
+                        last_target_by_vehicle[vehicle_id] = applied_target
 
                         # store new transition start
                         last_state_action[vehicle_id] = (state, action, current_edge)
