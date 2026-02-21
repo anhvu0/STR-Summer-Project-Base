@@ -765,13 +765,22 @@ class RLTrainingPipeline:
                         applied_target = None
 
                         try:
-                            traci.vehicle.changeTarget(vehicle_id, local_target)
+                            # Keep the global destination as the route sink so the vehicle is not
+                            # removed at intermediate control targets. Use the local target as a
+                            # temporary via edge whenever it differs from the final destination.
+                            if local_target != vehicle.destination:
+                                traci.vehicle.setVia(vehicle_id, [local_target])
+                            else:
+                                traci.vehicle.setVia(vehicle_id, [])
+
+                            traci.vehicle.changeTarget(vehicle_id, vehicle.destination)
                             applied_target = local_target
                         except traci.exceptions.TraCIException:
                             # Some local targets become infeasible from the vehicle's current
                             # route/lane context. Try falling back to the global destination
                             # instead of crashing the whole training run.
                             try:
+                                traci.vehicle.setVia(vehicle_id, [])
                                 traci.vehicle.changeTarget(vehicle_id, vehicle.destination)
                                 applied_target = vehicle.destination
                             except traci.exceptions.TraCIException:
