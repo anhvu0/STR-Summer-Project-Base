@@ -44,40 +44,56 @@ class RouteController(ABC):
         self.connection_info = connection_info
         self.direction_choices = [STRAIGHT, TURN_AROUND,  SLIGHT_RIGHT, RIGHT, SLIGHT_LEFT, LEFT]
 
+    def _next_edge_toward_destination(self, from_edge, destination):
+        """
+        Return the next edge on the shortest path from from_edge to destination.
+        Falls back to None if no path is known by TraCI.
+        """
+        try:
+            route = traci.simulation.findRoute(from_edge, destination)
+            edges = list(route.edges)
+            if len(edges) >= 2:
+                return edges[1]
+        except Exception:
+            return None
+        return None
+
     def compute_local_target(self, decision_list, vehicle):
         current_target_edge = vehicle.current_edge
         try:
-            path_length = 0
+            path_length = 0.0
             i = 0
 
             # Keep local targets far enough ahead so vehicles do not frequently
             # complete a tiny route segment and leave simulation before reaching
             # their true global destination.
-            horizon = max(vehicle.current_speed, 120)
+            horizon = max(vehicle.current_speed, 120.0)
             while path_length <= horizon:
                 if current_target_edge == vehicle.destination:
-                    print("vehicle done!")
                     break
 
                 outgoing = self.connection_info.outgoing_edges_dict.get(current_target_edge, {})
-
-                # if there is nowhere to go, return current edge as target (vehicle will stop / be handled by reward)
-                if not outgoing or len(outgoing) == 0:
+                if not outgoing:
                     return current_target_edge
 
-                # if the controller has no more planned decisions, stop at the
-                # last policy-produced edge instead of inventing a random turn.
-                if i >= len(decision_list):
-                    return current_target_edge
+                next_edge = None
 
-                choice = decision_list[i]
-                # if invalid direction, stop extending rather than forcing a
-                # random branch that can move away from the true destination.
-                if choice not in outgoing:
-                    return current_target_edge
+                # Primary: consume policy-produced decisions.
+                if i < len(decision_list):
+                    choice = decision_list[i]
+                    if choice in outgoing:
+                        next_edge = outgoing[choice]
 
-                current_target_edge = outgoing[choice]
-                path_length += self.connection_info.edge_length_dict[current_target_edge]
+                # Fallback: if policy plan runs out or is invalid, keep extending
+                # toward the global destination so vehicles are not removed at an
+                # intermediate local target.
+                if next_edge is None:
+                    next_edge = self._next_edge_toward_destination(current_target_edge, vehicle.destination)
+                    if next_edge is None or next_edge not in outgoing.values():
+                        return current_target_edge
+
+                current_target_edge = next_edge
+                path_length += self.connection_info.edge_length_dict.get(current_target_edge, 0.0)
 
                 if i > 0 and i < len(decision_list):
                     if decision_list[i - 1] == decision_list[i] and decision_list[i] == 't':
