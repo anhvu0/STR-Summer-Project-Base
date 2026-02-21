@@ -607,9 +607,12 @@ class RLTrainingPipeline:
             teleported_controlled_ids = set()
             arrived_ids = set()
             arrived_before_deadline_ids = set()
+            arrived_wrong_target_ids = set()
+            unexpected_removed_ids = set()
             exited_without_destination_ids = set()
             total_controlled = len(vehicles)
             controlled_ids = set(vehicles.keys())
+            unresolved_exit_debug = {}
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
@@ -718,14 +721,21 @@ class RLTrainingPipeline:
                         last_state_action[vehicle_id] = (state, action, current_edge)
                         last_decision_edge[vehicle_id] = current_edge
 
+                    controlled_present_pre_step = {
+                        vid for vid in vehicle_ids if vid in vehicles
+                    }
+
                     traci.simulationStep()
 
                     # Vehicles that completed their current SUMO route this step.
                     # NOTE: In TraCI, arrived vehicles are often removed immediately,
                     # so relying only on `getIDList()` + edge checks can miss them.
+                    arrived_this_step = set()
                     for arrived_id in traci.simulation.getArrivedIDList():
                         if arrived_id not in vehicles:
                             continue
+
+                        arrived_this_step.add(arrived_id)
 
                         vehicle = vehicles[arrived_id]
 
@@ -735,6 +745,8 @@ class RLTrainingPipeline:
                             arrived_ids.add(arrived_id)
                             if traci.simulation.getTime() <= vehicle.deadline:
                                 arrived_before_deadline_ids.add(arrived_id)
+                        else:
+                            arrived_wrong_target_ids.add(arrived_id)
 
                         last_state_action.pop(arrived_id, None)
                         last_decision_edge.pop(arrived_id, None)
@@ -772,6 +784,28 @@ class RLTrainingPipeline:
 
                             # Prevent repeated “decision” bookkeeping for teleported cars
                             last_decision_edge.pop(tid, None)
+
+                    # Controlled vehicles that disappeared this step without
+                    # arrival/teleport events. This is a strong signal that
+                    # our bookkeeping logic needs investigation.
+                    controlled_present_post_step = {
+                        vid for vid in traci.vehicle.getIDList() if vid in vehicles
+                    }
+                    unresolved_removed_ids = (
+                        controlled_present_pre_step
+                        - controlled_present_post_step
+                        - arrived_this_step
+                        - set(teleported_ids)
+                    )
+
+                    for missing_id in unresolved_removed_ids:
+                        unexpected_removed_ids.add(missing_id)
+                        v = vehicles[missing_id]
+                        unresolved_exit_debug[missing_id] = {
+                            "last_edge": v.current_edge,
+                            "last_local_target": v.local_destination,
+                            "global_destination": v.destination,
+                        }
 
                     if step % self.train_every == 0:
                         for _ in range(self.grad_steps):
@@ -825,6 +859,28 @@ class RLTrainingPipeline:
                     f"teleported_controlled={len(teleported_controlled_ids)}/{total_controlled}, "
                     f"exited_without_destination={len(exited_without_destination_ids)}/{total_controlled}"
                 )
+
+                if exited_without_destination_ids:
+                    exited_arrived_wrong_target = exited_without_destination_ids & arrived_wrong_target_ids
+                    exited_unexpected_removed = exited_without_destination_ids & unexpected_removed_ids
+                    print(
+                        f"Exit reason breakdown | "
+                        f"arrived_wrong_target={len(exited_arrived_wrong_target)}, "
+                        f"unexpected_removed={len(exited_unexpected_removed)}"
+                    )
+
+                    sample_ids = sorted(list(exited_without_destination_ids))[:5]
+                    if sample_ids:
+                        sample_parts = []
+                        for sid in sample_ids:
+                            v = vehicles[sid]
+                            dbg = unresolved_exit_debug.get(sid, {})
+                            sample_parts.append(
+                                f"{sid}(last_edge={dbg.get('last_edge', v.current_edge)}, "
+                                f"local_target={dbg.get('last_local_target', v.local_destination)}, "
+                                f"global_destination={dbg.get('global_destination', v.destination)})"
+                            )
+                        print("Exit samples | " + "; ".join(sample_parts))
                 traci.close()
 
         self.trainer.model.save(self.model_output_path)
