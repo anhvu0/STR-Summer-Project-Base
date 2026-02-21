@@ -50,9 +50,12 @@ class RouteController(ABC):
             path_length = 0
             i = 0
 
-            while path_length <= max(vehicle.current_speed, 20):
+            # Keep local targets far enough ahead so vehicles do not frequently
+            # complete a tiny route segment and leave simulation before reaching
+            # their true global destination.
+            horizon = max(vehicle.current_speed, 120)
+            while path_length <= horizon:
                 if current_target_edge == vehicle.destination:
-                    print("vehicle done!")
                     break
 
                 outgoing = self.connection_info.outgoing_edges_dict.get(current_target_edge, {})

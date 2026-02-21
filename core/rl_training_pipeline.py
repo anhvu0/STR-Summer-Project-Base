@@ -607,7 +607,10 @@ class RLTrainingPipeline:
             teleported_controlled_ids = set()
             arrived_ids = set()
             arrived_before_deadline_ids = set()
+            exited_without_destination_ids = set()
+            arrived_local_target_ids = set()
             total_controlled = len(vehicles)
+            controlled_ids = set(vehicles.keys())
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
@@ -709,13 +712,29 @@ class RLTrainingPipeline:
                         # compute local target and apply routing
                         decision_list = self.build_decision_list(current_edge, action)
                         local_target = self.route_helper.compute_local_target(decision_list, vehicle)
-                        traci.vehicle.changeTarget(vehicle_id, local_target)
+                        try:
+                            traci.vehicle.changeTarget(vehicle_id, local_target)
+                        except traci.TraCIException as exc:
+                            # Route replacement may fail when SUMO cannot build a route
+                            # to the requested local target from the vehicle's current state.
+                            # Skip this decision instead of aborting the whole training run.
+                            print(
+                                f"Warning: changeTarget failed for vehicle '{vehicle_id}' "
+                                f"from edge '{current_edge}' to '{local_target}': {exc}"
+                            )
+                            last_decision_edge[vehicle_id] = current_edge
+                            continue
 
                         # store new transition start
                         last_state_action[vehicle_id] = (state, action, current_edge)
                         last_decision_edge[vehicle_id] = current_edge
 
                     traci.simulationStep()
+
+                    arrived_this_step = set(traci.simulation.getArrivedIDList())
+                    for tid in (arrived_this_step & controlled_ids):
+                        if tid not in arrived_ids:
+                            arrived_local_target_ids.add(tid)
 
                     # =========================
                     # Teleport detection + terminal penalty
@@ -789,6 +808,20 @@ class RLTrainingPipeline:
                     f"teleported_controlled/ep={roll_tele_ctrl:.3f}, "
                     f"completion_before_deadline={roll_completion:.3f}, "
                     f"avg_return={roll_return:.3f}\n"
+                )
+
+                # Controlled vehicles that left simulation without being marked
+                # as arrived (global destination) or teleported.
+                exited_without_destination_ids = (
+                    controlled_ids - arrived_ids - teleported_controlled_ids
+                )
+                print(
+                    f"Controlled exit diagnostics | "
+                    f"arrived={len(arrived_ids)}/{total_controlled}, "
+                    f"arrived_before_deadline={len(arrived_before_deadline_ids)}/{total_controlled}, "
+                    f"arrived_local_target={len(arrived_local_target_ids)}/{total_controlled}, "
+                    f"teleported_controlled={len(teleported_controlled_ids)}/{total_controlled}, "
+                    f"exited_without_destination={len(exited_without_destination_ids)}/{total_controlled}"
                 )
                 traci.close()
 
