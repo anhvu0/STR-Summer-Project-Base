@@ -168,6 +168,7 @@ class RLTrainingPipeline:
         deadline_penalty=100.0,
         on_time_arrival_bonus=20.0,
         teleport_penalty=-150.0,
+        non_global_arrival_penalty=-120.0,
         epsilon_decay=0.997,
         epsilon_min=0.10,
         gamma=0.97,
@@ -192,6 +193,7 @@ class RLTrainingPipeline:
             deadline_penalty: Penalty when missing the deadline.
             on_time_arrival_bonus: Extra reward for arriving before deadline.
             teleport_penalty: Terminal penalty for teleport events.
+            non_global_arrival_penalty: Terminal penalty when a vehicle is removed before reaching global destination.
         """
         self.sumocfg_path = sumocfg_path
         self.model_output_path = model_output_path
@@ -203,6 +205,7 @@ class RLTrainingPipeline:
         self.deadline_penalty = deadline_penalty
         self.on_time_arrival_bonus = on_time_arrival_bonus
         self.teleport_penalty = teleport_penalty
+        self.non_global_arrival_penalty = non_global_arrival_penalty
         self.train_every = train_every
         self.grad_steps = grad_steps
         self.rolling_window = rolling_window
@@ -692,14 +695,10 @@ class RLTrainingPipeline:
                         last_seen_edge_by_vehicle[vehicle_id] = current_edge
                         recent_edge_history[vehicle_id].append(current_edge)
 
-                        # arrived
+                        # If the vehicle is already on its global destination edge,
+                        # do not issue a new decision. Terminal handling is done when
+                        # SUMO reports the vehicle in getArrivedIDList().
                         if current_edge == vehicle.destination:
-                            if vehicle_id not in arrived_ids:
-                                arrived_ids.add(vehicle_id)
-                                if step <= vehicle.deadline:
-                                    arrived_before_deadline_ids.add(vehicle_id)
-                            last_state_action.pop(vehicle_id, None)
-                            last_decision_edge.pop(vehicle_id, None)
                             continue
 
                         # only decide at decision points
@@ -818,6 +817,34 @@ class RLTrainingPipeline:
                                 arrived_before_deadline_ids.add(arrived_vehicle_id)
                         else:
                             arrived_non_global_ids.add(arrived_vehicle_id)
+
+                        # Close any open transition with terminal reward/penalty.
+                        if arrived_vehicle_id in last_state_action:
+                            prev_state, prev_action, prev_edge = last_state_action[arrived_vehicle_id]
+                            try:
+                                terminal_edge = traci.vehicle.getRoadID(arrived_vehicle_id)
+                            except Exception:
+                                terminal_edge = last_seen_edge if last_seen_edge != "<unknown>" else prev_edge
+
+                            if reached_global_destination:
+                                reward, _ = self.compute_reward(
+                                    vehicle,
+                                    prev_edge,
+                                    terminal_edge,
+                                    step,
+                                    arrived=True,
+                                    repeated_recent_edges=0,
+                                )
+                            else:
+                                reward = self.non_global_arrival_penalty
+
+                            next_state = self.make_terminal_next_state(
+                                arrived_vehicle_id,
+                                terminal_edge,
+                                vehicle.destination,
+                            )
+                            self.trainer.remember(prev_state, prev_action, reward, next_state, True)
+                            episode_return += reward
 
                         debug_record = {
                             "vehicle_id": arrived_vehicle_id,
