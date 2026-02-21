@@ -103,9 +103,11 @@ class StrSumo:
                     # current_edge_of_vehicle = self.controlled_vehicles[vehicle_id].current_edge
                     # target_edge = self.connection_info.outgoing_edges_dict[current_edge_of_vehicle][decision]
                     if vehicle_id in traci.vehicle.getIDList():
-                        #print("Changing the target of {} to {} with length {}".format(vehicle_id, local_target_edge, self.connection_info.edge_length_dict[local_target_edge]))
-                        traci.vehicle.changeTarget(vehicle_id, local_target_edge)
-                        self.controlled_vehicles[vehicle_id].local_destination = local_target_edge
+                        previous_target = self.controlled_vehicles[vehicle_id].local_destination
+                        if previous_target != local_target_edge:
+                            #print("Changing the target of {} to {} with length {}".format(vehicle_id, local_target_edge, self.connection_info.edge_length_dict[local_target_edge]))
+                            traci.vehicle.changeTarget(vehicle_id, local_target_edge)
+                            self.controlled_vehicles[vehicle_id].local_destination = local_target_edge
 
                 arrived_at_destination = traci.simulation.getArrivedIDList()
 
@@ -147,4 +149,3 @@ class StrSumo:
     def get_edge_vehicle_counts(self):
         for edge in self.connection_info.edge_list:
             self.connection_info.edge_vehicle_count[edge] = traci.edge.getLastStepVehicleNumber(edge)
-
