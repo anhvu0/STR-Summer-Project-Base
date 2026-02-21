@@ -512,7 +512,7 @@ class RLTrainingPipeline:
         route_path = os.path.join(self.sumocfg_dir, self.route_file)
         vehicle_list = generator.generate_vehicles(
             num_target_vehicles=10,
-            num_random_vehicles=30,
+            num_random_vehicles=15,
             pattern=3,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
