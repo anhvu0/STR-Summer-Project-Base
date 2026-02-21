@@ -11,6 +11,7 @@ import random
 from controller.RouteController import RouteController
 from core.Util import ConnectionInfo
 from core.target_vehicles_generation_protocols import target_vehicles_generator
+from core.routing_runtime import apply_routing_decision
 
 if 'SUMO_HOME' in os.environ:
     tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
@@ -711,7 +712,13 @@ class RLTrainingPipeline:
                         # compute local target and apply routing
                         decision_list = self.build_decision_list(current_edge, action)
                         local_target = self.route_helper.compute_local_target(decision_list, vehicle)
-                        traci.vehicle.changeTarget(vehicle_id, local_target)
+                        apply_routing_decision(
+                            traci,
+                            vehicle_id,
+                            current_edge,
+                            local_target,
+                            vehicle.destination,
+                        )
 
                         # store new transition start
                         last_state_action[vehicle_id] = (state, action, current_edge)

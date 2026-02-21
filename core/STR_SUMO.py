@@ -4,6 +4,7 @@ import optparse
 from xml.dom.minidom import parse, parseString
 from core.Util import *
 from core.target_vehicles_generation_protocols import *
+from core.routing_runtime import apply_routing_decision
 
 if 'SUMO_HOME' in os.environ:
     tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
@@ -103,9 +104,16 @@ class StrSumo:
                     # current_edge_of_vehicle = self.controlled_vehicles[vehicle_id].current_edge
                     # target_edge = self.connection_info.outgoing_edges_dict[current_edge_of_vehicle][decision]
                     if vehicle_id in traci.vehicle.getIDList():
-                        #print("Changing the target of {} to {} with length {}".format(vehicle_id, local_target_edge, self.connection_info.edge_length_dict[local_target_edge]))
-                        traci.vehicle.changeTarget(vehicle_id, local_target_edge)
-                        self.controlled_vehicles[vehicle_id].local_destination = local_target_edge
+                        assigned_target = apply_routing_decision(
+                            traci,
+                            vehicle_id,
+                            self.controlled_vehicles[vehicle_id].current_edge,
+                            local_target_edge,
+                            self.controlled_vehicles[vehicle_id].destination,
+                        )
+
+                        if assigned_target is not None:
+                            self.controlled_vehicles[vehicle_id].local_destination = assigned_target
 
                 arrived_at_destination = traci.simulation.getArrivedIDList()
 
@@ -147,4 +155,3 @@ class StrSumo:
     def get_edge_vehicle_counts(self):
         for edge in self.connection_info.edge_list:
             self.connection_info.edge_vehicle_count[edge] = traci.edge.getLastStepVehicleNumber(edge)
-
