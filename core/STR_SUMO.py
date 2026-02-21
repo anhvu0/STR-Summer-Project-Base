@@ -14,6 +14,7 @@ else:
 import traci
 import sumolib
 from controller.RouteController import *
+import heapq
 
 """
 SUMO Selfless Traffic Routing (STR) Testbed
@@ -103,9 +104,18 @@ class StrSumo:
                     # current_edge_of_vehicle = self.controlled_vehicles[vehicle_id].current_edge
                     # target_edge = self.connection_info.outgoing_edges_dict[current_edge_of_vehicle][decision]
                     if vehicle_id in traci.vehicle.getIDList():
-                        #print("Changing the target of {} to {} with length {}".format(vehicle_id, local_target_edge, self.connection_info.edge_length_dict[local_target_edge]))
-                        traci.vehicle.changeTarget(vehicle_id, local_target_edge)
-                        self.controlled_vehicles[vehicle_id].local_destination = local_target_edge
+                        current_edge = traci.vehicle.getRoadID(vehicle_id)
+                        route_to_target = self._build_route_to_target(current_edge, local_target_edge)
+
+                        if route_to_target is None:
+                            # Skip invalid targets instead of forcing SUMO into a bad route state.
+                            continue
+
+                        try:
+                            traci.vehicle.setRoute(vehicle_id, route_to_target)
+                            self.controlled_vehicles[vehicle_id].local_destination = local_target_edge
+                        except traci.TraCIException as err:
+                            print(f"setRoute failed for {vehicle_id} to {local_target_edge}: {err}")
 
                 arrived_at_destination = traci.simulation.getArrivedIDList()
 
@@ -148,3 +158,53 @@ class StrSumo:
         for edge in self.connection_info.edge_list:
             self.connection_info.edge_vehicle_count[edge] = traci.edge.getLastStepVehicleNumber(edge)
 
+    def _build_route_to_target(self, start_edge, target_edge):
+        """
+        Build a contiguous edge route using Dijkstra over connection_info topology.
+        Avoids dependency on traci.simulation.findRoute(...) signature differences.
+
+        :returns: list[str] route beginning at start_edge and ending at target_edge, or None if unreachable
+        """
+        if start_edge == target_edge:
+            return [start_edge]
+
+        outgoing_edges_dict = self.connection_info.outgoing_edges_dict
+        edge_length_dict = self.connection_info.edge_length_dict
+
+        if start_edge not in outgoing_edges_dict or target_edge not in self.connection_info.edge_index_dict:
+            return None
+
+        best_distance = {start_edge: 0.0}
+        parent = {start_edge: None}
+        frontier = [(0.0, start_edge)]
+
+        while frontier:
+            current_cost, edge = heapq.heappop(frontier)
+
+            if current_cost > best_distance.get(edge, float('inf')):
+                continue
+
+            if edge == target_edge:
+                break
+
+            for next_edge in outgoing_edges_dict.get(edge, {}).values():
+                edge_cost = edge_length_dict.get(next_edge, 1.0)
+                new_cost = current_cost + edge_cost
+
+                if new_cost >= best_distance.get(next_edge, float('inf')):
+                    continue
+
+                best_distance[next_edge] = new_cost
+                parent[next_edge] = edge
+                heapq.heappush(frontier, (new_cost, next_edge))
+
+        if target_edge not in parent:
+            return None
+
+        path = []
+        edge = target_edge
+        while edge is not None:
+            path.append(edge)
+            edge = parent[edge]
+
+        return list(reversed(path))
