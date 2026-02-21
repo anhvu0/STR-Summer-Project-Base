@@ -2,13 +2,13 @@ from abc import ABC, abstractmethod
 import random
 import os
 import sys
+import heapq
 from core.Util import *
 if 'SUMO_HOME' in os.environ:
     tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
     sys.path.append(tools)
 else:
     sys.exit("No environment variable SUMO_HOME!")
-import traci
 import sumolib
 
 STRAIGHT = "s"
@@ -46,16 +46,50 @@ class RouteController(ABC):
 
     def _next_edge_toward_destination(self, from_edge, destination):
         """
-        Return the next edge on the shortest path from from_edge to destination.
-        Falls back to None if no path is known by TraCI.
+        Return the next edge on a shortest path from ``from_edge`` to ``destination``.
+
+        This implementation relies only on the local connection graph instead of
+        TraCI's ``simulation.findRoute`` command. Avoiding that command prevents
+        SUMO/TraCI version-mismatch errors (for example, command 0xAB argument
+        count mismatches) from interrupting route-extension fallbacks.
         """
-        try:
-            route = traci.simulation.findRoute(from_edge, destination)
-            edges = list(route.edges)
-            if len(edges) >= 2:
-                return edges[1]
-        except Exception:
+        if from_edge == destination:
+            return destination
+
+        distances = {from_edge: 0.0}
+        previous = {}
+        heap = [(0.0, from_edge)]
+
+        while heap:
+            distance, current = heapq.heappop(heap)
+
+            if distance > distances.get(current, float("inf")):
+                continue
+
+            if current == destination:
+                break
+
+            outgoing = self.connection_info.outgoing_edges_dict.get(current, {})
+            for next_edge in outgoing.values():
+                edge_cost = self.connection_info.edge_length_dict.get(next_edge, 1.0)
+                next_distance = distance + edge_cost
+                if next_distance < distances.get(next_edge, float("inf")):
+                    distances[next_edge] = next_distance
+                    previous[next_edge] = current
+                    heapq.heappush(heap, (next_distance, next_edge))
+
+        if destination not in previous and destination != from_edge:
             return None
+
+        # Reconstruct from destination backwards until we find the first edge
+        # after from_edge.
+        edge = destination
+        while previous.get(edge) is not None and previous[edge] != from_edge:
+            edge = previous[edge]
+
+        if previous.get(edge) == from_edge:
+            return edge
+
         return None
 
     def compute_local_target(self, decision_list, vehicle):
