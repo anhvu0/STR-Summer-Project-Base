@@ -398,30 +398,67 @@ class RLTrainingPipeline:
             pass
         return np.zeros((1, self.state_size), dtype=np.float32)
 
-    def build_decision_list(self, edge_id, initial_action):
+    def _score_next_edge(self, next_edge, destination_edge, recent_edges, direction):
         """
-        Build a decision list that starts with the chosen action and is padded
-        with random valid actions to ensure a viable local target.
+        Lower score is better. Combines shortest-path proximity with loop/U-turn discouragement.
+        """
+        distance = self.get_distance_to_destination(next_edge, destination_edge)
+        if not math.isfinite(distance):
+            return math.inf
+
+        recent_penalty = 0.0
+        if recent_edges:
+            recent_penalty += 40.0 * sum(1 for e in recent_edges if e == next_edge)
+
+        turnaround_penalty = 25.0 if direction == 't' else 0.0
+        return float(distance) + recent_penalty + turnaround_penalty
+
+    def build_decision_list(self, edge_id, initial_action, vehicle, recent_edges):
+        """
+        Build a decision list that starts with the selected RL action and then
+        extends with destination-aware actions (instead of random padding).
         """
         decision_list = []
         current_edge = edge_id
-        for _ in range(self.decision_horizon):
-            if not self.connection_info.outgoing_edges_dict[current_edge]:
+
+        for step_idx in range(self.decision_horizon):
+            outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
+            if not outgoing:
                 break
-            if not decision_list:
+
+            if step_idx == 0:
                 action = initial_action
-            else:
                 valid_actions = self.valid_actions(current_edge)
-                if not valid_actions:
-                    break
-                action = random.choice(valid_actions) if decision_list else initial_action
                 if action not in valid_actions:
-                    action = random.choice(valid_actions)
-            direction = self.route_helper.direction_choices[action]
-            if direction not in self.connection_info.outgoing_edges_dict[current_edge]:
+                    break
+                direction = self.route_helper.direction_choices[action]
+            else:
+                best_direction = None
+                best_score = math.inf
+                for direction, candidate_edge in outgoing.items():
+                    score = self._score_next_edge(
+                        candidate_edge,
+                        vehicle.destination,
+                        recent_edges,
+                        direction,
+                    )
+                    if score < best_score:
+                        best_score = score
+                        best_direction = direction
+
+                if best_direction is None:
+                    break
+                direction = best_direction
+
+            if direction not in outgoing:
                 break
+
             decision_list.append(direction)
-            current_edge = self.connection_info.outgoing_edges_dict[current_edge][direction]
+            current_edge = outgoing[direction]
+
+            if current_edge == vehicle.destination:
+                break
+
         return decision_list
     
 
@@ -611,6 +648,7 @@ class RLTrainingPipeline:
             teleported_controlled_ids = set()
             arrived_ids = set()
             arrived_before_deadline_ids = set()
+            arrived_global_destination_ids = set()
             exited_without_destination_ids = set()
             total_controlled = len(vehicles)
             controlled_ids = set(vehicles.keys())
@@ -717,7 +755,12 @@ class RLTrainingPipeline:
                             duration=80
                         )
                         # compute local target and apply routing
-                        decision_list = self.build_decision_list(current_edge, action)
+                        decision_list = self.build_decision_list(
+                            current_edge,
+                            action,
+                            vehicle,
+                            recent_edge_history[vehicle_id],
+                        )
                         local_target = self.route_helper.compute_local_target(decision_list, vehicle)
                         traci.vehicle.changeTarget(vehicle_id, local_target)
                         last_target_by_vehicle[vehicle_id] = local_target
@@ -738,14 +781,23 @@ class RLTrainingPipeline:
 
                         vehicle = vehicles[arrived_vehicle_id]
                         arrived_ids.add(arrived_vehicle_id)
-                        if step <= vehicle.deadline:
-                            arrived_before_deadline_ids.add(arrived_vehicle_id)
+
+                        last_seen_edge = last_seen_edge_by_vehicle.get(arrived_vehicle_id, "<unknown>")
+                        reached_global_destination = (last_seen_edge == vehicle.destination)
+
+                        if reached_global_destination:
+                            arrived_global_destination_ids.add(arrived_vehicle_id)
+                            if step <= vehicle.deadline:
+                                arrived_before_deadline_ids.add(arrived_vehicle_id)
+                        else:
+                            exited_without_destination_ids.add(arrived_vehicle_id)
 
                         debug_record = {
                             "vehicle_id": arrived_vehicle_id,
                             "global_destination": vehicle.destination,
-                            "last_seen_edge": last_seen_edge_by_vehicle.get(arrived_vehicle_id, "<unknown>"),
+                            "last_seen_edge": last_seen_edge,
                             "last_local_target": last_target_by_vehicle.get(arrived_vehicle_id, "<unset>"),
+                            "reached_global_destination": reached_global_destination,
                         }
                         arrived_debug_records.append(debug_record)
 
@@ -829,12 +881,13 @@ class RLTrainingPipeline:
 
                 # Controlled vehicles that left simulation without being marked
                 # as arrived (global destination) or teleported.
-                exited_without_destination_ids = (
+                exited_without_destination_ids.update(
                     controlled_ids - arrived_ids - teleported_controlled_ids
                 )
                 print(
                     f"Controlled exit diagnostics | "
-                    f"arrived={len(arrived_ids)}/{total_controlled}, "
+                    f"arrived={len(arrived_global_destination_ids)}/{total_controlled}, "
+                    f"arrived_any_target={len(arrived_ids)}/{total_controlled}, "
                     f"arrived_before_deadline={len(arrived_before_deadline_ids)}/{total_controlled}, "
                     f"teleported_controlled={len(teleported_controlled_ids)}/{total_controlled}, "
                     f"exited_without_destination={len(exited_without_destination_ids)}/{total_controlled}"
@@ -843,7 +896,7 @@ class RLTrainingPipeline:
                 if self.debug_exit_diagnostics:
                     mismatched_arrivals = [
                         record for record in arrived_debug_records
-                        if record["last_local_target"] != record["global_destination"]
+                        if not record["reached_global_destination"]
                     ]
                     print(
                         f"Arrival debug | total_arrived={len(arrived_debug_records)}, "
