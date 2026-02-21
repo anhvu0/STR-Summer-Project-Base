@@ -6,7 +6,7 @@ from xml.dom.minidom import parse
 from keras.layers import Dense
 from keras.models import Sequential
 from keras.optimizers import Adam
-from collections import deque
+from collections import defaultdict, deque
 import random
 from controller.RouteController import RouteController
 from core.Util import ConnectionInfo
@@ -176,6 +176,8 @@ class RLTrainingPipeline:
         self._distance_cache = {}
         self.progress_reward_scale = 1.0  # or 0.0 to disable progress term cheaply
         self.system_congestion_scale = 0.01  # tune this later
+        self.loop_window = 12
+        self.loop_repeat_penalty = 10.0
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
@@ -423,7 +425,7 @@ class RLTrainingPipeline:
                 return
 
 
-    def compute_reward(self, vehicle, prev_edge, current_edge, step, arrived):
+    def compute_reward(self, vehicle, prev_edge, current_edge, step, arrived, repeated_recent_edges=0):
         """
         Compute a reward based on travel time, congestion, progress,
         and proper dead-end handling.
@@ -466,8 +468,12 @@ class RLTrainingPipeline:
             if curr_distance >= prev_distance and urgency > 0.7:
                 reward -= 5.0 * urgency
 
+        # Penalize repeatedly entering edges seen in recent history.
+        if repeated_recent_edges > 0:
+            reward -= self.loop_repeat_penalty * repeated_recent_edges
+
         # If vehicle moved into a region with no path to destination
-        elif math.isfinite(prev_distance) and not math.isfinite(curr_distance):
+        if math.isfinite(prev_distance) and not math.isfinite(curr_distance):
             reward -= 100.0
             done = True
 
@@ -550,6 +556,7 @@ class RLTrainingPipeline:
             last_state_action = {}
             # vehicle_id -> edge_id where we last issued a decision (prevents repeat decisions)
             last_decision_edge = {}
+            recent_edge_history = defaultdict(lambda: deque(maxlen=self.loop_window))
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
@@ -570,6 +577,7 @@ class RLTrainingPipeline:
                         vehicle = vehicles[vehicle_id]
                         vehicle.current_edge = current_edge
                         vehicle.current_speed = traci.vehicle.getSpeed(vehicle_id)
+                        recent_edge_history[vehicle_id].append(current_edge)
 
                         # arrived
                         if current_edge == vehicle.destination:
@@ -595,12 +603,17 @@ class RLTrainingPipeline:
                         if vehicle_id in last_state_action:
                             prev_state, prev_action, prev_edge = last_state_action[vehicle_id]
 
+                            repeated_recent_edges = sum(
+                                1 for edge in recent_edge_history[vehicle_id] if edge == current_edge
+                            )
+
                             reward, done = self.compute_reward(
                                 vehicle,
                                 prev_edge,
                                 current_edge,
                                 step,
-                                arrived=False
+                                arrived=False,
+                                repeated_recent_edges=repeated_recent_edges
                             )
 
                             next_state = self.encode_state(vehicle_id, current_edge, vehicle.destination)

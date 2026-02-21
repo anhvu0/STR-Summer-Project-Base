@@ -5,6 +5,7 @@ import numpy as np
 import traci
 import sumolib
 import math
+from collections import deque
 
 from xml.dom.minidom import parse
 import os
@@ -24,9 +25,20 @@ class QLearningPolicy(RouteController):
         self.net = sumolib.net.readNet(net_xml_file)
         self._visit_count = {}
         self._best_dist = {}
+        self._recent_edges = {}
+        self._metrics = {
+            "decisions": 0,
+            "overrides": 0,
+            "loop_overrides": 0,
+            "distance_overrides": 0,
+            "impossible_action_overrides": 0,
+        }
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
         # How many actions to plan ahead each time
         self.decision_horizon = 6
+        self.loop_window = 10
+        self.loop_repeat_threshold = 2
+        self.distance_slack = 50.0
 
 
     
@@ -80,6 +92,8 @@ class QLearningPolicy(RouteController):
                 self._visit_count[vid] = {}
             if vid not in self._best_dist:
                 self._best_dist[vid] = float("inf")
+            if vid not in self._recent_edges:
+                self._recent_edges[vid] = deque(maxlen=self.loop_window)
 
             i = 0
             while i < self.decision_horizon:
@@ -94,9 +108,11 @@ class QLearningPolicy(RouteController):
                 state = self.getState(vid, start_edge, vehicle.destination)
                 action_idx = self.act(state)
                 action = self.direction_choices[action_idx]
+                self._metrics["decisions"] += 1
 
                 # ---------- if model picks an impossible action, fallback ----------
                 if action not in outgoing:
+                    self._metrics["impossible_action_overrides"] += 1
                     print(
                         f"[IMPOSSIBLE] veh={vid} edge={start_edge} dest={vehicle.destination} "
                         f"chosen='{action}' valid_dirs={valid_dirs} state_bits={state[0][2:8].tolist()}"
@@ -138,6 +154,10 @@ class QLearningPolicy(RouteController):
                 else:
                     visit = 999
 
+                recent_repeat = 0
+                if prop_next is not None:
+                    recent_repeat = sum(1 for edge in self._recent_edges[vid] if edge == prop_next)
+
                 # update best distance achieved so far
                 if best_d < self._best_dist[vid]:
                     self._best_dist[vid] = best_d
@@ -151,13 +171,19 @@ class QLearningPolicy(RouteController):
                     override = True
                 if visit >= 3:
                     override = True
-                if prop_d > best_d + 50.0:   # slack threshold (tune this)
+                if recent_repeat >= self.loop_repeat_threshold:
                     override = True
+                    self._metrics["loop_overrides"] += 1
+                if prop_d > best_d + self.distance_slack:   # slack threshold (tune this)
+                    override = True
+                    self._metrics["distance_overrides"] += 1
 
                 if override:
+                    self._metrics["overrides"] += 1
                     print(
                         f"[OVERRIDE] veh={vid} edge={start_edge} dest={dest_id} "
-                        f"chosen='{action}' prop_d={prop_d} best_dir='{best_dir}' best_d={best_d} visit={visit}"
+                        f"chosen='{action}' prop_d={prop_d} best_dir='{best_dir}' best_d={best_d} "
+                        f"visit={visit} recent_repeat={recent_repeat}"
                     )
                     action = best_dir
                     prop_next = best_next
@@ -167,6 +193,7 @@ class QLearningPolicy(RouteController):
                 print(f"For vehicle {vid},Choice for " + str(start_edge) + " is: " + str(action))
 
                 target_edge = outgoing[action]
+                self._recent_edges[vid].append(target_edge)
                 start_edge = target_edge
                 decision_list.append(action)
 
@@ -178,6 +205,20 @@ class QLearningPolicy(RouteController):
                 continue
 
             local_targets[vehicle.vehicle_id] = self.compute_local_target(decision_list, vehicle)
+
+        if self._metrics["decisions"] > 0:
+            ratio = self._metrics["overrides"] / float(self._metrics["decisions"])
+            print(
+                "[Q-METRICS] decisions={} overrides={} override_ratio={:.2%} "
+                "loop_overrides={} distance_overrides={} impossible_action_overrides={}".format(
+                    self._metrics["decisions"],
+                    self._metrics["overrides"],
+                    ratio,
+                    self._metrics["loop_overrides"],
+                    self._metrics["distance_overrides"],
+                    self._metrics["impossible_action_overrides"],
+                )
+            )
 
         return local_targets
 
