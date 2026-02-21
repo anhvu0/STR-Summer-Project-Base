@@ -315,6 +315,57 @@ class RLTrainingPipeline:
             if choice in lane_map:
                 valid.append(idx)
         return valid
+
+    def get_next_edge_for_action(self, vehicle_id, edge_id, action):
+        """
+        Resolve the next edge for an action from the current lane, with
+        an edge-level fallback when lane mapping is missing.
+        """
+        direction = self.route_helper.direction_choices[action]
+        lane_id = traci.vehicle.getLaneID(vehicle_id)
+        lane_map = self.connection_info.lane_outgoing_edges_dict.get(lane_id, {})
+
+        if direction in lane_map:
+            return lane_map[direction]
+
+        edge_map = self.connection_info.outgoing_edges_dict.get(edge_id, {})
+        return edge_map.get(direction)
+
+    def apply_route_to_destination(self, vehicle_id, current_edge, next_edge, destination_edge):
+        """
+        Apply a full route that starts with the chosen next edge and continues
+        to the vehicle global destination.
+
+        Returns True on success, False if a valid route cannot be built.
+        """
+        if not next_edge:
+            return False
+
+        try:
+            start_edge_obj = self.net.getEdge(next_edge)
+            destination_edge_obj = self.net.getEdge(destination_edge)
+        except Exception:
+            return False
+
+        shortest_path = self.net.getShortestPath(start_edge_obj, destination_edge_obj)
+        if not shortest_path or not shortest_path[0]:
+            return False
+
+        suffix = [edge.getID() for edge in shortest_path[0]]
+        route_edges = [current_edge]
+        for edge_id in suffix:
+            if edge_id != route_edges[-1]:
+                route_edges.append(edge_id)
+
+        if len(route_edges) < 2:
+            return False
+
+        try:
+            traci.vehicle.setRoute(vehicle_id, route_edges)
+        except Exception:
+            return False
+
+        return True
     
     def dist_to_end(self, vehicle_id):
         """
@@ -717,11 +768,27 @@ class RLTrainingPipeline:
                             min_dist=align_min_dist,
                             duration=80
                         )
-                        # compute local target and apply routing
-                        decision_list = self.build_decision_list(current_edge, action)
-                        local_target = self.route_helper.compute_local_target(decision_list, vehicle)
-                        traci.vehicle.changeTarget(vehicle_id, local_target)
-                        last_target_by_vehicle[vehicle_id] = local_target
+
+                        # Build a full route to the GLOBAL destination starting
+                        # with the selected next edge. This addresses premature
+                        # vehicle removal at intermediate local targets.
+                        next_edge = self.get_next_edge_for_action(vehicle_id, current_edge, action)
+                        route_set = self.apply_route_to_destination(
+                            vehicle_id,
+                            current_edge,
+                            next_edge,
+                            vehicle.destination,
+                        )
+
+                        if route_set:
+                            last_target_by_vehicle[vehicle_id] = vehicle.destination
+                        else:
+                            # Fallback to the old local-target logic only when
+                            # full-route construction fails.
+                            decision_list = self.build_decision_list(current_edge, action)
+                            local_target = self.route_helper.compute_local_target(decision_list, vehicle)
+                            traci.vehicle.changeTarget(vehicle_id, local_target)
+                            last_target_by_vehicle[vehicle_id] = local_target
 
                         # store new transition start
                         last_state_action[vehicle_id] = (state, action, current_edge)
