@@ -611,6 +611,7 @@ class RLTrainingPipeline:
             teleported_controlled_ids = set()
             arrived_ids = set()
             arrived_before_deadline_ids = set()
+            arrived_non_global_ids = set()
             exited_without_destination_ids = set()
             total_controlled = len(vehicles)
             controlled_ids = set(vehicles.keys())
@@ -737,15 +738,26 @@ class RLTrainingPipeline:
                             continue
 
                         vehicle = vehicles[arrived_vehicle_id]
-                        arrived_ids.add(arrived_vehicle_id)
-                        if step <= vehicle.deadline:
-                            arrived_before_deadline_ids.add(arrived_vehicle_id)
+                        last_seen_edge = last_seen_edge_by_vehicle.get(arrived_vehicle_id, "<unknown>")
+                        last_local_target = last_target_by_vehicle.get(arrived_vehicle_id, "<unset>")
+                        reached_global_destination = (
+                            last_seen_edge == vehicle.destination
+                            or last_local_target == vehicle.destination
+                        )
+
+                        if reached_global_destination:
+                            arrived_ids.add(arrived_vehicle_id)
+                            if step <= vehicle.deadline:
+                                arrived_before_deadline_ids.add(arrived_vehicle_id)
+                        else:
+                            arrived_non_global_ids.add(arrived_vehicle_id)
 
                         debug_record = {
                             "vehicle_id": arrived_vehicle_id,
                             "global_destination": vehicle.destination,
-                            "last_seen_edge": last_seen_edge_by_vehicle.get(arrived_vehicle_id, "<unknown>"),
-                            "last_local_target": last_target_by_vehicle.get(arrived_vehicle_id, "<unset>"),
+                            "last_seen_edge": last_seen_edge,
+                            "last_local_target": last_local_target,
+                            "reached_global_destination": reached_global_destination,
                         }
                         arrived_debug_records.append(debug_record)
 
@@ -830,20 +842,21 @@ class RLTrainingPipeline:
                 # Controlled vehicles that left simulation without being marked
                 # as arrived (global destination) or teleported.
                 exited_without_destination_ids = (
-                    controlled_ids - arrived_ids - teleported_controlled_ids
+                    controlled_ids - arrived_ids - teleported_controlled_ids - arrived_non_global_ids
                 )
                 print(
                     f"Controlled exit diagnostics | "
                     f"arrived={len(arrived_ids)}/{total_controlled}, "
                     f"arrived_before_deadline={len(arrived_before_deadline_ids)}/{total_controlled}, "
                     f"teleported_controlled={len(teleported_controlled_ids)}/{total_controlled}, "
+                    f"arrived_non_global={len(arrived_non_global_ids)}/{total_controlled}, "
                     f"exited_without_destination={len(exited_without_destination_ids)}/{total_controlled}"
                 )
 
                 if self.debug_exit_diagnostics:
                     mismatched_arrivals = [
                         record for record in arrived_debug_records
-                        if record["last_local_target"] != record["global_destination"]
+                        if not record["reached_global_destination"]
                     ]
                     print(
                         f"Arrival debug | total_arrived={len(arrived_debug_records)}, "

@@ -53,7 +53,11 @@ class RouteController(ABC):
             # Keep local targets far enough ahead so vehicles do not frequently
             # complete a tiny route segment and leave simulation before reaching
             # their true global destination.
-            horizon = max(vehicle.current_speed, 120)
+            #
+            # A very small horizon (for example ~120m) can terminate a vehicle at
+            # an intermediate target before the next policy decision is taken.
+            # Use a larger lookahead distance that still scales with speed.
+            horizon = max(vehicle.current_speed * 8.0, 500.0)
             while path_length <= horizon:
                 if current_target_edge == vehicle.destination:
                     print("vehicle done!")
