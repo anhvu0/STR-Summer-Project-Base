@@ -65,15 +65,16 @@ class RouteController(ABC):
                 if not outgoing or len(outgoing) == 0:
                     return current_target_edge
 
-                # if decisions run out, extend behavior with a safe random valid direction
+                # if the controller has no more planned decisions, stop at the
+                # last policy-produced edge instead of inventing a random turn.
                 if i >= len(decision_list):
-                    # choose any valid direction from this edge
-                    choice = random.choice(list(outgoing.keys()))
-                else:
-                    choice = decision_list[i]
-                    # if invalid direction, fallback to a valid one instead of removing the vehicle
-                    if choice not in outgoing:
-                        choice = random.choice(list(outgoing.keys()))
+                    return current_target_edge
+
+                choice = decision_list[i]
+                # if invalid direction, stop extending rather than forcing a
+                # random branch that can move away from the true destination.
+                if choice not in outgoing:
+                    return current_target_edge
 
                 current_target_edge = outgoing[choice]
                 path_length += self.connection_info.edge_length_dict[current_target_edge]
