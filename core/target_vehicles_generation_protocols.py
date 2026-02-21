@@ -496,6 +496,18 @@ class target_vehicles_generator:
             release_time += release_period
             id_now += 1
             vs = root.getElementsByTagName("vehicle")
+        # Ensure route file is sorted by departure time to satisfy SUMO parser expectations.
+        # We rebuild the <vehicle> list after all insertions because mixed randomTrips output
+        # and controlled-agent injections can otherwise produce unsorted depart timestamps.
+        vehicles_sorted = sorted(
+            root.getElementsByTagName("vehicle"),
+            key=lambda node: float(node.getAttribute("depart") or 0.0),
+        )
+        for vehicle_node in list(root.getElementsByTagName("vehicle")):
+            root.removeChild(vehicle_node)
+        for vehicle_node in vehicles_sorted:
+            root.appendChild(vehicle_node)
+
         #write the vehicle information into the xml file
         with open(target_xml_file, 'w') as f:
             f.write(doc.toprettyxml())
