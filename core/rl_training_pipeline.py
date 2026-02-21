@@ -536,6 +536,11 @@ class RLTrainingPipeline:
         sumo_binary = checkBinary('sumo')
         TRAIN_EVERY = 10          # try 10–20
         GRAD_STEPS = 1            # try 1–4
+        ROLLING_WINDOW = 100
+        rolling_teleport_events = deque(maxlen=ROLLING_WINDOW)
+        rolling_teleported_controlled = deque(maxlen=ROLLING_WINDOW)
+        rolling_completion_rate = deque(maxlen=ROLLING_WINDOW)
+        rolling_avg_return = deque(maxlen=ROLLING_WINDOW)
 
         for episode in range(self.episodes):
             episode_seed = episode if self.seed_with_episode else None
@@ -557,6 +562,13 @@ class RLTrainingPipeline:
             # vehicle_id -> edge_id where we last issued a decision (prevents repeat decisions)
             last_decision_edge = {}
             recent_edge_history = defaultdict(lambda: deque(maxlen=self.loop_window))
+
+            episode_return = 0.0
+            episode_teleport_events = 0
+            teleported_controlled_ids = set()
+            arrived_ids = set()
+            arrived_before_deadline_ids = set()
+            total_controlled = len(vehicles)
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
@@ -581,6 +593,10 @@ class RLTrainingPipeline:
 
                         # arrived
                         if current_edge == vehicle.destination:
+                            if vehicle_id not in arrived_ids:
+                                arrived_ids.add(vehicle_id)
+                                if step <= vehicle.deadline:
+                                    arrived_before_deadline_ids.add(vehicle_id)
                             last_state_action.pop(vehicle_id, None)
                             last_decision_edge.pop(vehicle_id, None)
                             continue
@@ -618,6 +634,7 @@ class RLTrainingPipeline:
 
                             next_state = self.encode_state(vehicle_id, current_edge, vehicle.destination)
                             self.trainer.remember(prev_state, prev_action, reward, next_state, done)
+                            episode_return += reward
 
                             if done:
                                 last_state_action.pop(vehicle_id, None)
@@ -666,6 +683,8 @@ class RLTrainingPipeline:
                     # =========================
                     teleported_ids = self.get_teleport_ids()
                     if teleported_ids:
+                        episode_teleport_events += len(teleported_ids)
+                        teleported_controlled_ids.update(tid for tid in teleported_ids if tid in vehicles)
                         for tid in list(teleported_ids):
                             if tid not in vehicles:
                                 continue
@@ -686,6 +705,7 @@ class RLTrainingPipeline:
                                 next_state = self.make_terminal_next_state(tid, tele_edge, v.destination)
 
                                 self.trainer.remember(prev_state, prev_action, teleport_penalty, next_state, True)
+                                episode_return += teleport_penalty
 
                                 # Clear open transition
                                 last_state_action.pop(tid, None)
@@ -698,11 +718,40 @@ class RLTrainingPipeline:
                             self.trainer.replay()
 
             finally:
+                completion_rate = (
+                    len(arrived_before_deadline_ids) / float(total_controlled)
+                    if total_controlled > 0 else 0.0
+                )
+                avg_return = episode_return / float(total_controlled) if total_controlled > 0 else 0.0
+
+                rolling_teleport_events.append(float(episode_teleport_events))
+                rolling_teleported_controlled.append(float(len(teleported_controlled_ids)))
+                rolling_completion_rate.append(float(completion_rate))
+                rolling_avg_return.append(float(avg_return))
+
+                roll_tele_events = sum(rolling_teleport_events) / len(rolling_teleport_events)
+                roll_tele_ctrl = sum(rolling_teleported_controlled) / len(rolling_teleported_controlled)
+                roll_completion = sum(rolling_completion_rate) / len(rolling_completion_rate)
+                roll_return = sum(rolling_avg_return) / len(rolling_avg_return)
+
                 self.trainer.epsilon = max(
                     self.trainer.epsilon_min,
                     self.trainer.epsilon * self.trainer.epsilon_decay
                 )
-                print(f"\n\nDone with episode {episode}\n")
+                print(
+                    f"\n\nDone with episode {episode} | "
+                    f"teleport_events={episode_teleport_events}, "
+                    f"teleported_controlled={len(teleported_controlled_ids)}, "
+                    f"completion_before_deadline={completion_rate:.3f}, "
+                    f"avg_return={avg_return:.3f}"
+                )
+                print(
+                    f"Rolling({len(rolling_teleport_events)}) | "
+                    f"teleport_events/ep={roll_tele_events:.3f}, "
+                    f"teleported_controlled/ep={roll_tele_ctrl:.3f}, "
+                    f"completion_before_deadline={roll_completion:.3f}, "
+                    f"avg_return={roll_return:.3f}\n"
+                )
                 traci.close()
 
         self.trainer.model.save(self.model_output_path)
