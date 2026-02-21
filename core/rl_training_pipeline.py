@@ -607,7 +607,9 @@ class RLTrainingPipeline:
             teleported_controlled_ids = set()
             arrived_ids = set()
             arrived_before_deadline_ids = set()
+            exited_without_destination_ids = set()
             total_controlled = len(vehicles)
+            controlled_ids = set(vehicles.keys())
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
@@ -789,6 +791,19 @@ class RLTrainingPipeline:
                     f"teleported_controlled/ep={roll_tele_ctrl:.3f}, "
                     f"completion_before_deadline={roll_completion:.3f}, "
                     f"avg_return={roll_return:.3f}\n"
+                )
+
+                # Controlled vehicles that left simulation without being marked
+                # as arrived (global destination) or teleported.
+                exited_without_destination_ids = (
+                    controlled_ids - arrived_ids - teleported_controlled_ids
+                )
+                print(
+                    f"Controlled exit diagnostics | "
+                    f"arrived={len(arrived_ids)}/{total_controlled}, "
+                    f"arrived_before_deadline={len(arrived_before_deadline_ids)}/{total_controlled}, "
+                    f"teleported_controlled={len(teleported_controlled_ids)}/{total_controlled}, "
+                    f"exited_without_destination={len(exited_without_destination_ids)}/{total_controlled}"
                 )
                 traci.close()
 
