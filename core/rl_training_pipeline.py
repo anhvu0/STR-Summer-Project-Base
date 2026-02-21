@@ -712,12 +712,32 @@ class RLTrainingPipeline:
                         decision_list = self.build_decision_list(current_edge, action)
                         local_target = self.route_helper.compute_local_target(decision_list, vehicle)
                         traci.vehicle.changeTarget(vehicle_id, local_target)
+                        vehicle.local_destination = local_target
 
                         # store new transition start
                         last_state_action[vehicle_id] = (state, action, current_edge)
                         last_decision_edge[vehicle_id] = current_edge
 
                     traci.simulationStep()
+
+                    # Vehicles that completed their current SUMO route this step.
+                    # NOTE: In TraCI, arrived vehicles are often removed immediately,
+                    # so relying only on `getIDList()` + edge checks can miss them.
+                    for arrived_id in traci.simulation.getArrivedIDList():
+                        if arrived_id not in vehicles:
+                            continue
+
+                        vehicle = vehicles[arrived_id]
+
+                        # Count as true success only when the vehicle's last local
+                        # target equals its intended global destination.
+                        if vehicle.local_destination == vehicle.destination and arrived_id not in arrived_ids:
+                            arrived_ids.add(arrived_id)
+                            if traci.simulation.getTime() <= vehicle.deadline:
+                                arrived_before_deadline_ids.add(arrived_id)
+
+                        last_state_action.pop(arrived_id, None)
+                        last_decision_edge.pop(arrived_id, None)
 
                     # =========================
                     # Teleport detection + terminal penalty
