@@ -177,6 +177,8 @@ class RLTrainingPipeline:
         train_every=10,
         grad_steps=2,
         rolling_window=100,
+        debug_exit_diagnostics=True,
+        debug_exit_diagnostics_limit=20,
     ):
         """
         Args:
@@ -204,6 +206,8 @@ class RLTrainingPipeline:
         self.train_every = train_every
         self.grad_steps = grad_steps
         self.rolling_window = rolling_window
+        self.debug_exit_diagnostics = debug_exit_diagnostics
+        self.debug_exit_diagnostics_limit = max(int(debug_exit_diagnostics_limit), 0)
         self._distance_cache = {}
         self.progress_reward_scale = 1.0  # or 0.0 to disable progress term cheaply
         self.system_congestion_scale = 0.01  # tune this later
@@ -606,10 +610,14 @@ class RLTrainingPipeline:
             episode_teleport_events = 0
             teleported_controlled_ids = set()
             arrived_ids = set()
+            removed_controlled_ids = set()
             arrived_before_deadline_ids = set()
             exited_without_destination_ids = set()
             total_controlled = len(vehicles)
             controlled_ids = set(vehicles.keys())
+            last_seen_edge_by_vehicle = {}
+            last_target_by_vehicle = {}
+            arrived_debug_records = []
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
@@ -630,6 +638,7 @@ class RLTrainingPipeline:
                         vehicle = vehicles[vehicle_id]
                         vehicle.current_edge = current_edge
                         vehicle.current_speed = traci.vehicle.getSpeed(vehicle_id)
+                        last_seen_edge_by_vehicle[vehicle_id] = current_edge
                         recent_edge_history[vehicle_id].append(current_edge)
 
                         # arrived
@@ -712,12 +721,45 @@ class RLTrainingPipeline:
                         decision_list = self.build_decision_list(current_edge, action)
                         local_target = self.route_helper.compute_local_target(decision_list, vehicle)
                         traci.vehicle.changeTarget(vehicle_id, local_target)
+                        last_target_by_vehicle[vehicle_id] = local_target
 
                         # store new transition start
                         last_state_action[vehicle_id] = (state, action, current_edge)
                         last_decision_edge[vehicle_id] = current_edge
 
                     traci.simulationStep()
+
+                    # Vehicles removed by SUMO because they reached their current route target.
+                    # This is where we can tell whether they ended at the global destination
+                    # or were terminated at an intermediate/local target.
+                    arrived_this_step = traci.simulation.getArrivedIDList()
+                    for arrived_vehicle_id in arrived_this_step:
+                        if arrived_vehicle_id not in vehicles:
+                            continue
+
+                        vehicle = vehicles[arrived_vehicle_id]
+                        removed_controlled_ids.add(arrived_vehicle_id)
+
+                        reached_global_destination = (
+                            last_seen_edge_by_vehicle.get(arrived_vehicle_id) == vehicle.destination
+                        )
+                        if reached_global_destination:
+                            arrived_ids.add(arrived_vehicle_id)
+                            if step <= vehicle.deadline:
+                                arrived_before_deadline_ids.add(arrived_vehicle_id)
+
+                        debug_record = {
+                            "vehicle_id": arrived_vehicle_id,
+                            "global_destination": vehicle.destination,
+                            "last_seen_edge": last_seen_edge_by_vehicle.get(arrived_vehicle_id, "<unknown>"),
+                            "last_local_target": last_target_by_vehicle.get(arrived_vehicle_id, "<unset>"),
+                            "reached_global_destination": reached_global_destination,
+                        }
+                        arrived_debug_records.append(debug_record)
+
+                        # No more transitions should be open once SUMO removes the vehicle.
+                        last_state_action.pop(arrived_vehicle_id, None)
+                        last_decision_edge.pop(arrived_vehicle_id, None)
 
                     # =========================
                     # Teleport detection + terminal penalty
@@ -798,13 +840,58 @@ class RLTrainingPipeline:
                 exited_without_destination_ids = (
                     controlled_ids - arrived_ids - teleported_controlled_ids
                 )
+                removed_without_global_destination_ids = (
+                    removed_controlled_ids - arrived_ids
+                )
                 print(
                     f"Controlled exit diagnostics | "
                     f"arrived={len(arrived_ids)}/{total_controlled}, "
                     f"arrived_before_deadline={len(arrived_before_deadline_ids)}/{total_controlled}, "
                     f"teleported_controlled={len(teleported_controlled_ids)}/{total_controlled}, "
+                    f"removed_without_global_destination={len(removed_without_global_destination_ids)}/{total_controlled}, "
                     f"exited_without_destination={len(exited_without_destination_ids)}/{total_controlled}"
                 )
+
+                if self.debug_exit_diagnostics:
+                    mismatched_arrivals = [
+                        record for record in arrived_debug_records
+                        if not record["reached_global_destination"]
+                    ]
+                    print(
+                        f"Arrival debug | total_removed={len(arrived_debug_records)}, "
+                        f"removed_before_global_destination={len(mismatched_arrivals)}"
+                    )
+
+                    for record in mismatched_arrivals[:self.debug_exit_diagnostics_limit]:
+                        print(
+                            "  REMOVED_NON_GLOBAL "
+                            f"vehicle={record['vehicle_id']} "
+                            f"last_seen_edge={record['last_seen_edge']} "
+                            f"last_local_target={record['last_local_target']} "
+                            f"global_destination={record['global_destination']}"
+                        )
+
+                    if len(mismatched_arrivals) > self.debug_exit_diagnostics_limit:
+                        print(
+                            "  REMOVED_NON_GLOBAL ... "
+                            f"{len(mismatched_arrivals) - self.debug_exit_diagnostics_limit} more vehicles"
+                        )
+
+                    for vehicle_id in sorted(exited_without_destination_ids)[:self.debug_exit_diagnostics_limit]:
+                        vehicle = vehicles[vehicle_id]
+                        print(
+                            "  EXITED_WITHOUT_DEST "
+                            f"vehicle={vehicle_id} "
+                            f"last_seen_edge={last_seen_edge_by_vehicle.get(vehicle_id, '<unknown>')} "
+                            f"last_local_target={last_target_by_vehicle.get(vehicle_id, '<unset>')} "
+                            f"global_destination={vehicle.destination}"
+                        )
+
+                    if len(exited_without_destination_ids) > self.debug_exit_diagnostics_limit:
+                        print(
+                            "  EXITED_WITHOUT_DEST ... "
+                            f"{len(exited_without_destination_ids) - self.debug_exit_diagnostics_limit} more vehicles"
+                        )
                 traci.close()
 
         self.trainer.model.save(self.model_output_path)
