@@ -67,7 +67,19 @@ class DQNTrainer:
     Deep Q-Network trainer for routing decisions
     """
 
-    def __init__(self, state_size, action_size, learning_rate = 0.001, gamma = 0.95, epsilon = 1.0, epsilon_decay = 0.99, epsilon_min = 0.05, replay_capacity=10000, batch_size = 32):
+    def __init__(
+        self,
+        state_size,
+        action_size,
+        learning_rate=0.001,
+        gamma=0.95,
+        epsilon=1.0,
+        epsilon_decay=0.99,
+        epsilon_min=0.05,
+        replay_capacity=10000,
+        batch_size=32,
+        replay_warmup=1000,
+    ):
         """
         :param learning_rate: Can be adjusted for further optimization
         :param gamma: Can be adjusted for further optimization
@@ -82,6 +94,7 @@ class DQNTrainer:
         self.epsilon_decay = epsilon_decay
         self.epsilon_min = epsilon_min
         self.batch_size = batch_size
+        self.replay_warmup = max(int(replay_warmup), self.batch_size)
         self.memory = ReplayBuffer(replay_capacity)
         self.model = self.build_model(learning_rate)
 
@@ -118,7 +131,7 @@ class DQNTrainer:
         """
         Train the Q-network from replayed experiences. Update q-values of previous state based on the most recent one.
         """
-        if len(self.memory) < self.batch_size:
+        if len(self.memory) < self.replay_warmup:
             return
         minibatch = self.memory.sample(self.batch_size)
         states      = np.vstack([s[0] for s in minibatch])
@@ -153,6 +166,17 @@ class RLTrainingPipeline:
         decision_horizon=6,
         destination_reward=120.0,       #Adjustible
         deadline_penalty=100.0,
+        on_time_arrival_bonus=20.0,
+        teleport_penalty=-150.0,
+        epsilon_decay=0.997,
+        epsilon_min=0.10,
+        gamma=0.97,
+        replay_capacity=20000,
+        batch_size=64,
+        replay_warmup=2000,
+        train_every=10,
+        grad_steps=2,
+        rolling_window=100,
     ):
         """
         Args:
@@ -164,6 +188,8 @@ class RLTrainingPipeline:
             decision_horizon: Number of actions to pad a decision list.
             destination_reward: Reward when reaching the destination.
             deadline_penalty: Penalty when missing the deadline.
+            on_time_arrival_bonus: Extra reward for arriving before deadline.
+            teleport_penalty: Terminal penalty for teleport events.
         """
         self.sumocfg_path = sumocfg_path
         self.model_output_path = model_output_path
@@ -173,6 +199,11 @@ class RLTrainingPipeline:
         self.decision_horizon = decision_horizon
         self.destination_reward = destination_reward
         self.deadline_penalty = deadline_penalty
+        self.on_time_arrival_bonus = on_time_arrival_bonus
+        self.teleport_penalty = teleport_penalty
+        self.train_every = train_every
+        self.grad_steps = grad_steps
+        self.rolling_window = rolling_window
         self._distance_cache = {}
         self.progress_reward_scale = 1.0  # or 0.0 to disable progress term cheaply
         self.system_congestion_scale = 0.01  # tune this later
@@ -189,7 +220,16 @@ class RLTrainingPipeline:
 
         self.state_size = 2 + 6 + 3 + len(self.connection_info.edge_list)
         self.action_size = 6
-        self.trainer = DQNTrainer(self.state_size, self.action_size)
+        self.trainer = DQNTrainer(
+            self.state_size,
+            self.action_size,
+            gamma=gamma,
+            epsilon_decay=epsilon_decay,
+            epsilon_min=epsilon_min,
+            replay_capacity=replay_capacity,
+            batch_size=batch_size,
+            replay_warmup=replay_warmup,
+        )
 
     def _deadline_window(self, vehicle):
         """
@@ -480,6 +520,8 @@ class RLTrainingPipeline:
         # ---- Arrival handling ----
         if arrived:
             reward += self.destination_reward
+            if step <= vehicle.deadline:
+                reward += self.on_time_arrival_bonus
             done = True
             return reward, done
 
@@ -534,13 +576,10 @@ class RLTrainingPipeline:
         - Close transitions at the next decision point
         """
         sumo_binary = checkBinary('sumo')
-        TRAIN_EVERY = 10          # try 10–20
-        GRAD_STEPS = 1            # try 1–4
-        ROLLING_WINDOW = 100
-        rolling_teleport_events = deque(maxlen=ROLLING_WINDOW)
-        rolling_teleported_controlled = deque(maxlen=ROLLING_WINDOW)
-        rolling_completion_rate = deque(maxlen=ROLLING_WINDOW)
-        rolling_avg_return = deque(maxlen=ROLLING_WINDOW)
+        rolling_teleport_events = deque(maxlen=self.rolling_window)
+        rolling_teleported_controlled = deque(maxlen=self.rolling_window)
+        rolling_completion_rate = deque(maxlen=self.rolling_window)
+        rolling_avg_return = deque(maxlen=self.rolling_window)
 
         for episode in range(self.episodes):
             episode_seed = episode if self.seed_with_episode else None
@@ -701,11 +740,10 @@ class RLTrainingPipeline:
                                     tele_edge = prev_edge
 
                                 # Big penalty so agent learns to avoid situations leading to teleports
-                                teleport_penalty = -200.0
                                 next_state = self.make_terminal_next_state(tid, tele_edge, v.destination)
 
-                                self.trainer.remember(prev_state, prev_action, teleport_penalty, next_state, True)
-                                episode_return += teleport_penalty
+                                self.trainer.remember(prev_state, prev_action, self.teleport_penalty, next_state, True)
+                                episode_return += self.teleport_penalty
 
                                 # Clear open transition
                                 last_state_action.pop(tid, None)
@@ -713,8 +751,8 @@ class RLTrainingPipeline:
                             # Prevent repeated “decision” bookkeeping for teleported cars
                             last_decision_edge.pop(tid, None)
 
-                    if step % TRAIN_EVERY == 0:
-                        for _ in range(GRAD_STEPS):
+                    if step % self.train_every == 0:
+                        for _ in range(self.grad_steps):
                             self.trainer.replay()
 
             finally:
