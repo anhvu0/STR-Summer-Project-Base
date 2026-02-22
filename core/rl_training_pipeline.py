@@ -161,11 +161,11 @@ class RLTrainingPipeline:
         sumocfg_path,
         model_output_path,
         episodes=10,
-        spawn_interval=2.0,
+        spawn_interval=4.0,
         seed_with_episode=True,
         decision_horizon=6,
         destination_reward=120.0,       #Adjustible
-        deadline_penalty=120.0,
+        deadline_penalty=140.0,
         on_time_arrival_bonus=40.0,
         teleport_penalty=-150.0,
         epsilon_decay=0.99,
