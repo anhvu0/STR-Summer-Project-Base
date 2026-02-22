@@ -56,7 +56,6 @@ class RouteController(ABC):
             horizon = max(vehicle.current_speed, 120)
             while path_length <= horizon:
                 if current_target_edge == vehicle.destination:
-                    print("vehicle done!")
                     break
 
                 outgoing = self.connection_info.outgoing_edges_dict.get(current_target_edge, {})
