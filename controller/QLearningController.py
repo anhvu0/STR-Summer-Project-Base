@@ -33,6 +33,7 @@ class QLearningPolicy(RouteController):
             "distance_overrides": 0,
             "impossible_action_overrides": 0,
         }
+        self._last_metrics_snapshot = None
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
         # How many actions to plan ahead each time
         self.decision_horizon = 6
@@ -166,20 +167,24 @@ class QLearningPolicy(RouteController):
                 # 1) proposed has no path
                 # 2) proposed repeats too much
                 # 3) proposed is much worse than best available
-                override = False
-                if prop_d == float("inf"):
-                    override = True
-                if visit >= 3:
-                    override = True
-                if recent_repeat >= self.loop_repeat_threshold:
-                    override = True
-                    self._metrics["loop_overrides"] += 1
-                if prop_d > best_d + self.distance_slack:   # slack threshold (tune this)
-                    override = True
-                    self._metrics["distance_overrides"] += 1
+                no_path_override = prop_d == float("inf")
+                repeat_override = visit >= 3 or recent_repeat >= self.loop_repeat_threshold
+                distance_override = prop_d > best_d + self.distance_slack
+
+                override = no_path_override or repeat_override or distance_override
+
+                # If the model already chose the best available direction, avoid
+                # logging/counting a no-op override. This keeps metrics meaningful
+                # and reduces noisy repeated [OVERRIDE] messages.
+                if action == best_dir and prop_d != float("inf"):
+                    override = False
 
                 if override:
                     self._metrics["overrides"] += 1
+                    if repeat_override:
+                        self._metrics["loop_overrides"] += 1
+                    if distance_override:
+                        self._metrics["distance_overrides"] += 1
                     print(
                         f"[OVERRIDE] veh={vid} edge={start_edge} dest={dest_id} "
                         f"chosen='{action}' prop_d={prop_d} best_dir='{best_dir}' best_d={best_d} "
@@ -215,6 +220,17 @@ class QLearningPolicy(RouteController):
             local_targets[vehicle.vehicle_id] = self.compute_local_target(decision_list, vehicle)
 
         if self._metrics["decisions"] > 0:
+            snapshot = (
+                self._metrics["decisions"],
+                self._metrics["overrides"],
+                self._metrics["loop_overrides"],
+                self._metrics["distance_overrides"],
+                self._metrics["impossible_action_overrides"],
+            )
+            if snapshot == self._last_metrics_snapshot:
+                return local_targets
+
+            self._last_metrics_snapshot = snapshot
             ratio = self._metrics["overrides"] / float(self._metrics["decisions"])
             print(
                 "[Q-METRICS] decisions={} overrides={} override_ratio={:.2%} "
