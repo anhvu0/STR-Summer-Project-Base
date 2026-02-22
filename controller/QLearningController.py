@@ -129,9 +129,9 @@ class QLearningPolicy(RouteController):
                     return d, nxt
 
                 # best possible move from here (by distance-to-dest)
-                best_dir = None
-                best_d = float("inf")
-                best_next = None
+                best_dir = valid_dirs[0]
+                best_next = outgoing[best_dir]
+                best_d = self._dist_to_dest(best_next, dest_id)
                 for dch in valid_dirs:
                     d, nxt = score_dir(dch)
                     if d < best_d:
@@ -189,6 +189,14 @@ class QLearningPolicy(RouteController):
                     prop_next = best_next
                     prop_d = best_d
                 #------------------------------------------
+
+                if action not in outgoing:
+                    self._metrics["impossible_action_overrides"] += 1
+                    action = valid_dirs[0]
+                    print(
+                        f"[FALLBACK] veh={vid} edge={start_edge} dest={dest_id} "
+                        f"picked safe default action='{action}'"
+                    )
 
                 print(f"For vehicle {vid},Choice for " + str(start_edge) + " is: " + str(action))
 
