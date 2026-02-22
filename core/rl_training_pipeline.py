@@ -164,10 +164,10 @@ class RLTrainingPipeline:
         spawn_interval=4.0,
         seed_with_episode=True,
         decision_horizon=6,
-        destination_reward=120.0,       #Adjustible
-        deadline_penalty=140.0,
+        destination_reward=150.0,       #Adjustible
+        deadline_penalty=120.0,
         on_time_arrival_bonus=40.0,
-        teleport_penalty=-150.0,
+        teleport_penalty=-120.0,
         epsilon_decay=0.99,
         epsilon_min=0.10,
         gamma=0.97,
@@ -555,7 +555,7 @@ class RLTrainingPipeline:
 
         # If vehicle moved into a region with no path to destination
         if math.isfinite(prev_distance) and not math.isfinite(curr_distance):
-            reward -= 100.0
+            reward -= 120.0
             done = True
 
         # ---- Arrival handling ----
