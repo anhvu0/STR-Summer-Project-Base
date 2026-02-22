@@ -49,6 +49,16 @@ Current shaping includes:
 - destination bonus,
 - hard teleport penalty.
 
+### FAQ: what happens if a vehicle takes a lane/route that cannot reach the destination?
+
+Yes—this implementation penalizes that behavior so the policy can learn to avoid it over time.
+
+- If a vehicle moves onto an edge where the destination becomes unreachable (`curr_distance = inf`), reward gets an additional `-100` and the transition ends.
+- If the vehicle enters a true dead-end (no outgoing edges and not at destination), it gets another terminal `-50` dead-end penalty.
+- If the vehicle teleports (often a symptom of bad routing/gridlock), the trainer stores a terminal transition with `teleport_penalty` (default `-150`).
+
+Together, those terminal negatives push Q-values down for actions that lead into disconnected or trapping regions.
+
 Common failure mode: huge negative events dominate learning and hide incremental progress.
 
 Practical adjustments to test:
@@ -66,4 +76,3 @@ Practical adjustments to test:
 ## 6) Interpreting your current logs
 
 If `avg_return` improves while `completion_before_deadline` stays flat, you are likely optimizing shaping terms more than mission success. In that case, prioritize reward edits and KPI-driven selection over pure return improvements.
-
