@@ -222,7 +222,9 @@ class RLTrainingPipeline:
         self.connection_info = ConnectionInfo(os.path.join(self.sumocfg_dir, self.net_file))
         self.route_helper = TrainingRouteHelper(self.connection_info)
 
-        self.state_size = 2 + 6 + 3 + len(self.connection_info.edge_list)
+        # state = [edge, destination] + 6 direction flags + 3 lane features
+        #         + 3 deadline/time features + density vector
+        self.state_size = 2 + 6 + 3 + 3 + len(self.connection_info.edge_list)
         self.action_size = 6
         self.trainer = DQNTrainer(
             self.state_size,
@@ -265,7 +267,7 @@ class RLTrainingPipeline:
         route_file = route_file_node[0].attributes['value'].nodeValue
         return net_file, route_file
 
-    def encode_state(self, vehicle_id, edge_id, destination_edge):
+    def encode_state(self, vehicle_id, edge_id, destination_edge, vehicle=None, step=None):
         """
         Build a state vector for the given edge using cached per-step densities.
         """
@@ -291,7 +293,21 @@ class RLTrainingPipeline:
         state[lane_base + 1] = min(n_lanes, 6) / 6.0
         state[lane_base + 2] = min(dist_to_end, 200.0) / 200.0
 
-        state[lane_base + 3:] = self._density_vec
+        # deadline/time features (normalized)
+        deadline_base = lane_base + 3
+        if vehicle is not None:
+            if step is None:
+                step = traci.simulation.getTime()
+            deadline_window = self._deadline_window(vehicle)
+            time_left = max(float(vehicle.deadline) - float(step), 0.0)
+            elapsed = max(float(step) - float(vehicle.start_time), 0.0)
+            urgency = self._deadline_urgency(vehicle, step)
+
+            state[deadline_base + 0] = min(time_left / deadline_window, 1.0)
+            state[deadline_base + 1] = min(elapsed / deadline_window, 1.0)
+            state[deadline_base + 2] = urgency
+
+        state[deadline_base + 3:] = self._density_vec
         return state.reshape(1, -1)
 
     def valid_actions(self, edge_id):
@@ -752,7 +768,13 @@ class RLTrainingPipeline:
                                 repeated_recent_edges=repeated_recent_edges
                             )
 
-                            next_state = self.encode_state(vehicle_id, current_edge, vehicle.destination)
+                            next_state = self.encode_state(
+                                vehicle_id,
+                                current_edge,
+                                vehicle.destination,
+                                vehicle=vehicle,
+                                step=step,
+                            )
                             self.trainer.remember(prev_state, prev_action, reward, next_state, done)
                             episode_return += reward
 
@@ -762,7 +784,13 @@ class RLTrainingPipeline:
                                 continue
 
                         # ---- choose action (lane-feasible) ----
-                        state = self.encode_state(vehicle_id, current_edge, vehicle.destination)
+                        state = self.encode_state(
+                            vehicle_id,
+                            current_edge,
+                            vehicle.destination,
+                            vehicle=vehicle,
+                            step=step,
+                        )
 
                         valid = self.valid_actions_for_vehicle(vehicle_id, current_edge)
                         action = self.trainer.select_action(state, valid)
