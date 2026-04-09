@@ -427,11 +427,44 @@ class RLTrainingPipeline:
                 break
 
             if step_idx == 0:
+                # Start with model action, but enforce destination reachability.
                 action = initial_action
                 valid_actions = self.valid_actions(current_edge)
                 if action not in valid_actions:
                     break
-                direction = self.route_helper.direction_choices[action]
+                proposed_direction = self.route_helper.direction_choices[action]
+
+                if proposed_direction not in outgoing:
+                    break
+
+                proposed_next = outgoing[proposed_direction]
+                proposed_score = self._score_next_edge(
+                    proposed_next,
+                    vehicle.destination,
+                    recent_edges,
+                    proposed_direction,
+                )
+
+                if math.isfinite(proposed_score):
+                    direction = proposed_direction
+                else:
+                    # Fallback: choose the best reachable direction from this edge.
+                    best_direction = None
+                    best_score = math.inf
+                    for d, candidate_edge in outgoing.items():
+                        score = self._score_next_edge(
+                            candidate_edge,
+                            vehicle.destination,
+                            recent_edges,
+                            d,
+                        )
+                        if score < best_score:
+                            best_score = score
+                            best_direction = d
+
+                    if best_direction is None or not math.isfinite(best_score):
+                        break
+                    direction = best_direction
             else:
                 best_direction = None
                 best_score = math.inf
@@ -763,6 +796,14 @@ class RLTrainingPipeline:
                         )
                         local_target = self.route_helper.compute_local_target(decision_list, vehicle)
                         applied_target = None
+                        if local_target != vehicle.destination:
+                            dist_local_to_dest = self.get_distance_to_destination(
+                                local_target, vehicle.destination
+                            )
+                            if not math.isfinite(dist_local_to_dest):
+                                # Avoid setting an infeasible via edge that would
+                                # trigger "No connection between edge ... found".
+                                local_target = vehicle.destination
 
                         try:
                             # Keep the global destination as the route sink so the vehicle is not

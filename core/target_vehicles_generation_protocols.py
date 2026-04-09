@@ -70,8 +70,50 @@ class target_vehicles_generator:
         self.edge_list = None
         self.net = network_map_data_structures.getNetInfo(net_file)
         [self.length_dict, self.out_dict, self.index_dict, self.edge_list] = network_map_data_structures.getEdgesInfo(self.net)
+        self.incoming_count_dict = self.__build_incoming_count_dict()
 
         self.__current_target_xml_file__ = ""
+
+    def __build_incoming_count_dict(self):
+        """
+            Build a map of edge_id -> number of passenger-allowed incoming edges.
+            This uses the directed graph from out_dict so one-way constraints are
+            respected when selecting valid origins/destinations.
+        """
+        incoming_count = {}
+        for edge in self.edge_list:
+            incoming_count[edge.getID()] = 0
+
+        for from_edge_id, outgoing in self.out_dict.items():
+            for _direction, to_edge_id in outgoing.items():
+                if to_edge_id in incoming_count:
+                    incoming_count[to_edge_id] += 1
+
+        return incoming_count
+
+    def __edge_has_outgoing(self, edge):
+        """
+            True if edge has at least one passenger-allowed outgoing connection.
+        """
+        return len(self.out_dict.get(edge.getID(), {})) > 0
+
+    def __edge_has_incoming(self, edge):
+        """
+            True if edge has at least one passenger-allowed incoming connection.
+        """
+        return self.incoming_count_dict.get(edge.getID(), 0) > 0
+
+    def __origin_candidates(self, edge_pool):
+        """
+            Origins should not be on an incoming-only/sink edge.
+        """
+        return [edge for edge in edge_pool if self.__edge_has_outgoing(edge)]
+
+    def __destination_candidates(self, edge_pool):
+        """
+            Destinations should not be on an outgoing-only/source edge.
+        """
+        return [edge for edge in edge_pool if self.__edge_has_incoming(edge)]
 
 
     def generate_target_vehicles(self, num_vehicles, target_xml_file, pattern=None):
@@ -312,11 +354,19 @@ class target_vehicles_generator:
         vehicles_info = []
         
         # Generate @num_vehicle tuple-pairs of start_points and destinations:
+        spawn_edges = self.__origin_candidates(self.edge_list)
+        dest_edges = self.__destination_candidates(self.edge_list)
+        if len(spawn_edges) == 0 or len(dest_edges) == 0:
+            print("ERROR: No valid random start/destination candidates for directed network.")
+            return vehicles_info
+
         # TODO: Generate vehicle ID's:
         current_ID = target_vehicles_generator.target_vehicles_output_dict[self.__current_target_xml_file__]
         i = 0
         while i < num_vehicles:
-            pair = random.sample(self.edge_list, 2)
+            pair = [random.choice(spawn_edges), random.choice(dest_edges)]
+            if pair[0] == pair[1]:
+                continue
             if validate_path(self.net, pair[0], pair[1]):
                 vehicles_info.append( (current_ID + i, pair, True) )
                 i += 1
@@ -398,8 +448,21 @@ class target_vehicles_generator:
         #invoke randomTrips.py
         print("net_xml_file:",net_xml_file)
         print("what's our target",target_xml_file)
-        spawn_edges = [e for e in self.edge_list if not is_into_deadend(e)] # #Vehicles doesn't spawn on in-going dead-end
-        dest_edges  = [e for e in self.edge_list if not is_out_of_deadend(e)] #Vehicles doesn't finish at out-going dead-end
+        # Origin/destination candidate filtering for one-way maps:
+        # - origins: must have at least one outgoing edge
+        # - destinations: must have at least one incoming edge
+        # Keep dead-end filters as an additional guard.
+        spawn_edges = [
+            e for e in self.__origin_candidates(self.edge_list)
+            if not is_into_deadend(e)
+        ]
+        dest_edges = [
+            e for e in self.__destination_candidates(self.edge_list)
+            if not is_out_of_deadend(e)
+        ]
+        if len(spawn_edges) == 0 or len(dest_edges) == 0:
+            print("ERROR: No valid spawn/destination edge candidates after one-way/dead-end filtering.")
+            return None
         command_str = "python randomTrips.py -n "+net_xml_file+" -e "+str(latest_release_time)+" -p "+str(density) +" -r "+target_xml_file
         if seed is not None:
             command_str += " -s " + str(int(seed))
