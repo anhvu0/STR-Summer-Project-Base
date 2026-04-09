@@ -43,21 +43,25 @@ class QLearningPolicy(RouteController):
 
 
     
-    #The below function is for verifying whether the shape of the first layer matches the network expected in SUMO config file.
-    # def _validate_model_input_shape(self):
-    #     expected_state_size = 2 + 6 + len(self.connection_info.edge_list)
-    #     model_input_shape = self.model.input_shape
-    #     if isinstance(model_input_shape, (list, tuple)) and model_input_shape:
-    #         model_input_dim = model_input_shape[-1]
-    #     else:
-    #         model_input_dim = None
-    #     if model_input_dim != expected_state_size:
-    #         raise ValueError(
-    #             "Model input shape does not match SUMO network state size. "
-    #             f"Expected {expected_state_size}, got {model_input_dim}. "
-    #             "Retrain the model using the current SUMO .sumocfg/.net.xml files "
-    #             "or load a model trained on this network."
-    #         )
+
+
+    def _compute_deadline_features(self, vehicle_id):
+        vehicle_obj = self.vehicles.get(str(vehicle_id))
+        if vehicle_obj is None:
+            return [0.0, 0.0, 0.0]
+
+        now = traci.simulation.getTime()
+        deadline_window = max(float(vehicle_obj.deadline) - float(vehicle_obj.start_time), 1.0)
+        time_left = max(float(vehicle_obj.deadline) - float(now), 0.0)
+        elapsed = max(float(now) - float(vehicle_obj.start_time), 0.0)
+        urgency = 1.0 - min(time_left / deadline_window, 1.0)
+
+        return [
+            min(time_left / deadline_window, 1.0),
+            min(elapsed / deadline_window, 1.0),
+            urgency,
+        ]
+
     #-----------------------DEBUGGING-------------------------------------
     def _dist_to_dest(self, edge_id, dest_id):
         try:
@@ -294,6 +298,7 @@ class QLearningPolicy(RouteController):
             pass
 
         state.extend([lane_idx_norm, lane_count_norm, dist_to_end_norm])
+        state.extend(self._compute_deadline_features(vehicle_id))
 
         for edge_now in self.connection_info.edge_list:
             car_num = traci.edge.getLastStepVehicleNumber(edge_now)
