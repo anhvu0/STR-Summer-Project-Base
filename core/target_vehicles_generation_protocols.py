@@ -58,6 +58,10 @@ class target_vehicles_generator:
     target_vehicles_output_dict = {}
     VEHICLES_INFO = "vehicles info"
     __ERROR_MESSAGE__ = "error message"
+    __MIN_DEADLINE_BUFFER_SECONDS__ = 30.0
+    __BASE_DEADLINE_BUFFER_SECONDS__ = 15.0
+    __PER_HOP_BUFFER_SECONDS__ = 2.0
+    __MAX_PER_HOP_BUFFER_SECONDS__ = 40.0
     
 
     def __init__(self, net_file):
@@ -114,6 +118,46 @@ class target_vehicles_generator:
             Destinations should not be on an outgoing-only/source edge.
         """
         return [edge for edge in edge_pool if self.__edge_has_incoming(edge)]
+
+    def __estimate_deadline(self, start_edge, destination_edge, release_time):
+        """
+            Estimate a realistic absolute deadline (simulation step) for a vehicle.
+            The deadline is anchored to:
+            1) shortest-path free-flow travel-time estimate
+            2) bounded congestion slack
+            3) bounded route-complexity buffer
+        """
+        shortest_path = self.net.getShortestPath(start_edge, destination_edge)
+        if shortest_path is None or shortest_path[0] is None:
+            # Fallback only if path lookup fails unexpectedly.
+            return float(release_time) + target_vehicles_generator.__MIN_DEADLINE_BUFFER_SECONDS__
+
+        path_edges = shortest_path[0]
+        route_length_m = 0.0
+        free_flow_time_s = 0.0
+        for edge in path_edges:
+            edge_length = max(float(edge.getLength()), 0.0)
+            edge_speed = max(float(edge.getSpeed()), 0.1)
+            route_length_m += edge_length
+            free_flow_time_s += edge_length / edge_speed
+
+        # Slight variability avoids every vehicle having very similar urgency.
+        congestion_multiplier = random.uniform(1.25, 1.6)
+        complexity_buffer = min(
+            len(path_edges) * target_vehicles_generator.__PER_HOP_BUFFER_SECONDS__,
+            target_vehicles_generator.__MAX_PER_HOP_BUFFER_SECONDS__,
+        )
+        buffer_seconds = (
+            target_vehicles_generator.__BASE_DEADLINE_BUFFER_SECONDS__
+            + complexity_buffer
+            + max(route_length_m / 200.0, 0.0)
+        )
+        relative_deadline_s = free_flow_time_s * congestion_multiplier + buffer_seconds
+        relative_deadline_s = max(
+            relative_deadline_s,
+            target_vehicles_generator.__MIN_DEADLINE_BUFFER_SECONDS__,
+        )
+        return float(release_time) + relative_deadline_s
 
 
     def generate_target_vehicles(self, num_vehicles, target_xml_file, pattern=None):
@@ -553,7 +597,7 @@ class target_vehicles_generator:
                 root.insertBefore(temp_v, vs[index+1])
                 #root.appendChild(temp_v)
             #append the vehicle to the final vehicle list
-            ddl_now = random.randint(500,1000)#randomly set ddl in a range for now
+            ddl_now = self.__estimate_deadline(r[1][0], r[1][1], release_time)
             v_now = Util.Vehicle(str(id_now), r[1][1].getID(), release_time, ddl_now)
             vehicle_list.append(v_now)
             release_time += release_period
