@@ -104,8 +104,14 @@ class StrSumo:
                     # target_edge = self.connection_info.outgoing_edges_dict[current_edge_of_vehicle][decision]
                     if vehicle_id in traci.vehicle.getIDList():
                         #print("Changing the target of {} to {} with length {}".format(vehicle_id, local_target_edge, self.connection_info.edge_length_dict[local_target_edge]))
-                        traci.vehicle.changeTarget(vehicle_id, local_target_edge)
-                        self.controlled_vehicles[vehicle_id].local_destination = local_target_edge
+                        try:
+                            traci.vehicle.changeTarget(vehicle_id, local_target_edge)
+                            self.controlled_vehicles[vehicle_id].local_destination = local_target_edge
+                        except traci.exceptions.TraCIException:
+                            # If SUMO cannot build a route to this local target from
+                            # current lane/route context, keep the previous target and
+                            # retry on the next control step.
+                            continue
 
                 arrived_at_destination = traci.simulation.getArrivedIDList()
 
@@ -147,4 +153,3 @@ class StrSumo:
     def get_edge_vehicle_counts(self):
         for edge in self.connection_info.edge_list:
             self.connection_info.edge_vehicle_count[edge] = traci.edge.getLastStepVehicleNumber(edge)
-
