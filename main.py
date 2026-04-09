@@ -75,7 +75,11 @@ def run_simulation(scheduler, vehicles):
                  "--fcd-output", "./main_output/testTrace.xml","--quit-on-end"]) #The sumocfg file need to match with the one used in train_rl.py
     try:
         total_time, end_number, deadlines_missed = simulation.run()
-        print("Average timespan: {}, total vehicle number: {}, total vehicles reached destination: {}".format(str(total_time/end_number),\
+        if end_number > 0:
+            avg_timespan = str(total_time / end_number)
+        else:
+            avg_timespan = "N/A (no vehicles reached destination)"
+        print("Average timespan: {}, total vehicle number: {}, total vehicles reached destination: {}".format(avg_timespan,\
             str(len(vehicles)), str(end_number)))
         print(str(deadlines_missed) + ' deadlines missed.')
     finally:
