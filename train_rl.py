@@ -23,7 +23,7 @@ def build_parser():
 
     parser.add_argument(
         "--model-output",
-        default="./configurations/rl_model_test.h5",
+        default="./configurations/rl_model_4corners.h5",
         help="Path to save the trained model.",
     )
     parser.add_argument(
