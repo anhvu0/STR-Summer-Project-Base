@@ -77,8 +77,8 @@ class QLearningPolicy(RouteController):
 
         if not hasattr(self, "_debug_net_checked"):
             self._debug_net_checked = True
-            print("[DEBUG] has self.net:", hasattr(self, "net"))
-            print("[DEBUG] self.net type:", type(self.net))
+            # print("[DEBUG] has self.net:", hasattr(self, "net"))
+            # print("[DEBUG] self.net type:", type(self.net))
 
         for vehicle in vehicles:
             wrong_decision = False
@@ -102,7 +102,7 @@ class QLearningPolicy(RouteController):
                 valid_dirs = list(outgoing.keys())
 
                 if not valid_dirs:
-                    print(f"[DEADEND] veh={vid} edge={start_edge} dest={vehicle.destination} has no outgoing")
+                    # print(f"[DEADEND] veh={vid} edge={start_edge} dest={vehicle.destination} has no outgoing")
                     wrong_decision = True
                     break
 
@@ -114,10 +114,10 @@ class QLearningPolicy(RouteController):
                 # ---------- if model picks an impossible action, fallback ----------
                 if action not in outgoing:
                     self._metrics["impossible_action_overrides"] += 1
-                    print(
-                        f"[IMPOSSIBLE] veh={vid} edge={start_edge} dest={vehicle.destination} "
-                        f"chosen='{action}' valid_dirs={valid_dirs} state_bits={state[0][2:8].tolist()}"
-                    )
+                    # print(
+                    #     f"[IMPOSSIBLE] veh={vid} edge={start_edge} dest={vehicle.destination} "
+                    #     f"chosen='{action}' valid_dirs={valid_dirs} state_bits={state[0][2:8].tolist()}"
+                    # )
                     action = None  # trigger fallback below
 
                 #---------- PROGRESS / LOOP GUARD ----------
@@ -185,11 +185,11 @@ class QLearningPolicy(RouteController):
                         self._metrics["loop_overrides"] += 1
                     if distance_override:
                         self._metrics["distance_overrides"] += 1
-                    print(
-                        f"[OVERRIDE] veh={vid} edge={start_edge} dest={dest_id} "
-                        f"chosen='{action}' prop_d={prop_d} best_dir='{best_dir}' best_d={best_d} "
-                        f"visit={visit} recent_repeat={recent_repeat}"
-                    )
+                    # print(
+                    #     f"[OVERRIDE] veh={vid} edge={start_edge} dest={dest_id} "
+                    #     f"chosen='{action}' prop_d={prop_d} best_dir='{best_dir}' best_d={best_d} "
+                    #     f"visit={visit} recent_repeat={recent_repeat}"
+                    # )
                     action = best_dir
                     prop_next = best_next
                     prop_d = best_d
@@ -198,12 +198,12 @@ class QLearningPolicy(RouteController):
                 if action not in outgoing:
                     self._metrics["impossible_action_overrides"] += 1
                     action = valid_dirs[0]
-                    print(
-                        f"[FALLBACK] veh={vid} edge={start_edge} dest={dest_id} "
-                        f"picked safe default action='{action}'"
-                    )
+                    # print(
+                    #     f"[FALLBACK] veh={vid} edge={start_edge} dest={dest_id} "
+                    #     f"picked safe default action='{action}'"
+                    # )
 
-                print(f"For vehicle {vid},Choice for " + str(start_edge) + " is: " + str(action))
+                # print(f"For vehicle {vid},Choice for " + str(start_edge) + " is: " + str(action))
 
                 target_edge = outgoing[action]
                 self._recent_edges[vid].append(target_edge)
@@ -232,17 +232,17 @@ class QLearningPolicy(RouteController):
 
             self._last_metrics_snapshot = snapshot
             ratio = self._metrics["overrides"] / float(self._metrics["decisions"])
-            print(
-                "[Q-METRICS] decisions={} overrides={} override_ratio={:.2%} "
-                "loop_overrides={} distance_overrides={} impossible_action_overrides={}".format(
-                    self._metrics["decisions"],
-                    self._metrics["overrides"],
-                    ratio,
-                    self._metrics["loop_overrides"],
-                    self._metrics["distance_overrides"],
-                    self._metrics["impossible_action_overrides"],
-                )
-            )
+            # print(
+            #     "[Q-METRICS] decisions={} overrides={} override_ratio={:.2%} "
+            #     "loop_overrides={} distance_overrides={} impossible_action_overrides={}".format(
+            #         self._metrics["decisions"],
+            #         self._metrics["overrides"],
+            #         ratio,
+            #         self._metrics["loop_overrides"],
+            #         self._metrics["distance_overrides"],
+            #         self._metrics["impossible_action_overrides"],
+            #     )
+            # )
 
         return local_targets
 
