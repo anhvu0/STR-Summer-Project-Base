@@ -115,6 +115,35 @@ class target_vehicles_generator:
         """
         return [edge for edge in edge_pool if self.__edge_has_incoming(edge)]
 
+    def __estimate_deadline(self, start_edge, destination_edge, release_time):
+        """
+            Estimate a realistic per-vehicle deadline from a shortest-path
+            free-flow ETA plus buffers for junction delays and traffic noise.
+        """
+        shortest_path = self.net.getShortestPath(start_edge, destination_edge)
+
+        # Fallback keeps generation robust if path computation fails.
+        if shortest_path is None or shortest_path[0] is None:
+            return int(release_time + random.randint(600, 900))
+
+        path_edges = shortest_path[0]
+        free_flow_eta = 0.0
+        for edge in path_edges:
+            edge_speed = max(float(edge.getSpeed()), 5.0)
+            free_flow_eta += float(edge.getLength()) / edge_speed
+
+        # Add fixed delay per hop to account for intersections/signal waiting.
+        junction_delay = max(len(path_edges) - 1, 0) * 2.5
+
+        # Add a light congestion/noise buffer that grows with route duration.
+        traffic_buffer = 10.0 + (0.15 * free_flow_eta)
+        base_eta = free_flow_eta + junction_delay + traffic_buffer
+
+        # Allow some deadline variation while staying tied to route difficulty.
+        slack_factor = random.uniform(1.15, 1.50)
+        deadline_time = release_time + max(base_eta * slack_factor, base_eta + 30.0)
+        return int(deadline_time)
+
 
     def generate_target_vehicles(self, num_vehicles, target_xml_file, pattern=None):
         """
@@ -530,7 +559,7 @@ class target_vehicles_generator:
         index = 0
         print(len(vs))
         id_now = int(vs.item(len(vs) - 1).getAttribute('id')) + 1
-        #deadline set arbitrarily between a certain range
+        # Estimate deadline from route difficulty rather than a fixed random range.
         for r in result_lst:
             #find the vehicle slot based on the depart time (departure time must be sorted in xml)
             for i in range(index, len(vs)):
@@ -553,7 +582,7 @@ class target_vehicles_generator:
                 root.insertBefore(temp_v, vs[index+1])
                 #root.appendChild(temp_v)
             #append the vehicle to the final vehicle list
-            ddl_now = random.randint(500,1000)#randomly set ddl in a range for now
+            ddl_now = self.__estimate_deadline(r[1][0], r[1][1], release_time)
             v_now = Util.Vehicle(str(id_now), r[1][1].getID(), release_time, ddl_now)
             vehicle_list.append(v_now)
             release_time += release_period
