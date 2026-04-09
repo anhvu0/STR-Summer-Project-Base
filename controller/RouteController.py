@@ -64,10 +64,12 @@ class RouteController(ABC):
                 if not outgoing or len(outgoing) == 0:
                     return current_target_edge
 
-                # if decisions run out, extend behavior with a safe random valid direction
+                # If decisions run out, do not pad with random moves.
+                # Random extension can route vehicles into components that do
+                # not connect to their global destination and trigger
+                # "No connection between edge ... found" warnings.
                 if i >= len(decision_list):
-                    # choose any valid direction from this edge
-                    choice = random.choice(list(outgoing.keys()))
+                    return current_target_edge
                 else:
                     choice = decision_list[i]
                     # if invalid direction, fallback to a valid one instead of removing the vehicle
