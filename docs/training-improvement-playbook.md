@@ -4,15 +4,19 @@ This project already tracks useful online metrics:
 - `teleport_events/ep`
 - `teleported_controlled/ep`
 - `completion_before_deadline`
+- `avg_deadline_delta` (arrival step - deadline; lower is better)
+- `avg_tardiness` (late-only component of deadline delta)
 - `avg_return`
 
 (Printed in `core/rl_training_pipeline.py`.)
 
 ## 1) Optimize for the right objective first
 
-Treat **`completion_before_deadline`** as the primary KPI and `avg_return` as a secondary signal.
+Treat **`completion_before_deadline`** as the primary KPI, and use
+**`avg_deadline_delta` + `avg_tardiness`** to optimize schedule quality.
+Keep `avg_return` as a secondary signal.
 
-Why: reward can improve without true task success if reward shaping overweights terms that do not directly increase on-time arrivals.
+Why: reward can improve without true task success if reward shaping overweights terms that do not directly increase on-time arrivals or reduce lateness.
 
 ## 2) Run controlled A/B sweeps (one variable at a time)
 
@@ -37,7 +41,7 @@ The run is noisy. Use robust comparison rules:
 
 - Compare means over fixed windows (e.g., last 100 episodes).
 - Report at least 3 random seeds.
-- Select config by highest `completion_before_deadline`, then lowest `teleported_controlled/ep`, then best `avg_return`.
+- Select config by highest `completion_before_deadline`, then lowest `avg_tardiness`, then lowest `teleported_controlled/ep`, then best `avg_return`.
 
 ## 4) Reward-shaping guidance for this implementation
 
@@ -76,3 +80,14 @@ Practical adjustments to test:
 ## 6) Interpreting your current logs
 
 If `avg_return` improves while `completion_before_deadline` stays flat, you are likely optimizing shaping terms more than mission success. In that case, prioritize reward edits and KPI-driven selection over pure return improvements.
+
+## 7) Should you switch to multi-agent RL?
+
+Short answer: **not yet** unless your single-agent policy saturates after you fix metrics/reward alignment.
+
+Use this escalation path:
+1. Keep centralized single-policy DQN while adding KPI tracking for `avg_deadline_delta` and `avg_tardiness`.
+2. If results plateau, add a centralized critic or value baseline (CTDE-style) before fully decentralized MARL.
+3. Switch to MARL only when coordination conflicts dominate (e.g., many intersection deadlocks despite good single-agent tuning).
+
+Reasoning: your current state already includes global edge densities and deadline urgency, so a single shared policy can still learn selfless behavior. MARL increases non-stationarity and training cost; it usually pays off only after single-agent objective alignment is exhausted.
