@@ -79,6 +79,7 @@ class DQNTrainer:
         replay_capacity=10000,
         batch_size=32,
         replay_warmup=1000,
+        target_update_every=200,
     ):
         """
         :param learning_rate: Can be adjusted for further optimization
@@ -97,6 +98,10 @@ class DQNTrainer:
         self.replay_warmup = max(int(replay_warmup), self.batch_size)
         self.memory = ReplayBuffer(replay_capacity)
         self.model = self.build_model(learning_rate)
+        self.target_model = self.build_model(learning_rate)
+        self.target_model.set_weights(self.model.get_weights())
+        self.target_update_every = max(int(target_update_every), 1)
+        self.train_steps = 0
 
     def build_model(self, learning_rate):
         model = Sequential()
@@ -141,12 +146,15 @@ class DQNTrainer:
         dones       = np.array([s[4] for s in minibatch], dtype=np.bool_)
 
         q = self.model.predict(states, verbose=0)
-        q_next = self.model.predict(next_states, verbose=0)
+        q_next = self.target_model.predict(next_states, verbose=0)
 
         target = q.copy()
         target[np.arange(self.batch_size), actions] = rewards + (1.0 - dones.astype(np.float32)) * self.gamma * np.max(q_next, axis=1)
 
         self.model.train_on_batch(states, target)
+        self.train_steps += 1
+        if self.train_steps % self.target_update_every == 0:
+            self.target_model.set_weights(self.model.get_weights())
 
         # if self.epsilon > self.epsilon_min:
         #     self.epsilon *= self.epsilon_decay
@@ -177,6 +185,10 @@ class RLTrainingPipeline:
         train_every=20,
         grad_steps=1,
         rolling_window=100,
+        target_update_every=200,
+        deadline_step_penalty_scale=8.0,
+        near_deadline_threshold=0.40,
+        reward_clip=250.0,
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
     ):
@@ -206,6 +218,9 @@ class RLTrainingPipeline:
         self.train_every = train_every
         self.grad_steps = grad_steps
         self.rolling_window = rolling_window
+        self.deadline_step_penalty_scale = max(float(deadline_step_penalty_scale), 0.0)
+        self.near_deadline_threshold = min(max(float(near_deadline_threshold), 0.0), 1.0)
+        self.reward_clip = max(float(reward_clip), 1.0)
         self.debug_exit_diagnostics = debug_exit_diagnostics
         self.debug_exit_diagnostics_limit = max(int(debug_exit_diagnostics_limit), 0)
         self._distance_cache = {}
@@ -235,7 +250,11 @@ class RLTrainingPipeline:
             replay_capacity=replay_capacity,
             batch_size=batch_size,
             replay_warmup=replay_warmup,
+            target_update_every=target_update_every,
         )
+
+    def _clip_reward(self, reward):
+        return float(np.clip(reward, -self.reward_clip, self.reward_clip))
 
     def _deadline_window(self, vehicle):
         """
@@ -579,6 +598,7 @@ class RLTrainingPipeline:
         total_vehicles = sum(self.connection_info.edge_vehicle_count.values())
         system_penalty = -self.system_congestion_scale * total_vehicles
         reward += system_penalty
+        reward -= self.deadline_step_penalty_scale * urgency
 
         done = False
 
@@ -613,7 +633,7 @@ class RLTrainingPipeline:
             if step <= vehicle.deadline:
                 reward += self.on_time_arrival_bonus
             done = True
-            return reward, done
+            return self._clip_reward(reward), done
 
         # ---- Dead-end handling ----
         # If no outgoing edges AND this is not the destination
@@ -633,8 +653,11 @@ class RLTrainingPipeline:
             remaining_ratio = max(float(vehicle.deadline) - float(step), 0.0) / deadline_window
             if remaining_ratio < 0.25:
                 reward -= (0.25 - remaining_ratio) * 20.0
+            if remaining_ratio < self.near_deadline_threshold:
+                pressure = (self.near_deadline_threshold - remaining_ratio) / max(self.near_deadline_threshold, 1e-6)
+                reward -= pressure * self.deadline_step_penalty_scale * 2.0
 
-        return reward, done
+        return self._clip_reward(reward), done
 
     def generate_episode_vehicles(self, episode_seed=None):
         """
