@@ -760,9 +760,7 @@ class RLTrainingPipeline:
                         vehicle = vehicles[vehicle_id]
                         if vehicle_id not in seen_controlled_ids:
                             seen_controlled_ids.add(vehicle_id)
-                            planned_budget = max(float(vehicle.deadline) - float(vehicle.start_time), 1.0)
                             vehicle.start_time = float(step)
-                            vehicle.deadline = float(step) + planned_budget
                         vehicle.current_edge = current_edge
                         vehicle.current_speed = traci.vehicle.getSpeed(vehicle_id)
                         last_seen_edge_by_vehicle[vehicle_id] = current_edge
@@ -1020,11 +1018,11 @@ class RLTrainingPipeline:
                             self.trainer.replay()
 
             finally:
+                timeout_penalty = -50.0
                 for pending_vehicle_id, (prev_state, prev_action, prev_edge) in list(last_state_action.items()):
                     if pending_vehicle_id not in vehicles:
                         continue
                     v = vehicles[pending_vehicle_id]
-                    timeout_penalty = -50.0 - (20.0 * self._deadline_urgency(v, episode_last_step))
                     terminal_edge = last_seen_edge_by_vehicle.get(pending_vehicle_id, prev_edge)
                     terminal_next_state = self.make_terminal_next_state(
                         pending_vehicle_id,
