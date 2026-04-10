@@ -4,7 +4,7 @@ import sys
 import math
 from xml.dom.minidom import parse
 from keras.layers import Dense
-from keras.models import Sequential
+from keras.models import Sequential, clone_model
 from keras.optimizers import Adam
 from collections import defaultdict, deque
 import random
@@ -79,6 +79,8 @@ class DQNTrainer:
         replay_capacity=2000,
         batch_size=256,
         replay_warmup=1000,
+        target_update_every=200,
+        target_soft_tau=1.0,
     ):
         """
         :param learning_rate: Can be adjusted for further optimization
@@ -95,8 +97,39 @@ class DQNTrainer:
         self.epsilon_min = epsilon_min
         self.batch_size = batch_size
         self.replay_warmup = max(int(replay_warmup), self.batch_size)
+        self.target_update_every = max(int(target_update_every), 1)
+        self.target_soft_tau = float(np.clip(target_soft_tau, 0.0, 1.0))
         self.memory = ReplayBuffer(replay_capacity)
         self.model = self.build_model(learning_rate)
+        self.target_model = self._build_target_model()
+        self.train_steps = 0
+
+    def _build_target_model(self):
+        target_model = clone_model(self.model)
+        target_model.set_weights(self.model.get_weights())
+        return target_model
+
+    def update_target_network(self, force=False):
+        """
+        Synchronize online-network weights into target network.
+        - Hard update when target_soft_tau=1.0.
+        - Polyak averaging when target_soft_tau is in (0, 1).
+        """
+        if not force and (self.train_steps % self.target_update_every != 0):
+            return
+
+        online_weights = self.model.get_weights()
+        if self.target_soft_tau >= 1.0:
+            self.target_model.set_weights(online_weights)
+            return
+
+        target_weights = self.target_model.get_weights()
+        tau = self.target_soft_tau
+        mixed_weights = [
+            tau * online_w + (1.0 - tau) * target_w
+            for online_w, target_w in zip(online_weights, target_weights)
+        ]
+        self.target_model.set_weights(mixed_weights)
 
     def build_model(self, learning_rate):
         model = Sequential()
@@ -141,12 +174,14 @@ class DQNTrainer:
         dones       = np.array([s[4] for s in minibatch], dtype=np.bool_)
 
         q = self.model.predict(states, verbose=0)
-        q_next = self.model.predict(next_states, verbose=0)
+        q_next = self.target_model.predict(next_states, verbose=0)
 
         target = q.copy()
         target[np.arange(self.batch_size), actions] = rewards + (1.0 - dones.astype(np.float32)) * self.gamma * np.max(q_next, axis=1)
 
         self.model.train_on_batch(states, target)
+        self.train_steps += 1
+        self.update_target_network()
 
         # if self.epsilon > self.epsilon_min:
         #     self.epsilon *= self.epsilon_decay
@@ -239,6 +274,8 @@ class RLTrainingPipeline:
             replay_capacity=replay_capacity,
             batch_size=batch_size,
             replay_warmup=replay_warmup,
+            target_update_every=200,
+            target_soft_tau=1.0,
         )
 
     def _deadline_window(self, vehicle):
