@@ -104,6 +104,15 @@ class QLearningPolicy(RouteController):
             while i < self.decision_horizon:
                 outgoing = connection_info.outgoing_edges_dict.get(start_edge, {})
                 valid_dirs = list(outgoing.keys())
+                lane_valid_dirs = []
+                try:
+                    lane_id = traci.vehicle.getLaneID(vid)
+                    lane_outgoing = connection_info.lane_outgoing_edges_dict.get(lane_id, {})
+                    lane_valid_dirs = [d for d in valid_dirs if d in lane_outgoing]
+                except traci.TraCIException:
+                    lane_valid_dirs = []
+                if lane_valid_dirs:
+                    valid_dirs = lane_valid_dirs
 
                 if not valid_dirs:
                     # print(f"[DEADEND] veh={vid} edge={start_edge} dest={vehicle.destination} has no outgoing")
@@ -116,7 +125,7 @@ class QLearningPolicy(RouteController):
                 self._metrics["decisions"] += 1
 
                 # ---------- if model picks an impossible action, fallback ----------
-                if action not in outgoing:
+                if action not in valid_dirs:
                     self._metrics["impossible_action_overrides"] += 1
                     # print(
                     #     f"[IMPOSSIBLE] veh={vid} edge={start_edge} dest={vehicle.destination} "
@@ -199,7 +208,7 @@ class QLearningPolicy(RouteController):
                     prop_d = best_d
                 #------------------------------------------
 
-                if action not in outgoing:
+                if action not in valid_dirs:
                     self._metrics["impossible_action_overrides"] += 1
                     action = valid_dirs[0]
                     # print(
