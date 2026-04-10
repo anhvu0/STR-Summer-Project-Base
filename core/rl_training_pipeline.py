@@ -6,7 +6,7 @@ from xml.dom.minidom import parse
 from keras.layers import Dense
 from keras.models import Sequential
 from keras.optimizers import Adam
-from collections import defaultdict, deque
+from collections import defaultdict, deque, OrderedDict
 import random
 from controller.RouteController import RouteController
 from core.Util import ConnectionInfo
@@ -32,18 +32,22 @@ class ReplayBuffer:
     """
     This is the replay buffer mechanism in DQN
     """
-    def __init__(self, capacity):
+    def __init__(self, capacity, state_size):
         """
         :param capacity: Maximum number of transitions
         """
         self.buffer = deque(maxlen=capacity) # Use deque here so you can pop the first element later easily
         self.capacity = capacity
+        self.state_size = state_size
 
     def add(self, state, action, reward, next_state, done):
         """      
         Store one transition into the buffer
         """
-        self.buffer.append((state, action, reward, next_state, done))
+        # Store compact contiguous vectors to reduce RAM pressure on large maps.
+        state_vec = np.asarray(state, dtype=np.float16).reshape(self.state_size)
+        next_state_vec = np.asarray(next_state, dtype=np.float16).reshape(self.state_size)
+        self.buffer.append((state_vec, action, reward, next_state_vec, done))
 
     def sample(self, batch_size):
         return random.sample(self.buffer, batch_size)
@@ -95,7 +99,7 @@ class DQNTrainer:
         self.epsilon_min = epsilon_min
         self.batch_size = batch_size
         self.replay_warmup = max(int(replay_warmup), self.batch_size)
-        self.memory = ReplayBuffer(replay_capacity)
+        self.memory = ReplayBuffer(replay_capacity, state_size)
         self.model = self.build_model(learning_rate)
 
     def build_model(self, learning_rate):
@@ -134,10 +138,10 @@ class DQNTrainer:
         if len(self.memory) < self.replay_warmup:
             return
         minibatch = self.memory.sample(self.batch_size)
-        states      = np.vstack([s[0] for s in minibatch])
+        states      = np.vstack([s[0] for s in minibatch]).astype(np.float32, copy=False)
         actions     = np.array([s[1] for s in minibatch], dtype=np.int32)
         rewards     = np.array([s[2] for s in minibatch], dtype=np.float32)
-        next_states = np.vstack([s[3] for s in minibatch])
+        next_states = np.vstack([s[3] for s in minibatch]).astype(np.float32, copy=False)
         dones       = np.array([s[4] for s in minibatch], dtype=np.bool_)
 
         q = self.model.predict(states, verbose=0)
@@ -177,6 +181,7 @@ class RLTrainingPipeline:
         train_every=20,
         grad_steps=1,
         rolling_window=100,
+        distance_cache_capacity=50000,
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
     ):
@@ -208,7 +213,8 @@ class RLTrainingPipeline:
         self.rolling_window = rolling_window
         self.debug_exit_diagnostics = debug_exit_diagnostics
         self.debug_exit_diagnostics_limit = max(int(debug_exit_diagnostics_limit), 0)
-        self._distance_cache = {}
+        self.distance_cache_capacity = max(int(distance_cache_capacity), 1)
+        self._distance_cache = OrderedDict()
         self.progress_reward_scale = 1.0  # or 0.0 to disable progress term cheaply
         self.system_congestion_scale = 0.01  # tune this later
         self.loop_window = 12
@@ -518,18 +524,24 @@ class RLTrainingPipeline:
         """
         key = (edge_id, destination_edge)
         if key in self._distance_cache:
-            return self._distance_cache[key]
+            distance = self._distance_cache.pop(key)
+            self._distance_cache[key] = distance
+            return distance
 
         try:
             from_edge = self.net.getEdge(edge_id)
             to_edge = self.net.getEdge(destination_edge)
         except Exception:
             self._distance_cache[key] = math.inf
+            if len(self._distance_cache) > self.distance_cache_capacity:
+                self._distance_cache.popitem(last=False)
             return math.inf
 
         path_edges, path_cost = self.net.getShortestPath(from_edge, to_edge)
         distance = path_cost if path_edges is not None else math.inf
         self._distance_cache[key] = distance
+        if len(self._distance_cache) > self.distance_cache_capacity:
+            self._distance_cache.popitem(last=False)
         return distance
     
     def ensure_lane_for_direction(self, vehicle_id, edge_id, direction, min_dist=40.0, duration=50):
