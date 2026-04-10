@@ -1,5 +1,7 @@
 # STR SUMO RL Training Improvement Playbook
 
+For a focused explanation of the target network design and replay flow used by `DQNTrainer`, see `docs/target-network-flow.md`.
+
 This project already tracks useful online metrics:
 - `teleport_events/ep`
 - `teleported_controlled/ep`
