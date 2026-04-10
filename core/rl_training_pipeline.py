@@ -6,6 +6,7 @@ from xml.dom.minidom import parse
 from keras.layers import Dense
 from keras.models import Sequential
 from keras.optimizers import Adam
+from keras.losses import Huber
 from collections import defaultdict, deque, OrderedDict
 import random
 from controller.RouteController import RouteController
@@ -83,6 +84,7 @@ class DQNTrainer:
         replay_capacity=10000,
         batch_size=32,
         replay_warmup=1000,
+        target_update_steps=500,
     ):
         """
         :param learning_rate: Can be adjusted for further optimization
@@ -99,15 +101,19 @@ class DQNTrainer:
         self.epsilon_min = epsilon_min
         self.batch_size = batch_size
         self.replay_warmup = max(int(replay_warmup), self.batch_size)
+        self.target_update_steps = max(int(target_update_steps), 1)
+        self.train_steps = 0
         self.memory = ReplayBuffer(replay_capacity, state_size)
         self.model = self.build_model(learning_rate)
+        self.target_model = self.build_model(learning_rate)
+        self.target_model.set_weights(self.model.get_weights())
 
     def build_model(self, learning_rate):
         model = Sequential()
         model.add(Dense(64, input_dim=self.state_size, activation='relu'))      #May increase Dense for bigger network
         model.add(Dense(64, activation='relu'))
         model.add(Dense(self.action_size, activation='linear'))
-        model.compile(loss='mse', optimizer=Adam(learning_rate = learning_rate))
+        model.compile(loss=Huber(), optimizer=Adam(learning_rate=learning_rate, clipnorm=5.0))
         return model
     
     def select_action(self, state, valid_actions):
@@ -145,12 +151,18 @@ class DQNTrainer:
         dones       = np.array([s[4] for s in minibatch], dtype=np.bool_)
 
         q = self.model.predict(states, verbose=0)
-        q_next = self.model.predict(next_states, verbose=0)
+        q_next_online = self.model.predict(next_states, verbose=0)
+        q_next_target = self.target_model.predict(next_states, verbose=0)
+        next_actions = np.argmax(q_next_online, axis=1)
+        next_values = q_next_target[np.arange(self.batch_size), next_actions]
 
         target = q.copy()
-        target[np.arange(self.batch_size), actions] = rewards + (1.0 - dones.astype(np.float32)) * self.gamma * np.max(q_next, axis=1)
+        target[np.arange(self.batch_size), actions] = rewards + (1.0 - dones.astype(np.float32)) * self.gamma * next_values
 
         self.model.train_on_batch(states, target)
+        self.train_steps += 1
+        if self.train_steps % self.target_update_steps == 0:
+            self.target_model.set_weights(self.model.get_weights())
 
         # if self.epsilon > self.epsilon_min:
         #     self.epsilon *= self.epsilon_decay
@@ -178,10 +190,12 @@ class RLTrainingPipeline:
         replay_capacity=5000,
         batch_size=32,
         replay_warmup=2000,
+        target_update_steps=500,
         train_every=20,
         grad_steps=1,
         rolling_window=100,
         distance_cache_capacity=50000,
+        first_hop_only=True,
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
     ):
@@ -211,6 +225,7 @@ class RLTrainingPipeline:
         self.train_every = train_every
         self.grad_steps = grad_steps
         self.rolling_window = rolling_window
+        self.first_hop_only = bool(first_hop_only)
         self.debug_exit_diagnostics = debug_exit_diagnostics
         self.debug_exit_diagnostics_limit = max(int(debug_exit_diagnostics_limit), 0)
         self.distance_cache_capacity = max(int(distance_cache_capacity), 1)
@@ -241,6 +256,7 @@ class RLTrainingPipeline:
             replay_capacity=replay_capacity,
             batch_size=batch_size,
             replay_warmup=replay_warmup,
+            target_update_steps=target_update_steps,
         )
 
     def _deadline_window(self, vehicle):
@@ -443,7 +459,8 @@ class RLTrainingPipeline:
         decision_list = []
         current_edge = edge_id
 
-        for step_idx in range(self.decision_horizon):
+        horizon = 1 if self.first_hop_only else self.decision_horizon
+        for step_idx in range(horizon):
             outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
             if not outgoing:
                 break
@@ -705,6 +722,7 @@ class RLTrainingPipeline:
             recent_edge_history = defaultdict(lambda: deque(maxlen=self.loop_window))
 
             episode_return = 0.0
+            episode_last_step = 0
             episode_teleport_events = 0
             teleported_controlled_ids = set()
             arrived_ids = set()
@@ -714,12 +732,14 @@ class RLTrainingPipeline:
             deadline_delta_by_vehicle = {}
             total_controlled = len(vehicles)
             controlled_ids = set(vehicles.keys())
+            seen_controlled_ids = set()
             last_seen_edge_by_vehicle = {}
             last_target_by_vehicle = {}
             arrived_debug_records = []
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
+                    episode_last_step = step
                     if traci.simulation.getMinExpectedNumber() <= 0:
                         break
 
@@ -735,6 +755,9 @@ class RLTrainingPipeline:
                             continue
 
                         vehicle = vehicles[vehicle_id]
+                        if vehicle_id not in seen_controlled_ids:
+                            seen_controlled_ids.add(vehicle_id)
+                            vehicle.start_time = float(step)
                         vehicle.current_edge = current_edge
                         vehicle.current_speed = traci.vehicle.getSpeed(vehicle_id)
                         last_seen_edge_by_vehicle[vehicle_id] = current_edge
@@ -830,7 +853,6 @@ class RLTrainingPipeline:
 
                         if action is None:
                             # no feasible action from this lane; skip decision (or penalize if you prefer)
-                            last_decision_edge[vehicle_id] = current_edge
                             continue
 
                         direction = self.route_helper.direction_choices[action]
@@ -990,6 +1012,27 @@ class RLTrainingPipeline:
                             self.trainer.replay()
 
             finally:
+                timeout_penalty = -50.0
+                for pending_vehicle_id, (prev_state, prev_action, prev_edge) in list(last_state_action.items()):
+                    if pending_vehicle_id not in vehicles:
+                        continue
+                    v = vehicles[pending_vehicle_id]
+                    terminal_edge = last_seen_edge_by_vehicle.get(pending_vehicle_id, prev_edge)
+                    terminal_next_state = self.make_terminal_next_state(
+                        pending_vehicle_id,
+                        terminal_edge,
+                        v.destination,
+                    )
+                    self.trainer.remember(
+                        prev_state,
+                        prev_action,
+                        timeout_penalty,
+                        terminal_next_state,
+                        True,
+                    )
+                    episode_return += timeout_penalty
+                last_state_action.clear()
+
                 completion_rate = (
                     len(arrived_before_deadline_ids) / float(total_controlled)
                     if total_controlled > 0 else 0.0
@@ -1021,6 +1064,7 @@ class RLTrainingPipeline:
                 )
                 print(
                     f"\n\nDone with episode {episode} | "
+                    f"last_step={episode_last_step}, "
                     f"teleport_events={episode_teleport_events}, "
                     f"teleported_controlled={len(teleported_controlled_ids)}, "
                     f"completion_before_deadline={completion_rate:.3f}, "
