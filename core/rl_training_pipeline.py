@@ -294,8 +294,9 @@ class RLTrainingPipeline:
         Build a state vector for the given edge using cached per-step densities.
         """
         state = np.zeros(self.state_size, dtype=np.float32)
-        state[0] = self.connection_info.edge_index_dict[edge_id]
-        state[1] = self.connection_info.edge_index_dict[destination_edge]
+        denom = max(len(self.connection_info.edge_list) - 1, 1)
+        state[0] = self.connection_info.edge_index_dict[edge_id] / float(denom)
+        state[1] = self.connection_info.edge_index_dict[destination_edge] / float(denom)
 
         outgoing = self.connection_info.outgoing_edges_dict[edge_id]
         base = 2
@@ -353,6 +354,11 @@ class RLTrainingPipeline:
             if choice in lane_map:
                 valid.append(idx)
         return valid
+
+    def lane_can_take_direction(self, vehicle_id, direction):
+        lane_id = traci.vehicle.getLaneID(vehicle_id)
+        lane_map = self.connection_info.lane_outgoing_edges_dict.get(lane_id, {})
+        return direction in lane_map
     
     def dist_to_end(self, vehicle_id):
         """
@@ -487,23 +493,9 @@ class RLTrainingPipeline:
                 if math.isfinite(proposed_score):
                     direction = proposed_direction
                 else:
-                    # Fallback: choose the best reachable direction from this edge.
-                    best_direction = None
-                    best_score = math.inf
-                    for d, candidate_edge in outgoing.items():
-                        score = self._score_next_edge(
-                            candidate_edge,
-                            vehicle.destination,
-                            recent_edges,
-                            d,
-                        )
-                        if score < best_score:
-                            best_score = score
-                            best_direction = d
-
-                    if best_direction is None or not math.isfinite(best_score):
-                        break
-                    direction = best_direction
+                    # Keep action semantics clean in training: if selected action is
+                    # infeasible to destination, do not substitute another action here.
+                    break
             else:
                 best_direction = None
                 best_score = math.inf
@@ -626,6 +618,17 @@ class RLTrainingPipeline:
             # add extra shaping penalty so it reaches destination sooner.
             if curr_distance >= prev_distance and urgency > 0.7:
                 reward -= 5.0 * urgency
+
+        # Encourage avoiding edges that worsen local externalities.
+        prev_density = (
+            self.connection_info.edge_vehicle_count.get(prev_edge, 0) /
+            max(self.connection_info.edge_length_dict.get(prev_edge, 1.0), 1.0)
+        )
+        curr_density = (
+            self.connection_info.edge_vehicle_count.get(current_edge, 0) /
+            max(self.connection_info.edge_length_dict.get(current_edge, 1.0), 1.0)
+        )
+        reward -= 3.0 * max(curr_density - prev_density, 0.0)
 
         # Penalize repeatedly entering edges seen in recent history.
         if repeated_recent_edges > 0:
@@ -870,6 +873,9 @@ class RLTrainingPipeline:
                             min_dist=align_min_dist,
                             duration=80
                         )
+                        if not self.lane_can_take_direction(vehicle_id, direction):
+                            # Lane-change may fail due safety constraints; retry later.
+                            continue
                         # compute local target and apply routing
                         decision_list = self.build_decision_list(
                             current_edge,
