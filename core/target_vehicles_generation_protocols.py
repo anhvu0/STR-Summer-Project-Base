@@ -464,7 +464,6 @@ class target_vehicles_generator:
         latest_release_time = 50.0 #a constant number for the latest release time of all vehicles
         if spawn_interval is not None:
             latest_release_time = float(spawn_interval) * float(num_target_vehicles)
-        num_random_vehicles *= 2 # this is done to compensate the loss when generating using scripts. Need to solve this later.
         density =  latest_release_time / float(num_random_vehicles)
         density = int(density * 100)/100.0
         if seed is not None:

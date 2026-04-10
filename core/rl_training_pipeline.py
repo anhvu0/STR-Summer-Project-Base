@@ -164,10 +164,10 @@ class RLTrainingPipeline:
         spawn_interval=4.0,
         seed_with_episode=True,
         decision_horizon=6,
-        destination_reward=170.0,       #Adjustible
-        deadline_penalty=120.0,
-        on_time_arrival_bonus=50.0,
-        teleport_penalty=-100.0,
+        destination_reward=100.0,       #Adjustible
+        deadline_penalty=700.0,
+        on_time_arrival_bonus=30.0,
+        teleport_penalty=-70.0,
         epsilon_decay=0.99,
         epsilon_min=0.10,
         gamma=0.97,
@@ -643,8 +643,8 @@ class RLTrainingPipeline:
         generator = target_vehicles_generator(os.path.join(self.sumocfg_dir, self.net_file))
         route_path = os.path.join(self.sumocfg_dir, self.route_file)
         vehicle_list = generator.generate_vehicles(
-            num_target_vehicles=10,
-            num_random_vehicles=15,
+            num_target_vehicles=20,
+            num_random_vehicles=40,
             pattern=3,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
