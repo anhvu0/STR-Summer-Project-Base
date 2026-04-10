@@ -40,6 +40,8 @@ class QLearningPolicy(RouteController):
         self.loop_window = 10
         self.loop_repeat_threshold = 2
         self.score_slack = 30.0
+        self.deadline_deficit_override_slack = 2.0
+        self.distance_tiebreak_scale = 0.05
 
 
     
@@ -73,6 +75,12 @@ class QLearningPolicy(RouteController):
             return path_cost
         except Exception:
             return float("inf")
+
+    def _estimate_eta(self, edge_id, dest_id):
+        dist = self._dist_to_dest(edge_id, dest_id)
+        if not np.isfinite(dist):
+            return float("inf")
+        return float(dist) / 8.0
     #----------------------------------------------------------------------
 
 
@@ -142,33 +150,48 @@ class QLearningPolicy(RouteController):
                     nxt = outgoing[dir_char]
                     d = self._dist_to_dest(nxt, dest_id)
                     if not np.isfinite(d):
-                        return float("inf"), nxt
+                        return float("inf"), float("inf"), float("inf"), nxt
+
+                    now = traci.simulation.getTime()
+                    time_left = max(float(vehicle_obj.deadline) - float(now), 0.0) if vehicle_obj is not None else 0.0
+                    eta = self._estimate_eta(nxt, dest_id)
+                    deadline_deficit = max(eta - time_left, 0.0) if np.isfinite(eta) else float("inf")
+
                     edge_count = traci.edge.getLastStepVehicleNumber(nxt)
                     edge_length = max(self.connection_info.edge_length_dict.get(nxt, 5.0), 5.0)
                     density = edge_count / edge_length
                     # Flexible vehicles should yield more aggressively to reduce congestion.
                     density_weight = 80.0 * (0.8 + flexibility)
-                    score = float(d) + density_weight * density
-                    return score, nxt
+                    congestion_externality = density_weight * density
+                    score = (
+                        10000.0 * deadline_deficit
+                        + congestion_externality
+                        + (self.distance_tiebreak_scale * float(d))
+                    )
+                    return score, deadline_deficit, congestion_externality, nxt
 
                 # best possible move from here (distance + congestion score)
                 best_dir = valid_dirs[0]
                 best_next = outgoing[best_dir]
-                best_d, _ = score_dir(best_dir)
+                best_d, best_deadline_deficit, best_congestion_externality, _ = score_dir(best_dir)
                 for dch in valid_dirs:
-                    d, nxt = score_dir(dch)
+                    d, ddl_deficit, cong_externality, nxt = score_dir(dch)
                     if d < best_d:
                         best_d = d
+                        best_deadline_deficit = ddl_deficit
+                        best_congestion_externality = cong_externality
                         best_dir = dch
                         best_next = nxt
 
                 # model-proposed next
                 if action is not None:
                     prop_next = outgoing[action]
-                    prop_d, _ = score_dir(action)
+                    prop_d, prop_deadline_deficit, prop_congestion_externality, _ = score_dir(action)
                 else:
                     prop_next = None
                     prop_d = float("inf")
+                    prop_deadline_deficit = float("inf")
+                    prop_congestion_externality = float("inf")
 
                 # update visit count for proposed next (if any)
                 if prop_next is not None:
@@ -191,9 +214,18 @@ class QLearningPolicy(RouteController):
                 # 3) proposed is much worse than best available
                 no_path_override = prop_d == float("inf")
                 repeat_override = visit >= 3 or recent_repeat >= self.loop_repeat_threshold
-                distance_override = prop_d > best_d + self.score_slack
+                deadline_override = prop_deadline_deficit > (best_deadline_deficit + self.deadline_deficit_override_slack)
+                congestion_override = (
+                    (not deadline_override)
+                    and (prop_congestion_externality > best_congestion_externality + self.score_slack)
+                )
+                distance_override = (
+                    (not deadline_override)
+                    and (not congestion_override)
+                    and (prop_d > best_d + self.score_slack)
+                )
 
-                override = no_path_override or repeat_override or distance_override
+                override = no_path_override or repeat_override or deadline_override or congestion_override or distance_override
 
                 # If the model already chose the best available direction, avoid
                 # logging/counting a no-op override. This keeps metrics meaningful
