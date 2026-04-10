@@ -39,7 +39,7 @@ class QLearningPolicy(RouteController):
         self.decision_horizon = 6
         self.loop_window = 10
         self.loop_repeat_threshold = 2
-        self.distance_slack = 50.0
+        self.score_slack = 30.0
 
 
     
@@ -128,15 +128,33 @@ class QLearningPolicy(RouteController):
                 #Evaluate proposed action and alternatives using shortest-path distance
                 dest_id = vehicle.destination
 
+                vehicle_obj = self.vehicles.get(str(vid))
+                if vehicle_obj is not None:
+                    now = traci.simulation.getTime()
+                    deadline_window = max(float(vehicle_obj.deadline) - float(vehicle_obj.start_time), 1.0)
+                    time_left = max(float(vehicle_obj.deadline) - float(now), 0.0)
+                    urgency = 1.0 - min(time_left / deadline_window, 1.0)
+                else:
+                    urgency = 0.5
+                flexibility = 1.0 - urgency
+
                 def score_dir(dir_char):
                     nxt = outgoing[dir_char]
                     d = self._dist_to_dest(nxt, dest_id)
-                    return d, nxt
+                    if not np.isfinite(d):
+                        return float("inf"), nxt
+                    edge_count = traci.edge.getLastStepVehicleNumber(nxt)
+                    edge_length = max(self.connection_info.edge_length_dict.get(nxt, 5.0), 5.0)
+                    density = edge_count / edge_length
+                    # Flexible vehicles should yield more aggressively to reduce congestion.
+                    density_weight = 80.0 * (0.8 + flexibility)
+                    score = float(d) + density_weight * density
+                    return score, nxt
 
-                # best possible move from here (by distance-to-dest)
+                # best possible move from here (distance + congestion score)
                 best_dir = valid_dirs[0]
                 best_next = outgoing[best_dir]
-                best_d = self._dist_to_dest(best_next, dest_id)
+                best_d, _ = score_dir(best_dir)
                 for dch in valid_dirs:
                     d, nxt = score_dir(dch)
                     if d < best_d:
@@ -147,7 +165,7 @@ class QLearningPolicy(RouteController):
                 # model-proposed next
                 if action is not None:
                     prop_next = outgoing[action]
-                    prop_d = self._dist_to_dest(prop_next, dest_id)
+                    prop_d, _ = score_dir(action)
                 else:
                     prop_next = None
                     prop_d = float("inf")
@@ -173,7 +191,7 @@ class QLearningPolicy(RouteController):
                 # 3) proposed is much worse than best available
                 no_path_override = prop_d == float("inf")
                 repeat_override = visit >= 3 or recent_repeat >= self.loop_repeat_threshold
-                distance_override = prop_d > best_d + self.distance_slack
+                distance_override = prop_d > best_d + self.score_slack
 
                 override = no_path_override or repeat_override or distance_override
 
