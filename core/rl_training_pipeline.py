@@ -224,6 +224,13 @@ class RLTrainingPipeline:
         self.debug_exit_diagnostics = debug_exit_diagnostics
         self.debug_exit_diagnostics_limit = max(int(debug_exit_diagnostics_limit), 0)
         self._distance_cache = {}
+        self._step_cache_step = -1
+        self._lane_id_cache = {}
+        self._lane_position_cache = {}
+        self._lane_index_cache = {}
+        self._lane_length_cache = {}
+        self._edge_lane_count_cache = {}
+        self._lane_valid_actions_cache = {}
         self.progress_reward_scale = 1.0  # or 0.0 to disable progress term cheaply
         self.system_congestion_scale = 0.01  # tune this later
         self.loop_window = 12
@@ -286,6 +293,53 @@ class RLTrainingPipeline:
         route_file = route_file_node[0].attributes['value'].nodeValue
         return net_file, route_file
 
+    def _ensure_step_cache(self, step):
+        """
+        Reset per-step TraCI caches when simulation step changes.
+        """
+        if step == self._step_cache_step:
+            return
+        self._step_cache_step = step
+        self._lane_id_cache.clear()
+        self._lane_position_cache.clear()
+        self._lane_index_cache.clear()
+        self._lane_valid_actions_cache.clear()
+
+    def _get_lane_id(self, vehicle_id):
+        lane_id = self._lane_id_cache.get(vehicle_id)
+        if lane_id is None:
+            lane_id = traci.vehicle.getLaneID(vehicle_id)
+            self._lane_id_cache[vehicle_id] = lane_id
+        return lane_id
+
+    def _get_lane_position(self, vehicle_id):
+        lane_pos = self._lane_position_cache.get(vehicle_id)
+        if lane_pos is None:
+            lane_pos = traci.vehicle.getLanePosition(vehicle_id)
+            self._lane_position_cache[vehicle_id] = lane_pos
+        return lane_pos
+
+    def _get_lane_index(self, vehicle_id):
+        lane_idx = self._lane_index_cache.get(vehicle_id)
+        if lane_idx is None:
+            lane_idx = traci.vehicle.getLaneIndex(vehicle_id)
+            self._lane_index_cache[vehicle_id] = lane_idx
+        return lane_idx
+
+    def _get_lane_length(self, lane_id):
+        lane_len = self._lane_length_cache.get(lane_id)
+        if lane_len is None:
+            lane_len = traci.lane.getLength(lane_id)
+            self._lane_length_cache[lane_id] = lane_len
+        return lane_len
+
+    def _get_edge_lane_count(self, edge_id):
+        lane_count = self._edge_lane_count_cache.get(edge_id)
+        if lane_count is None:
+            lane_count = max(traci.edge.getLaneNumber(edge_id), 1)
+            self._edge_lane_count_cache[edge_id] = lane_count
+        return lane_count
+
     def encode_state(self, vehicle_id, edge_id, destination_edge, vehicle=None, step=None):
         """
         Build a state vector for the given edge using cached per-step densities.
@@ -300,11 +354,11 @@ class RLTrainingPipeline:
             state[base + i] = 1.0 if choice in outgoing else 0.0
 
         # lane features
-        lane_id = traci.vehicle.getLaneID(vehicle_id)
-        lane_idx = traci.vehicle.getLaneIndex(vehicle_id)
-        n_lanes = max(traci.edge.getLaneNumber(edge_id), 1)
-        lane_len = traci.lane.getLength(lane_id)
-        lane_pos = traci.vehicle.getLanePosition(vehicle_id)
+        lane_id = self._get_lane_id(vehicle_id)
+        lane_idx = self._get_lane_index(vehicle_id)
+        n_lanes = self._get_edge_lane_count(edge_id)
+        lane_len = self._get_lane_length(lane_id)
+        lane_pos = self._get_lane_position(vehicle_id)
         dist_to_end = max(lane_len - lane_pos, 0.0)
 
         lane_base = base + 6
@@ -343,21 +397,25 @@ class RLTrainingPipeline:
         """
         Valid actions from the vehicle's CURRENT LANE (not just edge-level).
         """
-        lane_id = traci.vehicle.getLaneID(vehicle_id)
+        lane_id = self._get_lane_id(vehicle_id)
+        cache_key = (lane_id, edge_id)
+        if cache_key in self._lane_valid_actions_cache:
+            return self._lane_valid_actions_cache[cache_key]
         lane_map = self.connection_info.lane_outgoing_edges_dict.get(lane_id, {})
         valid = []
         for idx, choice in enumerate(self.route_helper.direction_choices):
             if choice in lane_map:
                 valid.append(idx)
+        self._lane_valid_actions_cache[cache_key] = valid
         return valid
     
     def dist_to_end(self, vehicle_id):
         """
         Distance (meters) from the vehicle to the end of its current lane.
         """
-        lane_id = traci.vehicle.getLaneID(vehicle_id)
-        lane_len = traci.lane.getLength(lane_id)
-        lane_pos = traci.vehicle.getLanePosition(vehicle_id)
+        lane_id = self._get_lane_id(vehicle_id)
+        lane_len = self._get_lane_length(lane_id)
+        lane_pos = self._get_lane_position(vehicle_id)
         return max(lane_len - lane_pos, 0.0)
 
     def is_decision_point(self, edge_id, vehicle_id, dist_threshold=80.0):
@@ -556,9 +614,9 @@ class RLTrainingPipeline:
         If current lane cannot do 'direction', try to change into a lane that can,
         as long as we aren't too close to the junction end.
         """
-        lane_id = traci.vehicle.getLaneID(vehicle_id)
-        lane_pos = traci.vehicle.getLanePosition(vehicle_id)
-        lane_len = traci.lane.getLength(lane_id)
+        lane_id = self._get_lane_id(vehicle_id)
+        lane_pos = self._get_lane_position(vehicle_id)
+        lane_len = self._get_lane_length(lane_id)
         dist_to_end = lane_len - lane_pos
 
         if dist_to_end < min_dist:
@@ -568,7 +626,7 @@ class RLTrainingPipeline:
         for target_lane_index, ln_id in enumerate(lane_ids):
             lane_map = self.connection_info.lane_outgoing_edges_dict.get(ln_id, {})
             if direction in lane_map:
-                curr_idx = traci.vehicle.getLaneIndex(vehicle_id)
+                curr_idx = self._get_lane_index(vehicle_id)
                 if curr_idx != target_lane_index:
                     traci.vehicle.changeLane(vehicle_id, target_lane_index, duration)
                 return
@@ -733,6 +791,7 @@ class RLTrainingPipeline:
                     if traci.simulation.getMinExpectedNumber() <= 0:
                         break
 
+                    self._ensure_step_cache(step)
                     self.update_edge_vehicle_counts(step, every=10)  # try 10–20
                     vehicle_ids = list(traci.vehicle.getIDList())
 
