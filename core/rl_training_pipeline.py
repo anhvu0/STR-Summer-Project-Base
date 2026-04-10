@@ -180,10 +180,16 @@ class RLTrainingPipeline:
         spawn_interval=4.0,
         seed_with_episode=True,
         decision_horizon=6,
-        destination_reward=100.0,       #Adjustible
-        deadline_penalty=700.0,
-        on_time_arrival_bonus=30.0,
-        teleport_penalty=-70.0,
+        teleport_penalty=30.0,
+        individual_tardiness_weight=1.0,
+        system_tardiness_weight=0.3,
+        eta_speed_floor=5.0,
+        eta_speed_factor=0.8,
+        small_loop_penalty=5.0,
+        dead_end_penalty=20.0,
+        infeasible_penalty=30.0,
+        timeout_penalty=20.0,
+        arrival_zero_tardiness_bonus=5.0,
         epsilon_decay=0.99,
         epsilon_min=0.10,
         gamma=0.97,
@@ -207,10 +213,7 @@ class RLTrainingPipeline:
             spawn_interval: Interval between vehicle spawns.
             seed_with_episode: Whether to use the episode number as random seed.
             decision_horizon: Number of actions to pad a decision list.
-            destination_reward: Reward when reaching the destination.
-            deadline_penalty: Penalty when missing the deadline.
-            on_time_arrival_bonus: Extra reward for arriving before deadline.
-            teleport_penalty: Terminal penalty for teleport events.
+            teleport_penalty: Terminal penalty magnitude for teleport events.
         """
         self.sumocfg_path = sumocfg_path
         self.model_output_path = model_output_path
@@ -218,10 +221,16 @@ class RLTrainingPipeline:
         self.spawn_interval = spawn_interval
         self.seed_with_episode = seed_with_episode
         self.decision_horizon = decision_horizon
-        self.destination_reward = destination_reward
-        self.deadline_penalty = deadline_penalty
-        self.on_time_arrival_bonus = on_time_arrival_bonus
-        self.teleport_penalty = teleport_penalty
+        self.teleport_penalty = abs(float(teleport_penalty))
+        self.individual_tardiness_weight = float(individual_tardiness_weight)
+        self.system_tardiness_weight = float(system_tardiness_weight)
+        self.eta_speed_floor = max(float(eta_speed_floor), 0.1)
+        self.eta_speed_factor = max(float(eta_speed_factor), 0.1)
+        self.small_loop_penalty = max(float(small_loop_penalty), 0.0)
+        self.dead_end_penalty = max(float(dead_end_penalty), 0.0)
+        self.infeasible_penalty = max(float(infeasible_penalty), 0.0)
+        self.timeout_penalty = max(float(timeout_penalty), 0.0)
+        self.arrival_zero_tardiness_bonus = float(arrival_zero_tardiness_bonus)
         self.train_every = train_every
         self.grad_steps = grad_steps
         self.rolling_window = rolling_window
@@ -230,10 +239,7 @@ class RLTrainingPipeline:
         self.debug_exit_diagnostics_limit = max(int(debug_exit_diagnostics_limit), 0)
         self.distance_cache_capacity = max(int(distance_cache_capacity), 1)
         self._distance_cache = OrderedDict()
-        self.progress_reward_scale = 1.0  # or 0.0 to disable progress term cheaply
-        self.system_congestion_scale = 0.01  # tune this later
         self.loop_window = 12
-        self.loop_repeat_penalty = 10.0
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
@@ -576,95 +582,141 @@ class RLTrainingPipeline:
                 return
 
 
-    def compute_reward(self, vehicle, prev_edge, current_edge, step, arrived, repeated_recent_edges=0):
+    def estimate_vehicle_eta(self, vehicle, edge_id, step):
         """
-        Compute a reward based on travel time, congestion, progress,
-        and proper dead-end handling.
+        Estimate remaining travel time from edge_id to vehicle.destination.
+        Uses shortest-path distance and a conservative effective speed.
         """
+        if edge_id == vehicle.destination:
+            return 0.0
 
-        deadline_window = self._deadline_window(vehicle)
-        urgency = self._deadline_urgency(vehicle, step)
-        flexibility = 1.0 - urgency
+        distance = self.get_distance_to_destination(edge_id, vehicle.destination)
+        if not math.isfinite(distance):
+            return 1e6
 
-        # ---- Base penalties ----
-        time_penalty = -5.0
-        congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
-        congestion_penalty = -(congestion / max(self.connection_info.edge_length_dict[current_edge], 5.0))
-        # More flexible vehicles (larger deadline - start_time) should yield,
-        # so congestion penalty is stronger for them.
-        congestion_penalty *= (1.0 + flexibility)
+        try:
+            current_speed = float(vehicle.current_speed)
+        except Exception:
+            current_speed = 0.0
+        if current_speed <= 0.0:
+            current_speed = self.eta_speed_floor
 
-        reward = time_penalty + congestion_penalty
+        speed = max(current_speed * self.eta_speed_factor, self.eta_speed_floor)
 
-        # ---- Global system congestion penalty (selfless term) ----
-        total_vehicles = sum(self.connection_info.edge_vehicle_count.values())
-        system_penalty = -self.system_congestion_scale * total_vehicles
-        reward += system_penalty
-
-        done = False
-
-        # ---- Progress shaping ----
-        prev_distance = self.get_distance_to_destination(prev_edge, vehicle.destination)
-        curr_distance = self.get_distance_to_destination(current_edge, vehicle.destination)
-
-        if math.isfinite(prev_distance) and math.isfinite(curr_distance):
-            # Prioritize strict-deadline vehicles by giving urgency-dependent
-            # progress shaping. Flexible vehicles receive lower progress reward.
-            progress_scale = self.progress_reward_scale * (0.5 + urgency)
-            progress_reward = (prev_distance - curr_distance) * progress_scale
-            reward += progress_reward
-
-            # If a strict vehicle is spending too long without progress,
-            # add extra shaping penalty so it reaches destination sooner.
-            if curr_distance >= prev_distance and urgency > 0.7:
-                reward -= 5.0 * urgency
-
-        # Encourage avoiding edges that worsen local externalities.
-        prev_density = (
-            self.connection_info.edge_vehicle_count.get(prev_edge, 0) /
-            max(self.connection_info.edge_length_dict.get(prev_edge, 1.0), 1.0)
+        # Small congestion correction only as ETA calibration (not a target by itself).
+        density = (
+            self.connection_info.edge_vehicle_count.get(edge_id, 0) /
+            max(self.connection_info.edge_length_dict.get(edge_id, 1.0), 1.0)
         )
-        curr_density = (
-            self.connection_info.edge_vehicle_count.get(current_edge, 0) /
-            max(self.connection_info.edge_length_dict.get(current_edge, 1.0), 1.0)
+        congestion_factor = max(0.7, 1.0 - 0.05 * density)
+        effective_speed = max(speed * congestion_factor, self.eta_speed_floor)
+        return float(distance) / effective_speed
+
+    def estimate_vehicle_tardiness(self, vehicle, edge_id, step):
+        """
+        Estimate tardiness max(0, predicted_arrival - deadline) for a vehicle.
+        """
+        eta = self.estimate_vehicle_eta(vehicle, edge_id, step)
+        predicted_arrival = float(step) + eta
+        return max(predicted_arrival - float(vehicle.deadline), 0.0)
+
+    def estimate_system_tardiness(self, step, override_vehicle=None, override_edge=None):
+        """
+        Estimate total tardiness across active controlled vehicles.
+        Optionally override one vehicle's edge for counterfactual scoring.
+        """
+        total = 0.0
+        vehicles = getattr(self, "_vehicles_lookup", {})
+        active_ids = getattr(self, "_active_controlled_ids", set())
+        last_edges = getattr(self, "_last_seen_edge_by_vehicle", {})
+
+        for vehicle_id in active_ids:
+            vehicle = vehicles.get(vehicle_id)
+            if vehicle is None:
+                continue
+
+            edge_id = last_edges.get(vehicle_id)
+            if override_vehicle is not None and vehicle_id == override_vehicle.vehicle_id:
+                edge_id = override_edge
+
+            if edge_id is None:
+                continue
+            total += self.estimate_vehicle_tardiness(vehicle, edge_id, step)
+        return total
+
+    def compute_reward(
+        self,
+        vehicle,
+        prev_edge,
+        current_edge,
+        step,
+        arrived,
+        repeated_recent_edges=0,
+        infeasible=False,
+        dead_end=False,
+        teleported=False,
+        timeout=False,
+    ):
+        """
+        Tardiness-centric reward:
+            alpha * (prev individual tardiness - current individual tardiness)
+          + beta  * (prev system tardiness     - current system tardiness)
+          + constraint penalties.
+        """
+        prev_individual = self.estimate_vehicle_tardiness(vehicle, prev_edge, step)
+        prev_system = self.estimate_system_tardiness(
+            step,
+            override_vehicle=vehicle,
+            override_edge=prev_edge,
         )
-        reward -= 3.0 * max(curr_density - prev_density, 0.0)
 
-        # Penalize repeatedly entering edges seen in recent history.
-        if repeated_recent_edges > 0:
-            reward -= self.loop_repeat_penalty * repeated_recent_edges
-
-        # If vehicle moved into a region with no path to destination
-        if math.isfinite(prev_distance) and not math.isfinite(curr_distance):
-            reward -= 120.0
-            done = True
-
-        # ---- Arrival handling ----
         if arrived:
-            reward += self.destination_reward
-            if step <= vehicle.deadline:
-                reward += self.on_time_arrival_bonus
-            done = True
-            return reward, done
-
-        # ---- Dead-end handling ----
-        # If no outgoing edges AND this is not the destination
-        outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
-        if (not outgoing or len(outgoing) == 0) and current_edge != vehicle.destination:
-            dead_end_penalty = -50.0
-            reward += dead_end_penalty
-            done = True
-
-        # ---- Deadline handling ----
-        if step > vehicle.deadline:
-            reward -= self.deadline_penalty
-            done = True
+            current_individual = max(float(step) - float(vehicle.deadline), 0.0)
+            current_system = self.estimate_system_tardiness(
+                step,
+                override_vehicle=vehicle,
+                override_edge=vehicle.destination,
+            )
         else:
-            # Escalate penalty when approaching the deadline, normalized by
-            # (deadline - start_time) so strict deadlines are emphasized.
-            remaining_ratio = max(float(vehicle.deadline) - float(step), 0.0) / deadline_window
-            if remaining_ratio < 0.25:
-                reward -= (0.25 - remaining_ratio) * 20.0
+            current_individual = self.estimate_vehicle_tardiness(vehicle, current_edge, step)
+            current_system = self.estimate_system_tardiness(
+                step,
+                override_vehicle=vehicle,
+                override_edge=current_edge,
+            )
+
+        reward = (
+            self.individual_tardiness_weight * (prev_individual - current_individual)
+            + self.system_tardiness_weight * (prev_system - current_system)
+        )
+
+        if repeated_recent_edges > 0:
+            reward -= self.small_loop_penalty * repeated_recent_edges
+
+        done = bool(arrived or infeasible or dead_end or teleported or timeout)
+        if dead_end:
+            reward -= self.dead_end_penalty
+        if infeasible:
+            reward -= self.infeasible_penalty
+        if teleported:
+            reward -= self.teleport_penalty
+        if timeout:
+            reward -= self.timeout_penalty
+
+        # Small bonus only when arriving with zero tardiness.
+        if arrived and current_individual <= 0.0:
+            reward += self.arrival_zero_tardiness_bonus
+
+        # Terminal no-path detection.
+        if not arrived:
+            curr_distance = self.get_distance_to_destination(current_edge, vehicle.destination)
+            if not math.isfinite(curr_distance):
+                reward -= self.infeasible_penalty
+                done = True
+            outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
+            if (not outgoing) and current_edge != vehicle.destination:
+                reward -= self.dead_end_penalty
+                done = True
 
         return reward, done
 
@@ -710,6 +762,8 @@ class RLTrainingPipeline:
                 np.random.seed(episode_seed)
 
             vehicles = self.generate_episode_vehicles(episode_seed=episode_seed)
+            self._vehicles_lookup = vehicles
+            self._active_controlled_ids = set(vehicles.keys())
 
             traci.start([
                 sumo_binary,
@@ -737,6 +791,7 @@ class RLTrainingPipeline:
             controlled_ids = set(vehicles.keys())
             seen_controlled_ids = set()
             last_seen_edge_by_vehicle = {}
+            self._last_seen_edge_by_vehicle = last_seen_edge_by_vehicle
             last_target_by_vehicle = {}
             arrived_debug_records = []
 
@@ -794,6 +849,7 @@ class RLTrainingPipeline:
                                 episode_return += reward
                             last_state_action.pop(vehicle_id, None)
                             last_decision_edge.pop(vehicle_id, None)
+                            self._active_controlled_ids.discard(vehicle_id)
                             continue
 
                         # only decide at decision points
@@ -840,6 +896,7 @@ class RLTrainingPipeline:
                             if done:
                                 last_state_action.pop(vehicle_id, None)
                                 last_decision_edge[vehicle_id] = current_edge
+                                self._active_controlled_ids.discard(vehicle_id)
                                 continue
 
                         # ---- choose action (lane-feasible) ----
@@ -855,7 +912,7 @@ class RLTrainingPipeline:
                         action = self.trainer.select_action(state, valid)
 
                         if action is None:
-                            # no feasible action from this lane; skip decision (or penalize if you prefer)
+                            # no feasible action from this lane; skip decision
                             continue
 
                         direction = self.route_helper.direction_choices[action]
@@ -883,6 +940,18 @@ class RLTrainingPipeline:
                             vehicle,
                             recent_edge_history[vehicle_id],
                         )
+                        if not decision_list:
+                            infeasible_next_state = self.encode_state(
+                                vehicle_id,
+                                current_edge,
+                                vehicle.destination,
+                                vehicle=vehicle,
+                                step=step,
+                            )
+                            self.trainer.remember(state, action, -self.infeasible_penalty, infeasible_next_state, True)
+                            episode_return -= self.infeasible_penalty
+                            self._active_controlled_ids.discard(vehicle_id)
+                            continue
                         local_target = self.route_helper.compute_local_target(decision_list, vehicle)
                         applied_target = None
                         if local_target != vehicle.destination:
@@ -914,8 +983,22 @@ class RLTrainingPipeline:
                                 traci.vehicle.changeTarget(vehicle_id, vehicle.destination)
                                 applied_target = vehicle.destination
                             except traci.exceptions.TraCIException:
-                                # Keep episode running and retry next decision point.
-                                last_decision_edge[vehicle_id] = current_edge
+                                infeasible_next_state = self.encode_state(
+                                    vehicle_id,
+                                    current_edge,
+                                    vehicle.destination,
+                                    vehicle=vehicle,
+                                    step=step,
+                                )
+                                self.trainer.remember(
+                                    state,
+                                    action,
+                                    -self.infeasible_penalty,
+                                    infeasible_next_state,
+                                    True,
+                                )
+                                episode_return -= self.infeasible_penalty
+                                self._active_controlled_ids.discard(vehicle_id)
                                 continue
 
                         last_target_by_vehicle[vehicle_id] = applied_target
@@ -960,9 +1043,14 @@ class RLTrainingPipeline:
                         # No more transitions should be open once SUMO removes the vehicle.
                         if arrived_vehicle_id in last_state_action:
                             prev_state, prev_action, prev_edge = last_state_action[arrived_vehicle_id]
-                            terminal_reward = self.destination_reward if reached_global_destination else -self.deadline_penalty
-                            if reached_global_destination and step <= vehicle.deadline:
-                                terminal_reward += self.on_time_arrival_bonus
+                            terminal_reward, _ = self.compute_reward(
+                                vehicle,
+                                prev_edge,
+                                last_seen_edge,
+                                step,
+                                arrived=reached_global_destination,
+                                infeasible=(not reached_global_destination),
+                            )
                             terminal_next_state = self.make_terminal_next_state(
                                 arrived_vehicle_id,
                                 last_seen_edge,
@@ -978,6 +1066,7 @@ class RLTrainingPipeline:
                             episode_return += terminal_reward
                         last_state_action.pop(arrived_vehicle_id, None)
                         last_decision_edge.pop(arrived_vehicle_id, None)
+                        self._active_controlled_ids.discard(arrived_vehicle_id)
 
                     # =========================
                     # Teleport detection + terminal penalty
@@ -1004,26 +1093,42 @@ class RLTrainingPipeline:
                                 # Big penalty so agent learns to avoid situations leading to teleports
                                 next_state = self.make_terminal_next_state(tid, tele_edge, v.destination)
 
-                                self.trainer.remember(prev_state, prev_action, self.teleport_penalty, next_state, True)
-                                episode_return += self.teleport_penalty
+                                teleport_reward, _ = self.compute_reward(
+                                    v,
+                                    prev_edge,
+                                    tele_edge,
+                                    step,
+                                    arrived=False,
+                                    teleported=True,
+                                )
+                                self.trainer.remember(prev_state, prev_action, teleport_reward, next_state, True)
+                                episode_return += teleport_reward
 
                                 # Clear open transition
                                 last_state_action.pop(tid, None)
 
                             # Prevent repeated “decision” bookkeeping for teleported cars
                             last_decision_edge.pop(tid, None)
+                            self._active_controlled_ids.discard(tid)
 
                     if step % self.train_every == 0:
                         for _ in range(self.grad_steps):
                             self.trainer.replay()
 
             finally:
-                timeout_penalty = -50.0
                 for pending_vehicle_id, (prev_state, prev_action, prev_edge) in list(last_state_action.items()):
                     if pending_vehicle_id not in vehicles:
                         continue
                     v = vehicles[pending_vehicle_id]
                     terminal_edge = last_seen_edge_by_vehicle.get(pending_vehicle_id, prev_edge)
+                    timeout_reward, _ = self.compute_reward(
+                        v,
+                        prev_edge,
+                        terminal_edge,
+                        episode_last_step,
+                        arrived=False,
+                        timeout=True,
+                    )
                     terminal_next_state = self.make_terminal_next_state(
                         pending_vehicle_id,
                         terminal_edge,
@@ -1032,11 +1137,12 @@ class RLTrainingPipeline:
                     self.trainer.remember(
                         prev_state,
                         prev_action,
-                        timeout_penalty,
+                        timeout_reward,
                         terminal_next_state,
                         True,
                     )
-                    episode_return += timeout_penalty
+                    episode_return += timeout_reward
+                    self._active_controlled_ids.discard(pending_vehicle_id)
                 last_state_action.clear()
 
                 completion_rate = (
