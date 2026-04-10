@@ -177,6 +177,7 @@ class RLTrainingPipeline:
         train_every=20,
         grad_steps=1,
         rolling_window=100,
+        target_pattern=2,
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
     ):
@@ -192,6 +193,8 @@ class RLTrainingPipeline:
             deadline_penalty: Penalty when missing the deadline.
             on_time_arrival_bonus: Extra reward for arriving before deadline.
             teleport_penalty: Terminal penalty for teleport events.
+            target_pattern: Vehicle generation pattern. 2 means varied origins
+                and one shared destination (helps controlled deadline comparison).
         """
         self.sumocfg_path = sumocfg_path
         self.model_output_path = model_output_path
@@ -206,11 +209,12 @@ class RLTrainingPipeline:
         self.train_every = train_every
         self.grad_steps = grad_steps
         self.rolling_window = rolling_window
+        self.target_pattern = target_pattern
         self.debug_exit_diagnostics = debug_exit_diagnostics
         self.debug_exit_diagnostics_limit = max(int(debug_exit_diagnostics_limit), 0)
         self._distance_cache = {}
         self.progress_reward_scale = 1.0  # or 0.0 to disable progress term cheaply
-        self.system_congestion_scale = 0.01  # tune this later
+        self.system_congestion_scale = 0.10  # scales marginal congestion penalty on busy edges
         self.loop_window = 12
         self.loop_repeat_penalty = 10.0
 
@@ -568,16 +572,21 @@ class RLTrainingPipeline:
         # ---- Base penalties ----
         time_penalty = -5.0
         congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
-        congestion_penalty = -(congestion / max(self.connection_info.edge_length_dict[current_edge], 5.0))
+        edge_density = congestion / max(self.connection_info.edge_length_dict[current_edge], 5.0)
+        congestion_penalty = -edge_density
         # More flexible vehicles (larger deadline - start_time) should yield,
         # so congestion penalty is stronger for them.
         congestion_penalty *= (1.0 + flexibility)
 
         reward = time_penalty + congestion_penalty
 
-        # ---- Global system congestion penalty (selfless term) ----
-        total_vehicles = sum(self.connection_info.edge_vehicle_count.values())
-        system_penalty = -self.system_congestion_scale * total_vehicles
+        # ---- Marginal system congestion penalty (selfless term) ----
+        # Penalize using edges that are denser than the current network average.
+        # This is action-sensitive (unlike a pure global constant) and better
+        # aligns local choices with global congestion relief.
+        mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
+        marginal_pressure = max(edge_density - mean_density, 0.0)
+        system_penalty = -self.system_congestion_scale * marginal_pressure
         reward += system_penalty
 
         done = False
@@ -645,7 +654,7 @@ class RLTrainingPipeline:
         vehicle_list = generator.generate_vehicles(
             num_target_vehicles=20,
             num_random_vehicles=40,
-            pattern=3,
+            pattern=self.target_pattern,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
             spawn_interval=self.spawn_interval,
@@ -710,7 +719,8 @@ class RLTrainingPipeline:
                     if traci.simulation.getMinExpectedNumber() <= 0:
                         break
 
-                    self.update_edge_vehicle_counts(step, every=10)  # try 10–20
+                    # Keep density features fresh for routing choices and reward.
+                    self.update_edge_vehicle_counts(step, every=1)
                     vehicle_ids = list(traci.vehicle.getIDList())
 
                     for vehicle_id in vehicle_ids:
@@ -894,6 +904,30 @@ class RLTrainingPipeline:
                             "reached_global_destination": reached_global_destination,
                         }
                         arrived_debug_records.append(debug_record)
+
+                        # Close any open transition as a terminal arrival transition so
+                        # destination reward / on-time bonus are learned explicitly.
+                        if arrived_vehicle_id in last_state_action:
+                            prev_state, prev_action, prev_edge = last_state_action[arrived_vehicle_id]
+                            repeated_recent_edges = sum(
+                                1 for edge in recent_edge_history[arrived_vehicle_id]
+                                if edge == last_seen_edge
+                            )
+                            reward, done = self.compute_reward(
+                                vehicle,
+                                prev_edge,
+                                last_seen_edge,
+                                step,
+                                arrived=True,
+                                repeated_recent_edges=repeated_recent_edges,
+                            )
+                            next_state = self.make_terminal_next_state(
+                                arrived_vehicle_id,
+                                last_seen_edge,
+                                vehicle.destination,
+                            )
+                            self.trainer.remember(prev_state, prev_action, reward, next_state, done)
+                            episode_return += reward
 
                         # No more transitions should be open once SUMO removes the vehicle.
                         last_state_action.pop(arrived_vehicle_id, None)

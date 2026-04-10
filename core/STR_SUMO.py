@@ -105,7 +105,13 @@ class StrSumo:
                     if vehicle_id in traci.vehicle.getIDList():
                         #print("Changing the target of {} to {} with length {}".format(vehicle_id, local_target_edge, self.connection_info.edge_length_dict[local_target_edge]))
                         try:
-                            traci.vehicle.changeTarget(vehicle_id, local_target_edge)
+                            # Keep final destination as sink and use local target as a temporary via edge.
+                            destination = self.controlled_vehicles[vehicle_id].destination
+                            if local_target_edge != destination:
+                                traci.vehicle.setVia(vehicle_id, [local_target_edge])
+                            else:
+                                traci.vehicle.setVia(vehicle_id, [])
+                            traci.vehicle.changeTarget(vehicle_id, destination)
                             self.controlled_vehicles[vehicle_id].local_destination = local_target_edge
                         except traci.exceptions.TraCIException:
                             # If SUMO cannot build a route to this local target from
@@ -118,10 +124,8 @@ class StrSumo:
                 for vehicle_id in arrived_at_destination:
                     if vehicle_id in self.controlled_vehicles:
                         #print the raw result out to the terminal
-                        arrived_at_destination = False
-                        if self.controlled_vehicles[vehicle_id].local_destination == self.controlled_vehicles[vehicle_id].destination:
-                            arrived_at_destination = True
-                            end_number += 1
+                        arrived_at_destination = True
+                        end_number += 1
                         time_span = step - self.controlled_vehicles[vehicle_id].start_time
                         total_time += time_span
                         miss = False
