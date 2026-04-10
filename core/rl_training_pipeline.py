@@ -252,6 +252,14 @@ class RLTrainingPipeline:
         self.system_congestion_scale = 0.10  # scales marginal congestion penalty on busy edges
         self.loop_window = 12
         self.loop_repeat_penalty = 10.0
+        # Objective priority:
+        # 1) deadline feasibility (dominant)
+        # 2) congestion externality (secondary)
+        # 3) shortest-path distance only as weak tie-breaker
+        self.deadline_deficit_scale = 50.0
+        self.deadline_deficit_delta_scale = 25.0
+        self.deadline_critical_buffer = 20.0
+        self.distance_tiebreak_scale = 0.05
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
@@ -455,22 +463,51 @@ class RLTrainingPipeline:
             pass
         return np.zeros((1, self.state_size), dtype=np.float32)
 
-    def _score_next_edge(self, next_edge, destination_edge, recent_edges, direction):
+    def _score_next_edge(self, next_edge, destination_edge, recent_edges, direction, vehicle, step):
         """
-        Lower score is better. Combines shortest-path proximity with loop/U-turn discouragement.
+        Lower score is better with lexicographic-style priorities:
+        1) deadline feasibility deficit
+        2) congestion externality
+        3) distance tie-breaker
         """
         distance = self.get_distance_to_destination(next_edge, destination_edge)
         if not math.isfinite(distance):
             return math.inf
+
+        time_left = max(float(vehicle.deadline) - float(step), 0.0)
+        eta = self._estimate_remaining_eta(next_edge, destination_edge)
+        deadline_deficit = max(eta - time_left, 0.0) if math.isfinite(eta) else 9999.0
+
+        edge_count = self.connection_info.edge_vehicle_count.get(next_edge, 0)
+        edge_len = max(self.connection_info.edge_length_dict.get(next_edge, 5.0), 5.0)
+        edge_density = edge_count / edge_len
+        mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
+        marginal_pressure = max(edge_density - mean_density, 0.0)
 
         recent_penalty = 0.0
         if recent_edges:
             recent_penalty += 40.0 * sum(1 for e in recent_edges if e == next_edge)
 
         turnaround_penalty = 25.0 if direction == 't' else 0.0
-        return float(distance) + recent_penalty + turnaround_penalty
+        return (
+            10000.0 * deadline_deficit
+            + 400.0 * marginal_pressure
+            + (self.distance_tiebreak_scale * float(distance))
+            + recent_penalty
+            + turnaround_penalty
+        )
 
-    def build_decision_list(self, edge_id, initial_action, vehicle, recent_edges):
+    def _estimate_remaining_eta(self, edge_id, destination_edge):
+        """
+        Estimate travel time from edge_id to destination using shortest-path
+        distance and a conservative minimum speed floor.
+        """
+        distance = self.get_distance_to_destination(edge_id, destination_edge)
+        if not math.isfinite(distance):
+            return math.inf
+        return float(distance) / 8.0
+
+    def build_decision_list(self, edge_id, initial_action, vehicle, recent_edges, sim_step):
         """
         Build a decision list that starts with the selected RL action and then
         extends with destination-aware actions (instead of random padding).
@@ -500,6 +537,8 @@ class RLTrainingPipeline:
                     vehicle.destination,
                     recent_edges,
                     proposed_direction,
+                    vehicle,
+                    sim_step + step_idx,
                 )
 
                 if math.isfinite(proposed_score):
@@ -514,6 +553,8 @@ class RLTrainingPipeline:
                             vehicle.destination,
                             recent_edges,
                             d,
+                            vehicle,
+                            sim_step + step_idx,
                         )
                         if score < best_score:
                             best_score = score
@@ -531,6 +572,8 @@ class RLTrainingPipeline:
                         vehicle.destination,
                         recent_edges,
                         direction,
+                        vehicle,
+                        sim_step + step_idx,
                     )
                     if score < best_score:
                         best_score = score
@@ -605,9 +648,10 @@ class RLTrainingPipeline:
         deadline_window = self._deadline_window(vehicle)
         urgency = self._deadline_urgency(vehicle, step)
         flexibility = 1.0 - urgency
+        time_left = max(float(vehicle.deadline) - float(step), 0.0)
 
         # ---- Base penalties ----
-        time_penalty = -5.0
+        time_penalty = -3.0
         congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
         edge_density = congestion / max(self.connection_info.edge_length_dict[current_edge], 5.0)
         congestion_penalty = -edge_density
@@ -617,7 +661,7 @@ class RLTrainingPipeline:
 
         reward = time_penalty + congestion_penalty
 
-        # ---- Marginal system congestion penalty (selfless term) ----
+        # ---- Marginal system congestion penalty (secondary objective) ----
         # Penalize using edges that are denser than the current network average.
         # This is action-sensitive (unlike a pure global constant) and better
         # aligns local choices with global congestion relief.
@@ -628,21 +672,25 @@ class RLTrainingPipeline:
 
         done = False
 
-        # ---- Progress shaping ----
+        # ---- Deadline feasibility shaping (primary objective) ----
         prev_distance = self.get_distance_to_destination(prev_edge, vehicle.destination)
         curr_distance = self.get_distance_to_destination(current_edge, vehicle.destination)
+        prev_eta = self._estimate_remaining_eta(prev_edge, vehicle.destination)
+        curr_eta = self._estimate_remaining_eta(current_edge, vehicle.destination)
 
+        prev_deficit = max(prev_eta - (time_left + 1.0), 0.0) if math.isfinite(prev_eta) else self.deadline_deficit_scale
+        curr_deficit = max(curr_eta - time_left, 0.0) if math.isfinite(curr_eta) else self.deadline_deficit_scale
+        reward -= self.deadline_deficit_scale * curr_deficit
+        reward += self.deadline_deficit_delta_scale * (prev_deficit - curr_deficit)
+
+        if time_left < self.deadline_critical_buffer and curr_deficit > 0.0:
+            reward -= 30.0 * (1.0 + urgency) * min(curr_deficit, 2.0)
+
+        # ---- Distance-only tie breaker (tertiary objective) ----
         if math.isfinite(prev_distance) and math.isfinite(curr_distance):
-            # Prioritize strict-deadline vehicles by giving urgency-dependent
-            # progress shaping. Flexible vehicles receive lower progress reward.
-            progress_scale = self.progress_reward_scale * (0.5 + urgency)
+            progress_scale = self.distance_tiebreak_scale * self.progress_reward_scale
             progress_reward = (prev_distance - curr_distance) * progress_scale
             reward += progress_reward
-
-            # If a strict vehicle is spending too long without progress,
-            # add extra shaping penalty so it reaches destination sooner.
-            if curr_distance >= prev_distance and urgency > 0.7:
-                reward -= 5.0 * urgency
 
         # Penalize repeatedly entering edges seen in recent history.
         if repeated_recent_edges > 0:
@@ -868,6 +916,7 @@ class RLTrainingPipeline:
                             action,
                             vehicle,
                             recent_edge_history[vehicle_id],
+                            step,
                         )
                         local_target = self.route_helper.compute_local_target(decision_list, vehicle)
                         applied_target = None
