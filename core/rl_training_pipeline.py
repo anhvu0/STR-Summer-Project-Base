@@ -699,6 +699,7 @@ class RLTrainingPipeline:
             arrived_before_deadline_ids = set()
             arrived_global_destination_ids = set()
             exited_without_destination_ids = set()
+            deadline_delta_by_vehicle = {}
             total_controlled = len(vehicles)
             controlled_ids = set(vehicles.keys())
             last_seen_edge_by_vehicle = {}
@@ -733,6 +734,26 @@ class RLTrainingPipeline:
                                 arrived_ids.add(vehicle_id)
                                 if step <= vehicle.deadline:
                                     arrived_before_deadline_ids.add(vehicle_id)
+                                deadline_delta_by_vehicle[vehicle_id] = float(step) - float(vehicle.deadline)
+
+                            if vehicle_id in last_state_action:
+                                prev_state, prev_action, prev_edge = last_state_action[vehicle_id]
+                                reward, done = self.compute_reward(
+                                    vehicle,
+                                    prev_edge,
+                                    current_edge,
+                                    step,
+                                    arrived=True,
+                                )
+                                next_state = self.encode_state(
+                                    vehicle_id,
+                                    current_edge,
+                                    vehicle.destination,
+                                    vehicle=vehicle,
+                                    step=step,
+                                )
+                                self.trainer.remember(prev_state, prev_action, reward, next_state, done)
+                                episode_return += reward
                             last_state_action.pop(vehicle_id, None)
                             last_decision_edge.pop(vehicle_id, None)
                             continue
@@ -883,6 +904,7 @@ class RLTrainingPipeline:
                             arrived_global_destination_ids.add(arrived_vehicle_id)
                             if step <= vehicle.deadline:
                                 arrived_before_deadline_ids.add(arrived_vehicle_id)
+                            deadline_delta_by_vehicle[arrived_vehicle_id] = float(step) - float(vehicle.deadline)
                         else:
                             exited_without_destination_ids.add(arrived_vehicle_id)
 
@@ -896,6 +918,24 @@ class RLTrainingPipeline:
                         arrived_debug_records.append(debug_record)
 
                         # No more transitions should be open once SUMO removes the vehicle.
+                        if arrived_vehicle_id in last_state_action:
+                            prev_state, prev_action, prev_edge = last_state_action[arrived_vehicle_id]
+                            terminal_reward = self.destination_reward if reached_global_destination else -self.deadline_penalty
+                            if reached_global_destination and step <= vehicle.deadline:
+                                terminal_reward += self.on_time_arrival_bonus
+                            terminal_next_state = self.make_terminal_next_state(
+                                arrived_vehicle_id,
+                                last_seen_edge,
+                                vehicle.destination,
+                            )
+                            self.trainer.remember(
+                                prev_state,
+                                prev_action,
+                                terminal_reward,
+                                terminal_next_state,
+                                True,
+                            )
+                            episode_return += terminal_reward
                         last_state_action.pop(arrived_vehicle_id, None)
                         last_decision_edge.pop(arrived_vehicle_id, None)
 
@@ -942,6 +982,15 @@ class RLTrainingPipeline:
                     len(arrived_before_deadline_ids) / float(total_controlled)
                     if total_controlled > 0 else 0.0
                 )
+                avg_deadline_delta = (
+                    sum(deadline_delta_by_vehicle.values()) / float(len(deadline_delta_by_vehicle))
+                    if deadline_delta_by_vehicle else 0.0
+                )
+                avg_tardiness = (
+                    sum(max(0.0, delta) for delta in deadline_delta_by_vehicle.values()) /
+                    float(len(deadline_delta_by_vehicle))
+                    if deadline_delta_by_vehicle else 0.0
+                )
                 avg_return = episode_return / float(total_controlled) if total_controlled > 0 else 0.0
 
                 rolling_teleport_events.append(float(episode_teleport_events))
@@ -963,6 +1012,8 @@ class RLTrainingPipeline:
                     f"teleport_events={episode_teleport_events}, "
                     f"teleported_controlled={len(teleported_controlled_ids)}, "
                     f"completion_before_deadline={completion_rate:.3f}, "
+                    f"avg_deadline_delta={avg_deadline_delta:.3f}, "
+                    f"avg_tardiness={avg_tardiness:.3f}, "
                     f"avg_return={avg_return:.3f}"
                 )
                 print(
