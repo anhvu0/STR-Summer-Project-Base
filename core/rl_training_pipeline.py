@@ -249,6 +249,7 @@ class RLTrainingPipeline:
         grad_steps=1,
         rolling_window=100,
         target_pattern=2,
+        max_simulation_steps=2200,
     ):
         self.sumocfg_path = sumocfg_path
         self.model_output_path = model_output_path
@@ -260,6 +261,7 @@ class RLTrainingPipeline:
         self.grad_steps = int(grad_steps)
         self.rolling_window = int(rolling_window)
         self.target_pattern = target_pattern
+        self.max_simulation_steps = int(max_simulation_steps)
 
         self.w_deficit_delta = 6.0
         self.w_critical_worse = 12.0
@@ -292,9 +294,9 @@ class RLTrainingPipeline:
         self._route_blacklist = {}
         self.route_retry_cooldown_steps = 30
         self._curriculum = [
-            {"until": 0.33, "target": 12, "random": 16, "slack": (1.35, 1.55)},
-            {"until": 0.66, "target": 16, "random": 24, "slack": (1.20, 1.40)},
-            {"until": 1.00, "target": 20, "random": 30, "slack": (1.10, 1.30)},
+            {"until": 0.33, "target": 10, "random": 12, "slack": (1.35, 1.55)},
+            {"until": 0.66, "target": 14, "random": 18, "slack": (1.20, 1.40)},
+            {"until": 1.00, "target": 18, "random": 24, "slack": (1.10, 1.30)},
         ]
 
         self.base_feature_size = 20
@@ -608,7 +610,8 @@ class RLTrainingPipeline:
             # keep invalid/dead candidates masked out
             immediate_ok = self._is_valid_immediate_successor(vehicle_id, current_edge, next_edge)
             downstream_ok = dead_end < 1.0
-            if downstream_ok and immediate_ok:
+            lane_ok = bool(lane_m.get("feasible", False))
+            if downstream_ok and immediate_ok and lane_ok:
                 mask[i] = 1.0
 
         return np.concatenate([base, cand_vec.reshape(-1)], axis=0).reshape(1, -1), mask, cand_vec
@@ -762,7 +765,7 @@ class RLTrainingPipeline:
             route_diag = defaultdict(int)
 
             try:
-                for step in range(MAX_SIMULATION_STEPS):
+                for step in range(self.max_simulation_steps):
                     pre_step_on_destination = set()
                     final_step = step
                     if traci.simulation.getMinExpectedNumber() <= 0:
@@ -880,10 +883,10 @@ class RLTrainingPipeline:
                             continue
                         chosen_next = candidates[action]
                         lane_m = self.compute_candidate_lane_metrics(vid, edge, chosen_next)
-                        if lane_m["target_lanes"]:
+                        if lane_m["target_lanes"] and lane_m["feasible"] and lane_m["min_lane_shifts"] > 0:
                             target_lane = min(lane_m["target_lanes"], key=lambda idx: abs(idx - traci.vehicle.getLaneIndex(vid)))
                             try:
-                                traci.vehicle.changeLane(vid, int(target_lane), 60)
+                                traci.vehicle.changeLane(vid, int(target_lane), 25)
                             except Exception:
                                 pass
 

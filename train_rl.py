@@ -35,8 +35,20 @@ def build_parser():
     parser.add_argument(
         "--spawn-interval",
         type=float,
-        default=4.0,
+        default=5.5,
         help="Interval between vehicle spawns.",
+    )
+    parser.add_argument(
+        "--train-every",
+        type=int,
+        default=20,
+        help="Run replay updates every N simulation steps.",
+    )
+    parser.add_argument(
+        "--max-sim-steps",
+        type=int,
+        default=2200,
+        help="Upper bound on per-episode simulation steps.",
     )
     return parser
 
@@ -54,6 +66,8 @@ def main():
         model_output_path=args.model_output,
         episodes=args.episodes,
         spawn_interval=args.spawn_interval,
+        train_every=args.train_every,
+        max_simulation_steps=args.max_sim_steps,
     )
     pipeline.run()
 
