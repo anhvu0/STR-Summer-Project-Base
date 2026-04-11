@@ -213,6 +213,13 @@ class Commitment:
     candidate_repeated: float
 
 
+@dataclass
+class RouteApplyResult:
+    applied: bool
+    reason: str = "ok"
+    route_edges: list | None = None
+
+
 class RLTrainingPipeline:
     def __init__(
         self,
@@ -250,6 +257,9 @@ class RLTrainingPipeline:
         self.w_lane_failure = 20.0
         self.w_loop = 5.0
         self.execution_success_bonus = 8.0
+        self.invalid_first_hop_penalty = -10.0
+        self.downstream_path_missing_penalty = -8.0
+        self.route_set_exception_penalty = -12.0
         self.teleport_penalty = -180.0
         self.arrival_on_time_reward = 220.0
         self.arrival_late_reward = 80.0
@@ -269,6 +279,8 @@ class RLTrainingPipeline:
         self.route_helper = TrainingRouteHelper(self.connection_info)
         self._distance_cache = {}
         self._eta_cache = {}
+        self._route_blacklist = {}
+        self.route_retry_cooldown_steps = 30
         self._curriculum = [
             {"until": 0.33, "target": 12, "random": 16, "slack": (1.35, 1.55)},
             {"until": 0.66, "target": 16, "random": 24, "slack": (1.20, 1.40)},
@@ -369,13 +381,84 @@ class RLTrainingPipeline:
         self._global_density_std = float(np.std(self._density_vec)) if len(self._density_vec) else 0.0
         self._last_density_step = step
 
-    def enumerate_candidate_next_edges(self, edge_id):
+    def _blacklist_key(self, vehicle_id, current_edge, next_edge):
+        return (str(vehicle_id), str(current_edge), str(next_edge))
+
+    def _edge_from_lane_id(self, lane_id):
+        if lane_id is None:
+            return None
+        if "_" not in lane_id:
+            return None
+        return lane_id.rsplit("_", 1)[0]
+
+    def _get_vehicle_legal_successors(self, vehicle_id, edge_id):
+        legal = set()
+        lane_ids = self.connection_info.edge_lane_ids.get(edge_id, [])
+        try:
+            vclass = traci.vehicle.getVehicleClass(vehicle_id)
+        except Exception:
+            vclass = None
+        for lane_id in lane_ids:
+            try:
+                links = traci.lane.getLinks(lane_id)
+            except Exception:
+                links = []
+            for link in links:
+                if not link:
+                    continue
+                next_lane = link[0]
+                next_edge = self._edge_from_lane_id(next_lane)
+                if not next_edge:
+                    continue
+                if vclass is not None:
+                    try:
+                        allowed = traci.lane.getAllowed(next_lane)
+                        if allowed and (vclass not in allowed):
+                            continue
+                    except Exception:
+                        pass
+                legal.add(next_edge)
+        return legal
+
+    def _is_valid_immediate_successor(self, vehicle_id, current_edge, chosen_next_edge):
+        topological = set(self.connection_info.outgoing_edges_dict.get(current_edge, {}).values())
+        if chosen_next_edge not in topological:
+            return False
+        legal = self._get_vehicle_legal_successors(vehicle_id, current_edge)
+        if legal and chosen_next_edge not in legal:
+            return False
+        return True
+
+    def _has_downstream_path(self, chosen_next_edge, destination):
+        try:
+            from_edge = self.net.getEdge(chosen_next_edge)
+            to_edge = self.net.getEdge(destination)
+            path, _ = self.net.getShortestPath(from_edge, to_edge)
+            return path is not None
+        except Exception:
+            return False
+
+    def enumerate_candidate_next_edges(self, vehicle_id, edge_id, destination, step, diag=None):
         outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
         seen = set()
         candidates = []
         for _d, nxt in outgoing.items():
             if nxt not in seen:
                 seen.add(nxt)
+                bl_key = self._blacklist_key(vehicle_id, edge_id, nxt)
+                blocked_until = self._route_blacklist.get(bl_key, -1)
+                if blocked_until >= step:
+                    if diag is not None:
+                        diag["blacklist_hits"] += 1
+                    continue
+                if not self._is_valid_immediate_successor(vehicle_id, edge_id, nxt):
+                    if diag is not None:
+                        diag["invalid_first_hop_suppressions"] += 1
+                    continue
+                if not self._has_downstream_path(nxt, destination):
+                    if diag is not None:
+                        diag["downstream_path_failures"] += 1
+                    continue
                 candidates.append(nxt)
         return candidates[: self.candidate_slots]
 
@@ -478,7 +561,9 @@ class RLTrainingPipeline:
                 dead_end,
             ], dtype=np.float32)
             # keep invalid/dead candidates masked out
-            if lane_m["min_lane_shifts"] < 99 and lane_m["feasible"] and dead_end < 1.0:
+            immediate_ok = self._is_valid_immediate_successor(vehicle_id, current_edge, next_edge)
+            downstream_ok = dead_end < 1.0
+            if lane_m["min_lane_shifts"] < 99 and lane_m["feasible"] and downstream_ok and immediate_ok:
                 mask[i] = 1.0
 
         return np.concatenate([base, cand_vec.reshape(-1)], axis=0).reshape(1, -1), mask, cand_vec
@@ -517,17 +602,19 @@ class RLTrainingPipeline:
         return not lane_m["feasible"]
 
     def apply_route_commitment(self, vehicle_id, current_edge, chosen_next_edge, destination):
+        if not self._is_valid_immediate_successor(vehicle_id, current_edge, chosen_next_edge):
+            return RouteApplyResult(applied=False, reason="invalid_first_hop")
         try:
             from_edge = self.net.getEdge(chosen_next_edge)
             to_edge = self.net.getEdge(destination)
             path, _ = self.net.getShortestPath(from_edge, to_edge)
             if path is None:
-                return False
+                return RouteApplyResult(applied=False, reason="downstream_path_missing")
             route_edges = [current_edge] + [e.getID() for e in path]
             traci.vehicle.setRoute(vehicle_id, route_edges)
-            return True
+            return RouteApplyResult(applied=True, reason="ok", route_edges=route_edges)
         except Exception:
-            return False
+            return RouteApplyResult(applied=False, reason="route_set_exception")
 
     def _global_stats(self, controlled_ids, vehicles, step, teleported, failed):
         behind = 0
@@ -597,6 +684,7 @@ class RLTrainingPipeline:
         metrics_history = []
 
         for episode in range(self.episodes):
+            self._route_blacklist = {}
             if self.seed_with_episode:
                 random.seed(episode)
                 np.random.seed(episode)
@@ -621,6 +709,7 @@ class RLTrainingPipeline:
             removal_causes = defaultdict(int)
             terminal_step = {}
             final_step = 0
+            route_diag = defaultdict(int)
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
@@ -673,7 +762,7 @@ class RLTrainingPipeline:
                             pre_step_on_destination.add(vid)
                             continue
 
-                        candidates = self.enumerate_candidate_next_edges(edge)
+                        candidates = self.enumerate_candidate_next_edges(vid, edge, v.destination, step, diag=route_diag)
                         state, mask, cand_feat = self.build_state(vid, v, step, edge, candidates, recent_edges[vid], global_stats)
 
                         # Close commitments when execution outcome is known.
@@ -748,8 +837,32 @@ class RLTrainingPipeline:
                             except Exception:
                                 pass
 
-                        applied = self.apply_route_commitment(vid, edge, chosen_next, v.destination)
-                        if not applied:
+                        apply_result = self.apply_route_commitment(vid, edge, chosen_next, v.destination)
+                        if not apply_result.applied:
+                            route_diag[apply_result.reason] += 1
+                            if apply_result.reason == "downstream_path_missing":
+                                route_diag["downstream_path_failures"] += 1
+                            if apply_result.reason == "route_set_exception":
+                                route_diag["route_set_exceptions"] += 1
+                            bl_key = self._blacklist_key(vid, edge, chosen_next)
+                            self._route_blacklist[bl_key] = step + self.route_retry_cooldown_steps
+                            fail_penalty = 0.0
+                            if apply_result.reason == "invalid_first_hop":
+                                fail_penalty = self.invalid_first_hop_penalty
+                            elif apply_result.reason == "downstream_path_missing":
+                                fail_penalty = self.downstream_path_missing_penalty
+                            elif apply_result.reason == "route_set_exception":
+                                fail_penalty = self.route_set_exception_penalty
+                            transition = {
+                                "state": state,
+                                "action": action,
+                                "reward": fail_penalty,
+                                "next_state": state,
+                                "done": 0.0,
+                                "next_mask": mask.reshape(1, -1)[0],
+                            }
+                            push_nstep_transition(vid, transition)
+                            episode_return += fail_penalty
                             continue
 
                         eta_now = self.estimate_eta(edge, v.destination)
@@ -900,6 +1013,7 @@ class RLTrainingPipeline:
                 "loop_oscillation_rate": loop_rate,
                 "replay_td_error_stats": dict(self.trainer.last_td_error_stats),
                 "removals_by_cause": dict(removal_causes),
+                "route_failure_diagnostics": dict(route_diag),
                 "shared_bonus_triggered": shared_bonus_triggered,
                 "episode_return": episode_return / float(total),
             }
@@ -915,6 +1029,7 @@ class RLTrainingPipeline:
                 f"lane_fail={lane_failure_rate:.3f} loop={loop_rate:.3f} td_mean={self.trainer.last_td_error_stats['mean']:.4f}"
             )
             print(f"Removal causes: {dict(removal_causes)}")
+            print(f"Route diagnostics: {dict(route_diag)}")
 
         self.trainer.model.save(self.model_output_path)
         return metrics_history
