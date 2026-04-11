@@ -209,6 +209,7 @@ class Commitment:
     prev_deficit: float
     step: int
     candidate_repeated: float
+    cooperative_shaping: float
 
 
 @dataclass
@@ -273,6 +274,9 @@ class RLTrainingPipeline:
         self.arrival_late_reward = 80.0
         self.wrong_target_penalty = -200.0
         self.deadline_miss_terminal_scale = 0.8
+        self.w_cooperative = 2.2
+        self.w_fairness_guardrail = 1.0
+        self.fairness_deficit_threshold = 70.0
 
         self.loop_window = 10
         self.speed_norm = 20.0
@@ -297,8 +301,8 @@ class RLTrainingPipeline:
             {"until": 1.00, "target": 18, "random": 24, "slack": (1.10, 1.30)},
         ]
 
-        self.base_feature_size = 20
-        self.candidate_feature_size = 10
+        self.base_feature_size = 22
+        self.candidate_feature_size = 13
         self.state_size = self.base_feature_size + self.candidate_slots * self.candidate_feature_size
         self.action_size = self.candidate_slots
 
@@ -636,7 +640,48 @@ class RLTrainingPipeline:
         halted = self._edge_metric(edge_id, "halt", traci.edge.getLastStepHaltingNumber)
         return float(halted) / edge_len
 
-    def build_state(self, vehicle_id, vehicle, step, current_edge, candidates, recent_edges, global_stats, lane_metric_cache=None):
+    def _edge_pressure(self, edge_id):
+        density = self.connection_info.edge_vehicle_count.get(edge_id, 0) / max(self.connection_info.edge_length_dict.get(edge_id, 1.0), 1.0)
+        q = self._queue_proxy(edge_id)
+        mean_speed = self._edge_metric(edge_id, "speed", traci.edge.getLastStepMeanSpeed)
+        speed_degradation = np.clip(1.0 - (mean_speed / max(self.speed_norm, 1.0)), 0.0, 1.0)
+        return float(0.45 * np.clip(density, 0.0, 2.0) + 0.35 * np.clip(q, 0.0, 1.0) + 0.20 * speed_degradation)
+
+    def _compute_cooperative_context(self, controlled_ids, vehicles, step):
+        feasible = 0
+        deficits = []
+        urgency_edge_demand = defaultdict(float)
+        edge_pressure = {}
+        for vid in controlled_ids:
+            v = vehicles.get(vid)
+            if v is None or not v.current_edge or v.current_edge not in self.connection_info.edge_index_dict:
+                continue
+            edge = v.current_edge
+            tleft = max(float(v.deadline) - float(step), 0.0)
+            eta = self.estimate_eta(edge, v.destination)
+            if not math.isfinite(eta):
+                continue
+            deficit = max(eta - tleft, 0.0)
+            deficits.append(deficit)
+            if deficit <= 1.0:
+                feasible += 1
+            window = max(float(v.deadline) - float(v.start_time), 1.0)
+            urgency = float(np.clip(1.0 - (tleft / window), 0.0, 1.0))
+            urgency_edge_demand[edge] += urgency
+
+        for edge_id in self.connection_info.edge_list:
+            edge_pressure[edge_id] = self._edge_pressure(edge_id)
+
+        active_total = max(len(controlled_ids), 1)
+        positive = [d for d in deficits if d > 0.0]
+        return {
+            "fleet_feasible_fraction": feasible / float(active_total),
+            "fleet_mean_positive_deficit": (float(np.mean(positive)) if positive else 0.0),
+            "edge_pressure": edge_pressure,
+            "urgency_edge_demand": urgency_edge_demand,
+        }
+
+    def build_state(self, vehicle_id, vehicle, step, current_edge, candidates, recent_edges, global_stats, cooperative_context, lane_metric_cache=None):
         lane_idx = self._vehicle_var(vehicle_id, tc.VAR_LANE_INDEX, traci.vehicle.getLaneIndex, default=0)
         n_lanes = self._edge_lane_count_cache.get(current_edge, max(traci.edge.getLaneNumber(current_edge), 1))
         lane_id = self._vehicle_var(vehicle_id, tc.VAR_LANE_ID, traci.vehicle.getLaneID, default="")
@@ -676,10 +721,13 @@ class RLTrainingPipeline:
             np.clip(global_stats["std_density"], 0.0, 1.0),
             np.clip(global_stats["frac_behind"], 0.0, 1.0),
             np.clip(global_stats["frac_failed"], 0.0, 1.0),
+            np.clip(cooperative_context["fleet_feasible_fraction"], 0.0, 1.0),
+            np.clip(cooperative_context["fleet_mean_positive_deficit"] / self.time_norm, 0.0, 1.0),
         ], dtype=np.float32)
 
         cand_vec = np.zeros((self.candidate_slots, self.candidate_feature_size), dtype=np.float32)
         mask = np.zeros((self.candidate_slots,), dtype=np.float32)
+        cand_meta = []
         for i, next_edge in enumerate(candidates[: self.candidate_slots]):
             cache_key = (vehicle_id, current_edge, next_edge)
             if lane_metric_cache is not None and cache_key in lane_metric_cache:
@@ -694,6 +742,9 @@ class RLTrainingPipeline:
             deficit = max((eta - time_left), 0.0) if math.isfinite(eta) else self.time_norm
             repeated = 1.0 if next_edge in recent_edges else 0.0
             dead_end = 0.0 if math.isfinite(self.get_distance_to_destination(next_edge, vehicle.destination)) else 1.0
+            pressure = cooperative_context["edge_pressure"].get(next_edge, 0.0)
+            urgency_demand = cooperative_context["urgency_edge_demand"].get(next_edge, 0.0)
+            urgency_pressure = pressure * min(urgency_demand, 4.0)
             cand_vec[i] = np.array([
                 1.0,
                 np.clip(density, 0.0, 2.0) / 2.0,
@@ -705,7 +756,15 @@ class RLTrainingPipeline:
                 lane_m["score"],
                 repeated,
                 dead_end,
+                np.clip(pressure, 0.0, 2.0) / 2.0,
+                np.clip(urgency_pressure, 0.0, 4.0) / 4.0,
+                np.clip(urgency_demand, 0.0, 4.0) / 4.0,
             ], dtype=np.float32)
+            cand_meta.append({
+                "pressure": pressure,
+                "urgency_pressure": urgency_pressure,
+                "urgency_demand": urgency_demand,
+            })
             # keep invalid/dead candidates masked out
             immediate_ok = self._is_valid_immediate_successor(vehicle_id, current_edge, next_edge)
             downstream_ok = dead_end < 1.0
@@ -713,7 +772,7 @@ class RLTrainingPipeline:
             if downstream_ok and immediate_ok and lane_ok:
                 mask[i] = 1.0
 
-        return np.concatenate([base, cand_vec.reshape(-1)], axis=0).reshape(1, -1), mask, cand_vec
+        return np.concatenate([base, cand_vec.reshape(-1)], axis=0).reshape(1, -1), mask, cand_vec, cand_meta
 
     def _commitment_threshold(self, vehicle_id, edge_id, candidates):
         edge_len = float(self.connection_info.edge_length_dict.get(edge_id, 100.0))
@@ -789,7 +848,7 @@ class RLTrainingPipeline:
             "frac_failed": (len(teleported) + len(failed)) / float(total),
         }
 
-    def compute_reward(self, prev_deficit, curr_deficit, chosen_density, global_mean_density, lane_failed=False, repeated=0.0, arrived=False, on_time=False, wrong_target=False, teleported=False, deadline_missed=False, lateness=0.0, remain_dist=0.0):
+    def compute_reward(self, prev_deficit, curr_deficit, chosen_density, global_mean_density, lane_failed=False, repeated=0.0, cooperative_shaping=0.0, fairness_guardrail=0.0, arrived=False, on_time=False, wrong_target=False, teleported=False, deadline_missed=False, lateness=0.0, remain_dist=0.0):
         reward = 0.0
         reward += self.w_deficit_delta * (prev_deficit - curr_deficit)
         if prev_deficit > 0 and curr_deficit > prev_deficit:
@@ -798,6 +857,8 @@ class RLTrainingPipeline:
         if lane_failed:
             reward -= self.w_lane_failure
         reward -= self.w_loop * repeated
+        reward += self.w_cooperative * float(np.clip(cooperative_shaping, -1.0, 1.0))
+        reward += self.w_fairness_guardrail * float(np.clip(fairness_guardrail, -1.0, 0.0))
         if teleported:
             return reward + self.teleport_penalty, True
         if wrong_target:
@@ -809,6 +870,32 @@ class RLTrainingPipeline:
         if deadline_missed:
             return reward - (40.0 + self.deadline_miss_terminal_scale * (lateness + 0.05 * remain_dist)), True
         return reward, False
+
+    def _cooperative_signal_for_choice(self, chosen_idx, candidate_meta):
+        if chosen_idx < 0 or chosen_idx >= len(candidate_meta):
+            return 0.0
+        if not candidate_meta:
+            return 0.0
+        up_list = [c["urgency_pressure"] for c in candidate_meta]
+        pressure_list = [c["pressure"] for c in candidate_meta]
+        demand_list = [c["urgency_demand"] for c in candidate_meta]
+        chosen = candidate_meta[chosen_idx]
+        signal = 0.0
+        signal += (float(np.mean(up_list)) - chosen["urgency_pressure"]) * 0.60
+        signal += (float(np.mean(pressure_list)) - chosen["pressure"]) * 0.25
+        signal += (float(np.mean(demand_list)) - chosen["urgency_demand"]) * 0.15
+        return float(np.clip(signal, -1.0, 1.0))
+
+    def _fairness_guardrail(self, vehicle_id, prev_deficit, curr_deficit, severe_sacrifice_counts):
+        worsening = max(curr_deficit - prev_deficit, 0.0)
+        severe = max(worsening - self.fairness_deficit_threshold, 0.0)
+        if severe <= 0.0:
+            severe_sacrifice_counts[vehicle_id] = max(severe_sacrifice_counts.get(vehicle_id, 0) - 1, 0)
+            return 0.0
+        severe_sacrifice_counts[vehicle_id] = severe_sacrifice_counts.get(vehicle_id, 0) + 1
+        repeat_factor = max(severe_sacrifice_counts[vehicle_id] - 1, 0)
+        penalty = -min(1.0, 0.012 * severe + 0.10 * repeat_factor)
+        return float(penalty)
 
     def generate_episode_vehicles(self, episode_seed=None, curriculum_cfg=None):
         generator = target_vehicles_generator(os.path.join(self.sumocfg_dir, self.net_file))
@@ -899,6 +986,11 @@ class RLTrainingPipeline:
             terminal_step = {}
             final_step = 0
             route_diag = defaultdict(int)
+            severe_sacrifice_counts = defaultdict(int)
+            coop_signal_values = []
+            fairness_penalties = []
+            fleet_feasible_fracs = []
+            fleet_mean_positive_deficits = []
 
             try:
                 for step in range(self.max_simulation_steps):
@@ -924,6 +1016,9 @@ class RLTrainingPipeline:
                         failed_count=len(failed_ids),
                     )
                     global_stats = self._global_stats(set(vehicles.keys()), vehicles, step, teleported_controlled, failed_ids)
+                    cooperative_context = self._compute_cooperative_context(active_controlled, vehicles, step)
+                    fleet_feasible_fracs.append(cooperative_context["fleet_feasible_fraction"])
+                    fleet_mean_positive_deficits.append(cooperative_context["fleet_mean_positive_deficit"])
                     lane_metric_cache = {}
 
                     def push_nstep_transition(local_vid, transition):
@@ -968,7 +1063,7 @@ class RLTrainingPipeline:
                             continue
 
                         candidates = self.enumerate_candidate_next_edges(vid, edge, v.destination, step, diag=route_diag)
-                        state, mask, cand_feat = self.build_state(vid, v, step, edge, candidates, recent_edges[vid], global_stats, lane_metric_cache=lane_metric_cache)
+                        state, mask, cand_feat, cand_meta = self.build_state(vid, v, step, edge, candidates, recent_edges[vid], global_stats, cooperative_context, lane_metric_cache=lane_metric_cache)
 
                         # Close commitments when execution outcome is known.
                         c = commitments.get(vid)
@@ -996,6 +1091,7 @@ class RLTrainingPipeline:
                                 else:
                                     reward_base = 0.0
                                     lane_failures += 1
+                                fairness_guard = self._fairness_guardrail(vid, c.prev_deficit, curr_deficit, severe_sacrifice_counts)
                                 reward, done = self.compute_reward(
                                     c.prev_deficit,
                                     curr_deficit,
@@ -1003,9 +1099,14 @@ class RLTrainingPipeline:
                                     self._global_density_mean,
                                     lane_failed=late_impossible,
                                     repeated=repeated + c.candidate_repeated,
+                                    cooperative_shaping=(c.cooperative_shaping if entered_chosen else 0.0),
+                                    fairness_guardrail=fairness_guard,
                                 )
                                 reward += reward_base
                                 deficit_improvements.append(c.prev_deficit - curr_deficit)
+                                if entered_chosen:
+                                    coop_signal_values.append(c.cooperative_shaping)
+                                fairness_penalties.append(fairness_guard)
                                 next_state = state
                                 transition = {
                                     "state": c.state,
@@ -1041,6 +1142,7 @@ class RLTrainingPipeline:
                         if action is None or action >= len(candidates):
                             continue
                         chosen_next = candidates[action]
+                        coop_signal = self._cooperative_signal_for_choice(action, cand_meta)
                         key = (vid, edge, chosen_next)
                         lane_m = lane_metric_cache.get(key)
                         if lane_m is None:
@@ -1120,6 +1222,7 @@ class RLTrainingPipeline:
                             prev_deficit=prev_deficit,
                             step=step,
                             candidate_repeated=(1.0 if chosen_next in recent_edges[vid] else 0.0),
+                            cooperative_shaping=coop_signal,
                         )
 
                     traci.simulationStep()
@@ -1147,7 +1250,10 @@ class RLTrainingPipeline:
                             last_edge = v.current_edge or c.edge
                             curr_eta = self.estimate_eta(last_edge, v.destination)
                             curr_deficit = max(curr_eta - max(v.deadline - step, 0.0), 0.0) if math.isfinite(curr_eta) else self.time_norm
-                            reward, done = self.compute_reward(c.prev_deficit, curr_deficit, c.chosen_density, self._global_density_mean, wrong_target=(not is_true), arrived=is_true, on_time=(step <= v.deadline), lateness=lateness)
+                            fairness_guard = self._fairness_guardrail(aid, c.prev_deficit, curr_deficit, severe_sacrifice_counts)
+                            reward, done = self.compute_reward(c.prev_deficit, curr_deficit, c.chosen_density, self._global_density_mean, cooperative_shaping=c.cooperative_shaping, fairness_guardrail=fairness_guard, wrong_target=(not is_true), arrived=is_true, on_time=(step <= v.deadline), lateness=lateness)
+                            coop_signal_values.append(c.cooperative_shaping)
+                            fairness_penalties.append(fairness_guard)
                             transition = {"state": c.state, "action": c.action, "reward": reward, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": float(done), "next_mask": np.zeros((self.action_size,), dtype=np.float32)}
                             push_nstep_transition(aid, transition)
                             episode_return += reward
@@ -1164,7 +1270,9 @@ class RLTrainingPipeline:
                         removal_causes["teleport"] += 1
                         if tid in commitments:
                             c = commitments.pop(tid)
-                            reward, done = self.compute_reward(c.prev_deficit, c.prev_deficit + 5.0, c.chosen_density, self._global_density_mean, teleported=True)
+                            fairness_guard = self._fairness_guardrail(tid, c.prev_deficit, c.prev_deficit + 5.0, severe_sacrifice_counts)
+                            reward, done = self.compute_reward(c.prev_deficit, c.prev_deficit + 5.0, c.chosen_density, self._global_density_mean, fairness_guardrail=fairness_guard, teleported=True)
+                            fairness_penalties.append(fairness_guard)
                             transition = {"state": c.state, "action": c.action, "reward": reward, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": float(done), "next_mask": np.zeros((self.action_size,), dtype=np.float32)}
                             push_nstep_transition(tid, transition)
                             episode_return += reward
@@ -1190,7 +1298,9 @@ class RLTrainingPipeline:
                     v = vehicles[vid]
                     late = max(final_step - v.deadline, 0.0)
                     remain_dist = self.get_distance_to_destination(v.current_edge or c.edge, v.destination)
-                    reward, done = self.compute_reward(c.prev_deficit, c.prev_deficit + 2.0, c.chosen_density, self._global_density_mean, deadline_missed=True, lateness=late, remain_dist=(remain_dist if math.isfinite(remain_dist) else 1000.0))
+                    fairness_guard = self._fairness_guardrail(vid, c.prev_deficit, c.prev_deficit + 2.0, severe_sacrifice_counts)
+                    reward, done = self.compute_reward(c.prev_deficit, c.prev_deficit + 2.0, c.chosen_density, self._global_density_mean, fairness_guardrail=fairness_guard, deadline_missed=True, lateness=late, remain_dist=(remain_dist if math.isfinite(remain_dist) else 1000.0))
+                    fairness_penalties.append(fairness_guard)
                     transition = {"state": c.state, "action": c.action, "reward": reward, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": float(done), "next_mask": np.zeros((self.action_size,), dtype=np.float32)}
                     push_nstep_transition(vid, transition)
                     episode_return += reward
@@ -1237,6 +1347,10 @@ class RLTrainingPipeline:
             avg_deficit_improvement = float(np.mean(deficit_improvements)) if deficit_improvements else 0.0
             lane_failure_rate = lane_failures / float(max(len(deficit_improvements), 1))
             loop_rate = loops / float(max(len(deficit_improvements), 1))
+            avg_fleet_feasible_fraction = float(np.mean(fleet_feasible_fracs)) if fleet_feasible_fracs else 0.0
+            avg_fleet_mean_positive_deficit = float(np.mean(fleet_mean_positive_deficits)) if fleet_mean_positive_deficits else 0.0
+            avg_cooperative_signal = float(np.mean(coop_signal_values)) if coop_signal_values else 0.0
+            avg_fairness_penalty = float(np.mean(fairness_penalties)) if fairness_penalties else 0.0
 
             rolling_baseline.append(completion_before_deadline)
             base = float(np.mean(rolling_baseline)) if rolling_baseline else completion_before_deadline
@@ -1265,6 +1379,10 @@ class RLTrainingPipeline:
                 "replay_td_error_stats": dict(self.trainer.last_td_error_stats),
                 "removals_by_cause": dict(removal_causes),
                 "route_failure_diagnostics": dict(route_diag),
+                "avg_fleet_feasible_fraction": avg_fleet_feasible_fraction,
+                "avg_fleet_mean_positive_deficit": avg_fleet_mean_positive_deficit,
+                "avg_cooperative_signal": avg_cooperative_signal,
+                "avg_fairness_guardrail_penalty": avg_fairness_penalty,
                 "shared_bonus_triggered": shared_bonus_triggered,
                 "episode_return": episode_return / float(total),
             }
