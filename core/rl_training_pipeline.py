@@ -151,7 +151,7 @@ class DQNTrainer:
             return None
         if np.random.rand() <= self.epsilon: # Random to see if the agent should choose a new path
             return random.choice(valid_actions)
-        q_values = self.model.predict(state, verbose = 0)[0]
+        q_values = self.model(state, training=False).numpy()[0]
         masked_values = np.full_like(q_values, -1e9)    #Make all q-values -1e9, then valid actions will update their according value, invalid actions will not be updated and stay negative
         for action in valid_actions:
             masked_values[action] = q_values[action]
@@ -177,9 +177,9 @@ class DQNTrainer:
         dones       = np.array([s[4] for s in minibatch], dtype=np.bool_)
         next_valid_actions_batch = [s[5] for s in minibatch]
 
-        q = self.model.predict(states, verbose=0)
-        q_next_online = self.model.predict(next_states, verbose=0)
-        q_next_target = self.target_model.predict(next_states, verbose=0)
+        q = self.model(states, training=False).numpy()
+        q_next_online = self.model(next_states, training=False).numpy()
+        q_next_target = self.target_model(next_states, training=False).numpy()
 
         bootstrap_values = np.zeros(self.batch_size, dtype=np.float32)
         for idx, valid_actions in enumerate(next_valid_actions_batch):
@@ -1115,14 +1115,14 @@ class RLTrainingPipeline:
                         for _ in range(self.grad_steps):
                             self.trainer.replay()
 
-                    process = psutil.Process(os.getpid())
+                    # process = psutil.Process(os.getpid())
 
-                    if step % 100 == 0:
-                        print(
-                            "RAM_MB=", process.memory_info().rss / 1024 / 1024,
-                            " replay=", len(self.trainer.memory),
-                            " dist_cache=", len(self._distance_cache),
-                        )
+                    # if step % 100 == 0:
+                    #     print(
+                    #         "RAM_MB=", process.memory_info().rss / 1024 / 1024,
+                    #         " replay=", len(self.trainer.memory),
+                    #         " dist_cache=", len(self._distance_cache),
+                    #     )
 
             finally:
                 completion_rate = (
