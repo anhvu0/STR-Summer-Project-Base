@@ -220,6 +220,14 @@ class RouteApplyResult:
     route_edges: list | None = None
 
 
+@dataclass
+class LaneNotReadyState:
+    edge: str
+    chosen_next_edge: str
+    lane_index: int
+    distance_to_end: float
+
+
 class RLTrainingPipeline:
     def __init__(
         self,
@@ -425,9 +433,30 @@ class RLTrainingPipeline:
         if chosen_next_edge not in topological:
             return False
         legal = self._get_vehicle_legal_successors(vehicle_id, current_edge)
-        if legal and chosen_next_edge not in legal:
+        if not legal:
+            return False
+        if chosen_next_edge not in legal:
             return False
         return True
+
+    def _current_lane_successors(self, vehicle_id):
+        try:
+            lane_id = traci.vehicle.getLaneID(vehicle_id)
+        except Exception:
+            return set()
+        successors = set()
+        try:
+            links = traci.lane.getLinks(lane_id)
+        except Exception:
+            links = []
+        for link in links:
+            if not link:
+                continue
+            next_lane = link[0]
+            next_edge = self._edge_from_lane_id(next_lane)
+            if next_edge:
+                successors.add(next_edge)
+        return successors
 
     def _has_downstream_path(self, chosen_next_edge, destination):
         try:
@@ -563,7 +592,7 @@ class RLTrainingPipeline:
             # keep invalid/dead candidates masked out
             immediate_ok = self._is_valid_immediate_successor(vehicle_id, current_edge, next_edge)
             downstream_ok = dead_end < 1.0
-            if lane_m["min_lane_shifts"] < 99 and lane_m["feasible"] and downstream_ok and immediate_ok:
+            if downstream_ok and immediate_ok:
                 mask[i] = 1.0
 
         return np.concatenate([base, cand_vec.reshape(-1)], axis=0).reshape(1, -1), mask, cand_vec
@@ -604,6 +633,9 @@ class RLTrainingPipeline:
     def apply_route_commitment(self, vehicle_id, current_edge, chosen_next_edge, destination):
         if not self._is_valid_immediate_successor(vehicle_id, current_edge, chosen_next_edge):
             return RouteApplyResult(applied=False, reason="invalid_first_hop")
+        lane_succ = self._current_lane_successors(vehicle_id)
+        if chosen_next_edge not in lane_succ:
+            return RouteApplyResult(applied=False, reason="lane_not_ready")
         try:
             from_edge = self.net.getEdge(chosen_next_edge)
             to_edge = self.net.getEdge(destination)
@@ -694,6 +726,7 @@ class RLTrainingPipeline:
             traci.start([sumo_binary, '-c', self.sumocfg_path, '--tripinfo-output', os.path.join(self.sumocfg_dir, 'trips.trips.xml'), '--quit-on-end'])
 
             commitments = {}
+            lane_not_ready_state = {}
             nstep_buffers = defaultdict(lambda: deque(maxlen=self.trainer.n_step))
             recent_edges = defaultdict(lambda: deque(maxlen=self.loop_window))
             teleported_controlled = set()
@@ -837,13 +870,36 @@ class RLTrainingPipeline:
                             except Exception:
                                 pass
 
+                        blocked = lane_not_ready_state.get(vid)
+                        if blocked is not None and blocked.edge == edge and blocked.chosen_next_edge == chosen_next:
+                            curr_lane_idx = traci.vehicle.getLaneIndex(vid)
+                            lane_id = traci.vehicle.getLaneID(vid)
+                            dist_to_end = max(traci.lane.getLength(lane_id) - traci.vehicle.getLanePosition(vid), 0.0)
+                            progressed = dist_to_end < (blocked.distance_to_end - 1.0)
+                            lane_changed = curr_lane_idx != blocked.lane_index
+                            if not (progressed or lane_changed):
+                                route_diag["lane_not_ready_retry_suppressed"] += 1
+                                continue
+
                         apply_result = self.apply_route_commitment(vid, edge, chosen_next, v.destination)
                         if not apply_result.applied:
                             route_diag[apply_result.reason] += 1
+                            if apply_result.reason == "lane_not_ready":
+                                route_diag["lane_not_ready_count"] += 1
+                                lane_id = traci.vehicle.getLaneID(vid)
+                                lane_not_ready_state[vid] = LaneNotReadyState(
+                                    edge=edge,
+                                    chosen_next_edge=chosen_next,
+                                    lane_index=traci.vehicle.getLaneIndex(vid),
+                                    distance_to_end=max(traci.lane.getLength(lane_id) - traci.vehicle.getLanePosition(vid), 0.0),
+                                )
+                                continue
                             if apply_result.reason == "downstream_path_missing":
                                 route_diag["downstream_path_failures"] += 1
                             if apply_result.reason == "route_set_exception":
                                 route_diag["route_set_exceptions"] += 1
+                            if apply_result.reason == "invalid_first_hop":
+                                route_diag["invalid_first_hop_count"] += 1
                             bl_key = self._blacklist_key(vid, edge, chosen_next)
                             self._route_blacklist[bl_key] = step + self.route_retry_cooldown_steps
                             fail_penalty = 0.0
@@ -865,6 +921,7 @@ class RLTrainingPipeline:
                             episode_return += fail_penalty
                             continue
 
+                        lane_not_ready_state.pop(vid, None)
                         eta_now = self.estimate_eta(edge, v.destination)
                         time_left = max(v.deadline - step, 0.0)
                         prev_deficit = max(eta_now - time_left, 0.0) if math.isfinite(eta_now) else self.time_norm
