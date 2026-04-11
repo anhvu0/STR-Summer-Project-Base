@@ -28,6 +28,7 @@ else:
 
 from sumolib import checkBinary
 import traci
+import traci.constants as tc
 import sumolib
 
 MAX_SIMULATION_STEPS = 3000
@@ -318,6 +319,25 @@ class RLTrainingPipeline:
         self._progress_last_line_len = 0
         self.progress_emit_interval_s = 0.35
         self.edge_density_update_every = 2
+        self._vehicle_subscription_vars = (
+            tc.VAR_ROAD_ID,
+            tc.VAR_LANE_ID,
+            tc.VAR_LANEPOSITION,
+            tc.VAR_SPEED,
+            tc.VAR_LANE_INDEX,
+            tc.VAR_VEHICLECLASS,
+            tc.VAR_TYPE,
+        )
+        self._vehicle_subscribed = set()
+        self._vehicle_step_cache = {}
+        self._edge_step_cache = {}
+        self._lane_length_cache = {}
+        self._lane_links_cache = {}
+        self._lane_allowed_cache = {}
+        self._edge_lane_count_cache = {
+            edge_id: max(len(lane_ids), 1)
+            for edge_id, lane_ids in self.connection_info.edge_lane_ids.items()
+        }
 
     def parse_sumocfg(self, sumocfg_path):
         dom = parse(sumocfg_path)
@@ -397,6 +417,76 @@ class RLTrainingPipeline:
     def _blacklist_key(self, vehicle_id, current_edge, next_edge):
         return (str(vehicle_id), str(current_edge), str(next_edge))
 
+    def _start_step_cache(self):
+        self._vehicle_step_cache = {}
+        self._edge_step_cache = {}
+
+    def _ensure_vehicle_subscription(self, vehicle_id):
+        if vehicle_id in self._vehicle_subscribed:
+            return
+        try:
+            traci.vehicle.subscribe(vehicle_id, self._vehicle_subscription_vars)
+            self._vehicle_subscribed.add(vehicle_id)
+        except Exception:
+            pass
+
+    def _refresh_vehicle_snapshot(self, vehicle_ids):
+        for vid in vehicle_ids:
+            self._ensure_vehicle_subscription(vid)
+            vals = traci.vehicle.getSubscriptionResults(vid)
+            if vals:
+                self._vehicle_step_cache[vid] = vals
+
+    def _vehicle_var(self, vehicle_id, var, fallback_fn, default=None):
+        vals = self._vehicle_step_cache.get(vehicle_id, {})
+        if var in vals:
+            return vals[var]
+        try:
+            return fallback_fn(vehicle_id)
+        except Exception:
+            return default
+
+    def _lane_length(self, lane_id):
+        if lane_id in self._lane_length_cache:
+            return self._lane_length_cache[lane_id]
+        try:
+            length = float(traci.lane.getLength(lane_id))
+        except Exception:
+            length = 0.0
+        self._lane_length_cache[lane_id] = length
+        return length
+
+    def _lane_links(self, lane_id):
+        if lane_id in self._lane_links_cache:
+            return self._lane_links_cache[lane_id]
+        try:
+            links = traci.lane.getLinks(lane_id)
+        except Exception:
+            links = []
+        self._lane_links_cache[lane_id] = links
+        return links
+
+    def _lane_allowed(self, lane_id):
+        if lane_id in self._lane_allowed_cache:
+            return self._lane_allowed_cache[lane_id]
+        try:
+            allowed = traci.lane.getAllowed(lane_id)
+        except Exception:
+            allowed = ()
+        self._lane_allowed_cache[lane_id] = allowed
+        return allowed
+
+    def _edge_metric(self, edge_id, metric_key, fetch_fn, default=0.0):
+        key = (edge_id, metric_key)
+        if key in self._edge_step_cache:
+            return self._edge_step_cache[key]
+        try:
+            value = float(fetch_fn(edge_id))
+        except Exception:
+            value = float(default)
+        self._edge_step_cache[key] = value
+        return value
+
     def _edge_from_lane_id(self, lane_id):
         if lane_id is None:
             return None
@@ -408,7 +498,7 @@ class RLTrainingPipeline:
         legal = set()
         lane_ids = self.connection_info.edge_lane_ids.get(edge_id, [])
         try:
-            vclass = traci.vehicle.getVehicleClass(vehicle_id)
+            vclass = self._vehicle_var(vehicle_id, tc.VAR_VEHICLECLASS, traci.vehicle.getVehicleClass)
         except Exception:
             vclass = None
         cache_key = (edge_id, vclass)
@@ -417,7 +507,7 @@ class RLTrainingPipeline:
             return set(cached)
         for lane_id in lane_ids:
             try:
-                links = traci.lane.getLinks(lane_id)
+                links = self._lane_links(lane_id)
             except Exception:
                 links = []
             for link in links:
@@ -429,7 +519,7 @@ class RLTrainingPipeline:
                     continue
                 if vclass is not None:
                     try:
-                        allowed = traci.lane.getAllowed(next_lane)
+                        allowed = self._lane_allowed(next_lane)
                         if allowed and (vclass not in allowed):
                             continue
                     except Exception:
@@ -451,14 +541,11 @@ class RLTrainingPipeline:
 
     def _current_lane_successors(self, vehicle_id):
         try:
-            lane_id = traci.vehicle.getLaneID(vehicle_id)
+            lane_id = self._vehicle_var(vehicle_id, tc.VAR_LANE_ID, traci.vehicle.getLaneID)
         except Exception:
             return set()
         successors = set()
-        try:
-            links = traci.lane.getLinks(lane_id)
-        except Exception:
-            links = []
+        links = self._lane_links(lane_id)
         for link in links:
             if not link:
                 continue
@@ -478,7 +565,7 @@ class RLTrainingPipeline:
 
     def _find_traci_route_edges(self, from_edge, to_edge, vehicle_id):
         try:
-            vtype = traci.vehicle.getTypeID(vehicle_id)
+            vtype = self._vehicle_var(vehicle_id, tc.VAR_TYPE, traci.vehicle.getTypeID, default="")
         except Exception:
             vtype = ""
         try:
@@ -516,12 +603,12 @@ class RLTrainingPipeline:
 
     def compute_candidate_lane_metrics(self, vehicle_id, edge_id, next_edge):
         lane_ids = self.connection_info.edge_lane_ids.get(edge_id, [])
-        curr_lane = traci.vehicle.getLaneIndex(vehicle_id)
-        lane_id = traci.vehicle.getLaneID(vehicle_id)
-        lane_len = traci.lane.getLength(lane_id)
-        lane_pos = traci.vehicle.getLanePosition(vehicle_id)
+        curr_lane = self._vehicle_var(vehicle_id, tc.VAR_LANE_INDEX, traci.vehicle.getLaneIndex, default=0)
+        lane_id = self._vehicle_var(vehicle_id, tc.VAR_LANE_ID, traci.vehicle.getLaneID, default="")
+        lane_len = self._lane_length(lane_id)
+        lane_pos = self._vehicle_var(vehicle_id, tc.VAR_LANEPOSITION, traci.vehicle.getLanePosition, default=0.0)
         dist_to_end = max(lane_len - lane_pos, 0.0)
-        speed = max(traci.vehicle.getSpeed(vehicle_id), 1.0)
+        speed = max(self._vehicle_var(vehicle_id, tc.VAR_SPEED, traci.vehicle.getSpeed, default=1.0), 1.0)
 
         target_lanes = []
         for idx, ln in enumerate(lane_ids):
@@ -546,15 +633,16 @@ class RLTrainingPipeline:
 
     def _queue_proxy(self, edge_id):
         edge_len = max(self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0)
-        halted = traci.edge.getLastStepHaltingNumber(edge_id)
+        halted = self._edge_metric(edge_id, "halt", traci.edge.getLastStepHaltingNumber)
         return float(halted) / edge_len
 
     def build_state(self, vehicle_id, vehicle, step, current_edge, candidates, recent_edges, global_stats, lane_metric_cache=None):
-        lane_idx = traci.vehicle.getLaneIndex(vehicle_id)
-        n_lanes = max(traci.edge.getLaneNumber(current_edge), 1)
-        lane_id = traci.vehicle.getLaneID(vehicle_id)
-        dist_to_end = max(traci.lane.getLength(lane_id) - traci.vehicle.getLanePosition(vehicle_id), 0.0)
-        speed = traci.vehicle.getSpeed(vehicle_id)
+        lane_idx = self._vehicle_var(vehicle_id, tc.VAR_LANE_INDEX, traci.vehicle.getLaneIndex, default=0)
+        n_lanes = self._edge_lane_count_cache.get(current_edge, max(traci.edge.getLaneNumber(current_edge), 1))
+        lane_id = self._vehicle_var(vehicle_id, tc.VAR_LANE_ID, traci.vehicle.getLaneID, default="")
+        lane_pos = self._vehicle_var(vehicle_id, tc.VAR_LANEPOSITION, traci.vehicle.getLanePosition, default=0.0)
+        dist_to_end = max(self._lane_length(lane_id) - lane_pos, 0.0)
+        speed = self._vehicle_var(vehicle_id, tc.VAR_SPEED, traci.vehicle.getSpeed, default=0.0)
         time_left = max(float(vehicle.deadline) - float(step), 0.0)
         elapsed = max(float(step) - float(vehicle.start_time), 0.0)
         window = max(float(vehicle.deadline) - float(vehicle.start_time), 1.0)
@@ -563,7 +651,7 @@ class RLTrainingPipeline:
         urgency = float(np.clip(1.0 - (time_left / window), 0.0, 1.0))
 
         curr_density = self.connection_info.edge_vehicle_count.get(current_edge, 0) / max(self.connection_info.edge_length_dict.get(current_edge, 1.0), 1.0)
-        curr_mean_speed = traci.edge.getLastStepMeanSpeed(current_edge)
+        curr_mean_speed = self._edge_metric(current_edge, "speed", traci.edge.getLastStepMeanSpeed)
         sp_dist = self.get_distance_to_destination(current_edge, vehicle.destination)
         topo_hops = sp_dist / 120.0 if math.isfinite(sp_dist) else 10.0
 
@@ -601,7 +689,7 @@ class RLTrainingPipeline:
                 if lane_metric_cache is not None:
                     lane_metric_cache[cache_key] = lane_m
             density = self.connection_info.edge_vehicle_count.get(next_edge, 0) / max(self.connection_info.edge_length_dict.get(next_edge, 1.0), 1.0)
-            mean_speed = traci.edge.getLastStepMeanSpeed(next_edge)
+            mean_speed = self._edge_metric(next_edge, "speed", traci.edge.getLastStepMeanSpeed)
             eta = self.estimate_eta(next_edge, vehicle.destination)
             deficit = max((eta - time_left), 0.0) if math.isfinite(eta) else self.time_norm
             repeated = 1.0 if next_edge in recent_edges else 0.0
@@ -629,8 +717,8 @@ class RLTrainingPipeline:
 
     def _commitment_threshold(self, vehicle_id, edge_id, candidates):
         edge_len = float(self.connection_info.edge_length_dict.get(edge_id, 100.0))
-        speed = max(traci.vehicle.getSpeed(vehicle_id), 3.0)
-        lanes = max(traci.edge.getLaneNumber(edge_id), 1)
+        speed = max(self._vehicle_var(vehicle_id, tc.VAR_SPEED, traci.vehicle.getSpeed, default=3.0), 3.0)
+        lanes = self._edge_lane_count_cache.get(edge_id, max(traci.edge.getLaneNumber(edge_id), 1))
         lane_cost = 0.0
         for c in candidates:
             lane_cost = max(lane_cost, self.compute_candidate_lane_metrics(vehicle_id, edge_id, c)["min_lane_shifts"])
@@ -640,8 +728,9 @@ class RLTrainingPipeline:
     def should_make_decision(self, vehicle_id, edge_id, candidates, commitment, latest_density, current_density, candidate_densities, committed_deficit=None, candidate_deficits=None):
         if len(candidates) <= 1:
             return False
-        lane_id = traci.vehicle.getLaneID(vehicle_id)
-        dist_to_end = max(traci.lane.getLength(lane_id) - traci.vehicle.getLanePosition(vehicle_id), 0.0)
+        lane_id = self._vehicle_var(vehicle_id, tc.VAR_LANE_ID, traci.vehicle.getLaneID, default="")
+        lane_pos = self._vehicle_var(vehicle_id, tc.VAR_LANEPOSITION, traci.vehicle.getLanePosition, default=0.0)
+        dist_to_end = max(self._lane_length(lane_id) - lane_pos, 0.0)
         in_zone = dist_to_end <= self._commitment_threshold(vehicle_id, edge_id, candidates)
         if not in_zone:
             return False
@@ -813,6 +902,7 @@ class RLTrainingPipeline:
 
             try:
                 for step in range(self.max_simulation_steps):
+                    self._start_step_cache()
                     pre_step_on_destination = set()
                     final_step = step
                     pending = traci.simulation.getMinExpectedNumber()
@@ -820,6 +910,7 @@ class RLTrainingPipeline:
                         break
                     self.update_edge_vehicle_counts(step, every=self.edge_density_update_every)
                     vehicle_ids = list(traci.vehicle.getIDList())
+                    self._refresh_vehicle_snapshot(vehicle_ids)
                     active_controlled = [vid for vid in vehicle_ids if vid in vehicles]
                     self._render_episode_progress(
                         episode_idx=episode,
@@ -866,7 +957,7 @@ class RLTrainingPipeline:
                         if vid not in vehicles:
                             continue
                         v = vehicles[vid]
-                        edge = traci.vehicle.getRoadID(vid)
+                        edge = self._vehicle_var(vid, tc.VAR_ROAD_ID, traci.vehicle.getRoadID, default="")
                         if edge not in self.connection_info.edge_index_dict:
                             continue
                         v.current_edge = edge
@@ -956,7 +1047,7 @@ class RLTrainingPipeline:
                             lane_m = self.compute_candidate_lane_metrics(vid, edge, chosen_next)
                             lane_metric_cache[key] = lane_m
                         if lane_m["target_lanes"] and lane_m["feasible"] and lane_m["min_lane_shifts"] > 0:
-                            target_lane = min(lane_m["target_lanes"], key=lambda idx: abs(idx - traci.vehicle.getLaneIndex(vid)))
+                            target_lane = min(lane_m["target_lanes"], key=lambda idx: abs(idx - self._vehicle_var(vid, tc.VAR_LANE_INDEX, traci.vehicle.getLaneIndex, default=0)))
                             try:
                                 traci.vehicle.changeLane(vid, int(target_lane), 25)
                             except Exception:
@@ -964,9 +1055,10 @@ class RLTrainingPipeline:
 
                         blocked = lane_not_ready_state.get(vid)
                         if blocked is not None and blocked.edge == edge and blocked.chosen_next_edge == chosen_next:
-                            curr_lane_idx = traci.vehicle.getLaneIndex(vid)
-                            lane_id = traci.vehicle.getLaneID(vid)
-                            dist_to_end = max(traci.lane.getLength(lane_id) - traci.vehicle.getLanePosition(vid), 0.0)
+                            curr_lane_idx = self._vehicle_var(vid, tc.VAR_LANE_INDEX, traci.vehicle.getLaneIndex, default=0)
+                            lane_id = self._vehicle_var(vid, tc.VAR_LANE_ID, traci.vehicle.getLaneID, default="")
+                            lane_pos = self._vehicle_var(vid, tc.VAR_LANEPOSITION, traci.vehicle.getLanePosition, default=0.0)
+                            dist_to_end = max(self._lane_length(lane_id) - lane_pos, 0.0)
                             progressed = dist_to_end < (blocked.distance_to_end - 1.0)
                             lane_changed = curr_lane_idx != blocked.lane_index
                             if not (progressed or lane_changed):
@@ -978,12 +1070,13 @@ class RLTrainingPipeline:
                             route_diag[apply_result.reason] += 1
                             if apply_result.reason == "lane_not_ready":
                                 route_diag["lane_not_ready_count"] += 1
-                                lane_id = traci.vehicle.getLaneID(vid)
+                                lane_id = self._vehicle_var(vid, tc.VAR_LANE_ID, traci.vehicle.getLaneID, default="")
+                                lane_pos = self._vehicle_var(vid, tc.VAR_LANEPOSITION, traci.vehicle.getLanePosition, default=0.0)
                                 lane_not_ready_state[vid] = LaneNotReadyState(
                                     edge=edge,
                                     chosen_next_edge=chosen_next,
-                                    lane_index=traci.vehicle.getLaneIndex(vid),
-                                    distance_to_end=max(traci.lane.getLength(lane_id) - traci.vehicle.getLanePosition(vid), 0.0),
+                                    lane_index=self._vehicle_var(vid, tc.VAR_LANE_INDEX, traci.vehicle.getLaneIndex, default=0),
+                                    distance_to_end=max(self._lane_length(lane_id) - lane_pos, 0.0),
                                 )
                                 continue
                             if apply_result.reason == "downstream_path_missing":
