@@ -277,6 +277,17 @@ class RLTrainingPipeline:
         self.w_cooperative = 2.2
         self.w_fairness_guardrail = 1.0
         self.fairness_deficit_threshold = 70.0
+        # Keep cooperative shaping soft and bounded so local executability stays dominant.
+        self.cooperation_min_slack = 20.0
+        self.cooperation_full_slack = 120.0
+        self.cooperation_max_gate = 0.45
+        self.cooperation_required_margin = 10.0
+        self.cooperation_max_extra_deficit = 8.0
+        self.cooperation_hard_extra_deficit = 20.0
+        # Reduce commitment thrash: hold briefly, then reconsider only on meaningful gains.
+        self.decision_min_hold_steps = 3
+        self.reconsider_min_deficit_gain = 2.5
+        self.reconsider_min_pressure_gain = 0.08
 
         self.loop_window = 10
         self.speed_norm = 20.0
@@ -323,6 +334,9 @@ class RLTrainingPipeline:
         self._progress_last_line_len = 0
         self.progress_emit_interval_s = 0.35
         self.edge_density_update_every = 2
+        self.edge_pressure_refresh_every = 4
+        self._last_edge_pressure_step = -10**9
+        self._edge_pressure_cache = {}
         self._vehicle_subscription_vars = (
             tc.VAR_ROAD_ID,
             tc.VAR_LANE_ID,
@@ -687,7 +701,6 @@ class RLTrainingPipeline:
         feasible = 0
         deficits = []
         urgency_edge_demand = defaultdict(float)
-        edge_pressure = {}
         for vid in controlled_ids:
             v = vehicles.get(vid)
             if v is None or not v.current_edge or v.current_edge not in self.connection_info.edge_index_dict:
@@ -705,15 +718,24 @@ class RLTrainingPipeline:
             urgency = float(np.clip(1.0 - (tleft / window), 0.0, 1.0))
             urgency_edge_demand[edge] += urgency
 
-        for edge_id in self.connection_info.edge_list:
-            edge_pressure[edge_id] = self._edge_pressure(edge_id)
+        # Refresh expensive global edge pressure less often; reuse cache between refreshes.
+        needs_refresh = (
+            not self._edge_pressure_cache
+            or (step - self._last_edge_pressure_step) >= self.edge_pressure_refresh_every
+        )
+        if needs_refresh:
+            refreshed = {}
+            for edge_id in self.connection_info.edge_list:
+                refreshed[edge_id] = self._edge_pressure(edge_id)
+            self._edge_pressure_cache = refreshed
+            self._last_edge_pressure_step = step
 
         active_total = max(len(controlled_ids), 1)
         positive = [d for d in deficits if d > 0.0]
         return {
             "fleet_feasible_fraction": feasible / float(active_total),
             "fleet_mean_positive_deficit": (float(np.mean(positive)) if positive else 0.0),
-            "edge_pressure": edge_pressure,
+            "edge_pressure": self._edge_pressure_cache,
             "urgency_edge_demand": urgency_edge_demand,
         }
 
@@ -820,7 +842,7 @@ class RLTrainingPipeline:
         t = min(0.85 * edge_len, max(45.0, 2.2 * speed + 12.0 * lane_cost + 4.0 * lanes))
         return float(t)
 
-    def should_make_decision(self, vehicle_id, edge_id, candidates, commitment, latest_density, current_density, candidate_densities, committed_deficit=None, candidate_deficits=None):
+    def should_make_decision(self, vehicle_id, edge_id, candidates, commitment, latest_density, current_density, candidate_densities, step, committed_deficit=None, candidate_deficits=None):
         if len(candidates) <= 1:
             return False
         lane_id = self._vehicle_var(vehicle_id, tc.VAR_LANE_ID, traci.vehicle.getLaneID, default="")
@@ -833,16 +855,23 @@ class RLTrainingPipeline:
             return True
         if commitment.edge != edge_id:
             return True
-        if abs(current_density - latest_density) > 0.10:
+        # Always allow reconsideration if the committed lane maneuver became infeasible.
+        lane_m = self.compute_candidate_lane_metrics(vehicle_id, edge_id, commitment.chosen_next_edge)
+        if not lane_m["feasible"]:
             return True
+        # Small hold window after commit to reduce oscillatory re-decisions.
+        if (step - commitment.step) < self.decision_min_hold_steps:
+            return False
         if candidate_densities:
             best_idx = int(np.argmin(candidate_densities))
             best_candidate_density = candidate_densities[best_idx]
             best_candidate_deficit = candidate_deficits[best_idx] if candidate_deficits and best_idx < len(candidate_deficits) else math.inf
-            if (current_density - best_candidate_density) > 0.12 and (committed_deficit is None or best_candidate_deficit <= committed_deficit + 2.0):
+            pressure_gain = current_density - best_candidate_density
+            deficit_gain = (committed_deficit - best_candidate_deficit) if committed_deficit is not None else math.inf
+            # Reconsider only when both deficit and pressure gains are meaningful.
+            if pressure_gain > self.reconsider_min_pressure_gain and deficit_gain > self.reconsider_min_deficit_gain:
                 return True
-        lane_m = self.compute_candidate_lane_metrics(vehicle_id, edge_id, commitment.chosen_next_edge)
-        return not lane_m["feasible"]
+        return False
 
     def apply_route_commitment(self, vehicle_id, current_edge, chosen_next_edge, destination):
         if not self._is_valid_immediate_successor(vehicle_id, current_edge, chosen_next_edge):
@@ -921,6 +950,36 @@ class RLTrainingPipeline:
         signal += (float(np.mean(pressure_list)) - chosen["pressure"]) * 0.25
         signal += (float(np.mean(demand_list)) - chosen["urgency_demand"]) * 0.15
         return float(np.clip(signal, -1.0, 1.0))
+
+    def _cooperation_gate(self, slack, current_deficit):
+        # Gate is zero when already behind schedule or with small slack, then ramps with extra slack.
+        if current_deficit > 0.0:
+            return 0.0
+        if slack <= self.cooperation_min_slack:
+            return 0.0
+        ramp = (slack - self.cooperation_min_slack) / max(self.cooperation_full_slack - self.cooperation_min_slack, 1.0)
+        return float(np.clip(ramp, 0.0, 1.0) * self.cooperation_max_gate)
+
+    def _bounded_cooperative_signal(self, base_signal, slack, current_deficit, chosen_deficit, best_candidate_deficit):
+        gate = self._cooperation_gate(slack, current_deficit)
+        if gate <= 0.0:
+            return 0.0
+        if not math.isfinite(chosen_deficit) or not math.isfinite(best_candidate_deficit):
+            return 0.0
+        extra_deficit = max(chosen_deficit - best_candidate_deficit, 0.0)
+        # Require some extra margin before allowing cooperative shaping.
+        if slack < (self.cooperation_required_margin + extra_deficit):
+            return 0.0
+        # Proactively clip/zero cooperation when selected deficit is much worse than local best.
+        if extra_deficit >= self.cooperation_hard_extra_deficit:
+            return 0.0
+        if extra_deficit > self.cooperation_max_extra_deficit:
+            soft = 1.0 - (
+                (extra_deficit - self.cooperation_max_extra_deficit)
+                / max(self.cooperation_hard_extra_deficit - self.cooperation_max_extra_deficit, 1.0)
+            )
+            gate *= float(np.clip(soft, 0.0, 1.0))
+        return float(np.clip(base_signal, -1.0, 1.0) * gate)
 
     def _fairness_guardrail(self, vehicle_id, prev_deficit, curr_deficit, severe_sacrifice_counts):
         worsening = max(curr_deficit - prev_deficit, 0.0)
@@ -1171,7 +1230,7 @@ class RLTrainingPipeline:
                         curr_density = self.connection_info.edge_vehicle_count.get((commitments[vid].chosen_next_edge if vid in commitments else edge), 0) / max(self.connection_info.edge_length_dict.get((commitments[vid].chosen_next_edge if vid in commitments else edge), 1.0), 1.0)
                         committed_eta = self.estimate_eta((commitments[vid].chosen_next_edge if vid in commitments else edge), v.destination)
                         committed_deficit = max(committed_eta - time_left, 0.0) if math.isfinite(committed_eta) else self.time_norm
-                        if not self.should_make_decision(vid, edge, candidates, commitments.get(vid), prev_density, curr_density, candidate_densities, committed_deficit=committed_deficit, candidate_deficits=candidate_deficits):
+                        if not self.should_make_decision(vid, edge, candidates, commitments.get(vid), prev_density, curr_density, candidate_densities, step, committed_deficit=committed_deficit, candidate_deficits=candidate_deficits):
                             continue
 
                         if np.sum(mask) <= 0:
@@ -1180,7 +1239,19 @@ class RLTrainingPipeline:
                         if action is None or action >= len(candidates):
                             continue
                         chosen_next = candidates[action]
-                        coop_signal = self._cooperative_signal_for_choice(action, cand_meta)
+                        eta_now = self.estimate_eta(edge, v.destination)
+                        current_deficit = max(eta_now - time_left, 0.0) if math.isfinite(eta_now) else self.time_norm
+                        best_candidate_deficit = min(candidate_deficits) if candidate_deficits else current_deficit
+                        chosen_deficit = candidate_deficits[action] if action < len(candidate_deficits) else current_deficit
+                        slack = max(time_left - (eta_now if math.isfinite(eta_now) else self.time_norm), 0.0)
+                        coop_signal_raw = self._cooperative_signal_for_choice(action, cand_meta)
+                        coop_signal = self._bounded_cooperative_signal(
+                            coop_signal_raw,
+                            slack=slack,
+                            current_deficit=current_deficit,
+                            chosen_deficit=chosen_deficit,
+                            best_candidate_deficit=best_candidate_deficit,
+                        )
                         key = (vid, edge, chosen_next)
                         lane_m = lane_metric_cache.get(key)
                         if lane_m is None:
@@ -1247,7 +1318,6 @@ class RLTrainingPipeline:
                             continue
 
                         lane_not_ready_state.pop(vid, None)
-                        eta_now = self.estimate_eta(edge, v.destination)
                         time_left = max(v.deadline - step, 0.0)
                         prev_deficit = max(eta_now - time_left, 0.0) if math.isfinite(eta_now) else self.time_norm
                         chosen_density = self.connection_info.edge_vehicle_count.get(chosen_next, 0) / max(self.connection_info.edge_length_dict.get(chosen_next, 1.0), 1.0)
