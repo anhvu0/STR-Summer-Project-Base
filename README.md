@@ -72,7 +72,9 @@ python train_rl.py \
   --sumocfg ./configurations/myconfig.sumocfg \
   --model-output ./configurations/rl_model_4corners.h5 \
   --episodes 10 \
-  --spawn-interval 4.0
+  --spawn-interval 5.5 \
+  --train-every 20 \
+  --max-sim-steps 2200
 ```
 
 ### Reproducibility / seeds
