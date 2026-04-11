@@ -335,6 +335,13 @@ class RLTrainingPipeline:
         self._vehicle_subscribed = set()
         self._vehicle_step_cache = {}
         self._edge_step_cache = {}
+        self._edge_subscription_results = {}
+        self._edge_subscribed = False
+        self._edge_subscription_vars = (
+            tc.LAST_STEP_VEHICLE_NUMBER,
+            tc.LAST_STEP_MEAN_SPEED,
+            tc.LAST_STEP_VEHICLE_HALTING_NUMBER,
+        )
         self._lane_length_cache = {}
         self._lane_links_cache = {}
         self._lane_allowed_cache = {}
@@ -412,7 +419,8 @@ class RLTrainingPipeline:
         counts = self.connection_info.edge_vehicle_count
         lengths = self.connection_info.edge_length_dict
         for edge in self.connection_info.edge_list:
-            counts[edge] = traci.edge.getLastStepVehicleNumber(edge)
+            edge_state = self._edge_subscription_results.get(edge, {})
+            counts[edge] = edge_state.get(tc.LAST_STEP_VEHICLE_NUMBER, 0)
         self._density_vec = np.array([counts[e] / max(lengths[e], 1.0) for e in self.connection_info.edge_list], dtype=np.float32)
         self._global_density_mean = float(np.mean(self._density_vec)) if len(self._density_vec) else 0.0
         self._global_density_std = float(np.std(self._density_vec)) if len(self._density_vec) else 0.0
@@ -424,6 +432,22 @@ class RLTrainingPipeline:
     def _start_step_cache(self):
         self._vehicle_step_cache = {}
         self._edge_step_cache = {}
+
+    def _ensure_edge_subscriptions(self):
+        if self._edge_subscribed:
+            return
+        for edge in self.connection_info.edge_list:
+            try:
+                traci.edge.subscribe(edge, self._edge_subscription_vars)
+            except Exception:
+                continue
+        self._edge_subscribed = True
+
+    def _refresh_edge_snapshot(self):
+        try:
+            self._edge_subscription_results = traci.edge.getAllSubscriptionResults() or {}
+        except Exception:
+            self._edge_subscription_results = {}
 
     def _ensure_vehicle_subscription(self, vehicle_id):
         if vehicle_id in self._vehicle_subscribed:
@@ -437,7 +461,9 @@ class RLTrainingPipeline:
     def _refresh_vehicle_snapshot(self, vehicle_ids):
         for vid in vehicle_ids:
             self._ensure_vehicle_subscription(vid)
-            vals = traci.vehicle.getSubscriptionResults(vid)
+        all_vals = traci.vehicle.getAllSubscriptionResults() or {}
+        for vid in vehicle_ids:
+            vals = all_vals.get(vid)
             if vals:
                 self._vehicle_step_cache[vid] = vals
 
@@ -484,6 +510,16 @@ class RLTrainingPipeline:
         key = (edge_id, metric_key)
         if key in self._edge_step_cache:
             return self._edge_step_cache[key]
+        sub_var = {
+            "halt": tc.LAST_STEP_VEHICLE_HALTING_NUMBER,
+            "speed": tc.LAST_STEP_MEAN_SPEED,
+        }.get(metric_key)
+        if sub_var is not None:
+            edge_state = self._edge_subscription_results.get(edge_id, {})
+            if sub_var in edge_state:
+                value = float(edge_state.get(sub_var, default))
+                self._edge_step_cache[key] = value
+                return value
         try:
             value = float(fetch_fn(edge_id))
         except Exception:
@@ -967,6 +1003,8 @@ class RLTrainingPipeline:
             vehicles = self.generate_episode_vehicles(episode_seed=(episode if self.seed_with_episode else None), curriculum_cfg=curriculum_cfg)
 
             traci.start([sumo_binary, '-c', self.sumocfg_path, '--tripinfo-output', os.path.join(self.sumocfg_dir, 'trips.trips.xml'), '--quit-on-end'])
+            self._edge_subscribed = False
+            self._ensure_edge_subscriptions()
 
             commitments = {}
             lane_not_ready_state = {}
@@ -1000,6 +1038,7 @@ class RLTrainingPipeline:
                     pending = traci.simulation.getMinExpectedNumber()
                     if pending <= 0:
                         break
+                    self._refresh_edge_snapshot()
                     self.update_edge_vehicle_counts(step, every=self.edge_density_update_every)
                     vehicle_ids = list(traci.vehicle.getIDList())
                     self._refresh_vehicle_snapshot(vehicle_ids)
