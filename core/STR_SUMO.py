@@ -13,6 +13,7 @@ else:
 
 import traci
 import sumolib
+from traci import constants as tc
 from controller.RouteController import *
 
 """
@@ -56,6 +57,7 @@ class StrSumo:
         step = 0
         vehicles_to_direct = [] #  the batch of controlled vehicles passed to make_decisions()
         vehicle_IDs_in_simulation = []
+        subscribed_vehicle_ids = set()
 
         try:
             while traci.simulation.getMinExpectedNumber() > 0:
@@ -78,10 +80,19 @@ class StrSumo:
                     if vehicle_id not in vehicle_IDs_in_simulation and vehicle_id in self.controlled_vehicles:
                         vehicle_IDs_in_simulation.append(vehicle_id)
                         traci.vehicle.setColor(vehicle_id, (255, 0, 0)) # set color so we can visually track controlled vehicles
+                        # keep lane changing conflict-free: disable autonomous lane changes from SUMO
+                        # while preserving safety checks/collision avoidance behavior.
+                        traci.vehicle.setLaneChangeMode(vehicle_id, 512)
                         self.controlled_vehicles[vehicle_id].start_time = float(step)#Use the detected release time as start time
 
                     if vehicle_id in self.controlled_vehicles.keys():
-                        current_edge = traci.vehicle.getRoadID(vehicle_id)
+                        if vehicle_id not in subscribed_vehicle_ids:
+                            traci.vehicle.subscribe(vehicle_id, (tc.VAR_ROAD_ID, tc.VAR_SPEED))
+                            subscribed_vehicle_ids.add(vehicle_id)
+
+                        vehicle_state = traci.vehicle.getSubscriptionResults(vehicle_id) or {}
+                        current_edge = vehicle_state.get(tc.VAR_ROAD_ID)
+                        current_speed = vehicle_state.get(tc.VAR_SPEED, 0.0)
 
                         if current_edge not in self.connection_info.edge_index_dict.keys():
                             continue
@@ -91,7 +102,7 @@ class StrSumo:
                         #print("{} now on: {}, records on {}; {} ".format(vehicle_id, current_edge, self.controlled_vehicles[vehicle_id].current_edge, current_edge!=self.controlled_vehicles[vehicle_id].current_edge))
                         if current_edge != self.controlled_vehicles[vehicle_id].current_edge:
                             self.controlled_vehicles[vehicle_id].current_edge = current_edge
-                            self.controlled_vehicles[vehicle_id].current_speed = traci.vehicle.getSpeed(vehicle_id)
+                            self.controlled_vehicles[vehicle_id].current_speed = current_speed
                             vehicles_to_direct.append(self.controlled_vehicles[vehicle_id])
                 #print(len(vehicles_to_direct))
                 vehicle_decisions_by_id = self.route_controller.make_decisions(vehicles_to_direct, self.connection_info)
@@ -102,7 +113,7 @@ class StrSumo:
                     #
                     # current_edge_of_vehicle = self.controlled_vehicles[vehicle_id].current_edge
                     # target_edge = self.connection_info.outgoing_edges_dict[current_edge_of_vehicle][decision]
-                    if vehicle_id in traci.vehicle.getIDList():
+                    if vehicle_id in vehicle_ids:
                         #print("Changing the target of {} to {} with length {}".format(vehicle_id, local_target_edge, self.connection_info.edge_length_dict[local_target_edge]))
                         try:
                             # Keep final destination as sink and use local target as a temporary via edge.
