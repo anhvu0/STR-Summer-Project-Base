@@ -39,11 +39,11 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=capacity) # Use deque here so you can pop the first element later easily
         self.capacity = capacity
 
-    def add(self, state, action, reward, next_state, done):
+    def add(self, state, action, reward, next_state, done, next_valid_actions=None):
         """      
         Store one transition into the buffer
         """
-        self.buffer.append((state, action, reward, next_state, done))
+        self.buffer.append((state, action, reward, next_state, done, next_valid_actions))
 
     def sample(self, batch_size):
         return random.sample(self.buffer, batch_size)
@@ -154,11 +154,11 @@ class DQNTrainer:
             masked_values[action] = q_values[action]
         return int(np.argmax(masked_values))
     
-    def remember(self, state, action, reward, next_state, done):
+    def remember(self, state, action, reward, next_state, done, next_valid_actions=None):
         """
         Store 1 transition for replay
         """
-        self.memory.add(state, action, reward, next_state, done)
+        self.memory.add(state, action, reward, next_state, done, next_valid_actions)
     
     def replay(self):
         """
@@ -172,12 +172,25 @@ class DQNTrainer:
         rewards     = np.array([s[2] for s in minibatch], dtype=np.float32)
         next_states = np.vstack([s[3] for s in minibatch])
         dones       = np.array([s[4] for s in minibatch], dtype=np.bool_)
+        next_valid_actions_batch = [s[5] for s in minibatch]
 
         q = self.model.predict(states, verbose=0)
-        q_next = self.target_model.predict(next_states, verbose=0)
+        q_next_online = self.model.predict(next_states, verbose=0)
+        q_next_target = self.target_model.predict(next_states, verbose=0)
+
+        bootstrap_values = np.zeros(self.batch_size, dtype=np.float32)
+        for idx, valid_actions in enumerate(next_valid_actions_batch):
+            if dones[idx] or not valid_actions:
+                continue
+            masked_online = np.full(self.action_size, -1e9, dtype=np.float32)
+            masked_online[valid_actions] = q_next_online[idx, valid_actions]
+            best_next_action = int(np.argmax(masked_online))
+            bootstrap_values[idx] = q_next_target[idx, best_next_action]
 
         target = q.copy()
-        target[np.arange(self.batch_size), actions] = rewards + (1.0 - dones.astype(np.float32)) * self.gamma * np.max(q_next, axis=1)
+        target[np.arange(self.batch_size), actions] = (
+            rewards + (1.0 - dones.astype(np.float32)) * self.gamma * bootstrap_values
+        )
 
         self.model.train_on_batch(states, target)
         self.train_steps += 1
@@ -269,9 +282,13 @@ class RLTrainingPipeline:
         self.connection_info = ConnectionInfo(os.path.join(self.sumocfg_dir, self.net_file))
         self.route_helper = TrainingRouteHelper(self.connection_info)
 
-        # state = [edge, destination] + 6 direction flags + 3 lane features
-        #         + 3 deadline/time features + density vector
-        self.state_size = 2 + 6 + 3 + 3 + len(self.connection_info.edge_list)
+        # state = [edge_embedding, destination_embedding] + 6 direction flags
+        #         + 3 lane features + 3 deadline/time features
+        #         + local congestion summary
+        self.edge_embedding_dim = 8
+        self.local_congestion_k = 6
+        self._init_edge_embeddings(seed=1337)
+        self.state_size = (2 * self.edge_embedding_dim) + 6 + 3 + 3 + self.local_congestion_k
         self.action_size = 6
         self.trainer = DQNTrainer(
             self.state_size,
@@ -284,6 +301,54 @@ class RLTrainingPipeline:
             replay_warmup=replay_warmup,
             target_update_every=200,
             target_soft_tau=1.0,
+        )
+
+    def _init_edge_embeddings(self, seed=1337):
+        """
+        Fixed edge embeddings avoid fake ordinal structure from raw edge indices.
+        """
+        rng = np.random.default_rng(seed)
+        self._edge_embeddings = {}
+        for edge_id in self.connection_info.edge_list:
+            emb = rng.normal(loc=0.0, scale=0.1, size=self.edge_embedding_dim).astype(np.float32)
+            self._edge_embeddings[edge_id] = emb
+
+    def _get_edge_embedding(self, edge_id):
+        return self._edge_embeddings.get(
+            edge_id,
+            np.zeros(self.edge_embedding_dim, dtype=np.float32),
+        )
+
+    def _local_congestion_features(self, edge_id):
+        """
+        Compact congestion summary around current edge to reduce input noise.
+        """
+        counts = self.connection_info.edge_vehicle_count
+        lengths = self.connection_info.edge_length_dict
+
+        current_density = counts.get(edge_id, 0) / max(lengths.get(edge_id, 5.0), 5.0)
+        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
+        outgoing_densities = [
+            counts.get(next_edge, 0) / max(lengths.get(next_edge, 5.0), 5.0)
+            for next_edge in outgoing.values()
+        ]
+
+        mean_out = float(np.mean(outgoing_densities)) if outgoing_densities else current_density
+        max_out = float(np.max(outgoing_densities)) if outgoing_densities else current_density
+        min_out = float(np.min(outgoing_densities)) if outgoing_densities else current_density
+        mean_global = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
+        std_global = float(np.std(self._density_vec)) if len(self._density_vec) > 0 else 0.0
+
+        return np.array(
+            [
+                current_density,
+                mean_out,
+                max_out,
+                min_out,
+                current_density - mean_global,
+                std_global,
+            ],
+            dtype=np.float32,
         )
 
     def _deadline_window(self, vehicle):
@@ -321,11 +386,11 @@ class RLTrainingPipeline:
         Build a state vector for the given edge using cached per-step densities.
         """
         state = np.zeros(self.state_size, dtype=np.float32)
-        state[0] = self.connection_info.edge_index_dict[edge_id]
-        state[1] = self.connection_info.edge_index_dict[destination_edge]
+        state[0:self.edge_embedding_dim] = self._get_edge_embedding(edge_id)
+        state[self.edge_embedding_dim:(2 * self.edge_embedding_dim)] = self._get_edge_embedding(destination_edge)
 
         outgoing = self.connection_info.outgoing_edges_dict[edge_id]
-        base = 2
+        base = 2 * self.edge_embedding_dim
         for i, choice in enumerate(self.route_helper.direction_choices):
             state[base + i] = 1.0 if choice in outgoing else 0.0
 
@@ -356,7 +421,7 @@ class RLTrainingPipeline:
             state[deadline_base + 1] = min(elapsed / deadline_window, 1.0)
             state[deadline_base + 2] = urgency
 
-        state[deadline_base + 3:] = self._density_vec
+        state[deadline_base + 3:] = self._local_congestion_features(edge_id)
         return state.reshape(1, -1)
 
     def valid_actions(self, edge_id):
@@ -490,8 +555,8 @@ class RLTrainingPipeline:
 
         turnaround_penalty = 25.0 if direction == 't' else 0.0
         return (
-            10000.0 * deadline_deficit
-            + 400.0 * marginal_pressure
+            (self.deadline_deficit_scale * deadline_deficit)
+            + (self.system_congestion_scale * 100.0 * marginal_pressure)
             + (self.distance_tiebreak_scale * float(distance))
             + recent_penalty
             + turnaround_penalty
@@ -509,79 +574,22 @@ class RLTrainingPipeline:
 
     def build_decision_list(self, edge_id, initial_action, vehicle, recent_edges, sim_step):
         """
-        Build a decision list that starts with the selected RL action and then
-        extends with destination-aware actions (instead of random padding).
+        Build a decision list with RL-driven control.
+        We intentionally avoid heuristic horizon takeover during training.
         """
         decision_list = []
         current_edge = edge_id
 
-        for step_idx in range(self.decision_horizon):
+        for _ in range(1):
             outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
             if not outgoing:
                 break
 
-            if step_idx == 0:
-                # Start with model action, but enforce destination reachability.
-                action = initial_action
-                valid_actions = self.valid_actions(current_edge)
-                if action not in valid_actions:
-                    break
-                proposed_direction = self.route_helper.direction_choices[action]
-
-                if proposed_direction not in outgoing:
-                    break
-
-                proposed_next = outgoing[proposed_direction]
-                proposed_score = self._score_next_edge(
-                    proposed_next,
-                    vehicle.destination,
-                    recent_edges,
-                    proposed_direction,
-                    vehicle,
-                    sim_step + step_idx,
-                )
-
-                if math.isfinite(proposed_score):
-                    direction = proposed_direction
-                else:
-                    # Fallback: choose the best reachable direction from this edge.
-                    best_direction = None
-                    best_score = math.inf
-                    for d, candidate_edge in outgoing.items():
-                        score = self._score_next_edge(
-                            candidate_edge,
-                            vehicle.destination,
-                            recent_edges,
-                            d,
-                            vehicle,
-                            sim_step + step_idx,
-                        )
-                        if score < best_score:
-                            best_score = score
-                            best_direction = d
-
-                    if best_direction is None or not math.isfinite(best_score):
-                        break
-                    direction = best_direction
-            else:
-                best_direction = None
-                best_score = math.inf
-                for direction, candidate_edge in outgoing.items():
-                    score = self._score_next_edge(
-                        candidate_edge,
-                        vehicle.destination,
-                        recent_edges,
-                        direction,
-                        vehicle,
-                        sim_step + step_idx,
-                    )
-                    if score < best_score:
-                        best_score = score
-                        best_direction = direction
-
-                if best_direction is None:
-                    break
-                direction = best_direction
+            action = initial_action
+            valid_actions = self.valid_actions(current_edge)
+            if action not in valid_actions:
+                break
+            direction = self.route_helper.direction_choices[action]
 
             if direction not in outgoing:
                 break
@@ -639,7 +647,17 @@ class RLTrainingPipeline:
                 return
 
 
-    def compute_reward(self, vehicle, prev_edge, current_edge, step, arrived, repeated_recent_edges=0):
+    def compute_reward(
+        self,
+        vehicle,
+        prev_edge,
+        current_edge,
+        step,
+        arrived,
+        repeated_recent_edges=0,
+        delta_t=1.0,
+        reached_global_destination=False,
+    ):
         """
         Compute a reward based on travel time, congestion, progress,
         and proper dead-end handling.
@@ -651,10 +669,11 @@ class RLTrainingPipeline:
         time_left = max(float(vehicle.deadline) - float(step), 0.0)
 
         # ---- Base penalties ----
-        time_penalty = -3.0
+        elapsed = max(float(delta_t), 1.0)
+        time_penalty = -3.0 * elapsed
         congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
         edge_density = congestion / max(self.connection_info.edge_length_dict[current_edge], 5.0)
-        congestion_penalty = -edge_density
+        congestion_penalty = -edge_density * elapsed
         # More flexible vehicles (larger deadline - start_time) should yield,
         # so congestion penalty is stronger for them.
         congestion_penalty *= (1.0 + flexibility)
@@ -667,7 +686,7 @@ class RLTrainingPipeline:
         # aligns local choices with global congestion relief.
         mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
         marginal_pressure = max(edge_density - mean_density, 0.0)
-        system_penalty = -self.system_congestion_scale * marginal_pressure
+        system_penalty = -self.system_congestion_scale * marginal_pressure * elapsed
         reward += system_penalty
 
         done = False
@@ -703,9 +722,12 @@ class RLTrainingPipeline:
 
         # ---- Arrival handling ----
         if arrived:
-            reward += self.destination_reward
-            if step <= vehicle.deadline:
-                reward += self.on_time_arrival_bonus
+            if reached_global_destination:
+                reward += self.destination_reward
+                if step <= vehicle.deadline:
+                    reward += self.on_time_arrival_bonus
+            else:
+                reward -= 0.5 * self.deadline_penalty
             done = True
             return reward, done
 
@@ -755,8 +777,7 @@ class RLTrainingPipeline:
         """
         Run the full training loop across episodes, with cleaner decision timing:
         - Decide near junctions (decision points), not on every edge change
-        - Mask actions by lane feasibility
-        - Optionally force lane alignment for chosen direction
+        - Select route-intent actions at edge level and align lanes as low-level control
         - Close transitions at the next decision point
         """
         sumo_binary = checkBinary('sumo')
@@ -780,7 +801,7 @@ class RLTrainingPipeline:
                 "--quit-on-end",
             ])
 
-            # vehicle_id -> (state, action, decision_edge)
+            # vehicle_id -> (state, action, decision_edge, decision_step)
             last_state_action = {}
             # vehicle_id -> edge_id where we last issued a decision (prevents repeat decisions)
             last_decision_edge = {}
@@ -836,9 +857,9 @@ class RLTrainingPipeline:
                         if not self.is_decision_point_adaptive(
                             current_edge,
                             vehicle_id,
-                            max_dist=200.0,   # cap for long edges
-                            ratio=0.6,        # 60% of edge length
-                            min_dist=30.0     # don't go too tiny
+                            max_dist=260.0,   # decide earlier to allow lane changes
+                            ratio=0.85,       # 85% of edge length
+                            min_dist=60.0
                         ):
                             continue
 
@@ -848,19 +869,21 @@ class RLTrainingPipeline:
 
                         # ---- close previous transition at this decision point ----
                         if vehicle_id in last_state_action:
-                            prev_state, prev_action, prev_edge = last_state_action[vehicle_id]
+                            prev_state, prev_action, prev_edge, prev_step = last_state_action[vehicle_id]
 
                             repeated_recent_edges = sum(
                                 1 for edge in recent_edge_history[vehicle_id] if edge == current_edge
                             )
 
+                            decision_delta_t = max(step - prev_step, 1)
                             reward, done = self.compute_reward(
                                 vehicle,
                                 prev_edge,
                                 current_edge,
                                 step,
                                 arrived=False,
-                                repeated_recent_edges=repeated_recent_edges
+                                repeated_recent_edges=repeated_recent_edges,
+                                delta_t=decision_delta_t,
                             )
 
                             next_state = self.encode_state(
@@ -870,7 +893,15 @@ class RLTrainingPipeline:
                                 vehicle=vehicle,
                                 step=step,
                             )
-                            self.trainer.remember(prev_state, prev_action, reward, next_state, done)
+                            next_valid = self.valid_actions_for_vehicle(vehicle_id, current_edge)
+                            self.trainer.remember(
+                                prev_state,
+                                prev_action,
+                                reward,
+                                next_state,
+                                done,
+                                next_valid_actions=next_valid,
+                            )
                             episode_return += reward
 
                             if done:
@@ -887,11 +918,13 @@ class RLTrainingPipeline:
                             step=step,
                         )
 
-                        valid = self.valid_actions_for_vehicle(vehicle_id, current_edge)
-                        action = self.trainer.select_action(state, valid)
+                        edge_valid = self.valid_actions(current_edge)
+                        # Route intent is chosen from edge-feasible actions; lane feasibility
+                        # is handled by alignment below.
+                        action = self.trainer.select_action(state, edge_valid)
 
                         if action is None:
-                            # no feasible action from this lane; skip decision (or penalize if you prefer)
+                            # no feasible action from this edge
                             last_decision_edge[vehicle_id] = current_edge
                             continue
 
@@ -956,7 +989,7 @@ class RLTrainingPipeline:
                         last_target_by_vehicle[vehicle_id] = applied_target
 
                         # store new transition start
-                        last_state_action[vehicle_id] = (state, action, current_edge)
+                        last_state_action[vehicle_id] = (state, action, current_edge, step)
                         last_decision_edge[vehicle_id] = current_edge
 
                     traci.simulationStep()
@@ -994,11 +1027,12 @@ class RLTrainingPipeline:
                         # Close any open transition as a terminal arrival transition so
                         # destination reward / on-time bonus are learned explicitly.
                         if arrived_vehicle_id in last_state_action:
-                            prev_state, prev_action, prev_edge = last_state_action[arrived_vehicle_id]
+                            prev_state, prev_action, prev_edge, prev_step = last_state_action[arrived_vehicle_id]
                             repeated_recent_edges = sum(
                                 1 for edge in recent_edge_history[arrived_vehicle_id]
                                 if edge == last_seen_edge
                             )
+                            decision_delta_t = max(step - prev_step, 1)
                             reward, done = self.compute_reward(
                                 vehicle,
                                 prev_edge,
@@ -1006,13 +1040,22 @@ class RLTrainingPipeline:
                                 step,
                                 arrived=True,
                                 repeated_recent_edges=repeated_recent_edges,
+                                delta_t=decision_delta_t,
+                                reached_global_destination=reached_global_destination,
                             )
                             next_state = self.make_terminal_next_state(
                                 arrived_vehicle_id,
                                 last_seen_edge,
                                 vehicle.destination,
                             )
-                            self.trainer.remember(prev_state, prev_action, reward, next_state, done)
+                            self.trainer.remember(
+                                prev_state,
+                                prev_action,
+                                reward,
+                                next_state,
+                                done,
+                                next_valid_actions=[],
+                            )
                             episode_return += reward
 
                         # No more transitions should be open once SUMO removes the vehicle.
@@ -1032,7 +1075,7 @@ class RLTrainingPipeline:
 
                             # If we have an open transition for this vehicle, close it as terminal
                             if tid in last_state_action:
-                                prev_state, prev_action, prev_edge = last_state_action[tid]
+                                prev_state, prev_action, prev_edge, prev_step = last_state_action[tid]
                                 v = vehicles[tid]
 
                                 # Try to get where it ended up; may fail if removed, so guard
@@ -1044,7 +1087,14 @@ class RLTrainingPipeline:
                                 # Big penalty so agent learns to avoid situations leading to teleports
                                 next_state = self.make_terminal_next_state(tid, tele_edge, v.destination)
 
-                                self.trainer.remember(prev_state, prev_action, self.teleport_penalty, next_state, True)
+                                self.trainer.remember(
+                                    prev_state,
+                                    prev_action,
+                                    self.teleport_penalty,
+                                    next_state,
+                                    True,
+                                    next_valid_actions=[],
+                                )
                                 episode_return += self.teleport_penalty
 
                                 # Clear open transition
