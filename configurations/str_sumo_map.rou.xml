@@ -1,6 +1,6 @@
 <?xml version="1.0" ?>
-<!-- generated on Sat Apr 11 11:18:19 2026 by Eclipse SUMO duarouter Version 1.4.0
-<configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/duarouterConfiguration.xsd">
+<!-- generated on 2026-04-11T14:04:02.673024-06:00 by Eclipse SUMO duarouter 1.26.0
+<duarouterConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/duarouterConfiguration.xsd">
 
     <input>
         <net-file value="./configurations/map.net.xml"/>
@@ -9,7 +9,6 @@
 
     <output>
         <output-file value="./configurations/str_sumo_map.rou.xml"/>
-        <alternatives-output value="./configurations/str_sumo_map.rou.alt.xml"/>
     </output>
 
     <time>
@@ -23,7 +22,7 @@
         <no-step-log value="true"/>
     </report>
 
-</configuration>
+</duarouterConfiguration>
 -->
 <routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
 	
@@ -194,7 +193,7 @@
 	<vehicle id="14" depart="42.00">
 		
         
-		<route edges="569369536 -569369536 -47796089#10 -47796089#9 -47796089#8 -47796089#7 -47796089#6 -47796089#5 -47796089#4 -47796089#3 -47796089#2 -47796089#1 -47796089#0 -439801896 5673363#0 620796857 5672019#0 5672019#1 -196116986 196116987 497262775 195743139#0 195743139#1 658579519#1 658579519#2"/>
+		<route edges="569369536 569369535#0 -569369535#0 -569369536 -47796089#10 -47796089#9 -47796089#8 -47796089#7 -47796089#6 -47796089#5 -47796089#4 -47796089#3 -47796089#2 -47796089#1 -47796089#0 -439801896 5673363#0 620796857 5672019#0 5672019#1 -196116986 196116987 497262775 195743139#0 195743139#1 658579519#1 658579519#2"/>
 		
     
 	</vehicle>

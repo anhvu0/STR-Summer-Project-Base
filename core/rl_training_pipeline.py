@@ -20,7 +20,8 @@ from core.target_vehicles_generation_protocols import target_vehicles_generator
 
 if 'SUMO_HOME' in os.environ:
     tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
-    sys.path.append(tools)
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
 else:
     sys.exit("No environment variable SUMO_HOME!")
 
