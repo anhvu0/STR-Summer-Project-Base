@@ -1,16 +1,18 @@
-import numpy as np
-import os
-import sys
 import math
-
-import os, psutil
-
-from xml.dom.minidom import parse
-from keras.layers import Dense
-from keras.models import Sequential, clone_model
-from keras.optimizers import Adam
-from collections import defaultdict, deque
+import os
 import random
+import sys
+from collections import defaultdict, deque
+from dataclasses import dataclass
+
+import numpy as np
+from keras import backend as K
+from keras.layers import Dense, Input, Lambda
+from keras.losses import Huber
+from keras.models import Model, clone_model
+from keras.optimizers import Adam
+from xml.dom.minidom import parse
+
 from controller.RouteController import RouteController
 from core.Util import ConnectionInfo
 from core.target_vehicles_generation_protocols import target_vehicles_generator
@@ -25,188 +27,192 @@ from sumolib import checkBinary
 import traci
 import sumolib
 
-"""
-In this file, we build a DQN network
-"""
+MAX_SIMULATION_STEPS = 3000
 
-MAX_SIMULATION_STEPS = 3000 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
 
-class ReplayBuffer:
-    """
-    This is the replay buffer mechanism in DQN
-    """
-    def __init__(self, capacity):
-        """
-        :param capacity: Maximum number of transitions
-        """
-        self.buffer = deque(maxlen=capacity) # Use deque here so you can pop the first element later easily
-        self.capacity = capacity
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity, alpha=0.6, eps=1e-5):
+        self.capacity = int(capacity)
+        self.alpha = float(alpha)
+        self.eps = float(eps)
+        self.buffer = []
+        self.priorities = np.zeros(self.capacity, dtype=np.float32)
+        self.pos = 0
 
-    def add(self, state, action, reward, next_state, done, next_valid_actions=None):
-        """      
-        Store one transition into the buffer
-        """
-        self.buffer.append((state, action, reward, next_state, done, next_valid_actions))
-
-    def sample(self, batch_size):
-        return random.sample(self.buffer, batch_size)
-    
     def __len__(self):
         return len(self.buffer)
 
-class TrainingRouteHelper(RouteController):
-    """
-    Helper class to reuse compute_local_target during RL training and use connection_info
-    """
+    def add(self, transition, priority=None):
+        max_p = float(np.max(self.priorities[: len(self.buffer)]) if self.buffer else 1.0)
+        p = max(priority if priority is not None else max_p, self.eps)
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(transition)
+        else:
+            self.buffer[self.pos] = transition
+        self.priorities[self.pos] = p
+        self.pos = (self.pos + 1) % self.capacity
 
+    def sample(self, batch_size, beta=0.4):
+        size = len(self.buffer)
+        if size == 0:
+            return [], np.array([], dtype=np.int32), np.array([], dtype=np.float32)
+        probs = self.priorities[:size] ** self.alpha
+        probs = probs / np.sum(probs)
+        idx = np.random.choice(size, batch_size, p=probs, replace=(size < batch_size))
+        samples = [self.buffer[i] for i in idx]
+        weights = (size * probs[idx]) ** (-beta)
+        weights = weights / np.max(weights)
+        return samples, idx, weights.astype(np.float32)
+
+    def update_priorities(self, indices, td_errors):
+        for i, td in zip(indices, td_errors):
+            self.priorities[int(i)] = max(abs(float(td)) + self.eps, self.eps)
+
+
+class TrainingRouteHelper(RouteController):
     def __init__(self, connection_info):
         super().__init__(connection_info)
 
     def make_decisions(self, vehicles, connection_info):
         return {}
 
-class DQNTrainer:
-    """
-    Deep Q-Network trainer for routing decisions
-    """
 
+class DQNTrainer:
     def __init__(
         self,
         state_size,
         action_size,
-        learning_rate=0.001,
-        gamma=0.95,
+        learning_rate=5e-4,
+        gamma=0.99,
         epsilon=1.0,
-        epsilon_decay=0.99,
+        epsilon_decay=0.995,
         epsilon_min=0.05,
-        replay_capacity=2000,
+        replay_capacity=50000,
         batch_size=64,
-        replay_warmup=1000,
-        target_update_every=200,
-        target_soft_tau=1.0,
+        replay_warmup=2000,
+        target_update_every=1,
+        target_soft_tau=0.01,
+        grad_clip_norm=10.0,
+        n_step=3,
+        per_alpha=0.6,
+        per_beta_start=0.4,
+        per_beta_anneal_steps=100000,
     ):
-        """
-        :param learning_rate: Can be adjusted for further optimization
-        :param gamma: Can be adjusted for further optimization
-        :param epsilon: 1.0 allows free exploration
-        :param epsilon_decay: epsilon value in next episode
-        :param epsilon_min: minimum epsilon to ensure that there's still some chance for free exploration later
-        """
         self.state_size = state_size
         self.action_size = action_size
-        self.gamma = gamma
-        self.epsilon = epsilon
-        self.epsilon_decay = epsilon_decay
-        self.epsilon_min = epsilon_min
-        self.batch_size = batch_size
+        self.gamma = float(gamma)
+        self.epsilon = float(epsilon)
+        self.epsilon_decay = float(epsilon_decay)
+        self.epsilon_min = float(epsilon_min)
+        self.batch_size = int(batch_size)
         self.replay_warmup = max(int(replay_warmup), self.batch_size)
         self.target_update_every = max(int(target_update_every), 1)
         self.target_soft_tau = float(np.clip(target_soft_tau, 0.0, 1.0))
-        self.memory = ReplayBuffer(replay_capacity)
-        self.model = self.build_model(learning_rate)
-        self.target_model = self._build_target_model()
+        self.grad_clip_norm = float(grad_clip_norm)
+        self.n_step = max(int(n_step), 1)
+        self.memory = PrioritizedReplayBuffer(replay_capacity, alpha=per_alpha)
+        self.per_beta_start = float(per_beta_start)
+        self.per_beta_anneal_steps = max(int(per_beta_anneal_steps), 1)
         self.train_steps = 0
+        self.last_td_error_stats = {"mean": 0.0, "max": 0.0, "min": 0.0}
 
-    def _build_target_model(self):
-        target_model = clone_model(self.model)
-        target_model.set_weights(self.model.get_weights())
-        return target_model
-
-    def update_target_network(self, force=False):
-        """
-        Synchronize online-network weights into target network.
-        - Hard update when target_soft_tau=1.0.
-        - Polyak averaging when target_soft_tau is in (0, 1).
-        """
-        if not force and (self.train_steps % self.target_update_every != 0):
-            return
-
-        online_weights = self.model.get_weights()
-        if self.target_soft_tau >= 1.0:
-            self.target_model.set_weights(online_weights)
-            return
-
-        target_weights = self.target_model.get_weights()
-        tau = self.target_soft_tau
-        mixed_weights = [
-            tau * online_w + (1.0 - tau) * target_w
-            for online_w, target_w in zip(online_weights, target_weights)
-        ]
-        self.target_model.set_weights(mixed_weights)
+        self.model = self.build_model(learning_rate)
+        self.target_model = clone_model(self.model)
+        self.target_model.set_weights(self.model.get_weights())
 
     def build_model(self, learning_rate):
-        model = Sequential()
-        model.add(Dense(64, input_dim=self.state_size, activation='relu'))      #May increase Dense for bigger network
-        model.add(Dense(64, activation='relu'))
-        model.add(Dense(self.action_size, activation='linear'))
-        model.compile(loss='mse', optimizer=Adam(learning_rate = learning_rate))
+        inp = Input(shape=(self.state_size,))
+        x = Dense(256, activation='relu')(inp)
+        x = Dense(256, activation='relu')(x)
+        x = Dense(128, activation='relu')(x)
+        value = Dense(1, activation='linear')(x)
+        advantage = Dense(self.action_size, activation='linear')(x)
+        centered_adv = Lambda(lambda a: a - K.mean(a, axis=1, keepdims=True))(advantage)
+        q_vals = Lambda(lambda va: va[0] + va[1])([value, centered_adv])
+        model = Model(inp, q_vals)
+        model.compile(optimizer=Adam(learning_rate=learning_rate, clipnorm=self.grad_clip_norm), loss=Huber())
         return model
-    
-    def select_action(self, state, valid_actions):
-        """
-        Select an action with epsilon-greedy exploration
-        :param valid_actions: List of valid actions at a specific edge
-        """
-        if not valid_actions:
+
+    def _beta(self):
+        return min(1.0, self.per_beta_start + (1.0 - self.per_beta_start) * (self.train_steps / self.per_beta_anneal_steps))
+
+    def select_action(self, state_vec, valid_mask):
+        valid_idx = np.flatnonzero(valid_mask > 0)
+        if len(valid_idx) == 0:
             return None
-        if np.random.rand() <= self.epsilon: # Random to see if the agent should choose a new path
-            return random.choice(valid_actions)
-        q_values = self.model(state, training=False).numpy()[0]
-        masked_values = np.full_like(q_values, -1e9)    #Make all q-values -1e9, then valid actions will update their according value, invalid actions will not be updated and stay negative
-        for action in valid_actions:
-            masked_values[action] = q_values[action]
-        return int(np.argmax(masked_values))
-    
-    def remember(self, state, action, reward, next_state, done, next_valid_actions=None):
-        """
-        Store 1 transition for replay
-        """
-        self.memory.add(state, action, reward, next_state, done, next_valid_actions)
-    
+        if np.random.rand() <= self.epsilon:
+            return int(random.choice(valid_idx))
+        q_values = self.model(state_vec, training=False).numpy()[0]
+        masked = np.full_like(q_values, -1e9)
+        masked[valid_idx] = q_values[valid_idx]
+        return int(np.argmax(masked))
+
+    def remember(self, transition, priority=None):
+        self.memory.add(transition, priority=priority)
+
     def replay(self):
-        """
-        Train the Q-network from replayed experiences. Update q-values of previous state based on the most recent one.
-        """
         if len(self.memory) < self.replay_warmup:
             return
-        minibatch = self.memory.sample(self.batch_size)
-        states      = np.vstack([s[0] for s in minibatch])
-        actions     = np.array([s[1] for s in minibatch], dtype=np.int32)
-        rewards     = np.array([s[2] for s in minibatch], dtype=np.float32)
-        next_states = np.vstack([s[3] for s in minibatch])
-        dones       = np.array([s[4] for s in minibatch], dtype=np.bool_)
-        next_valid_actions_batch = [s[5] for s in minibatch]
 
-        q = self.model(states, training=False).numpy()
+        samples, idxs, is_weights = self.memory.sample(self.batch_size, beta=self._beta())
+        states = np.vstack([t["state"] for t in samples])
+        actions = np.array([t["action"] for t in samples], dtype=np.int32)
+        rewards = np.array([t["reward"] for t in samples], dtype=np.float32)
+        next_states = np.vstack([t["next_state"] for t in samples])
+        dones = np.array([t["done"] for t in samples], dtype=np.float32)
+        next_masks = np.vstack([t["next_mask"] for t in samples])
+
+        q_pred = self.model(states, training=False).numpy()
         q_next_online = self.model(next_states, training=False).numpy()
         q_next_target = self.target_model(next_states, training=False).numpy()
 
-        bootstrap_values = np.zeros(self.batch_size, dtype=np.float32)
-        for idx, valid_actions in enumerate(next_valid_actions_batch):
-            if dones[idx] or not valid_actions:
+        bootstrap = np.zeros(self.batch_size, dtype=np.float32)
+        for i in range(self.batch_size):
+            if dones[i] >= 1.0:
+                continue
+            valid = np.flatnonzero(next_masks[i] > 0)
+            if len(valid) == 0:
                 continue
             masked_online = np.full(self.action_size, -1e9, dtype=np.float32)
-            masked_online[valid_actions] = q_next_online[idx, valid_actions]
-            best_next_action = int(np.argmax(masked_online))
-            bootstrap_values[idx] = q_next_target[idx, best_next_action]
+            masked_online[valid] = q_next_online[i, valid]
+            best_a = int(np.argmax(masked_online))
+            bootstrap[i] = q_next_target[i, best_a]
 
-        target = q.copy()
-        target[np.arange(self.batch_size), actions] = (
-            rewards + (1.0 - dones.astype(np.float32)) * self.gamma * bootstrap_values
-        )
+        target = q_pred.copy()
+        y = rewards + (1.0 - dones) * self.gamma * bootstrap
+        td_errors = y - q_pred[np.arange(self.batch_size), actions]
+        target[np.arange(self.batch_size), actions] = q_pred[np.arange(self.batch_size), actions] + td_errors
 
-        self.model.train_on_batch(states, target)
+        self.model.train_on_batch(states, target, sample_weight=is_weights)
+        self.memory.update_priorities(idxs, td_errors)
+        self.last_td_error_stats = {
+            "mean": float(np.mean(np.abs(td_errors))),
+            "max": float(np.max(np.abs(td_errors))),
+            "min": float(np.min(np.abs(td_errors))),
+        }
+
         self.train_steps += 1
-        self.update_target_network()
+        if self.train_steps % self.target_update_every == 0:
+            online = self.model.get_weights()
+            target_w = self.target_model.get_weights()
+            tau = self.target_soft_tau
+            mixed = [tau * o + (1.0 - tau) * t for o, t in zip(online, target_w)]
+            self.target_model.set_weights(mixed)
 
-        # if self.epsilon > self.epsilon_min:
-        #     self.epsilon *= self.epsilon_decay
-            
+
+@dataclass
+class Commitment:
+    state: np.ndarray
+    action: int
+    edge: str
+    chosen_next_edge: str
+    chosen_density: float
+    prev_deficit: float
+    step: int
+    candidate_repeated: float
+
+
 class RLTrainingPipeline:
-    """
-    Pipeline for training a routing policy with Deep Q-Learning.
-    """
-
     def __init__(
         self,
         sumocfg_path,
@@ -214,85 +220,65 @@ class RLTrainingPipeline:
         episodes=10,
         spawn_interval=4.0,
         seed_with_episode=True,
-        decision_horizon=6,
-        destination_reward=80.0,       #Adjustible
-        deadline_penalty=100.0,
-        on_time_arrival_bonus=40.0,
-        teleport_penalty=-100.0,
-        epsilon_decay=0.99,
+        candidate_slots=6,
+        epsilon_decay=0.995,
         epsilon_min=0.10,
-        gamma=0.97,
-        replay_capacity=2000,
+        gamma=0.99,
+        replay_capacity=50000,
         batch_size=64,
-        replay_warmup=1000,
-        train_every=20,
+        replay_warmup=2000,
+        train_every=5,
         grad_steps=1,
         rolling_window=100,
         target_pattern=2,
-        debug_exit_diagnostics=False,
-        debug_exit_diagnostics_limit=20,
     ):
-        """
-        Args:
-            sumocfg_path: SUMO config file path.
-            model_output_path: Path to save the trained model.
-            episodes: Number of training episodes.
-            spawn_interval: Interval between vehicle spawns.
-            seed_with_episode: Whether to use the episode number as random seed.
-            decision_horizon: Number of actions to pad a decision list.
-            destination_reward: Reward when reaching the destination.
-            deadline_penalty: Penalty when missing the deadline.
-            on_time_arrival_bonus: Extra reward for arriving before deadline.
-            teleport_penalty: Terminal penalty for teleport events.
-            target_pattern: Vehicle generation pattern. 2 means varied origins
-                and one shared destination (helps controlled deadline comparison).
-        """
         self.sumocfg_path = sumocfg_path
         self.model_output_path = model_output_path
         self.episodes = episodes
         self.spawn_interval = spawn_interval
         self.seed_with_episode = seed_with_episode
-        self.decision_horizon = decision_horizon
-        self.destination_reward = destination_reward
-        self.deadline_penalty = deadline_penalty
-        self.on_time_arrival_bonus = on_time_arrival_bonus
-        self.teleport_penalty = teleport_penalty
-        self.train_every = train_every
-        self.grad_steps = grad_steps
-        self.rolling_window = rolling_window
+        self.candidate_slots = int(candidate_slots)
+        self.train_every = int(train_every)
+        self.grad_steps = int(grad_steps)
+        self.rolling_window = int(rolling_window)
         self.target_pattern = target_pattern
-        self.debug_exit_diagnostics = debug_exit_diagnostics
-        self.debug_exit_diagnostics_limit = max(int(debug_exit_diagnostics_limit), 0)
-        self._distance_cache = {}
-        self.progress_reward_scale = 0.80  # or 0.0 to disable progress term cheaply
-        self.system_congestion_scale = 0.10  # scales marginal congestion penalty on busy edges
-        self.loop_window = 12
-        self.loop_repeat_penalty = 10.0
-        # Objective priority:
-        # 1) deadline feasibility (dominant)
-        # 2) congestion externality (secondary)
-        # 3) shortest-path distance only as weak tie-breaker
-        self.deadline_deficit_scale = 50.0
-        self.deadline_deficit_delta_scale = 25.0
-        self.deadline_critical_buffer = 20.0
-        self.distance_tiebreak_scale = 0.05
+
+        self.w_deficit_delta = 6.0
+        self.w_critical_worse = 12.0
+        self.w_externality = 2.5
+        self.w_lane_failure = 20.0
+        self.w_loop = 5.0
+        self.execution_success_bonus = 8.0
+        self.teleport_penalty = -180.0
+        self.arrival_on_time_reward = 220.0
+        self.arrival_late_reward = 80.0
+        self.wrong_target_penalty = -200.0
+        self.deadline_miss_terminal_scale = 0.8
+        self.global_shared_bonus = 3.0
+
+        self.loop_window = 10
+        self.speed_norm = 20.0
+        self.dist_norm = 300.0
+        self.time_norm = 1200.0
+        self.max_lane_shift_norm = 4.0
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
-
         self.net = sumolib.net.readNet(os.path.join(self.sumocfg_dir, self.net_file))
-
         self.connection_info = ConnectionInfo(os.path.join(self.sumocfg_dir, self.net_file))
         self.route_helper = TrainingRouteHelper(self.connection_info)
+        self._distance_cache = {}
+        self._curriculum = [
+            {"until": 0.33, "target": 12, "random": 16, "slack": (1.35, 1.55)},
+            {"until": 0.66, "target": 16, "random": 24, "slack": (1.20, 1.40)},
+            {"until": 1.00, "target": 20, "random": 30, "slack": (1.10, 1.30)},
+        ]
 
-        # state = [edge_embedding, destination_embedding] + 6 direction flags
-        #         + 3 lane features + 3 deadline/time features
-        #         + local congestion summary
-        self.edge_embedding_dim = 8
-        self.local_congestion_k = 6
-        self._init_edge_embeddings(seed=1337)
-        self.state_size = (2 * self.edge_embedding_dim) + 6 + 3 + 3 + self.local_congestion_k
-        self.action_size = 6
+        self.base_feature_size = 20
+        self.candidate_feature_size = 10
+        self.state_size = self.base_feature_size + self.candidate_slots * self.candidate_feature_size
+        self.action_size = self.candidate_slots
+
         self.trainer = DQNTrainer(
             self.state_size,
             self.action_size,
@@ -302,935 +288,549 @@ class RLTrainingPipeline:
             replay_capacity=replay_capacity,
             batch_size=batch_size,
             replay_warmup=replay_warmup,
-            target_update_every=200,
-            target_soft_tau=1.0,
+            n_step=3,
+            target_soft_tau=0.01,
+            target_update_every=1,
         )
-
-    def _init_edge_embeddings(self, seed=1337):
-        """
-        Fixed edge embeddings avoid fake ordinal structure from raw edge indices.
-        """
-        rng = np.random.default_rng(seed)
-        self._edge_embeddings = {}
-        for edge_id in self.connection_info.edge_list:
-            emb = rng.normal(loc=0.0, scale=0.1, size=self.edge_embedding_dim).astype(np.float32)
-            self._edge_embeddings[edge_id] = emb
-
-    def _get_edge_embedding(self, edge_id):
-        return self._edge_embeddings.get(
-            edge_id,
-            np.zeros(self.edge_embedding_dim, dtype=np.float32),
-        )
-
-    def _local_congestion_features(self, edge_id):
-        """
-        Compact congestion summary around current edge to reduce input noise.
-        """
-        counts = self.connection_info.edge_vehicle_count
-        lengths = self.connection_info.edge_length_dict
-
-        current_density = counts.get(edge_id, 0) / max(lengths.get(edge_id, 5.0), 5.0)
-        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
-        outgoing_densities = [
-            counts.get(next_edge, 0) / max(lengths.get(next_edge, 5.0), 5.0)
-            for next_edge in outgoing.values()
-        ]
-
-        mean_out = float(np.mean(outgoing_densities)) if outgoing_densities else current_density
-        max_out = float(np.max(outgoing_densities)) if outgoing_densities else current_density
-        min_out = float(np.min(outgoing_densities)) if outgoing_densities else current_density
-        mean_global = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
-        std_global = float(np.std(self._density_vec)) if len(self._density_vec) > 0 else 0.0
-
-        return np.array(
-            [
-                current_density,
-                mean_out,
-                max_out,
-                min_out,
-                current_density - mean_global,
-                std_global,
-            ],
-            dtype=np.float32,
-        )
-
-    def _deadline_window(self, vehicle):
-        """
-        Return a strictly positive scheduling window based on
-        (deadline - start_time).
-        """
-        return max(float(vehicle.deadline) - float(vehicle.start_time), 1.0)
-
-    def _deadline_urgency(self, vehicle, step):
-        """
-        Convert deadline flexibility into an urgency score in [0, 1].
-
-        Vehicles with smaller (deadline - start_time) or little time left
-        have higher urgency and should be prioritized.
-        """
-        deadline_window = self._deadline_window(vehicle)
-        time_left = max(float(vehicle.deadline) - float(step), 0.0)
-        # 1.0 means no slack left, 0.0 means fully relaxed.
-        return 1.0 - min(time_left / deadline_window, 1.0)
 
     def parse_sumocfg(self, sumocfg_path):
-        """
-        Parse the SUMO config file and return net and route filenames.
-        """
         dom = parse(sumocfg_path)
-        net_file_node = dom.getElementsByTagName('net-file')
-        route_file_node = dom.getElementsByTagName('route-files')
-        net_file = net_file_node[0].attributes['value'].nodeValue
-        route_file = route_file_node[0].attributes['value'].nodeValue
+        net_file = dom.getElementsByTagName('net-file')[0].attributes['value'].nodeValue
+        route_file = dom.getElementsByTagName('route-files')[0].attributes['value'].nodeValue
         return net_file, route_file
 
-    def encode_state(self, vehicle_id, edge_id, destination_edge, vehicle=None, step=None):
-        """
-        Build a state vector for the given edge using cached per-step densities.
-        """
-        state = np.zeros(self.state_size, dtype=np.float32)
-        state[0:self.edge_embedding_dim] = self._get_edge_embedding(edge_id)
-        state[self.edge_embedding_dim:(2 * self.edge_embedding_dim)] = self._get_edge_embedding(destination_edge)
-
-        outgoing = self.connection_info.outgoing_edges_dict[edge_id]
-        base = 2 * self.edge_embedding_dim
-        for i, choice in enumerate(self.route_helper.direction_choices):
-            state[base + i] = 1.0 if choice in outgoing else 0.0
-
-        # lane features
-        lane_id = traci.vehicle.getLaneID(vehicle_id)
-        lane_idx = traci.vehicle.getLaneIndex(vehicle_id)
-        n_lanes = max(traci.edge.getLaneNumber(edge_id), 1)
-        lane_len = traci.lane.getLength(lane_id)
-        lane_pos = traci.vehicle.getLanePosition(vehicle_id)
-        dist_to_end = max(lane_len - lane_pos, 0.0)
-
-        lane_base = base + 6
-        state[lane_base + 0] = lane_idx / max(n_lanes - 1, 1)
-        state[lane_base + 1] = min(n_lanes, 6) / 6.0
-        state[lane_base + 2] = min(dist_to_end, 200.0) / 200.0
-
-        # deadline/time features (normalized)
-        deadline_base = lane_base + 3
-        if vehicle is not None:
-            if step is None:
-                step = traci.simulation.getTime()
-            deadline_window = self._deadline_window(vehicle)
-            time_left = max(float(vehicle.deadline) - float(step), 0.0)
-            elapsed = max(float(step) - float(vehicle.start_time), 0.0)
-            urgency = self._deadline_urgency(vehicle, step)
-
-            state[deadline_base + 0] = min(time_left / deadline_window, 1.0)
-            state[deadline_base + 1] = min(elapsed / deadline_window, 1.0)
-            state[deadline_base + 2] = urgency
-
-        state[deadline_base + 3:] = self._local_congestion_features(edge_id)
-        return state.reshape(1, -1)
-
-    def valid_actions(self, edge_id):
-        """
-        Return action indices that are valid from the current edge.
-        """
-        valid = []
-        for idx, choice in enumerate(self.route_helper.direction_choices):
-            if choice in self.connection_info.outgoing_edges_dict[edge_id]:
-                valid.append(idx)
-        return valid
-    
-    def valid_actions_for_vehicle(self, vehicle_id, edge_id):
-        """
-        Valid actions from the vehicle's CURRENT LANE (not just edge-level).
-        """
-        lane_id = traci.vehicle.getLaneID(vehicle_id)
-        lane_map = self.connection_info.lane_outgoing_edges_dict.get(lane_id, {})
-        valid = []
-        for idx, choice in enumerate(self.route_helper.direction_choices):
-            if choice in lane_map:
-                valid.append(idx)
-        return valid
-    
-    def dist_to_end(self, vehicle_id):
-        """
-        Distance (meters) from the vehicle to the end of its current lane.
-        """
-        lane_id = traci.vehicle.getLaneID(vehicle_id)
-        lane_len = traci.lane.getLength(lane_id)
-        lane_pos = traci.vehicle.getLanePosition(vehicle_id)
-        return max(lane_len - lane_pos, 0.0)
-
-    def is_decision_point(self, edge_id, vehicle_id, dist_threshold=80.0):
-        """
-        Make routing decisions only when it matters:
-        - the edge has > 1 outgoing option (real branch), AND
-        - the vehicle is close enough to the junction (within dist_threshold meters)
-        """
-        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
-        if outgoing is None or len(outgoing) <= 1:
-            return False
-        return self.dist_to_end(vehicle_id) <= dist_threshold
-    
-    def adaptive_dist_threshold(self, edge_id, max_dist=200.0, ratio=0.6, min_dist=30.0):
-        """
-        Adaptive threshold: decide when within min(max_dist, ratio * edge_length),
-        clamped to at least min_dist.
-        """
-        edge_len = self.connection_info.edge_length_dict.get(edge_id, None)
-        if edge_len is None:
-            return max_dist
-        return max(min_dist, min(max_dist, ratio * float(edge_len)))
-
-    def is_decision_point_adaptive(self, edge_id, vehicle_id, max_dist=200.0, ratio=0.6, min_dist=30.0):
-        """
-        Decide near junctions, but adapt threshold based on edge length so short edges are safe.
-        """
-        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
-        if not outgoing or len(outgoing) <= 1:
-            return False
-
-        dist_th = self.adaptive_dist_threshold(edge_id, max_dist=max_dist, ratio=ratio, min_dist=min_dist)
-        return self.dist_to_end(vehicle_id) <= dist_th
-
-    # =========================
-    # Teleport detection helpers
-    # =========================
-    def get_teleport_ids(self):
-        """
-        Return a set of vehicle IDs that teleported this step.
-
-        SUMO/TraCI API differs by version, so we try multiple methods.
-        """
-        teleported = set()
-
-        # Most common in many SUMO versions:
-        try:
-            teleported.update(traci.simulation.getStartingTeleportIDList())
-        except Exception:
-            pass
-        try:
-            teleported.update(traci.simulation.getEndingTeleportIDList())
-        except Exception:
-            pass
-
-        # Some versions expose a vehicle-level list:
-        try:
-            teleported.update(traci.vehicle.getTeleportingList())
-        except Exception:
-            pass
-
-        return teleported
-
-    def make_terminal_next_state(self, vehicle_id, edge_id, destination_edge):
-        """
-        Build a next_state even if the vehicle is in a weird edge after teleport.
-        If edge_id is unknown, fall back to a zero state (safe for training).
-        """
-        try:
-            if edge_id in self.connection_info.edge_index_dict and destination_edge in self.connection_info.edge_index_dict:
-                return self.encode_state(vehicle_id, edge_id, destination_edge)
-        except Exception:
-            pass
-        return np.zeros((1, self.state_size), dtype=np.float32)
-
-    def _score_next_edge(self, next_edge, destination_edge, recent_edges, direction, vehicle, step):
-        """
-        Lower score is better with lexicographic-style priorities:
-        1) deadline feasibility deficit
-        2) congestion externality
-        3) distance tie-breaker
-        """
-        distance = self.get_distance_to_destination(next_edge, destination_edge)
-        if not math.isfinite(distance):
-            return math.inf
-
-        time_left = max(float(vehicle.deadline) - float(step), 0.0)
-        eta = self._estimate_remaining_eta(next_edge, destination_edge)
-        deadline_deficit = max(eta - time_left, 0.0) if math.isfinite(eta) else 9999.0
-
-        edge_count = self.connection_info.edge_vehicle_count.get(next_edge, 0)
-        edge_len = max(self.connection_info.edge_length_dict.get(next_edge, 5.0), 5.0)
-        edge_density = edge_count / edge_len
-        mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
-        marginal_pressure = max(edge_density - mean_density, 0.0)
-
-        recent_penalty = 0.0
-        if recent_edges:
-            recent_penalty += 40.0 * sum(1 for e in recent_edges if e == next_edge)
-
-        turnaround_penalty = 25.0 if direction == 't' else 0.0
-        return (
-            (self.deadline_deficit_scale * deadline_deficit)
-            + (self.system_congestion_scale * 100.0 * marginal_pressure)
-            + (self.distance_tiebreak_scale * float(distance))
-            + recent_penalty
-            + turnaround_penalty
-        )
-
-    def _estimate_remaining_eta(self, edge_id, destination_edge):
-        """
-        Estimate travel time from edge_id to destination using shortest-path
-        distance and a conservative minimum speed floor.
-        """
-        distance = self.get_distance_to_destination(edge_id, destination_edge)
-        if not math.isfinite(distance):
-            return math.inf
-        return float(distance) / 8.0
-
-    def build_decision_list(self, edge_id, initial_action, vehicle, recent_edges, sim_step):
-        """
-        Build a decision list with RL-driven control.
-        We intentionally avoid heuristic horizon takeover during training.
-        """
-        decision_list = []
-        current_edge = edge_id
-
-        for _ in range(1):
-            outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
-            if not outgoing:
-                break
-
-            action = initial_action
-            valid_actions = self.valid_actions(current_edge)
-            if action not in valid_actions:
-                break
-            direction = self.route_helper.direction_choices[action]
-
-            if direction not in outgoing:
-                break
-
-            decision_list.append(direction)
-            current_edge = outgoing[direction]
-
-            if current_edge == vehicle.destination:
-                break
-
-        return decision_list
-    
+    def get_curriculum_config(self, episode_idx):
+        frac = (episode_idx + 1) / float(max(self.episodes, 1))
+        for phase in self._curriculum:
+            if frac <= phase["until"]:
+                return phase
+        return self._curriculum[-1]
 
     def get_distance_to_destination(self, edge_id, destination_edge):
-        """
-        Return shortest-path cost from edge_id to destination_edge.
-        Uses a cache because this is called frequently during training.
-        """
         key = (edge_id, destination_edge)
         if key in self._distance_cache:
             return self._distance_cache[key]
-
         try:
-            from_edge = self.net.getEdge(edge_id)
-            to_edge = self.net.getEdge(destination_edge)
+            e0 = self.net.getEdge(edge_id)
+            e1 = self.net.getEdge(destination_edge)
+            path, cost = self.net.getShortestPath(e0, e1)
+            dist = float(cost) if path is not None else math.inf
         except Exception:
-            self._distance_cache[key] = math.inf
+            dist = math.inf
+        self._distance_cache[key] = dist
+        return dist
+
+    def estimate_eta(self, edge_id, destination_edge):
+        dist = self.get_distance_to_destination(edge_id, destination_edge)
+        if not math.isfinite(dist):
             return math.inf
+        return dist / 8.0
 
-        path_edges, path_cost = self.net.getShortestPath(from_edge, to_edge)
-        distance = path_cost if path_edges is not None else math.inf
-        self._distance_cache[key] = distance
-        return distance
-    
-    def ensure_lane_for_direction(self, vehicle_id, edge_id, direction, min_dist=40.0, duration=50):
-        """
-        If current lane cannot do 'direction', try to change into a lane that can,
-        as long as we aren't too close to the junction end.
-        """
-        lane_id = traci.vehicle.getLaneID(vehicle_id)
-        lane_pos = traci.vehicle.getLanePosition(vehicle_id)
-        lane_len = traci.lane.getLength(lane_id)
-        dist_to_end = lane_len - lane_pos
+    def get_teleport_ids(self):
+        teleported = set()
+        for fn in [
+            lambda: traci.simulation.getStartingTeleportIDList(),
+            lambda: traci.simulation.getEndingTeleportIDList(),
+            lambda: traci.vehicle.getTeleportingList(),
+        ]:
+            try:
+                teleported.update(fn())
+            except Exception:
+                pass
+        return teleported
 
-        if dist_to_end < min_dist:
-            return  # too late
+    def update_edge_vehicle_counts(self, step, every=1):
+        if hasattr(self, "_last_density_step") and (step - self._last_density_step) < every:
+            return
+        counts = self.connection_info.edge_vehicle_count
+        lengths = self.connection_info.edge_length_dict
+        for edge in self.connection_info.edge_list:
+            counts[edge] = traci.edge.getLastStepVehicleNumber(edge)
+        self._density_vec = np.array([counts[e] / max(lengths[e], 1.0) for e in self.connection_info.edge_list], dtype=np.float32)
+        self._global_density_mean = float(np.mean(self._density_vec)) if len(self._density_vec) else 0.0
+        self._global_density_std = float(np.std(self._density_vec)) if len(self._density_vec) else 0.0
 
+    def enumerate_candidate_next_edges(self, edge_id):
+        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
+        seen = set()
+        candidates = []
+        for _d, nxt in outgoing.items():
+            if nxt not in seen:
+                seen.add(nxt)
+                candidates.append(nxt)
+        return candidates[: self.candidate_slots]
+
+    def compute_candidate_lane_metrics(self, vehicle_id, edge_id, next_edge):
         lane_ids = self.connection_info.edge_lane_ids.get(edge_id, [])
-        for target_lane_index, ln_id in enumerate(lane_ids):
-            lane_map = self.connection_info.lane_outgoing_edges_dict.get(ln_id, {})
-            if direction in lane_map:
-                curr_idx = traci.vehicle.getLaneIndex(vehicle_id)
-                if curr_idx != target_lane_index:
-                    traci.vehicle.changeLane(vehicle_id, target_lane_index, duration)
-                return
+        curr_lane = traci.vehicle.getLaneIndex(vehicle_id)
+        lane_id = traci.vehicle.getLaneID(vehicle_id)
+        lane_len = traci.lane.getLength(lane_id)
+        lane_pos = traci.vehicle.getLanePosition(vehicle_id)
+        dist_to_end = max(lane_len - lane_pos, 0.0)
+        speed = max(traci.vehicle.getSpeed(vehicle_id), 1.0)
 
+        target_lanes = []
+        for idx, ln in enumerate(lane_ids):
+            for _direction, out_edge in self.connection_info.lane_outgoing_edges_dict.get(ln, {}).items():
+                if out_edge == next_edge:
+                    target_lanes.append(idx)
+                    break
+        if not target_lanes:
+            return {"target_lanes": [], "min_lane_shifts": 99, "feasible": False, "score": 0.0}
 
-    def compute_reward(
-        self,
-        vehicle,
-        prev_edge,
-        current_edge,
-        step,
-        arrived,
-        repeated_recent_edges=0,
-        delta_t=1.0,
-        reached_global_destination=False,
-    ):
-        """
-        Compute a reward based on travel time, congestion, progress,
-        and proper dead-end handling.
-        """
+        min_shift = min(abs(curr_lane - t) for t in target_lanes)
+        est_shift_distance = 18.0 * min_shift
+        comfort_budget = max(35.0, speed * 2.3)
+        feasible = dist_to_end >= est_shift_distance + 8.0
+        score = float(np.clip((dist_to_end - est_shift_distance) / comfort_budget, 0.0, 1.0))
+        return {
+            "target_lanes": target_lanes,
+            "min_lane_shifts": min_shift,
+            "feasible": feasible,
+            "score": score,
+        }
 
-        deadline_window = self._deadline_window(vehicle)
-        urgency = self._deadline_urgency(vehicle, step)
-        flexibility = 1.0 - urgency
+    def _queue_proxy(self, edge_id):
+        edge_len = max(self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0)
+        halted = traci.edge.getLastStepHaltingNumber(edge_id)
+        return float(halted) / edge_len
+
+    def build_state(self, vehicle_id, vehicle, step, current_edge, candidates, recent_edges, global_stats):
+        lane_idx = traci.vehicle.getLaneIndex(vehicle_id)
+        n_lanes = max(traci.edge.getLaneNumber(current_edge), 1)
+        lane_id = traci.vehicle.getLaneID(vehicle_id)
+        dist_to_end = max(traci.lane.getLength(lane_id) - traci.vehicle.getLanePosition(vehicle_id), 0.0)
+        speed = traci.vehicle.getSpeed(vehicle_id)
         time_left = max(float(vehicle.deadline) - float(step), 0.0)
+        elapsed = max(float(step) - float(vehicle.start_time), 0.0)
+        window = max(float(vehicle.deadline) - float(vehicle.start_time), 1.0)
+        eta_curr = self.estimate_eta(current_edge, vehicle.destination)
+        slack = (time_left - eta_curr) if math.isfinite(eta_curr) else -self.time_norm
+        urgency = float(np.clip(1.0 - (time_left / window), 0.0, 1.0))
 
-        # ---- Base penalties ----
-        elapsed = max(float(delta_t), 1.0)
-        time_penalty = -3.0 * elapsed
-        congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
-        edge_density = congestion / max(self.connection_info.edge_length_dict[current_edge], 5.0)
-        congestion_penalty = -edge_density * elapsed
-        # More flexible vehicles (larger deadline - start_time) should yield,
-        # so congestion penalty is stronger for them.
-        congestion_penalty *= (1.0 + flexibility)
+        curr_density = self.connection_info.edge_vehicle_count.get(current_edge, 0) / max(self.connection_info.edge_length_dict.get(current_edge, 1.0), 1.0)
+        curr_mean_speed = traci.edge.getLastStepMeanSpeed(current_edge)
+        sp_dist = self.get_distance_to_destination(current_edge, vehicle.destination)
+        topo_hops = sp_dist / 120.0 if math.isfinite(sp_dist) else 10.0
 
-        reward = time_penalty + congestion_penalty
+        base = np.array([
+            lane_idx / max(n_lanes - 1, 1),
+            min(n_lanes, 6) / 6.0,
+            min(dist_to_end, self.dist_norm) / self.dist_norm,
+            min(speed, self.speed_norm) / self.speed_norm,
+            min(time_left, self.time_norm) / self.time_norm,
+            min(elapsed / window, 2.0) / 2.0,
+            urgency,
+            np.clip(slack / self.time_norm, -1.0, 1.0),
+            np.clip(curr_density, 0.0, 2.0) / 2.0,
+            np.clip(curr_mean_speed / self.speed_norm, 0.0, 1.5) / 1.5,
+            np.clip(self._queue_proxy(current_edge), 0.0, 1.0),
+            min(len(candidates), self.candidate_slots) / float(self.candidate_slots),
+            1.0 if current_edge in recent_edges else 0.0,
+            np.clip(eta_curr / self.time_norm if math.isfinite(eta_curr) else 1.0, 0.0, 2.0) / 2.0,
+            np.clip(sp_dist / 3000.0 if math.isfinite(sp_dist) else 1.0, 0.0, 1.0),
+            np.clip(topo_hops / 20.0, 0.0, 1.0),
+            np.clip(global_stats["mean_density"], 0.0, 2.0) / 2.0,
+            np.clip(global_stats["std_density"], 0.0, 1.0),
+            np.clip(global_stats["frac_behind"], 0.0, 1.0),
+            np.clip(global_stats["frac_failed"], 0.0, 1.0),
+        ], dtype=np.float32)
 
-        # ---- Marginal system congestion penalty (secondary objective) ----
-        # Penalize using edges that are denser than the current network average.
-        # This is action-sensitive (unlike a pure global constant) and better
-        # aligns local choices with global congestion relief.
-        mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
-        marginal_pressure = max(edge_density - mean_density, 0.0)
-        system_penalty = -self.system_congestion_scale * marginal_pressure * elapsed
-        reward += system_penalty
+        cand_vec = np.zeros((self.candidate_slots, self.candidate_feature_size), dtype=np.float32)
+        mask = np.zeros((self.candidate_slots,), dtype=np.float32)
+        for i, next_edge in enumerate(candidates[: self.candidate_slots]):
+            lane_m = self.compute_candidate_lane_metrics(vehicle_id, current_edge, next_edge)
+            density = self.connection_info.edge_vehicle_count.get(next_edge, 0) / max(self.connection_info.edge_length_dict.get(next_edge, 1.0), 1.0)
+            mean_speed = traci.edge.getLastStepMeanSpeed(next_edge)
+            eta = self.estimate_eta(next_edge, vehicle.destination)
+            deficit = max((eta - time_left), 0.0) if math.isfinite(eta) else self.time_norm
+            repeated = 1.0 if next_edge in recent_edges else 0.0
+            dead_end = 0.0 if math.isfinite(self.get_distance_to_destination(next_edge, vehicle.destination)) else 1.0
+            cand_vec[i] = np.array([
+                1.0,
+                np.clip(density, 0.0, 2.0) / 2.0,
+                np.clip(mean_speed / self.speed_norm, 0.0, 1.5) / 1.5,
+                np.clip(eta / self.time_norm if math.isfinite(eta) else 1.0, 0.0, 2.0) / 2.0,
+                np.clip(deficit / self.time_norm, 0.0, 1.0),
+                np.clip(max(density - global_stats["mean_density"], 0.0), 0.0, 1.0),
+                np.clip(lane_m["min_lane_shifts"] / self.max_lane_shift_norm, 0.0, 1.0),
+                lane_m["score"],
+                repeated,
+                dead_end,
+            ], dtype=np.float32)
+            # keep invalid/dead candidates masked out
+            if lane_m["min_lane_shifts"] < 99 and dead_end < 1.0:
+                mask[i] = 1.0
 
-        done = False
+        return np.concatenate([base, cand_vec.reshape(-1)], axis=0).reshape(1, -1), mask, cand_vec
 
-        # ---- Deadline feasibility shaping (primary objective) ----
-        prev_distance = self.get_distance_to_destination(prev_edge, vehicle.destination)
-        curr_distance = self.get_distance_to_destination(current_edge, vehicle.destination)
-        prev_eta = self._estimate_remaining_eta(prev_edge, vehicle.destination)
-        curr_eta = self._estimate_remaining_eta(current_edge, vehicle.destination)
+    def _commitment_threshold(self, vehicle_id, edge_id, candidates):
+        edge_len = float(self.connection_info.edge_length_dict.get(edge_id, 100.0))
+        speed = max(traci.vehicle.getSpeed(vehicle_id), 3.0)
+        lanes = max(traci.edge.getLaneNumber(edge_id), 1)
+        lane_cost = 0.0
+        for c in candidates:
+            lane_cost = max(lane_cost, self.compute_candidate_lane_metrics(vehicle_id, edge_id, c)["min_lane_shifts"])
+        t = min(0.85 * edge_len, max(45.0, 2.2 * speed + 12.0 * lane_cost + 4.0 * lanes))
+        return float(t)
 
-        prev_deficit = max(prev_eta - (time_left + 1.0), 0.0) if math.isfinite(prev_eta) else self.deadline_deficit_scale
-        curr_deficit = max(curr_eta - time_left, 0.0) if math.isfinite(curr_eta) else self.deadline_deficit_scale
-        reward -= self.deadline_deficit_scale * curr_deficit
-        reward += self.deadline_deficit_delta_scale * (prev_deficit - curr_deficit)
+    def should_make_decision(self, vehicle_id, edge_id, candidates, commitment, latest_density, current_density):
+        if len(candidates) <= 1:
+            return False
+        lane_id = traci.vehicle.getLaneID(vehicle_id)
+        dist_to_end = max(traci.lane.getLength(lane_id) - traci.vehicle.getLanePosition(vehicle_id), 0.0)
+        in_zone = dist_to_end <= self._commitment_threshold(vehicle_id, edge_id, candidates)
+        if not in_zone:
+            return False
+        if commitment is None:
+            return True
+        if commitment.edge != edge_id:
+            return True
+        if abs(current_density - latest_density) > 0.10:
+            return True
+        lane_m = self.compute_candidate_lane_metrics(vehicle_id, edge_id, commitment.chosen_next_edge)
+        return not lane_m["feasible"]
 
-        if time_left < self.deadline_critical_buffer and curr_deficit > 0.0:
-            reward -= 30.0 * (1.0 + urgency) * min(curr_deficit, 2.0)
+    def apply_route_commitment(self, vehicle_id, current_edge, chosen_next_edge, destination):
+        try:
+            from_edge = self.net.getEdge(chosen_next_edge)
+            to_edge = self.net.getEdge(destination)
+            path, _ = self.net.getShortestPath(from_edge, to_edge)
+            if path is None:
+                return False
+            route_edges = [current_edge] + [e.getID() for e in path]
+            traci.vehicle.setRoute(vehicle_id, route_edges)
+            return True
+        except Exception:
+            return False
 
-        # ---- Distance-only tie breaker (tertiary objective) ----
-        if math.isfinite(prev_distance) and math.isfinite(curr_distance):
-            progress_scale = self.distance_tiebreak_scale * self.progress_reward_scale
-            progress_reward = (prev_distance - curr_distance) * progress_scale
-            reward += progress_reward
+    def _global_stats(self, controlled_ids, vehicles, step, teleported, failed):
+        behind = 0
+        for vid in controlled_ids:
+            if vid not in vehicles:
+                continue
+            v = vehicles[vid]
+            edge = v.current_edge
+            if not edge:
+                continue
+            tleft = max(v.deadline - step, 0.0)
+            eta = self.estimate_eta(edge, v.destination)
+            if math.isfinite(eta) and eta > tleft:
+                behind += 1
+        total = max(len(controlled_ids), 1)
+        return {
+            "mean_density": self._global_density_mean,
+            "std_density": self._global_density_std,
+            "frac_behind": behind / float(total),
+            "frac_failed": (len(teleported) + len(failed)) / float(total),
+        }
 
-        # Penalize repeatedly entering edges seen in recent history.
-        if repeated_recent_edges > 0:
-            reward -= self.loop_repeat_penalty * repeated_recent_edges
-
-        # If vehicle moved into a region with no path to destination
-        if math.isfinite(prev_distance) and not math.isfinite(curr_distance):
-            reward -= 120.0
-            done = True
-
-        # ---- Arrival handling ----
+    def compute_reward(self, prev_deficit, curr_deficit, chosen_density, global_mean_density, lane_failed=False, repeated=0.0, arrived=False, on_time=False, wrong_target=False, teleported=False, deadline_missed=False, lateness=0.0, remain_dist=0.0):
+        reward = 0.0
+        reward += self.w_deficit_delta * (prev_deficit - curr_deficit)
+        if prev_deficit > 0 and curr_deficit > prev_deficit:
+            reward -= self.w_critical_worse * (curr_deficit - prev_deficit)
+        reward -= self.w_externality * max(chosen_density - global_mean_density, 0.0)
+        if lane_failed:
+            reward -= self.w_lane_failure
+        reward -= self.w_loop * repeated
+        if teleported:
+            return reward + self.teleport_penalty, True
+        if wrong_target:
+            return reward + self.wrong_target_penalty, True
         if arrived:
-            if reached_global_destination:
-                reward += self.destination_reward
-                if step <= vehicle.deadline:
-                    reward += self.on_time_arrival_bonus
-            else:
-                reward -= 0.5 * self.deadline_penalty
-            done = True
-            return reward, done
+            if on_time:
+                return reward + self.arrival_on_time_reward, True
+            return reward + self.arrival_late_reward - min(lateness, 300.0) * 0.2, True
+        if deadline_missed:
+            return reward - (40.0 + self.deadline_miss_terminal_scale * (lateness + 0.05 * remain_dist)), True
+        return reward, False
 
-        # ---- Dead-end handling ----
-        # If no outgoing edges AND this is not the destination
-        outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
-        if (not outgoing or len(outgoing) == 0) and current_edge != vehicle.destination:
-            dead_end_penalty = -50.0
-            reward += dead_end_penalty
-            done = True
-
-        # ---- Deadline handling ----
-        if step > vehicle.deadline:
-            reward -= self.deadline_penalty
-            done = True
-        else:
-            # Escalate penalty when approaching the deadline, normalized by
-            # (deadline - start_time) so strict deadlines are emphasized.
-            remaining_ratio = max(float(vehicle.deadline) - float(step), 0.0) / deadline_window
-            if remaining_ratio < 0.25:
-                reward -= (0.25 - remaining_ratio) * 20.0
-
-        return reward, done
-
-    def generate_episode_vehicles(self, episode_seed=None):
-        """
-        Generate controlled and uncontrolled vehicles for one training episode.
-        """
+    def generate_episode_vehicles(self, episode_seed=None, curriculum_cfg=None):
         generator = target_vehicles_generator(os.path.join(self.sumocfg_dir, self.net_file))
         route_path = os.path.join(self.sumocfg_dir, self.route_file)
-        vehicle_list = generator.generate_vehicles(
-            num_target_vehicles=20,
-            num_random_vehicles=30,
+        c = curriculum_cfg or self._curriculum[-1]
+        vlist = generator.generate_vehicles(
+            num_target_vehicles=c["target"],
+            num_random_vehicles=c["random"],
             pattern=self.target_pattern,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
             spawn_interval=self.spawn_interval,
             seed=episode_seed,
+            deadline_slack_range=c["slack"],
+            curriculum_phase=c,
         )
-        if vehicle_list is None:
-            raise RuntimeError(
-                "Failed to generate vehicles. Check randomTrips.py output for errors."
-            )
-        return {str(vehicle.vehicle_id): vehicle for vehicle in vehicle_list}
+        if vlist is None:
+            raise RuntimeError("Failed to generate vehicles")
+        return {str(v.vehicle_id): v for v in vlist}
 
     def run(self):
-        """
-        Run the full training loop across episodes, with cleaner decision timing:
-        - Decide near junctions (decision points), not on every edge change
-        - Select route-intent actions at edge level and align lanes as low-level control
-        - Close transitions at the next decision point
-        """
         sumo_binary = checkBinary('sumo')
-        rolling_teleport_events = deque(maxlen=self.rolling_window)
-        rolling_teleported_controlled = deque(maxlen=self.rolling_window)
-        rolling_completion_rate = deque(maxlen=self.rolling_window)
-        rolling_avg_return = deque(maxlen=self.rolling_window)
-
-        # MAX_CACHE_SIZE = 5000
+        rolling = defaultdict(lambda: deque(maxlen=self.rolling_window))
+        rolling_baseline = deque(maxlen=30)
+        metrics_history = []
 
         for episode in range(self.episodes):
-            episode_seed = episode if self.seed_with_episode else None
-            if episode_seed is not None:
-                random.seed(episode_seed)
-                np.random.seed(episode_seed)
+            if self.seed_with_episode:
+                random.seed(episode)
+                np.random.seed(episode)
+            curriculum_cfg = self.get_curriculum_config(episode)
+            vehicles = self.generate_episode_vehicles(episode_seed=(episode if self.seed_with_episode else None), curriculum_cfg=curriculum_cfg)
 
-            # if len(self._distance_cache) > MAX_CACHE_SIZE:
-            #     self._distance_cache.clear()
+            traci.start([sumo_binary, '-c', self.sumocfg_path, '--tripinfo-output', os.path.join(self.sumocfg_dir, 'trips.trips.xml'), '--quit-on-end'])
 
-            vehicles = self.generate_episode_vehicles(episode_seed=episode_seed)
-
-            traci.start([
-                sumo_binary,
-                "-c", self.sumocfg_path,
-                "--tripinfo-output", os.path.join(self.sumocfg_dir, "trips.trips.xml"),
-                "--quit-on-end",
-            ])
-
-            # vehicle_id -> (state, action, decision_edge, decision_step)
-            last_state_action = {}
-            # vehicle_id -> edge_id where we last issued a decision (prevents repeat decisions)
-            last_decision_edge = {}
-            recent_edge_history = defaultdict(lambda: deque(maxlen=self.loop_window))
-
+            commitments = {}
+            nstep_buffers = defaultdict(lambda: deque(maxlen=self.trainer.n_step))
+            recent_edges = defaultdict(lambda: deque(maxlen=self.loop_window))
+            teleported_controlled = set()
+            failed_ids = set()
+            arrived_true_dest = set()
+            arrived_on_time = set()
+            arrived_any = set()
+            wrong_target = set()
+            exited_wo_dest = set()
+            lane_failures = 0
+            deficit_improvements = []
+            loops = 0
             episode_return = 0.0
-            episode_teleport_events = 0
-            teleported_controlled_ids = set()
-            arrived_ids = set()
-            arrived_before_deadline_ids = set()
-            arrived_global_destination_ids = set()
-            exited_without_destination_ids = set()
-            total_controlled = len(vehicles)
-            controlled_ids = set(vehicles.keys())
-            last_seen_edge_by_vehicle = {}
-            last_target_by_vehicle = {}
-            arrived_debug_records = []
+            removal_causes = defaultdict(int)
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
                     if traci.simulation.getMinExpectedNumber() <= 0:
                         break
-
-                    # Keep density features fresh for routing choices and reward.
                     self.update_edge_vehicle_counts(step, every=1)
                     vehicle_ids = list(traci.vehicle.getIDList())
+                    global_stats = self._global_stats(set(vehicles.keys()), vehicles, step, teleported_controlled, failed_ids)
 
-                    for vehicle_id in vehicle_ids:
-                        if vehicle_id not in vehicles:
+                    for vid in vehicle_ids:
+                        if vid not in vehicles:
+                            continue
+                        v = vehicles[vid]
+                        edge = traci.vehicle.getRoadID(vid)
+                        if edge not in self.connection_info.edge_index_dict:
+                            continue
+                        v.current_edge = edge
+                        recent_edges[vid].append(edge)
+
+                        if edge == v.destination:
+                            arrived_true_dest.add(vid)
+                            arrived_any.add(vid)
+                            removal_causes["reached_true_destination"] += 1
                             continue
 
-                        current_edge = traci.vehicle.getRoadID(vehicle_id)
-                        if current_edge not in self.connection_info.edge_index_dict:
+                        candidates = self.enumerate_candidate_next_edges(edge)
+                        state, mask, cand_feat = self.build_state(vid, v, step, edge, candidates, recent_edges[vid], global_stats)
+
+                        # Close commitments when execution outcome is known.
+                        c = commitments.get(vid)
+                        if c is not None:
+                            curr_eta = self.estimate_eta(edge, v.destination)
+                            time_left = max(v.deadline - step, 0.0)
+                            curr_deficit = max(curr_eta - time_left, 0.0) if math.isfinite(curr_eta) else self.time_norm
+                            entered_chosen = (edge == c.chosen_next_edge)
+                            lane_m = self.compute_candidate_lane_metrics(vid, c.edge, c.chosen_next_edge) if c.edge == edge else {"feasible": True}
+                            late_impossible = (not lane_m.get("feasible", True)) and not entered_chosen
+                            repeated = 1.0 if edge in list(recent_edges[vid])[:-1] else 0.0
+                            if repeated > 0:
+                                loops += 1
+
+                            if entered_chosen or late_impossible:
+                                if entered_chosen:
+                                    reward_base = self.execution_success_bonus
+                                else:
+                                    reward_base = 0.0
+                                    lane_failures += 1
+                                reward, done = self.compute_reward(
+                                    c.prev_deficit,
+                                    curr_deficit,
+                                    c.chosen_density,
+                                    self._global_density_mean,
+                                    lane_failed=late_impossible,
+                                    repeated=repeated + c.candidate_repeated,
+                                )
+                                reward += reward_base
+                                deficit_improvements.append(c.prev_deficit - curr_deficit)
+                                next_state = state
+                                transition = {
+                                    "state": c.state,
+                                    "action": c.action,
+                                    "reward": reward,
+                                    "next_state": next_state,
+                                    "done": float(done),
+                                    "next_mask": mask.reshape(1, -1)[0],
+                                }
+                                nstep_buffers[vid].append(transition)
+                                if len(nstep_buffers[vid]) == self.trainer.n_step or done:
+                                    first = nstep_buffers[vid][0]
+                                    R = 0.0
+                                    for i, t in enumerate(nstep_buffers[vid]):
+                                        R += (self.trainer.gamma ** i) * t["reward"]
+                                    out = {
+                                        "state": first["state"],
+                                        "action": first["action"],
+                                        "reward": R,
+                                        "next_state": transition["next_state"],
+                                        "done": transition["done"],
+                                        "next_mask": transition["next_mask"],
+                                    }
+                                    self.trainer.remember(out)
+                                    if nstep_buffers[vid]:
+                                        nstep_buffers[vid].popleft()
+                                commitments.pop(vid, None)
+                                episode_return += reward
+
+                        prev_density = commitments[vid].chosen_density if vid in commitments else self.connection_info.edge_vehicle_count.get(edge, 0) / max(self.connection_info.edge_length_dict.get(edge, 1.0), 1.0)
+                        curr_density = self.connection_info.edge_vehicle_count.get(edge, 0) / max(self.connection_info.edge_length_dict.get(edge, 1.0), 1.0)
+                        if not self.should_make_decision(vid, edge, candidates, commitments.get(vid), prev_density, curr_density):
                             continue
 
-                        vehicle = vehicles[vehicle_id]
-                        vehicle.current_edge = current_edge
-                        vehicle.current_speed = traci.vehicle.getSpeed(vehicle_id)
-                        last_seen_edge_by_vehicle[vehicle_id] = current_edge
-                        recent_edge_history[vehicle_id].append(current_edge)
-
-                        # arrived
-                        if current_edge == vehicle.destination:
-                            if vehicle_id not in arrived_ids:
-                                arrived_ids.add(vehicle_id)
-                                if step <= vehicle.deadline:
-                                    arrived_before_deadline_ids.add(vehicle_id)
-                            last_state_action.pop(vehicle_id, None)
-                            last_decision_edge.pop(vehicle_id, None)
+                        if np.sum(mask) <= 0:
                             continue
-
-                        # only decide at decision points
-                        if not self.is_decision_point_adaptive(
-                            current_edge,
-                            vehicle_id,
-                            max_dist=260.0,   # decide earlier to allow lane changes
-                            ratio=0.85,       # 85% of edge length
-                            min_dist=60.0
-                        ):
+                        action = self.trainer.select_action(state, mask)
+                        if action is None or action >= len(candidates):
                             continue
-
-                        # avoid repeating decisions multiple steps on same edge
-                        if last_decision_edge.get(vehicle_id) == current_edge:
-                            continue
-
-                        # ---- close previous transition at this decision point ----
-                        if vehicle_id in last_state_action:
-                            prev_state, prev_action, prev_edge, prev_step = last_state_action[vehicle_id]
-
-                            repeated_recent_edges = sum(
-                                1 for edge in recent_edge_history[vehicle_id] if edge == current_edge
-                            )
-
-                            decision_delta_t = max(step - prev_step, 1)
-                            reward, done = self.compute_reward(
-                                vehicle,
-                                prev_edge,
-                                current_edge,
-                                step,
-                                arrived=False,
-                                repeated_recent_edges=repeated_recent_edges,
-                                delta_t=decision_delta_t,
-                            )
-
-                            next_state = self.encode_state(
-                                vehicle_id,
-                                current_edge,
-                                vehicle.destination,
-                                vehicle=vehicle,
-                                step=step,
-                            )
-                            next_valid = self.valid_actions_for_vehicle(vehicle_id, current_edge)
-                            self.trainer.remember(
-                                prev_state,
-                                prev_action,
-                                reward,
-                                next_state,
-                                done,
-                                next_valid_actions=next_valid,
-                            )
-                            episode_return += reward
-
-                            if done:
-                                last_state_action.pop(vehicle_id, None)
-                                last_decision_edge[vehicle_id] = current_edge
-                                continue
-
-                        # ---- choose action (lane-feasible) ----
-                        state = self.encode_state(
-                            vehicle_id,
-                            current_edge,
-                            vehicle.destination,
-                            vehicle=vehicle,
-                            step=step,
-                        )
-
-                        edge_valid = self.valid_actions(current_edge)
-                        # Route intent is chosen from edge-feasible actions; lane feasibility
-                        # is handled by alignment below.
-                        action = self.trainer.select_action(state, edge_valid)
-
-                        if action is None:
-                            # no feasible action from this edge
-                            last_decision_edge[vehicle_id] = current_edge
-                            continue
-
-                        direction = self.route_helper.direction_choices[action]
-
-                        # optional lane alignment (strongly recommended)
-                        align_min_dist = min(
-                            150.0,
-                            0.6 * self.connection_info.edge_length_dict.get(current_edge, 250.0)
-                        )
-
-                        self.ensure_lane_for_direction(
-                            vehicle_id,
-                            current_edge,
-                            direction,
-                            min_dist=align_min_dist,
-                            duration=80
-                        )
-                        # compute local target and apply routing
-                        decision_list = self.build_decision_list(
-                            current_edge,
-                            action,
-                            vehicle,
-                            recent_edge_history[vehicle_id],
-                            step,
-                        )
-                        local_target = self.route_helper.compute_local_target(decision_list, vehicle)
-                        applied_target = None
-                        if local_target != vehicle.destination:
-                            dist_local_to_dest = self.get_distance_to_destination(
-                                local_target, vehicle.destination
-                            )
-                            if not math.isfinite(dist_local_to_dest):
-                                # Avoid setting an infeasible via edge that would
-                                # trigger "No connection between edge ... found".
-                                local_target = vehicle.destination
-
-                        try:
-                            # Keep the global destination as the route sink so the vehicle is not
-                            # removed at intermediate control targets. Use the local target as a
-                            # temporary via edge whenever it differs from the final destination.
-                            if local_target != vehicle.destination:
-                                traci.vehicle.setVia(vehicle_id, [local_target])
-                            else:
-                                traci.vehicle.setVia(vehicle_id, [])
-
-                            traci.vehicle.changeTarget(vehicle_id, vehicle.destination)
-                            applied_target = local_target
-                        except traci.exceptions.TraCIException:
-                            # Some local targets become infeasible from the vehicle's current
-                            # route/lane context. Try falling back to the global destination
-                            # instead of crashing the whole training run.
+                        chosen_next = candidates[action]
+                        lane_m = self.compute_candidate_lane_metrics(vid, edge, chosen_next)
+                        if lane_m["target_lanes"]:
+                            target_lane = min(lane_m["target_lanes"], key=lambda idx: abs(idx - traci.vehicle.getLaneIndex(vid)))
                             try:
-                                traci.vehicle.setVia(vehicle_id, [])
-                                traci.vehicle.changeTarget(vehicle_id, vehicle.destination)
-                                applied_target = vehicle.destination
-                            except traci.exceptions.TraCIException:
-                                # Keep episode running and retry next decision point.
-                                last_decision_edge[vehicle_id] = current_edge
-                                continue
+                                traci.vehicle.changeLane(vid, int(target_lane), 60)
+                            except Exception:
+                                pass
 
-                        last_target_by_vehicle[vehicle_id] = applied_target
+                        self.apply_route_commitment(vid, edge, chosen_next, v.destination)
 
-                        # store new transition start
-                        last_state_action[vehicle_id] = (state, action, current_edge, step)
-                        last_decision_edge[vehicle_id] = current_edge
+                        eta_now = self.estimate_eta(edge, v.destination)
+                        time_left = max(v.deadline - step, 0.0)
+                        prev_deficit = max(eta_now - time_left, 0.0) if math.isfinite(eta_now) else self.time_norm
+                        chosen_density = self.connection_info.edge_vehicle_count.get(chosen_next, 0) / max(self.connection_info.edge_length_dict.get(chosen_next, 1.0), 1.0)
+                        commitments[vid] = Commitment(
+                            state=state,
+                            action=action,
+                            edge=edge,
+                            chosen_next_edge=chosen_next,
+                            chosen_density=chosen_density,
+                            prev_deficit=prev_deficit,
+                            step=step,
+                            candidate_repeated=(1.0 if chosen_next in recent_edges[vid] else 0.0),
+                        )
 
                     traci.simulationStep()
 
-                    # Vehicles removed by SUMO because they reached their current route target.
-                    # This is where we can tell whether they ended at the global destination
-                    # or were terminated at an intermediate/local target.
-                    arrived_this_step = traci.simulation.getArrivedIDList()
-                    for arrived_vehicle_id in arrived_this_step:
-                        if arrived_vehicle_id not in vehicles:
+                    for aid in traci.simulation.getArrivedIDList():
+                        if aid not in vehicles:
                             continue
-
-                        vehicle = vehicles[arrived_vehicle_id]
-                        arrived_ids.add(arrived_vehicle_id)
-
-                        last_seen_edge = last_seen_edge_by_vehicle.get(arrived_vehicle_id, "<unknown>")
-                        reached_global_destination = (last_seen_edge == vehicle.destination)
-
-                        if reached_global_destination:
-                            arrived_global_destination_ids.add(arrived_vehicle_id)
-                            if step <= vehicle.deadline:
-                                arrived_before_deadline_ids.add(arrived_vehicle_id)
+                        v = vehicles[aid]
+                        arrived_any.add(aid)
+                        last_edge = v.current_edge
+                        is_true = (last_edge == v.destination)
+                        if is_true:
+                            arrived_true_dest.add(aid)
+                            if step <= v.deadline:
+                                arrived_on_time.add(aid)
+                            removal_causes["reached_true_destination"] += 1
                         else:
-                            exited_without_destination_ids.add(arrived_vehicle_id)
-
-                        debug_record = {
-                            "vehicle_id": arrived_vehicle_id,
-                            "global_destination": vehicle.destination,
-                            "last_seen_edge": last_seen_edge,
-                            "last_local_target": last_target_by_vehicle.get(arrived_vehicle_id, "<unset>"),
-                            "reached_global_destination": reached_global_destination,
-                        }
-                        arrived_debug_records.append(debug_record)
-
-                        # Close any open transition as a terminal arrival transition so
-                        # destination reward / on-time bonus are learned explicitly.
-                        if arrived_vehicle_id in last_state_action:
-                            prev_state, prev_action, prev_edge, prev_step = last_state_action[arrived_vehicle_id]
-                            repeated_recent_edges = sum(
-                                1 for edge in recent_edge_history[arrived_vehicle_id]
-                                if edge == last_seen_edge
-                            )
-                            decision_delta_t = max(step - prev_step, 1)
-                            reward, done = self.compute_reward(
-                                vehicle,
-                                prev_edge,
-                                last_seen_edge,
-                                step,
-                                arrived=True,
-                                repeated_recent_edges=repeated_recent_edges,
-                                delta_t=decision_delta_t,
-                                reached_global_destination=reached_global_destination,
-                            )
-                            next_state = self.make_terminal_next_state(
-                                arrived_vehicle_id,
-                                last_seen_edge,
-                                vehicle.destination,
-                            )
-                            self.trainer.remember(
-                                prev_state,
-                                prev_action,
-                                reward,
-                                next_state,
-                                done,
-                                next_valid_actions=[],
-                            )
+                            wrong_target.add(aid)
+                            failed_ids.add(aid)
+                            removal_causes["reached_wrong_target"] += 1
+                        if aid in commitments:
+                            c = commitments.pop(aid)
+                            lateness = max(step - v.deadline, 0.0)
+                            curr_eta = self.estimate_eta(last_edge, v.destination)
+                            curr_deficit = max(curr_eta - max(v.deadline - step, 0.0), 0.0) if math.isfinite(curr_eta) else self.time_norm
+                            reward, done = self.compute_reward(c.prev_deficit, curr_deficit, c.chosen_density, self._global_density_mean, wrong_target=(not is_true), arrived=is_true, on_time=(step <= v.deadline), lateness=lateness)
+                            transition = {"state": c.state, "action": c.action, "reward": reward, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": float(done), "next_mask": np.zeros((self.action_size,), dtype=np.float32)}
+                            self.trainer.remember(transition)
                             episode_return += reward
 
-                        # No more transitions should be open once SUMO removes the vehicle.
-                        last_state_action.pop(arrived_vehicle_id, None)
-                        last_decision_edge.pop(arrived_vehicle_id, None)
-
-                    # =========================
-                    # Teleport detection + terminal penalty
-                    # =========================
-                    teleported_ids = self.get_teleport_ids()
-                    if teleported_ids:
-                        episode_teleport_events += len(teleported_ids)
-                        teleported_controlled_ids.update(tid for tid in teleported_ids if tid in vehicles)
-                        for tid in list(teleported_ids):
-                            if tid not in vehicles:
-                                continue
-
-                            # If we have an open transition for this vehicle, close it as terminal
-                            if tid in last_state_action:
-                                prev_state, prev_action, prev_edge, prev_step = last_state_action[tid]
-                                v = vehicles[tid]
-
-                                # Try to get where it ended up; may fail if removed, so guard
-                                try:
-                                    tele_edge = traci.vehicle.getRoadID(tid)
-                                except Exception:
-                                    tele_edge = prev_edge
-
-                                # Big penalty so agent learns to avoid situations leading to teleports
-                                next_state = self.make_terminal_next_state(tid, tele_edge, v.destination)
-
-                                self.trainer.remember(
-                                    prev_state,
-                                    prev_action,
-                                    self.teleport_penalty,
-                                    next_state,
-                                    True,
-                                    next_valid_actions=[],
-                                )
-                                episode_return += self.teleport_penalty
-
-                                # Clear open transition
-                                last_state_action.pop(tid, None)
-
-                            # Prevent repeated “decision” bookkeeping for teleported cars
-                            last_decision_edge.pop(tid, None)
+                    tele = self.get_teleport_ids()
+                    for tid in tele:
+                        if tid not in vehicles:
+                            continue
+                        teleported_controlled.add(tid)
+                        failed_ids.add(tid)
+                        removal_causes["teleport"] += 1
+                        if tid in commitments:
+                            c = commitments.pop(tid)
+                            reward, done = self.compute_reward(c.prev_deficit, c.prev_deficit + 5.0, c.chosen_density, self._global_density_mean, teleported=True)
+                            transition = {"state": c.state, "action": c.action, "reward": reward, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": float(done), "next_mask": np.zeros((self.action_size,), dtype=np.float32)}
+                            self.trainer.remember(transition)
+                            episode_return += reward
 
                     if step % self.train_every == 0:
                         for _ in range(self.grad_steps):
                             self.trainer.replay()
 
-                    # process = psutil.Process(os.getpid())
+                # unresolved vehicles
+                controlled_ids = set(vehicles.keys())
+                disappeared = controlled_ids - set(traci.vehicle.getIDList()) - arrived_any - teleported_controlled
+                for vid in disappeared:
+                    if vid not in arrived_any and vid not in teleported_controlled:
+                        failed_ids.add(vid)
+                        removal_causes["disappeared"] += 1
 
-                    # if step % 100 == 0:
-                    #     print(
-                    #         "RAM_MB=", process.memory_info().rss / 1024 / 1024,
-                    #         " replay=", len(self.trainer.memory),
-                    #         " dist_cache=", len(self._distance_cache),
-                    #     )
+                for vid, c in list(commitments.items()):
+                    v = vehicles[vid]
+                    late = max(MAX_SIMULATION_STEPS - v.deadline, 0.0)
+                    remain_dist = self.get_distance_to_destination(v.current_edge or c.edge, v.destination)
+                    reward, done = self.compute_reward(c.prev_deficit, c.prev_deficit + 2.0, c.chosen_density, self._global_density_mean, deadline_missed=True, lateness=late, remain_dist=(remain_dist if math.isfinite(remain_dist) else 1000.0))
+                    transition = {"state": c.state, "action": c.action, "reward": reward, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": float(done), "next_mask": np.zeros((self.action_size,), dtype=np.float32)}
+                    self.trainer.remember(transition)
+                    episode_return += reward
+                    commitments.pop(vid, None)
+                    failed_ids.add(vid)
+                    removal_causes["dead_end_trapped"] += 1
 
             finally:
-                completion_rate = (
-                    len(arrived_before_deadline_ids) / float(total_controlled)
-                    if total_controlled > 0 else 0.0
-                )
-                avg_return = episode_return / float(total_controlled) if total_controlled > 0 else 0.0
-
-                rolling_teleport_events.append(float(episode_teleport_events))
-                rolling_teleported_controlled.append(float(len(teleported_controlled_ids)))
-                rolling_completion_rate.append(float(completion_rate))
-                rolling_avg_return.append(float(avg_return))
-
-                roll_tele_events = sum(rolling_teleport_events) / len(rolling_teleport_events)
-                roll_tele_ctrl = sum(rolling_teleported_controlled) / len(rolling_teleported_controlled)
-                roll_completion = sum(rolling_completion_rate) / len(rolling_completion_rate)
-                roll_return = sum(rolling_avg_return) / len(rolling_avg_return)
-
-                self.trainer.epsilon = max(
-                    self.trainer.epsilon_min,
-                    self.trainer.epsilon * self.trainer.epsilon_decay
-                )
-                print(
-                    f"\n\nDone with episode {episode} | "
-                    f"teleport_events={episode_teleport_events}, "
-                    f"teleported_controlled={len(teleported_controlled_ids)}, "
-                    f"completion_before_deadline={completion_rate:.3f}, "
-                    f"avg_return={avg_return:.3f}"
-                )
-                print(
-                    f"Rolling({len(rolling_teleport_events)}) | "
-                    f"teleport_events/ep={roll_tele_events:.3f}, "
-                    f"teleported_controlled/ep={roll_tele_ctrl:.3f}, "
-                    f"completion_before_deadline={roll_completion:.3f}, "
-                    f"avg_return={roll_return:.3f}\n"
-                )
-
-                # Controlled vehicles that left simulation without being marked
-                # as arrived (global destination) or teleported.
-                exited_without_destination_ids.update(
-                    controlled_ids - arrived_ids - teleported_controlled_ids
-                )
-                print(
-                    f"Controlled exit diagnostics | "
-                    f"arrived={len(arrived_global_destination_ids)}/{total_controlled}, "
-                    f"arrived_any_target={len(arrived_ids)}/{total_controlled}, "
-                    f"arrived_before_deadline={len(arrived_before_deadline_ids)}/{total_controlled}, "
-                    f"teleported_controlled={len(teleported_controlled_ids)}/{total_controlled}, "
-                    f"exited_without_destination={len(exited_without_destination_ids)}/{total_controlled}"
-                )
-
-                if self.debug_exit_diagnostics:
-                    mismatched_arrivals = [
-                        record for record in arrived_debug_records
-                        if not record["reached_global_destination"]
-                    ]
-                    print(
-                        f"Arrival debug | total_arrived={len(arrived_debug_records)}, "
-                        f"arrived_at_non_global_target={len(mismatched_arrivals)}"
-                    )
-
-                    for record in mismatched_arrivals[:self.debug_exit_diagnostics_limit]:
-                        print(
-                            "  ARRIVED_NON_GLOBAL "
-                            f"vehicle={record['vehicle_id']} "
-                            f"last_seen_edge={record['last_seen_edge']} "
-                            f"last_local_target={record['last_local_target']} "
-                            f"global_destination={record['global_destination']}"
-                        )
-
-                    if len(mismatched_arrivals) > self.debug_exit_diagnostics_limit:
-                        print(
-                            "  ARRIVED_NON_GLOBAL ... "
-                            f"{len(mismatched_arrivals) - self.debug_exit_diagnostics_limit} more vehicles"
-                        )
-
-                    for vehicle_id in sorted(exited_without_destination_ids)[:self.debug_exit_diagnostics_limit]:
-                        vehicle = vehicles[vehicle_id]
-                        print(
-                            "  EXITED_WITHOUT_DEST "
-                            f"vehicle={vehicle_id} "
-                            f"last_seen_edge={last_seen_edge_by_vehicle.get(vehicle_id, '<unknown>')} "
-                            f"last_local_target={last_target_by_vehicle.get(vehicle_id, '<unset>')} "
-                            f"global_destination={vehicle.destination}"
-                        )
-
-                    if len(exited_without_destination_ids) > self.debug_exit_diagnostics_limit:
-                        print(
-                            "  EXITED_WITHOUT_DEST ... "
-                            f"{len(exited_without_destination_ids) - self.debug_exit_diagnostics_limit} more vehicles"
-                        )
                 traci.close()
 
+            total = max(len(vehicles), 1)
+            on_time = len(arrived_on_time)
+            completion_before_deadline = on_time / float(total)
+            true_arrival_rate = len(arrived_true_dest) / float(total)
+            wrong_target_rate = len(wrong_target) / float(total)
+            teleport_rate = len(teleported_controlled) / float(total)
+            exit_wo_dest_rate = len((set(vehicles.keys()) - arrived_true_dest - teleported_controlled)) / float(total)
+            avg_lateness = float(np.mean([max(step - vehicles[vid].deadline, 0.0) for vid in set(vehicles.keys()) - arrived_true_dest])) if vehicles else 0.0
+            avg_deficit_improvement = float(np.mean(deficit_improvements)) if deficit_improvements else 0.0
+            lane_failure_rate = lane_failures / float(max(len(deficit_improvements), 1))
+            loop_rate = loops / float(max(len(deficit_improvements), 1))
+
+            rolling_baseline.append(completion_before_deadline)
+            base = float(np.mean(rolling_baseline)) if rolling_baseline else completion_before_deadline
+            if completion_before_deadline > base:
+                # small shared bonus
+                self.trainer.remember({"state": np.zeros((1, self.state_size), dtype=np.float32), "action": 0, "reward": self.global_shared_bonus, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": 1.0, "next_mask": np.zeros((self.action_size,), dtype=np.float32)}, priority=0.1)
+
+            metrics = {
+                "episode": episode,
+                "true_destination_arrival_rate": true_arrival_rate,
+                "completion_before_deadline_rate": completion_before_deadline,
+                "wrong_target_arrival_rate": wrong_target_rate,
+                "exit_without_destination_rate": exit_wo_dest_rate,
+                "teleport_rate": teleport_rate,
+                "average_deadline_lateness": avg_lateness,
+                "average_deficit_improvement": avg_deficit_improvement,
+                "lane_execution_failure_rate": lane_failure_rate,
+                "loop_oscillation_rate": loop_rate,
+                "replay_td_error_stats": dict(self.trainer.last_td_error_stats),
+                "removals_by_cause": dict(removal_causes),
+                "episode_return": episode_return / float(total),
+            }
+            metrics_history.append(metrics)
+            for k, v in metrics.items():
+                if isinstance(v, (int, float)):
+                    rolling[k].append(float(v))
+
+            self.trainer.epsilon = max(self.trainer.epsilon_min, self.trainer.epsilon * self.trainer.epsilon_decay)
+            print(
+                f"Ep {episode} | arr_true={true_arrival_rate:.3f} on_time={completion_before_deadline:.3f} "
+                f"wrong_target={wrong_target_rate:.3f} exit_wo_dest={exit_wo_dest_rate:.3f} tele={teleport_rate:.3f} "
+                f"lane_fail={lane_failure_rate:.3f} loop={loop_rate:.3f} td_mean={self.trainer.last_td_error_stats['mean']:.4f}"
+            )
+            print(f"Removal causes: {dict(removal_causes)}")
+
         self.trainer.model.save(self.model_output_path)
-
-    def update_edge_vehicle_counts(self, step, every=10):
-        if hasattr(self, "_last_density_step") and (step - self._last_density_step) < every:
-            return  # reuse cached self._density_vec
-
-        counts = self.connection_info.edge_vehicle_count
-        edge_list = self.connection_info.edge_list
-        lengths = self.connection_info.edge_length_dict
-
-        for edge in edge_list:
-            counts[edge] = traci.edge.getLastStepVehicleNumber(edge)
-
-        self._density_vec = np.array(
-            [counts[e] / max(lengths[e], 1e-6) for e in edge_list],
-            dtype=np.float32
-        )
-        self._last_density_step = step
+        return metrics_history
