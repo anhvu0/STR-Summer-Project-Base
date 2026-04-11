@@ -4,7 +4,7 @@ import random
 import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from keras import backend as K
@@ -29,6 +29,27 @@ import traci
 import sumolib
 
 MAX_SIMULATION_STEPS = 3000
+
+"""
+Migration note (old -> new pipeline):
+- Old design coupled "choose next edge" with immediate setRoute and ad-hoc route stitching.
+  This violated SUMO lane/routing semantics and caused recurring command 0xc4 failures
+  ("Invalid route replacement").
+- New design introduces a two-stage controller:
+  (1) Strategic intent selection over a feasibility-filtered action mask.
+  (2) Tactical execution gate that commits only when lane/junction/signal constraints are safe.
+- Route application now uses SUMO-native route construction (traci.simulation.findRoute)
+  and explicit pre-commit validation, preventing invalid route replacements by design.
+- Learning objective remains SELFLESS: reward is dominated by fleet-level deadline deficit
+  improvement, with local safety/tactical penalties as secondary shaping.
+
+Diagnostics checklist (if warnings remain):
+1) Inspect diagnostics counters for pre-blocked invalid proposals (should be high before any 0xc4).
+2) Verify tactical defer reasons near junctions / red zones / best-lane infeasibility.
+3) Check route proposal logs: current edge/lane, intent, SUMO route, route-valid flag.
+4) Confirm emergency-brake counter trends downward as defer-zone tuning is adjusted.
+5) Check oscillation and repeated-intent cooldown counters for excessive re-decisions.
+"""
 
 
 class PrioritizedReplayBuffer:
@@ -203,30 +224,50 @@ class DQNTrainer:
 
 
 @dataclass
-class Commitment:
+class StrategicIntent:
+    intent_type: str  # keep, delay, reroute
+    target_edge: Optional[str]
+    route_edges: List[str]
+    reason: str = "ok"
+
+
+@dataclass
+class IntentProposal:
+    intent: StrategicIntent
+    features: np.ndarray
+    valid: bool
+
+
+@dataclass
+class PendingIntent:
     state: np.ndarray
     action: int
-    edge: str
-    chosen_next_edge: str
-    chosen_density: float
-    prev_deficit: float
-    step: int
-    candidate_repeated: float
+    intent: StrategicIntent
+    created_step: int
+    prev_global_deficit: float
 
 
-@dataclass
-class RouteApplyResult:
-    applied: bool
-    reason: str = "ok"
-    route_edges: Optional[List[str]] = None
+class FleetMetricComputer:
+    def __init__(self, eta_fn, time_norm=1200.0):
+        self.eta_fn = eta_fn
+        self.time_norm = float(time_norm)
 
-
-@dataclass
-class LaneNotReadyState:
-    edge: str
-    chosen_next_edge: str
-    lane_index: int
-    distance_to_end: float
+    def global_deadline_deficit(self, controlled_ids, vehicles, step):
+        total = 0.0
+        per_vehicle = {}
+        for vid in controlled_ids:
+            if vid not in vehicles:
+                continue
+            v = vehicles[vid]
+            edge = v.current_edge
+            if not edge:
+                continue
+            eta = self.eta_fn(edge, v.destination)
+            tleft = max(float(v.deadline) - float(step), 0.0)
+            deficit = max(eta - tleft, 0.0) if math.isfinite(eta) else self.time_norm
+            per_vehicle[vid] = deficit
+            total += deficit
+        return total, per_vehicle
 
 
 class RLTrainingPipeline:
@@ -237,7 +278,7 @@ class RLTrainingPipeline:
         episodes=10,
         spawn_interval=4.0,
         seed_with_episode=True,
-        candidate_slots=6,
+        candidate_slots=8,
         epsilon_decay=0.995,
         epsilon_min=0.10,
         gamma=0.99,
@@ -260,45 +301,49 @@ class RLTrainingPipeline:
         self.rolling_window = int(rolling_window)
         self.target_pattern = target_pattern
 
-        self.w_deficit_delta = 6.0
-        self.w_critical_worse = 12.0
-        self.w_externality = 2.5
-        self.w_lane_failure = 20.0
-        self.w_loop = 5.0
-        self.execution_success_bonus = 8.0
-        self.invalid_first_hop_penalty = -10.0
-        self.downstream_path_missing_penalty = -8.0
-        self.route_set_exception_penalty = -12.0
+        # Reward weights: global/selfless objective dominates.
+        self.w_global = 12.0
+        self.w_local_externality = 1.0
+        self.w_invalid_blocked = 1.5
+        self.w_tactical_defer = 0.3
+        self.w_oscillation = 2.0
+        self.w_harsh_brake = 5.0
         self.teleport_penalty = -180.0
-        self.arrival_on_time_reward = 220.0
-        self.arrival_late_reward = 80.0
-        self.wrong_target_penalty = -200.0
-        self.deadline_miss_terminal_scale = 0.8
+        self.arrival_on_time_reward = 180.0
+        self.arrival_late_reward = 20.0
+        self.deadline_miss_penalty = -50.0
 
-        self.loop_window = 10
         self.speed_norm = 20.0
         self.dist_norm = 300.0
         self.time_norm = 1200.0
         self.max_lane_shift_norm = 4.0
+
+        # Tactical gating configuration.
+        self.min_commit_distance = 35.0
+        self.red_stop_zone_distance = 25.0
+        self.intent_ttl = 12
+        self.oscillation_window = 20
+        self.route_retry_cooldown_steps = 30
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
         self.net = sumolib.net.readNet(os.path.join(self.sumocfg_dir, self.net_file))
         self.connection_info = ConnectionInfo(os.path.join(self.sumocfg_dir, self.net_file))
         self.route_helper = TrainingRouteHelper(self.connection_info)
+
         self._distance_cache = {}
         self._eta_cache = {}
-        self._route_blacklist = {}
-        self.route_retry_cooldown_steps = 30
+        self._route_feasibility_cache = {}
+        self._failed_intent_cooldown = {}
         self._curriculum = [
             {"until": 0.33, "target": 12, "random": 16, "slack": (1.35, 1.55)},
             {"until": 0.66, "target": 16, "random": 24, "slack": (1.20, 1.40)},
             {"until": 1.00, "target": 20, "random": 30, "slack": (1.10, 1.30)},
         ]
 
-        self.base_feature_size = 20
-        self.candidate_feature_size = 10
-        self.state_size = self.base_feature_size + self.candidate_slots * self.candidate_feature_size
+        self.base_feature_size = 22
+        self.intent_feature_size = 10
+        self.state_size = self.base_feature_size + self.candidate_slots * self.intent_feature_size
         self.action_size = self.candidate_slots
 
         self.trainer = DQNTrainer(
@@ -314,6 +359,7 @@ class RLTrainingPipeline:
             target_soft_tau=0.01,
             target_update_every=1,
         )
+        self.metric_computer = FleetMetricComputer(self.estimate_eta, time_norm=self.time_norm)
 
     def parse_sumocfg(self, sumocfg_path):
         dom = parse(sumocfg_path)
@@ -343,40 +389,29 @@ class RLTrainingPipeline:
         return dist
 
     def estimate_eta(self, edge_id, destination_edge):
-        key = (edge_id, destination_edge)
+        # Dynamic ETA via SUMO-native route computation (refresh frequently).
+        key = (edge_id, destination_edge, int(traci.simulation.getTime() // 10 if traci.isLoaded() else 0))
         if key in self._eta_cache:
             return self._eta_cache[key]
         try:
-            e0 = self.net.getEdge(edge_id)
-            e1 = self.net.getEdge(destination_edge)
-            path, _ = self.net.getShortestPath(e0, e1)
-            if path is None:
+            route = traci.simulation.findRoute(edge_id, destination_edge)
+            edges = list(route.edges) if route and route.edges else []
+            if not edges:
                 eta = math.inf
             else:
-                free_flow_eta = 0.0
-                for e in path:
-                    edge_speed = max(float(e.getSpeed()), 5.0)
-                    free_flow_eta += float(e.getLength()) / edge_speed
-                junction_delay = max(len(path) - 1, 0) * 2.0
-                congestion_allowance = 6.0 + 0.10 * free_flow_eta
-                eta = free_flow_eta + junction_delay + congestion_allowance
+                # Use SUMO route travel time when available; fall back to edge means.
+                tt = float(getattr(route, "travelTime", 0.0) or 0.0)
+                if tt <= 0:
+                    tt = 0.0
+                    for e in edges:
+                        ms = max(float(traci.edge.getLastStepMeanSpeed(e)), 3.0)
+                        ln = max(float(self.connection_info.edge_length_dict.get(e, 25.0)), 5.0)
+                        tt += ln / ms
+                eta = tt
         except Exception:
             eta = math.inf
         self._eta_cache[key] = eta
         return eta
-
-    def get_teleport_ids(self):
-        teleported = set()
-        for fn in [
-            lambda: traci.simulation.getStartingTeleportIDList(),
-            lambda: traci.simulation.getEndingTeleportIDList(),
-            lambda: traci.vehicle.getTeleportingList(),
-        ]:
-            try:
-                teleported.update(fn())
-            except Exception:
-                pass
-        return teleported
 
     def update_edge_vehicle_counts(self, step, every=1):
         if hasattr(self, "_last_density_step") and (step - self._last_density_step) < every:
@@ -390,62 +425,13 @@ class RLTrainingPipeline:
         self._global_density_std = float(np.std(self._density_vec)) if len(self._density_vec) else 0.0
         self._last_density_step = step
 
-    def _blacklist_key(self, vehicle_id, current_edge, next_edge):
-        return (str(vehicle_id), str(current_edge), str(next_edge))
-
     def _edge_from_lane_id(self, lane_id):
-        if lane_id is None:
-            return None
-        if "_" not in lane_id:
+        if lane_id is None or "_" not in lane_id:
             return None
         return lane_id.rsplit("_", 1)[0]
 
-    def _get_vehicle_legal_successors(self, vehicle_id, edge_id):
-        legal = set()
-        lane_ids = self.connection_info.edge_lane_ids.get(edge_id, [])
-        try:
-            vclass = traci.vehicle.getVehicleClass(vehicle_id)
-        except Exception:
-            vclass = None
-        for lane_id in lane_ids:
-            try:
-                links = traci.lane.getLinks(lane_id)
-            except Exception:
-                links = []
-            for link in links:
-                if not link:
-                    continue
-                next_lane = link[0]
-                next_edge = self._edge_from_lane_id(next_lane)
-                if not next_edge:
-                    continue
-                if vclass is not None:
-                    try:
-                        allowed = traci.lane.getAllowed(next_lane)
-                        if allowed and (vclass not in allowed):
-                            continue
-                    except Exception:
-                        pass
-                legal.add(next_edge)
-        return legal
-
-    def _is_valid_immediate_successor(self, vehicle_id, current_edge, chosen_next_edge):
-        topological = set(self.connection_info.outgoing_edges_dict.get(current_edge, {}).values())
-        if chosen_next_edge not in topological:
-            return False
-        legal = self._get_vehicle_legal_successors(vehicle_id, current_edge)
-        if not legal:
-            return False
-        if chosen_next_edge not in legal:
-            return False
-        return True
-
-    def _current_lane_successors(self, vehicle_id):
-        try:
-            lane_id = traci.vehicle.getLaneID(vehicle_id)
-        except Exception:
-            return set()
-        successors = set()
+    def _lane_successors(self, lane_id):
+        succ = set()
         try:
             links = traci.lane.getLinks(lane_id)
         except Exception:
@@ -453,242 +439,276 @@ class RLTrainingPipeline:
         for link in links:
             if not link:
                 continue
-            next_lane = link[0]
-            next_edge = self._edge_from_lane_id(next_lane)
-            if next_edge:
-                successors.add(next_edge)
-        return successors
+            nxt_lane = link[0]
+            nxt_edge = self._edge_from_lane_id(nxt_lane)
+            if nxt_edge:
+                succ.add(nxt_edge)
+        return succ
 
-    def _has_downstream_path(self, chosen_next_edge, destination):
+    def _vehicle_legal_next_edges(self, vehicle_id, edge_id):
+        legal = set()
+        for lane_id in self.connection_info.edge_lane_ids.get(edge_id, []):
+            legal.update(self._lane_successors(lane_id))
+        return legal
+
+    def _distance_to_lane_end(self, vehicle_id):
+        lane_id = traci.vehicle.getLaneID(vehicle_id)
+        return max(traci.lane.getLength(lane_id) - traci.vehicle.getLanePosition(vehicle_id), 0.0)
+
+    def _best_lane_reachable(self, vehicle_id, required_next_edge):
+        # SUMO best-lane guidance can signal if continuation is realistic from current tactical state.
         try:
-            from_edge = self.net.getEdge(chosen_next_edge)
-            to_edge = self.net.getEdge(destination)
-            path, _ = self.net.getShortestPath(from_edge, to_edge)
-            return path is not None
+            best = traci.vehicle.getBestLanes(vehicle_id)
         except Exception:
-            return False
+            best = []
+        if not best:
+            return True
+        for entry in best:
+            # entry schema may vary by SUMO version; last field often list of reachable continuations.
+            if len(entry) >= 6 and isinstance(entry[5], (list, tuple)):
+                cont = set(entry[5])
+                if required_next_edge in cont:
+                    return True
+        return False
 
-    def enumerate_candidate_next_edges(self, vehicle_id, edge_id, destination, step, diag=None):
-        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
-        seen = set()
-        candidates = []
-        for _d, nxt in outgoing.items():
-            if nxt not in seen:
-                seen.add(nxt)
-                bl_key = self._blacklist_key(vehicle_id, edge_id, nxt)
-                blocked_until = self._route_blacklist.get(bl_key, -1)
-                if blocked_until >= step:
-                    if diag is not None:
-                        diag["blacklist_hits"] += 1
-                    continue
-                if not self._is_valid_immediate_successor(vehicle_id, edge_id, nxt):
-                    if diag is not None:
-                        diag["invalid_first_hop_suppressions"] += 1
-                    continue
-                if not self._has_downstream_path(nxt, destination):
-                    if diag is not None:
-                        diag["downstream_path_failures"] += 1
-                    continue
-                candidates.append(nxt)
-        return candidates[: self.candidate_slots]
+    def _route_cache_key(self, vehicle_id, current_edge, lane_id, target_edge, destination):
+        return (vehicle_id, current_edge, lane_id, target_edge or "", destination)
 
-    def compute_candidate_lane_metrics(self, vehicle_id, edge_id, next_edge):
+    def _cooldown_key(self, vehicle_id, current_edge, target_edge):
+        return (vehicle_id, current_edge, target_edge or "")
+
+    def _build_route_via_target(self, vehicle_id, current_edge, target_edge, destination):
+        # Route construction is SUMO-native to avoid illegal ad-hoc concatenation.
+        try:
+            r1 = traci.simulation.findRoute(current_edge, target_edge, vType=traci.vehicle.getTypeID(vehicle_id))
+            if not r1 or not r1.edges:
+                return [], "no_valid_sumo_route_from_current"
+            r2 = traci.simulation.findRoute(target_edge, destination, vType=traci.vehicle.getTypeID(vehicle_id))
+            if not r2 or not r2.edges:
+                return [], "no_valid_sumo_route_to_destination"
+            merged = list(r1.edges)
+            tail = list(r2.edges)
+            if merged and tail and merged[-1] == tail[0]:
+                merged.extend(tail[1:])
+            else:
+                merged.extend(tail)
+            if not merged:
+                return [], "empty_route"
+            return merged, "ok"
+        except Exception:
+            return [], "find_route_exception"
+
+    def _build_keep_route(self, vehicle_id, current_edge, destination):
+        try:
+            r = traci.simulation.findRoute(current_edge, destination, vType=traci.vehicle.getTypeID(vehicle_id))
+            return list(r.edges) if r and r.edges else []
+        except Exception:
+            return []
+
+    def _first_actionable_next_edge(self, route_edges, current_edge):
+        if not route_edges:
+            return None
+        if route_edges[0] == current_edge:
+            return route_edges[1] if len(route_edges) > 1 else None
+        return route_edges[0]
+
+    def _lane_shift_estimate(self, vehicle_id, edge_id, next_edge):
         lane_ids = self.connection_info.edge_lane_ids.get(edge_id, [])
         curr_lane = traci.vehicle.getLaneIndex(vehicle_id)
-        lane_id = traci.vehicle.getLaneID(vehicle_id)
-        lane_len = traci.lane.getLength(lane_id)
-        lane_pos = traci.vehicle.getLanePosition(vehicle_id)
-        dist_to_end = max(lane_len - lane_pos, 0.0)
-        speed = max(traci.vehicle.getSpeed(vehicle_id), 1.0)
-
-        target_lanes = []
-        for idx, ln in enumerate(lane_ids):
-            for _direction, out_edge in self.connection_info.lane_outgoing_edges_dict.get(ln, {}).items():
+        targets = []
+        for idx, lane in enumerate(lane_ids):
+            for _d, out_edge in self.connection_info.lane_outgoing_edges_dict.get(lane, {}).items():
                 if out_edge == next_edge:
-                    target_lanes.append(idx)
+                    targets.append(idx)
                     break
-        if not target_lanes:
-            return {"target_lanes": [], "min_lane_shifts": 99, "feasible": False, "score": 0.0}
+        if not targets:
+            return 99
+        return min(abs(curr_lane - t) for t in targets)
 
-        min_shift = min(abs(curr_lane - t) for t in target_lanes)
-        est_shift_distance = 18.0 * min_shift
-        comfort_budget = max(35.0, speed * 2.3)
-        feasible = dist_to_end >= est_shift_distance + 8.0
-        score = float(np.clip((dist_to_end - est_shift_distance) / comfort_budget, 0.0, 1.0))
-        return {
-            "target_lanes": target_lanes,
-            "min_lane_shifts": min_shift,
-            "feasible": feasible,
-            "score": score,
-        }
-
-    def _queue_proxy(self, edge_id):
-        edge_len = max(self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0)
-        halted = traci.edge.getLastStepHaltingNumber(edge_id)
-        return float(halted) / edge_len
-
-    def build_state(self, vehicle_id, vehicle, step, current_edge, candidates, recent_edges, global_stats):
-        lane_idx = traci.vehicle.getLaneIndex(vehicle_id)
-        n_lanes = max(traci.edge.getLaneNumber(current_edge), 1)
+    def _propose_intents(self, vehicle_id, vehicle, edge_id, destination, step, diag):
+        proposals = []
         lane_id = traci.vehicle.getLaneID(vehicle_id)
-        dist_to_end = max(traci.lane.getLength(lane_id) - traci.vehicle.getLanePosition(vehicle_id), 0.0)
-        speed = traci.vehicle.getSpeed(vehicle_id)
-        time_left = max(float(vehicle.deadline) - float(step), 0.0)
-        elapsed = max(float(step) - float(vehicle.start_time), 0.0)
-        window = max(float(vehicle.deadline) - float(vehicle.start_time), 1.0)
-        eta_curr = self.estimate_eta(current_edge, vehicle.destination)
-        slack = (time_left - eta_curr) if math.isfinite(eta_curr) else -self.time_norm
-        urgency = float(np.clip(1.0 - (time_left / window), 0.0, 1.0))
+        legal_next = self._vehicle_legal_next_edges(vehicle_id, edge_id)
 
-        curr_density = self.connection_info.edge_vehicle_count.get(current_edge, 0) / max(self.connection_info.edge_length_dict.get(current_edge, 1.0), 1.0)
-        curr_mean_speed = traci.edge.getLastStepMeanSpeed(current_edge)
-        sp_dist = self.get_distance_to_destination(current_edge, vehicle.destination)
-        topo_hops = sp_dist / 120.0 if math.isfinite(sp_dist) else 10.0
+        keep_route = self._build_keep_route(vehicle_id, edge_id, destination)
+        proposals.append(IntentProposal(StrategicIntent("keep", None, keep_route, reason="keep"), np.array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32), valid=bool(keep_route)))
 
-        base = np.array([
-            lane_idx / max(n_lanes - 1, 1),
-            min(n_lanes, 6) / 6.0,
-            min(dist_to_end, self.dist_norm) / self.dist_norm,
-            min(speed, self.speed_norm) / self.speed_norm,
-            min(time_left, self.time_norm) / self.time_norm,
-            min(elapsed / window, 2.0) / 2.0,
-            urgency,
-            np.clip(slack / self.time_norm, -1.0, 1.0),
-            np.clip(curr_density, 0.0, 2.0) / 2.0,
-            np.clip(curr_mean_speed / self.speed_norm, 0.0, 1.5) / 1.5,
-            np.clip(self._queue_proxy(current_edge), 0.0, 1.0),
-            min(len(candidates), self.candidate_slots) / float(self.candidate_slots),
-            1.0 if current_edge in recent_edges else 0.0,
-            np.clip(eta_curr / self.time_norm if math.isfinite(eta_curr) else 1.0, 0.0, 2.0) / 2.0,
-            np.clip(sp_dist / 3000.0 if math.isfinite(sp_dist) else 1.0, 0.0, 1.0),
-            np.clip(topo_hops / 20.0, 0.0, 1.0),
-            np.clip(global_stats["mean_density"], 0.0, 2.0) / 2.0,
-            np.clip(global_stats["std_density"], 0.0, 1.0),
-            np.clip(global_stats["frac_behind"], 0.0, 1.0),
-            np.clip(global_stats["frac_failed"], 0.0, 1.0),
-        ], dtype=np.float32)
+        # Delay action explicitly represents strategic hold when tactical state is not ready.
+        proposals.append(IntentProposal(StrategicIntent("delay", None, [], reason="delay"), np.array([0, 1, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32), valid=True))
 
-        cand_vec = np.zeros((self.candidate_slots, self.candidate_feature_size), dtype=np.float32)
-        mask = np.zeros((self.candidate_slots,), dtype=np.float32)
-        for i, next_edge in enumerate(candidates[: self.candidate_slots]):
-            lane_m = self.compute_candidate_lane_metrics(vehicle_id, current_edge, next_edge)
-            density = self.connection_info.edge_vehicle_count.get(next_edge, 0) / max(self.connection_info.edge_length_dict.get(next_edge, 1.0), 1.0)
-            mean_speed = traci.edge.getLastStepMeanSpeed(next_edge)
-            eta = self.estimate_eta(next_edge, vehicle.destination)
-            deficit = max((eta - time_left), 0.0) if math.isfinite(eta) else self.time_norm
-            repeated = 1.0 if next_edge in recent_edges else 0.0
-            dead_end = 0.0 if math.isfinite(self.get_distance_to_destination(next_edge, vehicle.destination)) else 1.0
-            cand_vec[i] = np.array([
-                1.0,
+        outgoing = list(dict.fromkeys(self.connection_info.outgoing_edges_dict.get(edge_id, {}).values()))
+        for target in outgoing:
+            ckey = self._cooldown_key(vehicle_id, edge_id, target)
+            if self._failed_intent_cooldown.get(ckey, -1) >= step:
+                diag["filtered_tactical_cooldown"] += 1
+                continue
+
+            cache_key = self._route_cache_key(vehicle_id, edge_id, lane_id, target, destination)
+            if cache_key in self._route_feasibility_cache:
+                route_edges, reason = self._route_feasibility_cache[cache_key]
+            else:
+                route_edges, reason = self._build_route_via_target(vehicle_id, edge_id, target, destination)
+                self._route_feasibility_cache[cache_key] = (route_edges, reason)
+            if not route_edges:
+                diag[f"filtered_{reason}"] += 1
+                continue
+
+            first_next = self._first_actionable_next_edge(route_edges, edge_id)
+            if first_next is None or first_next not in legal_next:
+                diag["filtered_no_legal_lane_successor"] += 1
+                continue
+
+            eta = self.estimate_eta(target, destination)
+            tleft = max(vehicle.deadline - step, 0.0)
+            deficit = max(eta - tleft, 0.0) if math.isfinite(eta) else self.time_norm
+            density = self.connection_info.edge_vehicle_count.get(target, 0) / max(self.connection_info.edge_length_dict.get(target, 1.0), 1.0)
+            shift = self._lane_shift_estimate(vehicle_id, edge_id, first_next)
+            feat = np.array([
+                0,
+                0,
+                1,
                 np.clip(density, 0.0, 2.0) / 2.0,
-                np.clip(mean_speed / self.speed_norm, 0.0, 1.5) / 1.5,
-                np.clip(eta / self.time_norm if math.isfinite(eta) else 1.0, 0.0, 2.0) / 2.0,
+                np.clip((eta if math.isfinite(eta) else self.time_norm) / self.time_norm, 0.0, 2.0) / 2.0,
                 np.clip(deficit / self.time_norm, 0.0, 1.0),
-                np.clip(max(density - global_stats["mean_density"], 0.0), 0.0, 1.0),
-                np.clip(lane_m["min_lane_shifts"] / self.max_lane_shift_norm, 0.0, 1.0),
-                lane_m["score"],
-                repeated,
-                dead_end,
+                np.clip(shift / self.max_lane_shift_norm, 0.0, 1.0),
+                1.0 if self._best_lane_reachable(vehicle_id, first_next) else 0.0,
+                1.0 if first_next == target else 0.5,
+                1.0,
             ], dtype=np.float32)
-            # keep invalid/dead candidates masked out
-            immediate_ok = self._is_valid_immediate_successor(vehicle_id, current_edge, next_edge)
-            downstream_ok = dead_end < 1.0
-            if downstream_ok and immediate_ok:
-                mask[i] = 1.0
+            proposals.append(IntentProposal(StrategicIntent("reroute", target, route_edges, reason="ok"), feat, valid=True))
 
-        return np.concatenate([base, cand_vec.reshape(-1)], axis=0).reshape(1, -1), mask, cand_vec
+        return proposals[: self.candidate_slots]
 
-    def _commitment_threshold(self, vehicle_id, edge_id, candidates):
-        edge_len = float(self.connection_info.edge_length_dict.get(edge_id, 100.0))
-        speed = max(traci.vehicle.getSpeed(vehicle_id), 3.0)
-        lanes = max(traci.edge.getLaneNumber(edge_id), 1)
-        lane_cost = 0.0
-        for c in candidates:
-            lane_cost = max(lane_cost, self.compute_candidate_lane_metrics(vehicle_id, edge_id, c)["min_lane_shifts"])
-        t = min(0.85 * edge_len, max(45.0, 2.2 * speed + 12.0 * lane_cost + 4.0 * lanes))
-        return float(t)
-
-    def should_make_decision(self, vehicle_id, edge_id, candidates, commitment, latest_density, current_density, candidate_densities, committed_deficit=None, candidate_deficits=None):
-        if len(candidates) <= 1:
-            return False
-        lane_id = traci.vehicle.getLaneID(vehicle_id)
-        dist_to_end = max(traci.lane.getLength(lane_id) - traci.vehicle.getLanePosition(vehicle_id), 0.0)
-        in_zone = dist_to_end <= self._commitment_threshold(vehicle_id, edge_id, candidates)
-        if not in_zone:
-            return False
-        if commitment is None:
-            return True
-        if commitment.edge != edge_id:
-            return True
-        if abs(current_density - latest_density) > 0.10:
-            return True
-        if candidate_densities:
-            best_idx = int(np.argmin(candidate_densities))
-            best_candidate_density = candidate_densities[best_idx]
-            best_candidate_deficit = candidate_deficits[best_idx] if candidate_deficits and best_idx < len(candidate_deficits) else math.inf
-            if (current_density - best_candidate_density) > 0.12 and (committed_deficit is None or best_candidate_deficit <= committed_deficit + 2.0):
-                return True
-        lane_m = self.compute_candidate_lane_metrics(vehicle_id, edge_id, commitment.chosen_next_edge)
-        return not lane_m["feasible"]
-
-    def apply_route_commitment(self, vehicle_id, current_edge, chosen_next_edge, destination):
-        if not self._is_valid_immediate_successor(vehicle_id, current_edge, chosen_next_edge):
-            return RouteApplyResult(applied=False, reason="invalid_first_hop")
-        lane_succ = self._current_lane_successors(vehicle_id)
-        if chosen_next_edge not in lane_succ:
-            return RouteApplyResult(applied=False, reason="lane_not_ready")
+    def _signal_or_stop_zone(self, vehicle_id):
+        # Conservative signal/stop-zone gating to avoid last-second unsafe reroutes.
         try:
-            from_edge = self.net.getEdge(chosen_next_edge)
-            to_edge = self.net.getEdge(destination)
-            path, _ = self.net.getShortestPath(from_edge, to_edge)
-            if path is None:
-                return RouteApplyResult(applied=False, reason="downstream_path_missing")
-            route_edges = [current_edge] + [e.getID() for e in path]
-            traci.vehicle.setRoute(vehicle_id, route_edges)
-            return RouteApplyResult(applied=True, reason="ok", route_edges=route_edges)
+            tls = traci.vehicle.getNextTLS(vehicle_id)
         except Exception:
-            return RouteApplyResult(applied=False, reason="route_set_exception")
+            tls = []
+        if not tls:
+            return False
+        for item in tls:
+            if len(item) < 3:
+                continue
+            dist = float(item[2])
+            if dist <= self.red_stop_zone_distance:
+                return True
+        return False
+
+    def _tactical_gate(self, vehicle_id, intent: StrategicIntent, step, diag) -> Tuple[bool, str]:
+        if intent.intent_type in ("keep", "delay"):
+            return True, "safe_hold"
+
+        dist_to_end = self._distance_to_lane_end(vehicle_id)
+        if dist_to_end < self.min_commit_distance:
+            diag["filtered_too_close_to_junction"] += 1
+            return False, "too_close_to_junction"
+
+        if self._signal_or_stop_zone(vehicle_id):
+            diag["filtered_red_stop_zone"] += 1
+            return False, "red_stop_zone"
+
+        current_edge = traci.vehicle.getRoadID(vehicle_id)
+        first_next = self._first_actionable_next_edge(intent.route_edges, current_edge)
+        if first_next is None:
+            diag["filtered_empty_actionable_hop"] += 1
+            return False, "empty_actionable_hop"
+
+        lane_succ = self._lane_successors(traci.vehicle.getLaneID(vehicle_id))
+        if first_next not in lane_succ:
+            diag["filtered_current_lane_no_successor"] += 1
+            return False, "lane_not_ready"
+
+        if not self._best_lane_reachable(vehicle_id, first_next):
+            diag["filtered_best_lane_infeasible"] += 1
+            return False, "best_lane_infeasible"
+
+        return True, "executable"
+
+    def _apply_intent(self, vehicle_id, intent: StrategicIntent, diag):
+        if intent.intent_type in ("keep", "delay"):
+            return True, "noop"
+        if not intent.route_edges:
+            return False, "empty_route"
+        try:
+            traci.vehicle.setRoute(vehicle_id, intent.route_edges)
+            try:
+                if not traci.vehicle.isRouteValid(vehicle_id):
+                    diag["route_application_invalid_after_set"] += 1
+                    return False, "route_invalid_after_set"
+            except Exception:
+                pass
+            return True, "applied"
+        except Exception:
+            diag["route_application_failures"] += 1
+            return False, "set_route_exception"
 
     def _global_stats(self, controlled_ids, vehicles, step, teleported, failed):
-        behind = 0
-        for vid in controlled_ids:
-            if vid not in vehicles:
-                continue
-            v = vehicles[vid]
-            edge = v.current_edge
-            if not edge:
-                continue
-            tleft = max(v.deadline - step, 0.0)
-            eta = self.estimate_eta(edge, v.destination)
-            if math.isfinite(eta) and eta > tleft:
-                behind += 1
         total = max(len(controlled_ids), 1)
+        global_deficit, per_vehicle = self.metric_computer.global_deadline_deficit(controlled_ids, vehicles, step)
+        behind = sum(1 for _vid, d in per_vehicle.items() if d > 0.0)
         return {
             "mean_density": self._global_density_mean,
             "std_density": self._global_density_std,
             "frac_behind": behind / float(total),
             "frac_failed": (len(teleported) + len(failed)) / float(total),
+            "global_deficit": global_deficit,
         }
 
-    def compute_reward(self, prev_deficit, curr_deficit, chosen_density, global_mean_density, lane_failed=False, repeated=0.0, arrived=False, on_time=False, wrong_target=False, teleported=False, deadline_missed=False, lateness=0.0, remain_dist=0.0):
-        reward = 0.0
-        reward += self.w_deficit_delta * (prev_deficit - curr_deficit)
-        if prev_deficit > 0 and curr_deficit > prev_deficit:
-            reward -= self.w_critical_worse * (curr_deficit - prev_deficit)
-        reward -= self.w_externality * max(chosen_density - global_mean_density, 0.0)
-        if lane_failed:
-            reward -= self.w_lane_failure
-        reward -= self.w_loop * repeated
+    def _build_state(self, vehicle_id, vehicle, step, proposals, global_stats, recent_actions):
+        edge = traci.vehicle.getRoadID(vehicle_id)
+        lane_idx = traci.vehicle.getLaneIndex(vehicle_id)
+        n_lanes = max(traci.edge.getLaneNumber(edge), 1)
+        dist_to_end = self._distance_to_lane_end(vehicle_id)
+        speed = traci.vehicle.getSpeed(vehicle_id)
+        time_left = max(float(vehicle.deadline) - float(step), 0.0)
+        eta_curr = self.estimate_eta(edge, vehicle.destination)
+        slack = (time_left - eta_curr) if math.isfinite(eta_curr) else -self.time_norm
+        base = np.array([
+            lane_idx / max(n_lanes - 1, 1),
+            min(n_lanes, 6) / 6.0,
+            np.clip(dist_to_end / self.dist_norm, 0.0, 1.0),
+            np.clip(speed / self.speed_norm, 0.0, 1.5) / 1.5,
+            np.clip(time_left / self.time_norm, 0.0, 1.0),
+            np.clip((eta_curr if math.isfinite(eta_curr) else self.time_norm) / self.time_norm, 0.0, 2.0) / 2.0,
+            np.clip(slack / self.time_norm, -1.0, 1.0),
+            np.clip(global_stats["mean_density"], 0.0, 2.0) / 2.0,
+            np.clip(global_stats["std_density"], 0.0, 1.0),
+            np.clip(global_stats["frac_behind"], 0.0, 1.0),
+            np.clip(global_stats["frac_failed"], 0.0, 1.0),
+            np.clip(global_stats["global_deficit"] / (self.time_norm * max(1, len(proposals))), 0.0, 1.0),
+            1.0 if self._signal_or_stop_zone(vehicle_id) else 0.0,
+            1.0 if dist_to_end < self.min_commit_distance else 0.0,
+            np.clip(self.connection_info.edge_vehicle_count.get(edge, 0) / max(self.connection_info.edge_length_dict.get(edge, 1.0), 1.0), 0.0, 2.0) / 2.0,
+            1.0 if len(recent_actions) >= 2 and recent_actions[-1] != recent_actions[-2] else 0.0,
+            np.clip(len(proposals) / float(max(self.candidate_slots, 1)), 0.0, 1.0),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ], dtype=np.float32)
+
+        cand = np.zeros((self.candidate_slots, self.intent_feature_size), dtype=np.float32)
+        mask = np.zeros((self.candidate_slots,), dtype=np.float32)
+        for i, p in enumerate(proposals[: self.candidate_slots]):
+            cand[i] = p.features
+            if p.valid:
+                mask[i] = 1.0
+        return np.concatenate([base, cand.reshape(-1)], axis=0).reshape(1, -1), mask
+
+    def _reward(self, prev_global_deficit, new_global_deficit, blocked_invalid=0, tactical_defer=0, oscillation=0, harsh_brake=0, arrived=False, on_time=False, teleported=False, deadline_missed=False):
+        reward = self.w_global * (prev_global_deficit - new_global_deficit)
+        reward -= self.w_invalid_blocked * float(blocked_invalid)
+        reward -= self.w_tactical_defer * float(tactical_defer)
+        reward -= self.w_oscillation * float(oscillation)
+        reward -= self.w_harsh_brake * float(harsh_brake)
         if teleported:
             return reward + self.teleport_penalty, True
-        if wrong_target:
-            return reward + self.wrong_target_penalty, True
         if arrived:
-            if on_time:
-                return reward + self.arrival_on_time_reward, True
-            return reward + self.arrival_late_reward - min(lateness, 300.0) * 0.2, True
+            return reward + (self.arrival_on_time_reward if on_time else self.arrival_late_reward), True
         if deadline_missed:
-            return reward - (40.0 + self.deadline_miss_terminal_scale * (lateness + 0.05 * remain_dist)), True
+            return reward + self.deadline_miss_penalty, True
         return reward, False
 
     def generate_episode_vehicles(self, episode_seed=None, curriculum_cfg=None):
@@ -713,11 +733,9 @@ class RLTrainingPipeline:
     def run(self):
         sumo_binary = checkBinary('sumo')
         rolling = defaultdict(lambda: deque(maxlen=self.rolling_window))
-        rolling_baseline = deque(maxlen=30)
         metrics_history = []
 
         for episode in range(self.episodes):
-            self._route_blacklist = {}
             if self.seed_with_episode:
                 random.seed(episode)
                 np.random.seed(episode)
@@ -726,354 +744,254 @@ class RLTrainingPipeline:
 
             traci.start([sumo_binary, '-c', self.sumocfg_path, '--tripinfo-output', os.path.join(self.sumocfg_dir, 'trips.trips.xml'), '--quit-on-end'])
 
-            commitments = {}
-            lane_not_ready_state = {}
+            pending: Dict[str, PendingIntent] = {}
             nstep_buffers = defaultdict(lambda: deque(maxlen=self.trainer.n_step))
-            recent_edges = defaultdict(lambda: deque(maxlen=self.loop_window))
             teleported_controlled = set()
             failed_ids = set()
-            arrived_true_dest = set()
             arrived_on_time = set()
             arrived_any = set()
-            wrong_target = set()
-            lane_failures = 0
-            deficit_improvements = []
-            loops = 0
-            episode_return = 0.0
             removal_causes = defaultdict(int)
-            terminal_step = {}
-            final_step = 0
             route_diag = defaultdict(int)
+            recent_actions = defaultdict(lambda: deque(maxlen=self.oscillation_window))
+            prev_speeds = {}
+            terminal_step = {}
+            episode_return = 0.0
+            final_step = 0
+
+            def push_nstep_transition(local_vid, transition):
+                buf = nstep_buffers[local_vid]
+                buf.append(transition)
+                terminal = transition["done"] >= 1.0
+                while buf and (len(buf) >= self.trainer.n_step or terminal):
+                    horizon = min(len(buf), self.trainer.n_step)
+                    first = buf[0]
+                    R = 0.0
+                    for i in range(horizon):
+                        R += (self.trainer.gamma ** i) * buf[i]["reward"]
+                    last = buf[horizon - 1]
+                    out = {
+                        "state": first["state"],
+                        "action": first["action"],
+                        "reward": R,
+                        "next_state": last["next_state"],
+                        "done": last["done"],
+                        "next_mask": last["next_mask"],
+                        "horizon": horizon,
+                    }
+                    self.trainer.remember(out)
+                    buf.popleft()
+                    if not terminal and len(buf) < self.trainer.n_step:
+                        break
+                if terminal:
+                    buf.clear()
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
-                    pre_step_on_destination = set()
                     final_step = step
                     if traci.simulation.getMinExpectedNumber() <= 0:
                         break
                     self.update_edge_vehicle_counts(step, every=1)
-                    vehicle_ids = list(traci.vehicle.getIDList())
-                    global_stats = self._global_stats(set(vehicles.keys()), vehicles, step, teleported_controlled, failed_ids)
+                    ids = list(traci.vehicle.getIDList())
+                    for vid in ids:
+                        if vid in vehicles:
+                            vehicles[vid].current_edge = traci.vehicle.getRoadID(vid)
+                    g = self._global_stats(set(vehicles.keys()), vehicles, step, teleported_controlled, failed_ids)
 
-                    def push_nstep_transition(local_vid, transition):
-                        buf = nstep_buffers[local_vid]
-                        buf.append(transition)
-                        terminal = transition["done"] >= 1.0
-                        while buf and (len(buf) >= self.trainer.n_step or terminal):
-                            horizon = min(len(buf), self.trainer.n_step)
-                            first = buf[0]
-                            R = 0.0
-                            for i in range(horizon):
-                                R += (self.trainer.gamma ** i) * buf[i]["reward"]
-                            last = buf[horizon - 1]
-                            out = {
-                                "state": first["state"],
-                                "action": first["action"],
-                                "reward": R,
-                                "next_state": last["next_state"],
-                                "done": last["done"],
-                                "next_mask": last["next_mask"],
-                                "horizon": horizon,
-                            }
-                            self.trainer.remember(out)
-                            buf.popleft()
-                            if not terminal and len(buf) < self.trainer.n_step:
-                                break
-                        if terminal:
-                            buf.clear()
-
-                    for vid in vehicle_ids:
+                    for vid in ids:
                         if vid not in vehicles:
                             continue
                         v = vehicles[vid]
-                        edge = traci.vehicle.getRoadID(vid)
+                        edge = v.current_edge
                         if edge not in self.connection_info.edge_index_dict:
                             continue
-                        v.current_edge = edge
-                        recent_edges[vid].append(edge)
 
-                        if edge == v.destination:
-                            pre_step_on_destination.add(vid)
-                            continue
+                        # Emergency braking monitor.
+                        curr_speed = traci.vehicle.getSpeed(vid)
+                        prev_speed = prev_speeds.get(vid, curr_speed)
+                        harsh_brake = 1 if (prev_speed - curr_speed) > 4.5 else 0
+                        prev_speeds[vid] = curr_speed
+                        if harsh_brake:
+                            route_diag["emergency_braking_events"] += 1
 
-                        candidates = self.enumerate_candidate_next_edges(vid, edge, v.destination, step, diag=route_diag)
-                        state, mask, cand_feat = self.build_state(vid, v, step, edge, candidates, recent_edges[vid], global_stats)
-
-                        # Close commitments when execution outcome is known.
-                        c = commitments.get(vid)
-                        if c is not None:
-                            curr_eta = self.estimate_eta(edge, v.destination)
-                            time_left = max(v.deadline - step, 0.0)
-                            curr_deficit = max(curr_eta - time_left, 0.0) if math.isfinite(curr_eta) else self.time_norm
-                            entered_chosen = (edge == c.chosen_next_edge)
-                            lane_m = self.compute_candidate_lane_metrics(vid, c.edge, c.chosen_next_edge) if c.edge == edge else {"feasible": True}
-                            late_impossible = (not lane_m.get("feasible", True)) and not entered_chosen
-                            repeated = 1.0 if edge in list(recent_edges[vid])[:-1] else 0.0
-                            if repeated > 0:
-                                loops += 1
-
-                            if entered_chosen or late_impossible:
-                                if entered_chosen:
-                                    reward_base = self.execution_success_bonus
-                                else:
-                                    reward_base = 0.0
-                                    lane_failures += 1
-                                reward, done = self.compute_reward(
-                                    c.prev_deficit,
-                                    curr_deficit,
-                                    c.chosen_density,
-                                    self._global_density_mean,
-                                    lane_failed=late_impossible,
-                                    repeated=repeated + c.candidate_repeated,
-                                )
-                                reward += reward_base
-                                deficit_improvements.append(c.prev_deficit - curr_deficit)
-                                next_state = state
-                                transition = {
-                                    "state": c.state,
-                                    "action": c.action,
-                                    "reward": reward,
-                                    "next_state": next_state,
-                                    "done": float(done),
-                                    "next_mask": mask.reshape(1, -1)[0],
-                                }
-                                push_nstep_transition(vid, transition)
-                                commitments.pop(vid, None)
-                                episode_return += reward
-
-                        candidate_densities = [
-                            self.connection_info.edge_vehicle_count.get(nxt, 0) / max(self.connection_info.edge_length_dict.get(nxt, 1.0), 1.0)
-                            for nxt in candidates
-                        ]
-                        time_left = max(v.deadline - step, 0.0)
-                        candidate_deficits = []
-                        for nxt in candidates:
-                            eta_next = self.estimate_eta(nxt, v.destination)
-                            candidate_deficits.append(max(eta_next - time_left, 0.0) if math.isfinite(eta_next) else self.time_norm)
-                        prev_density = commitments[vid].chosen_density if vid in commitments else self.connection_info.edge_vehicle_count.get(edge, 0) / max(self.connection_info.edge_length_dict.get(edge, 1.0), 1.0)
-                        curr_density = self.connection_info.edge_vehicle_count.get((commitments[vid].chosen_next_edge if vid in commitments else edge), 0) / max(self.connection_info.edge_length_dict.get((commitments[vid].chosen_next_edge if vid in commitments else edge), 1.0), 1.0)
-                        committed_eta = self.estimate_eta((commitments[vid].chosen_next_edge if vid in commitments else edge), v.destination)
-                        committed_deficit = max(committed_eta - time_left, 0.0) if math.isfinite(committed_eta) else self.time_norm
-                        if not self.should_make_decision(vid, edge, candidates, commitments.get(vid), prev_density, curr_density, candidate_densities, committed_deficit=committed_deficit, candidate_deficits=candidate_deficits):
-                            continue
-
+                        proposals = self._propose_intents(vid, v, edge, v.destination, step, route_diag)
+                        state, mask = self._build_state(vid, v, step, proposals, g, recent_actions[vid])
                         if np.sum(mask) <= 0:
+                            route_diag["no_actions_after_filter"] += 1
                             continue
+
+                        # Resolve pending intent first (stage 2 tactical executor).
+                        if vid in pending:
+                            p = pending[vid]
+                            if step - p.created_step > self.intent_ttl:
+                                route_diag["pending_intent_expired"] += 1
+                                pending.pop(vid, None)
+                            else:
+                                ok, reason = self._tactical_gate(vid, p.intent, step, route_diag)
+                                if ok:
+                                    # Log route proposal before application.
+                                    route_diag["route_proposals_attempted"] += 1
+                                    success, app_reason = self._apply_intent(vid, p.intent, route_diag)
+                                    if success:
+                                        if p.intent.intent_type == "reroute":
+                                            route_diag["reroute_applied"] += 1
+                                        now_global, _ = self.metric_computer.global_deadline_deficit(set(vehicles.keys()), vehicles, step)
+                                        rew, done = self._reward(p.prev_global_deficit, now_global, harsh_brake=harsh_brake)
+                                        transition = {
+                                            "state": p.state,
+                                            "action": p.action,
+                                            "reward": rew,
+                                            "next_state": state,
+                                            "done": float(done),
+                                            "next_mask": mask.reshape(1, -1)[0],
+                                        }
+                                        push_nstep_transition(vid, transition)
+                                        episode_return += rew
+                                        pending.pop(vid, None)
+                                    else:
+                                        route_diag["route_application_failures"] += 1
+                                        ck = self._cooldown_key(vid, edge, p.intent.target_edge)
+                                        self._failed_intent_cooldown[ck] = step + self.route_retry_cooldown_steps
+                                        pending.pop(vid, None)
+                                        rew, _done = self._reward(p.prev_global_deficit, p.prev_global_deficit, blocked_invalid=1, harsh_brake=harsh_brake)
+                                        transition = {
+                                            "state": p.state,
+                                            "action": p.action,
+                                            "reward": rew,
+                                            "next_state": state,
+                                            "done": 0.0,
+                                            "next_mask": mask.reshape(1, -1)[0],
+                                        }
+                                        push_nstep_transition(vid, transition)
+                                        episode_return += rew
+                                else:
+                                    route_diag[f"tactical_defer_{reason}"] += 1
+                            continue
+
                         action = self.trainer.select_action(state, mask)
-                        if action is None or action >= len(candidates):
+                        if action is None or action >= len(proposals):
                             continue
-                        chosen_next = candidates[action]
-                        lane_m = self.compute_candidate_lane_metrics(vid, edge, chosen_next)
-                        if lane_m["target_lanes"]:
-                            target_lane = min(lane_m["target_lanes"], key=lambda idx: abs(idx - traci.vehicle.getLaneIndex(vid)))
-                            try:
-                                traci.vehicle.changeLane(vid, int(target_lane), 60)
-                            except Exception:
-                                pass
+                        selected = proposals[action].intent
+                        recent_actions[vid].append(selected.intent_type + ":" + str(selected.target_edge))
+                        oscillation = 1 if len(recent_actions[vid]) >= 2 and recent_actions[vid][-1] != recent_actions[vid][-2] else 0
+                        if oscillation:
+                            route_diag["oscillation_events"] += 1
 
-                        blocked = lane_not_ready_state.get(vid)
-                        if blocked is not None and blocked.edge == edge and blocked.chosen_next_edge == chosen_next:
-                            curr_lane_idx = traci.vehicle.getLaneIndex(vid)
-                            lane_id = traci.vehicle.getLaneID(vid)
-                            dist_to_end = max(traci.lane.getLength(lane_id) - traci.vehicle.getLanePosition(vid), 0.0)
-                            progressed = dist_to_end < (blocked.distance_to_end - 1.0)
-                            lane_changed = curr_lane_idx != blocked.lane_index
-                            if not (progressed or lane_changed):
-                                route_diag["lane_not_ready_retry_suppressed"] += 1
-                                continue
-
-                        apply_result = self.apply_route_commitment(vid, edge, chosen_next, v.destination)
-                        if not apply_result.applied:
-                            route_diag[apply_result.reason] += 1
-                            if apply_result.reason == "lane_not_ready":
-                                route_diag["lane_not_ready_count"] += 1
-                                lane_id = traci.vehicle.getLaneID(vid)
-                                lane_not_ready_state[vid] = LaneNotReadyState(
-                                    edge=edge,
-                                    chosen_next_edge=chosen_next,
-                                    lane_index=traci.vehicle.getLaneIndex(vid),
-                                    distance_to_end=max(traci.lane.getLength(lane_id) - traci.vehicle.getLanePosition(vid), 0.0),
-                                )
-                                continue
-                            if apply_result.reason == "downstream_path_missing":
-                                route_diag["downstream_path_failures"] += 1
-                            if apply_result.reason == "route_set_exception":
-                                route_diag["route_set_exceptions"] += 1
-                            if apply_result.reason == "invalid_first_hop":
-                                route_diag["invalid_first_hop_count"] += 1
-                            bl_key = self._blacklist_key(vid, edge, chosen_next)
-                            self._route_blacklist[bl_key] = step + self.route_retry_cooldown_steps
-                            fail_penalty = 0.0
-                            if apply_result.reason == "invalid_first_hop":
-                                fail_penalty = self.invalid_first_hop_penalty
-                            elif apply_result.reason == "downstream_path_missing":
-                                fail_penalty = self.downstream_path_missing_penalty
-                            elif apply_result.reason == "route_set_exception":
-                                fail_penalty = self.route_set_exception_penalty
+                        prev_global, _ = self.metric_computer.global_deadline_deficit(set(vehicles.keys()), vehicles, step)
+                        if selected.intent_type in ("keep", "delay"):
+                            new_global, _ = self.metric_computer.global_deadline_deficit(set(vehicles.keys()), vehicles, step)
+                            rew, done = self._reward(prev_global, new_global, tactical_defer=(1 if selected.intent_type == "delay" else 0), oscillation=oscillation, harsh_brake=harsh_brake)
                             transition = {
                                 "state": state,
                                 "action": action,
-                                "reward": fail_penalty,
+                                "reward": rew,
                                 "next_state": state,
-                                "done": 0.0,
+                                "done": float(done),
                                 "next_mask": mask.reshape(1, -1)[0],
                             }
                             push_nstep_transition(vid, transition)
-                            episode_return += fail_penalty
+                            episode_return += rew
                             continue
 
-                        lane_not_ready_state.pop(vid, None)
-                        eta_now = self.estimate_eta(edge, v.destination)
-                        time_left = max(v.deadline - step, 0.0)
-                        prev_deficit = max(eta_now - time_left, 0.0) if math.isfinite(eta_now) else self.time_norm
-                        chosen_density = self.connection_info.edge_vehicle_count.get(chosen_next, 0) / max(self.connection_info.edge_length_dict.get(chosen_next, 1.0), 1.0)
-                        commitments[vid] = Commitment(
-                            state=state,
-                            action=action,
-                            edge=edge,
-                            chosen_next_edge=chosen_next,
-                            chosen_density=chosen_density,
-                            prev_deficit=prev_deficit,
-                            step=step,
-                            candidate_repeated=(1.0 if chosen_next in recent_edges[vid] else 0.0),
-                        )
+                        ok, reason = self._tactical_gate(vid, selected, step, route_diag)
+                        if not ok:
+                            pending[vid] = PendingIntent(state=state, action=action, intent=selected, created_step=step, prev_global_deficit=prev_global)
+                            route_diag[f"pending_due_to_{reason}"] += 1
+                            continue
+
+                        route_diag["route_proposals_attempted"] += 1
+                        success, app_reason = self._apply_intent(vid, selected, route_diag)
+                        if not success:
+                            ck = self._cooldown_key(vid, edge, selected.target_edge)
+                            self._failed_intent_cooldown[ck] = step + self.route_retry_cooldown_steps
+                            rew, done = self._reward(prev_global, prev_global, blocked_invalid=1, oscillation=oscillation, harsh_brake=harsh_brake)
+                            transition = {
+                                "state": state,
+                                "action": action,
+                                "reward": rew,
+                                "next_state": state,
+                                "done": float(done),
+                                "next_mask": mask.reshape(1, -1)[0],
+                            }
+                            push_nstep_transition(vid, transition)
+                            episode_return += rew
+                            continue
+
+                        now_global, _ = self.metric_computer.global_deadline_deficit(set(vehicles.keys()), vehicles, step)
+                        rew, done = self._reward(prev_global, now_global, oscillation=oscillation, harsh_brake=harsh_brake)
+                        transition = {
+                            "state": state,
+                            "action": action,
+                            "reward": rew,
+                            "next_state": state,
+                            "done": float(done),
+                            "next_mask": mask.reshape(1, -1)[0],
+                        }
+                        push_nstep_transition(vid, transition)
+                        episode_return += rew
 
                     traci.simulationStep()
 
                     for aid in traci.simulation.getArrivedIDList():
-                        if aid not in vehicles:
+                        if aid not in vehicles or aid in terminal_step:
                             continue
-                        if aid in terminal_step:
-                            continue
-                        v = vehicles[aid]
                         arrived_any.add(aid)
-                        is_true = (aid in pre_step_on_destination)
-                        if is_true:
-                            arrived_true_dest.add(aid)
-                            if step <= v.deadline:
-                                arrived_on_time.add(aid)
-                            removal_causes["reached_true_destination"] += 1
-                        else:
-                            wrong_target.add(aid)
-                            failed_ids.add(aid)
-                            removal_causes["reached_wrong_target"] += 1
-                        if aid in commitments:
-                            c = commitments.pop(aid)
-                            lateness = max(step - v.deadline, 0.0)
-                            last_edge = v.current_edge or c.edge
-                            curr_eta = self.estimate_eta(last_edge, v.destination)
-                            curr_deficit = max(curr_eta - max(v.deadline - step, 0.0), 0.0) if math.isfinite(curr_eta) else self.time_norm
-                            reward, done = self.compute_reward(c.prev_deficit, curr_deficit, c.chosen_density, self._global_density_mean, wrong_target=(not is_true), arrived=is_true, on_time=(step <= v.deadline), lateness=lateness)
-                            transition = {"state": c.state, "action": c.action, "reward": reward, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": float(done), "next_mask": np.zeros((self.action_size,), dtype=np.float32)}
-                            push_nstep_transition(aid, transition)
-                            episode_return += reward
+                        v = vehicles[aid]
+                        on_time = (step <= v.deadline)
+                        if on_time:
+                            arrived_on_time.add(aid)
+                        removal_causes["arrived"] += 1
                         terminal_step[aid] = step
 
-                    tele = self.get_teleport_ids()
-                    for tid in tele:
-                        if tid not in vehicles:
-                            continue
-                        if tid in terminal_step:
+                    for tid in traci.simulation.getStartingTeleportIDList():
+                        if tid not in vehicles or tid in terminal_step:
                             continue
                         teleported_controlled.add(tid)
                         failed_ids.add(tid)
                         removal_causes["teleport"] += 1
-                        if tid in commitments:
-                            c = commitments.pop(tid)
-                            reward, done = self.compute_reward(c.prev_deficit, c.prev_deficit + 5.0, c.chosen_density, self._global_density_mean, teleported=True)
-                            transition = {"state": c.state, "action": c.action, "reward": reward, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": float(done), "next_mask": np.zeros((self.action_size,), dtype=np.float32)}
-                            push_nstep_transition(tid, transition)
-                            episode_return += reward
                         terminal_step[tid] = step
 
                     if step % self.train_every == 0:
                         for _ in range(self.grad_steps):
                             self.trainer.replay()
 
-                # unresolved vehicles
                 controlled_ids = set(vehicles.keys())
-                disappeared = controlled_ids - set(traci.vehicle.getIDList()) - arrived_any - teleported_controlled
-                for vid in disappeared:
-                    if vid not in arrived_any and vid not in teleported_controlled and vid not in terminal_step:
-                        failed_ids.add(vid)
-                        removal_causes["disappeared"] += 1
-                        terminal_step[vid] = final_step
+                for vid in controlled_ids:
+                    if vid not in terminal_step:
+                        if vid not in traci.vehicle.getIDList():
+                            failed_ids.add(vid)
+                            terminal_step[vid] = final_step
+                            removal_causes["disappeared"] += 1
 
-                for vid, c in list(commitments.items()):
-                    if vid in terminal_step:
-                        commitments.pop(vid, None)
-                        continue
-                    v = vehicles[vid]
-                    late = max(final_step - v.deadline, 0.0)
-                    remain_dist = self.get_distance_to_destination(v.current_edge or c.edge, v.destination)
-                    reward, done = self.compute_reward(c.prev_deficit, c.prev_deficit + 2.0, c.chosen_density, self._global_density_mean, deadline_missed=True, lateness=late, remain_dist=(remain_dist if math.isfinite(remain_dist) else 1000.0))
-                    transition = {"state": c.state, "action": c.action, "reward": reward, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": float(done), "next_mask": np.zeros((self.action_size,), dtype=np.float32)}
+                for vid, p in list(pending.items()):
+                    rew, done = self._reward(p.prev_global_deficit, p.prev_global_deficit, deadline_missed=True)
+                    transition = {
+                        "state": p.state,
+                        "action": p.action,
+                        "reward": rew,
+                        "next_state": np.zeros((1, self.state_size), dtype=np.float32),
+                        "done": float(done),
+                        "next_mask": np.zeros((self.action_size,), dtype=np.float32),
+                    }
                     push_nstep_transition(vid, transition)
-                    episode_return += reward
-                    commitments.pop(vid, None)
-                    failed_ids.add(vid)
-                    removal_causes["dead_end_trapped"] += 1
-                    terminal_step[vid] = final_step
-
-                for vid, buf in list(nstep_buffers.items()):
-                    while buf:
-                        horizon = min(len(buf), self.trainer.n_step)
-                        first = buf[0]
-                        R = 0.0
-                        for i in range(horizon):
-                            R += (self.trainer.gamma ** i) * buf[i]["reward"]
-                        last = buf[horizon - 1]
-                        out = {
-                            "state": first["state"],
-                            "action": first["action"],
-                            "reward": R,
-                            "next_state": last["next_state"],
-                            "done": last["done"],
-                            "next_mask": last["next_mask"],
-                            "horizon": horizon,
-                        }
-                        self.trainer.remember(out)
-                        buf.popleft()
+                    episode_return += rew
+                    pending.pop(vid, None)
 
             finally:
                 traci.close()
 
             total = max(len(vehicles), 1)
-            on_time = len(arrived_on_time)
-            completion_before_deadline = on_time / float(total)
-            true_arrival_rate = len(arrived_true_dest) / float(total)
-            wrong_target_rate = len(wrong_target) / float(total)
+            on_time_rate = len(arrived_on_time) / float(total)
             teleport_rate = len(teleported_controlled) / float(total)
-            exit_wo_dest_rate = len((set(vehicles.keys()) - arrived_true_dest - teleported_controlled)) / float(total)
-            avg_lateness = float(np.mean([max(terminal_step.get(vid, final_step) - vehicles[vid].deadline, 0.0) for vid in vehicles])) if vehicles else 0.0
-            late_vehicles = [vid for vid in vehicles if max(terminal_step.get(vid, final_step) - vehicles[vid].deadline, 0.0) > 0]
-            avg_lateness_late_only = float(np.mean([max(terminal_step.get(vid, final_step) - vehicles[vid].deadline, 0.0) for vid in late_vehicles])) if late_vehicles else 0.0
-            avg_deficit_improvement = float(np.mean(deficit_improvements)) if deficit_improvements else 0.0
-            lane_failure_rate = lane_failures / float(max(len(deficit_improvements), 1))
-            loop_rate = loops / float(max(len(deficit_improvements), 1))
-
-            rolling_baseline.append(completion_before_deadline)
-            base = float(np.mean(rolling_baseline)) if rolling_baseline else completion_before_deadline
-            shared_bonus_triggered = completion_before_deadline > base
-
+            miss_rate = len([vid for vid in vehicles if max(terminal_step.get(vid, final_step) - vehicles[vid].deadline, 0.0) > 0]) / float(total)
             metrics = {
                 "episode": episode,
-                "true_destination_arrival_rate": true_arrival_rate,
-                "completion_before_deadline_rate": completion_before_deadline,
-                "wrong_target_arrival_rate": wrong_target_rate,
-                "exit_without_destination_rate": exit_wo_dest_rate,
-                "non_true_destination_non_teleport_rate": exit_wo_dest_rate,
+                "on_time_rate": on_time_rate,
                 "teleport_rate": teleport_rate,
-                "average_deadline_lateness": avg_lateness,
-                "average_deadline_lateness_late_only": avg_lateness_late_only,
-                "average_deficit_improvement": avg_deficit_improvement,
-                "lane_execution_failure_rate": lane_failure_rate,
-                "loop_oscillation_rate": loop_rate,
-                "replay_td_error_stats": dict(self.trainer.last_td_error_stats),
-                "removals_by_cause": dict(removal_causes),
-                "route_failure_diagnostics": dict(route_diag),
-                "shared_bonus_triggered": shared_bonus_triggered,
+                "deadline_miss_rate": miss_rate,
                 "episode_return": episode_return / float(total),
+                "replay_td_error_stats": dict(self.trainer.last_td_error_stats),
+                "route_failure_diagnostics": dict(route_diag),
+                "removals_by_cause": dict(removal_causes),
             }
             metrics_history.append(metrics)
             for k, v in metrics.items():
@@ -1082,12 +1000,10 @@ class RLTrainingPipeline:
 
             self.trainer.epsilon = max(self.trainer.epsilon_min, self.trainer.epsilon * self.trainer.epsilon_decay)
             print(
-                f"Ep {episode} | arr_true={true_arrival_rate:.3f} on_time={completion_before_deadline:.3f} "
-                f"wrong_target={wrong_target_rate:.3f} exit_wo_dest={exit_wo_dest_rate:.3f} tele={teleport_rate:.3f} "
-                f"lane_fail={lane_failure_rate:.3f} loop={loop_rate:.3f} td_mean={self.trainer.last_td_error_stats['mean']:.4f}"
+                f"Ep {episode} | on_time={on_time_rate:.3f} tele={teleport_rate:.3f} "
+                f"miss={miss_rate:.3f} td_mean={self.trainer.last_td_error_stats['mean']:.4f}"
             )
-            print(f"Removal causes: {dict(removal_causes)}")
-            print(f"Route diagnostics: {dict(route_diag)}")
+            print(f"Diagnostics: {dict(route_diag)}")
 
         self.trainer.model.save(self.model_output_path)
         return metrics_history
