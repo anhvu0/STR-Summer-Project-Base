@@ -4,6 +4,7 @@ import random
 import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from typing import List, Optional
 
 import numpy as np
 from keras import backend as K
@@ -217,7 +218,7 @@ class Commitment:
 class RouteApplyResult:
     applied: bool
     reason: str = "ok"
-    route_edges: list | None = None
+    route_edges: Optional[List[str]] = None
 
 
 @dataclass
