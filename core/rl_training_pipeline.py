@@ -170,17 +170,11 @@ class DQNTrainer:
         q_next_online = self.model(next_states, training=False).numpy()
         q_next_target = self.target_model(next_states, training=False).numpy()
 
-        bootstrap = np.zeros(self.batch_size, dtype=np.float32)
-        for i in range(self.batch_size):
-            if dones[i] >= 1.0:
-                continue
-            valid = np.flatnonzero(next_masks[i] > 0)
-            if len(valid) == 0:
-                continue
-            masked_online = np.full(self.action_size, -1e9, dtype=np.float32)
-            masked_online[valid] = q_next_online[i, valid]
-            best_a = int(np.argmax(masked_online))
-            bootstrap[i] = q_next_target[i, best_a]
+        valid_any = np.any(next_masks > 0, axis=1)
+        masked_online = np.where(next_masks > 0, q_next_online, -1e9)
+        best_actions = np.argmax(masked_online, axis=1)
+        bootstrap = q_next_target[np.arange(self.batch_size), best_actions].astype(np.float32)
+        bootstrap *= ((dones < 1.0) & valid_any).astype(np.float32)
 
         target = q_pred.copy()
         y = rewards + (1.0 - dones) * (self.gamma ** horizons) * bootstrap
@@ -322,6 +316,8 @@ class RLTrainingPipeline:
         )
         self._progress_last_emit_ts = 0.0
         self._progress_last_line_len = 0
+        self.progress_emit_interval_s = 0.35
+        self.edge_density_update_every = 2
 
     def parse_sumocfg(self, sumocfg_path):
         dom = parse(sumocfg_path)
@@ -758,7 +754,7 @@ class RLTrainingPipeline:
         force=False,
     ):
         now = time.time()
-        if (not force) and (now - self._progress_last_emit_ts < 0.08):
+        if (not force) and (now - self._progress_last_emit_ts < self.progress_emit_interval_s):
             return
         done_steps = min(max(step + 1, 0), max(total_steps, 1))
         bar_width = 26
@@ -822,7 +818,7 @@ class RLTrainingPipeline:
                     pending = traci.simulation.getMinExpectedNumber()
                     if pending <= 0:
                         break
-                    self.update_edge_vehicle_counts(step, every=1)
+                    self.update_edge_vehicle_counts(step, every=self.edge_density_update_every)
                     vehicle_ids = list(traci.vehicle.getIDList())
                     active_controlled = [vid for vid in vehicle_ids if vid in vehicles]
                     self._render_episode_progress(
@@ -1185,13 +1181,28 @@ class RLTrainingPipeline:
                     rolling[k].append(float(v))
 
             self.trainer.epsilon = max(self.trainer.epsilon_min, self.trainer.epsilon * self.trainer.epsilon_decay)
+            reached_true_late = len(arrived_true_dest - arrived_on_time)
+            print(f"Episode {episode + 1}/{self.episodes} summary")
             print(
-                f"Episode {episode + 1}/{self.episodes} complete | total={len(vehicles)} arr_true={len(arrived_true_dest)} "
-                f"on_time={len(arrived_on_time)} missed_deadline={deadline_missed_count} wrong_target={len(wrong_target)} "
-                f"failed={len(failed_ids)} tele={len(teleported_controlled)} | "
-                f"arr_true_rate={true_arrival_rate:.3f} on_time_rate={completion_before_deadline:.3f} "
-                f"wrong_target_rate={wrong_target_rate:.3f} exit_wo_dest_rate={exit_wo_dest_rate:.3f} tele_rate={teleport_rate:.3f} "
-                f"lane_fail={lane_failure_rate:.3f} loop={loop_rate:.3f} td_mean={self.trainer.last_td_error_stats['mean']:.4f}"
+                "  Outcomes: "
+                f"total={len(vehicles)} | reached_destination={len(arrived_true_dest)} ({true_arrival_rate:.1%}) | "
+                f"on_time={len(arrived_on_time)} ({completion_before_deadline:.1%}) | "
+                f"destination_but_late={reached_true_late} | "
+                f"missed_deadline={deadline_missed_count} ({(deadline_missed_count / float(total)):.1%})"
+            )
+            print(
+                "  Failures: "
+                f"wrong_target={len(wrong_target)} ({wrong_target_rate:.1%}) | "
+                f"teleported={len(teleported_controlled)} ({teleport_rate:.1%}) | "
+                f"failed={len(failed_ids)} | "
+                f"exit_wo_destination={int(exit_wo_dest_rate * total)} ({exit_wo_dest_rate:.1%})"
+            )
+            print(
+                "  Training: "
+                f"avg_return={metrics['episode_return']:.4f} | "
+                f"avg_lateness={avg_lateness:.2f} | late_only={avg_lateness_late_only:.2f} | "
+                f"lane_fail_rate={lane_failure_rate:.3f} | loop_rate={loop_rate:.3f} | "
+                f"td_mean={self.trainer.last_td_error_stats['mean']:.4f} | eps={self.trainer.epsilon:.4f}"
             )
             print(f"Removal causes: {dict(removal_causes)}")
             print(f"Route diagnostics: {dict(route_diag)}")
