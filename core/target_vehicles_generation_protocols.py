@@ -115,7 +115,7 @@ class target_vehicles_generator:
         """
         return [edge for edge in edge_pool if self.__edge_has_incoming(edge)]
 
-    def __estimate_deadline(self, start_edge, destination_edge, release_time):
+    def __estimate_deadline(self, start_edge, destination_edge, release_time, slack_range=(1.15, 1.35), noise_ratio=0.05):
         """
             Estimate a realistic per-vehicle deadline from a shortest-path
             free-flow ETA plus buffers for junction delays and traffic noise.
@@ -124,7 +124,7 @@ class target_vehicles_generator:
 
         # Fallback keeps generation robust if path computation fails.
         if shortest_path is None or shortest_path[0] is None:
-            return int(release_time + random.randint(600, 900))
+            return int(release_time + 900)
 
         path_edges = shortest_path[0]
         free_flow_eta = 0.0
@@ -132,19 +132,14 @@ class target_vehicles_generator:
             edge_speed = max(float(edge.getSpeed()), 5.0)
             free_flow_eta += float(edge.getLength()) / edge_speed
 
-        # Add fixed delay per hop to account for intersections/signal waiting.
-        junction_delay = max(len(path_edges) - 1, 0) * 2.5
+        junction_delay = max(len(path_edges) - 1, 0) * 2.0
+        congestion_allowance = 6.0 + 0.10 * free_flow_eta
+        base_eta = free_flow_eta + junction_delay + congestion_allowance
 
-        # Add a light congestion/noise buffer that grows with route duration.
-        traffic_buffer = 10.0 + (0.15 * free_flow_eta)
-        base_eta = free_flow_eta + junction_delay + traffic_buffer
-
-        # Allow some deadline variation while staying tied to route difficulty.
-        slack_factor = random.uniform(1.15, 1.50)
-        deadline_time = release_time + max(base_eta * slack_factor, base_eta + 30.0)
-        # Preserve current deadline logic, but add extra random slack for
-        # controllable flexibility during routing/training experiments.
-        deadline_time += random.randint(0, 600)
+        slack_factor = random.uniform(float(slack_range[0]), float(slack_range[1]))
+        bounded_noise = random.uniform(-noise_ratio, noise_ratio) * base_eta
+        deadline_time = release_time + base_eta * slack_factor + bounded_noise
+        deadline_time = max(deadline_time, release_time + base_eta * 1.05)
         return int(deadline_time)
 
 
@@ -441,7 +436,7 @@ class target_vehicles_generator:
         
         target_vehicles_generator.target_vehicles_output_dict[target_xml_file] = 0
 
-    def generate_vehicles(self, num_target_vehicles, num_random_vehicles, pattern, target_xml_file, net_xml_file, spawn_interval = None, seed = None):
+    def generate_vehicles(self, num_target_vehicles, num_random_vehicles, pattern, target_xml_file, net_xml_file, spawn_interval = None, seed = None, deadline_slack_range=(1.15, 1.35), curriculum_phase=None):
         """
             param @num_target_vehicles <int>: The number of target vehicles.
             param @num_random_vehicles <int>: The number of uncontrolled vehicles.
@@ -584,7 +579,14 @@ class target_vehicles_generator:
                 root.insertBefore(temp_v, vs[index+1])
                 #root.appendChild(temp_v)
             #append the vehicle to the final vehicle list
-            ddl_now = self.__estimate_deadline(r[1][0], r[1][1], release_time)
+            urgency_draw = random.random()
+            if urgency_draw < 0.30:
+                urgency_scale = (deadline_slack_range[0], min(deadline_slack_range[1], deadline_slack_range[0] + 0.08))
+            elif urgency_draw < 0.75:
+                urgency_scale = deadline_slack_range
+            else:
+                urgency_scale = (min(deadline_slack_range[1] + 0.04, 1.60), min(deadline_slack_range[1] + 0.12, 1.70))
+            ddl_now = self.__estimate_deadline(r[1][0], r[1][1], release_time, slack_range=urgency_scale, noise_ratio=0.05)
             v_now = Util.Vehicle(str(id_now), r[1][1].getID(), release_time, ddl_now)
             vehicle_list.append(v_now)
             release_time += release_period
