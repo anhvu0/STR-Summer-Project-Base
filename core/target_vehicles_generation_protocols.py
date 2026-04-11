@@ -118,13 +118,13 @@ class target_vehicles_generator:
     def __estimate_deadline(self, start_edge, destination_edge, release_time):
         """
             Estimate a realistic per-vehicle deadline from a shortest-path
-            free-flow ETA plus buffers for junction delays and traffic noise.
+            free-flow ETA plus proportional buffers for junction delays and traffic noise.
         """
         shortest_path = self.net.getShortestPath(start_edge, destination_edge)
 
         # Fallback keeps generation robust if path computation fails.
         if shortest_path is None or shortest_path[0] is None:
-            return int(release_time + random.randint(600, 900))
+            return int(release_time + 900)
 
         path_edges = shortest_path[0]
         free_flow_eta = 0.0
@@ -132,19 +132,18 @@ class target_vehicles_generator:
             edge_speed = max(float(edge.getSpeed()), 5.0)
             free_flow_eta += float(edge.getLength()) / edge_speed
 
-        # Add fixed delay per hop to account for intersections/signal waiting.
-        junction_delay = max(len(path_edges) - 1, 0) * 2.5
+        # Add delay per hop to account for intersections/signal waiting.
+        # Keep this proportional to route duration instead of fixed random slack.
+        junction_delay = max(len(path_edges) - 1, 0) * 2.0
 
-        # Add a light congestion/noise buffer that grows with route duration.
-        traffic_buffer = 10.0 + (0.15 * free_flow_eta)
+        # Add a congestion/noise buffer proportional to route duration.
+        traffic_buffer = 0.25 * free_flow_eta
         base_eta = free_flow_eta + junction_delay + traffic_buffer
 
-        # Allow some deadline variation while staying tied to route difficulty.
-        slack_factor = random.uniform(1.15, 1.50)
-        deadline_time = release_time + max(base_eta * slack_factor, base_eta + 30.0)
-        # Preserve current deadline logic, but add extra random slack for
-        # controllable flexibility during routing/training experiments.
-        deadline_time += random.randint(0, 600)
+        # Deadline is proportional to route difficulty with only light multiplicative jitter.
+        # This avoids very loose +random(0,600) deadlines that blur urgency.
+        slack_factor = random.uniform(1.20, 1.45)
+        deadline_time = release_time + max(base_eta * slack_factor, base_eta + 20.0)
         return int(deadline_time)
 
 

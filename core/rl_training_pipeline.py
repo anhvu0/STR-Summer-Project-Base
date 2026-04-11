@@ -215,9 +215,9 @@ class RLTrainingPipeline:
         spawn_interval=4.0,
         seed_with_episode=True,
         decision_horizon=6,
-        destination_reward=80.0,       #Adjustible
-        deadline_penalty=100.0,
-        on_time_arrival_bonus=40.0,
+        destination_reward=120.0,       #Adjustible
+        deadline_penalty=180.0,
+        on_time_arrival_bonus=220.0,
         teleport_penalty=-100.0,
         epsilon_decay=0.99,
         epsilon_min=0.10,
@@ -272,10 +272,11 @@ class RLTrainingPipeline:
         # 1) deadline feasibility (dominant)
         # 2) congestion externality (secondary)
         # 3) shortest-path distance only as weak tie-breaker
-        self.deadline_deficit_scale = 50.0
-        self.deadline_deficit_delta_scale = 25.0
+        self.deadline_deficit_scale = 60.0
+        self.deadline_deficit_delta_scale = 30.0
         self.deadline_critical_buffer = 20.0
         self.distance_tiebreak_scale = 0.05
+        self.invalid_route_penalty = 30.0
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
@@ -519,6 +520,30 @@ class RLTrainingPipeline:
 
         return teleported
 
+    def _vehicle_is_active(self, vehicle_id):
+        """Best-effort guard for TraCI calls on vehicles that may have just left simulation."""
+        try:
+            return vehicle_id in traci.vehicle.getIDList()
+        except Exception:
+            return False
+
+    def _remember_invalid_decision(self, state, action, vehicle_id, current_edge, destination_edge):
+        """
+        Record a non-terminal penalty when a chosen action cannot be executed.
+        This preserves learning signal instead of silently falling back to a
+        shortest-path/global-target command.
+        """
+        next_state = np.array(state, copy=True)
+        next_valid = self.valid_actions(current_edge)
+        self.trainer.remember(
+            state,
+            action,
+            -float(self.invalid_route_penalty),
+            next_state,
+            False,
+            next_valid_actions=next_valid,
+        )
+
     def make_terminal_next_state(self, vehicle_id, edge_id, destination_edge):
         """
         Build a next_state even if the vehicle is in a weird edge after teleport.
@@ -632,6 +657,8 @@ class RLTrainingPipeline:
         If current lane cannot do 'direction', try to change into a lane that can,
         as long as we aren't too close to the junction end.
         """
+        if not self._vehicle_is_active(vehicle_id):
+            return
         lane_id = traci.vehicle.getLaneID(vehicle_id)
         lane_pos = traci.vehicle.getLanePosition(vehicle_id)
         lane_len = traci.lane.getLength(lane_id)
@@ -673,10 +700,11 @@ class RLTrainingPipeline:
 
         # ---- Base penalties ----
         elapsed = max(float(delta_t), 1.0)
-        time_penalty = -3.0 * elapsed
+        # Keep per-step pressure modest so sparse success signals remain learnable.
+        time_penalty = -0.6 * elapsed
         congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
         edge_density = congestion / max(self.connection_info.edge_length_dict[current_edge], 5.0)
-        congestion_penalty = -edge_density * elapsed
+        congestion_penalty = -0.35 * edge_density * elapsed
         # More flexible vehicles (larger deadline - start_time) should yield,
         # so congestion penalty is stronger for them.
         congestion_penalty *= (1.0 + flexibility)
@@ -706,7 +734,7 @@ class RLTrainingPipeline:
         reward += self.deadline_deficit_delta_scale * (prev_deficit - curr_deficit)
 
         if time_left < self.deadline_critical_buffer and curr_deficit > 0.0:
-            reward -= 30.0 * (1.0 + urgency) * min(curr_deficit, 2.0)
+            reward -= 24.0 * (1.0 + urgency) * min(curr_deficit, 2.0)
 
         # ---- Distance-only tie breaker (tertiary objective) ----
         if math.isfinite(prev_distance) and math.isfinite(curr_distance):
@@ -729,8 +757,11 @@ class RLTrainingPipeline:
                 reward += self.destination_reward
                 if step <= vehicle.deadline:
                     reward += self.on_time_arrival_bonus
+                else:
+                    # Reaching destination late is much worse than on-time completion.
+                    reward -= 0.6 * self.deadline_penalty
             else:
-                reward -= 0.5 * self.deadline_penalty
+                reward -= 0.8 * self.deadline_penalty
             done = True
             return reward, done
 
@@ -961,6 +992,33 @@ class RLTrainingPipeline:
                         )
                         local_target = self.route_helper.compute_local_target(decision_list, vehicle)
                         applied_target = None
+
+                        # Hard guard: if destination is currently unreachable from where
+                        # the vehicle actually is, do not issue route commands that can
+                        # trigger "no connection to the next edge" failures downstream.
+                        dist_current_to_dest = self.get_distance_to_destination(
+                            current_edge, vehicle.destination
+                        )
+                        if not math.isfinite(dist_current_to_dest):
+                            self._remember_invalid_decision(
+                                state, action, vehicle_id, current_edge, vehicle.destination
+                            )
+                            episode_return -= self.invalid_route_penalty
+                            last_decision_edge[vehicle_id] = current_edge
+                            continue
+
+                        # Same guard for local target: keep only reachable intermediate vias.
+                        dist_current_to_local = self.get_distance_to_destination(
+                            current_edge, local_target
+                        )
+                        if not math.isfinite(dist_current_to_local):
+                            self._remember_invalid_decision(
+                                state, action, vehicle_id, current_edge, vehicle.destination
+                            )
+                            episode_return -= self.invalid_route_penalty
+                            last_decision_edge[vehicle_id] = current_edge
+                            continue
+
                         if local_target != vehicle.destination:
                             dist_local_to_dest = self.get_distance_to_destination(
                                 local_target, vehicle.destination
@@ -968,9 +1026,17 @@ class RLTrainingPipeline:
                             if not math.isfinite(dist_local_to_dest):
                                 # Avoid setting an infeasible via edge that would
                                 # trigger "No connection between edge ... found".
-                                local_target = vehicle.destination
+                                self._remember_invalid_decision(
+                                    state, action, vehicle_id, current_edge, vehicle.destination
+                                )
+                                episode_return -= self.invalid_route_penalty
+                                last_decision_edge[vehicle_id] = current_edge
+                                continue
 
                         try:
+                            if not self._vehicle_is_active(vehicle_id):
+                                last_decision_edge[vehicle_id] = current_edge
+                                continue
                             # Keep the global destination as the route sink so the vehicle is not
                             # removed at intermediate control targets. Use the local target as a
                             # temporary via edge whenever it differs from the final destination.
@@ -982,17 +1048,15 @@ class RLTrainingPipeline:
                             traci.vehicle.changeTarget(vehicle_id, vehicle.destination)
                             applied_target = local_target
                         except traci.exceptions.TraCIException:
-                            # Some local targets become infeasible from the vehicle's current
-                            # route/lane context. Try falling back to the global destination
-                            # instead of crashing the whole training run.
-                            try:
-                                traci.vehicle.setVia(vehicle_id, [])
-                                traci.vehicle.changeTarget(vehicle_id, vehicle.destination)
-                                applied_target = vehicle.destination
-                            except traci.exceptions.TraCIException:
-                                # Keep episode running and retry next decision point.
-                                last_decision_edge[vehicle_id] = current_edge
-                                continue
+                            # Treat infeasible command execution as a bad action so
+                            # the policy learns to avoid it, instead of silently
+                            # falling back to shortest-path target updates.
+                            self._remember_invalid_decision(
+                                state, action, vehicle_id, current_edge, vehicle.destination
+                            )
+                            episode_return -= self.invalid_route_penalty
+                            last_decision_edge[vehicle_id] = current_edge
+                            continue
 
                         last_target_by_vehicle[vehicle_id] = applied_target
 
@@ -1077,6 +1141,7 @@ class RLTrainingPipeline:
                     if teleported_ids:
                         episode_teleport_events += len(teleported_ids)
                         teleported_controlled_ids.update(tid for tid in teleported_ids if tid in vehicles)
+                        active_vehicle_ids = set(traci.vehicle.getIDList())
                         for tid in list(teleported_ids):
                             if tid not in vehicles:
                                 continue
@@ -1088,6 +1153,8 @@ class RLTrainingPipeline:
 
                                 # Try to get where it ended up; may fail if removed, so guard
                                 try:
+                                    if tid not in active_vehicle_ids:
+                                        raise traci.exceptions.TraCIException("")
                                     tele_edge = traci.vehicle.getRoadID(tid)
                                 except Exception:
                                     tele_edge = prev_edge
