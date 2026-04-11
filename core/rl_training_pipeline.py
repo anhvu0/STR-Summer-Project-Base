@@ -87,9 +87,9 @@ class DQNTrainer:
         epsilon=1.0,
         epsilon_decay=0.995,
         epsilon_min=0.05,
-        replay_capacity=50000,
+        replay_capacity=10000,
         batch_size=64,
-        replay_warmup=2000,
+        replay_warmup=1000,
         target_update_every=1,
         target_soft_tau=0.01,
         grad_clip_norm=10.0,
@@ -122,9 +122,9 @@ class DQNTrainer:
 
     def build_model(self, learning_rate):
         inp = Input(shape=(self.state_size,))
-        x = Dense(256, activation='relu')(inp)
-        x = Dense(256, activation='relu')(x)
+        x = Dense(128, activation='relu')(inp)
         x = Dense(128, activation='relu')(x)
+        x = Dense(64, activation='relu')(x)
         value = Dense(1, activation='linear')(x)
         advantage = Dense(self.action_size, activation='linear')(x)
         centered_adv = Lambda(lambda a: a - K.mean(a, axis=1, keepdims=True))(advantage)
@@ -225,9 +225,9 @@ class RLTrainingPipeline:
         epsilon_decay=0.995,
         epsilon_min=0.10,
         gamma=0.99,
-        replay_capacity=50000,
+        replay_capacity=10000,
         batch_size=64,
-        replay_warmup=2000,
+        replay_warmup=1000,
         train_every=5,
         grad_steps=1,
         rolling_window=100,
