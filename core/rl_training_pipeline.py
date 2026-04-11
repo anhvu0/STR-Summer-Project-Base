@@ -2,6 +2,9 @@ import numpy as np
 import os
 import sys
 import math
+
+import os, psutil
+
 from xml.dom.minidom import parse
 from keras.layers import Dense
 from keras.models import Sequential, clone_model
@@ -77,7 +80,7 @@ class DQNTrainer:
         epsilon_decay=0.99,
         epsilon_min=0.05,
         replay_capacity=2000,
-        batch_size=256,
+        batch_size=64,
         replay_warmup=1000,
         target_update_every=200,
         target_soft_tau=1.0,
@@ -133,8 +136,8 @@ class DQNTrainer:
 
     def build_model(self, learning_rate):
         model = Sequential()
-        model.add(Dense(256, input_dim=self.state_size, activation='relu'))      #May increase Dense for bigger network
-        model.add(Dense(256, activation='relu'))
+        model.add(Dense(64, input_dim=self.state_size, activation='relu'))      #May increase Dense for bigger network
+        model.add(Dense(64, activation='relu'))
         model.add(Dense(self.action_size, activation='linear'))
         model.compile(loss='mse', optimizer=Adam(learning_rate = learning_rate))
         return model
@@ -212,16 +215,16 @@ class RLTrainingPipeline:
         spawn_interval=4.0,
         seed_with_episode=True,
         decision_horizon=6,
-        destination_reward=100.0,       #Adjustible
-        deadline_penalty=700.0,
-        on_time_arrival_bonus=30.0,
-        teleport_penalty=-70.0,
+        destination_reward=80.0,       #Adjustible
+        deadline_penalty=100.0,
+        on_time_arrival_bonus=40.0,
+        teleport_penalty=-100.0,
         epsilon_decay=0.99,
         epsilon_min=0.10,
         gamma=0.97,
         replay_capacity=2000,
-        batch_size=128,
-        replay_warmup=2000,
+        batch_size=64,
+        replay_warmup=1000,
         train_every=20,
         grad_steps=1,
         rolling_window=100,
@@ -261,7 +264,7 @@ class RLTrainingPipeline:
         self.debug_exit_diagnostics = debug_exit_diagnostics
         self.debug_exit_diagnostics_limit = max(int(debug_exit_diagnostics_limit), 0)
         self._distance_cache = {}
-        self.progress_reward_scale = 1.0  # or 0.0 to disable progress term cheaply
+        self.progress_reward_scale = 0.80  # or 0.0 to disable progress term cheaply
         self.system_congestion_scale = 0.10  # scales marginal congestion penalty on busy edges
         self.loop_window = 12
         self.loop_repeat_penalty = 10.0
@@ -760,7 +763,7 @@ class RLTrainingPipeline:
         route_path = os.path.join(self.sumocfg_dir, self.route_file)
         vehicle_list = generator.generate_vehicles(
             num_target_vehicles=20,
-            num_random_vehicles=40,
+            num_random_vehicles=30,
             pattern=self.target_pattern,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
@@ -786,11 +789,16 @@ class RLTrainingPipeline:
         rolling_completion_rate = deque(maxlen=self.rolling_window)
         rolling_avg_return = deque(maxlen=self.rolling_window)
 
+        # MAX_CACHE_SIZE = 5000
+
         for episode in range(self.episodes):
             episode_seed = episode if self.seed_with_episode else None
             if episode_seed is not None:
                 random.seed(episode_seed)
                 np.random.seed(episode_seed)
+
+            # if len(self._distance_cache) > MAX_CACHE_SIZE:
+            #     self._distance_cache.clear()
 
             vehicles = self.generate_episode_vehicles(episode_seed=episode_seed)
 
@@ -1106,6 +1114,15 @@ class RLTrainingPipeline:
                     if step % self.train_every == 0:
                         for _ in range(self.grad_steps):
                             self.trainer.replay()
+
+                    process = psutil.Process(os.getpid())
+
+                    if step % 100 == 0:
+                        print(
+                            "RAM_MB=", process.memory_info().rss / 1024 / 1024,
+                            " replay=", len(self.trainer.memory),
+                            " dist_cache=", len(self._distance_cache),
+                        )
 
             finally:
                 completion_rate = (

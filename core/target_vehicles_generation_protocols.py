@@ -477,8 +477,8 @@ class target_vehicles_generator:
         #     print("ERROR: Failed to copy randomTrips.py to current directory.")
         #     return None
         #invoke randomTrips.py
-        print("net_xml_file:",net_xml_file)
-        print("what's our target",target_xml_file)
+        # print("net_xml_file:",net_xml_file)
+        # print("what's our target",target_xml_file)
         # Origin/destination candidate filtering for one-way maps:
         # - origins: must have at least one outgoing edge
         # - destinations: must have at least one incoming edge
