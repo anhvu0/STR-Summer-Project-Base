@@ -93,7 +93,7 @@ class DQNTrainer:
         replay_capacity=5000,
         batch_size=64,
         replay_warmup=1000,
-        target_update_every=1,
+        target_update_every=20,
         target_soft_tau=0.01,
         grad_clip_norm=10.0,
         n_step=3,
@@ -247,10 +247,10 @@ class RLTrainingPipeline:
         batch_size=64,
         replay_warmup=1000,
         train_every=15,
-        grad_steps=1,
+        grad_steps=2,
         rolling_window=100,
         target_pattern=2,
-        max_simulation_steps=2200,
+        max_simulation_steps=MAX_SIMULATION_STEPS,
     ):
         self.sumocfg_path = sumocfg_path
         self.model_output_path = model_output_path
@@ -318,7 +318,7 @@ class RLTrainingPipeline:
             replay_warmup=replay_warmup,
             n_step=3,
             target_soft_tau=0.01,
-            target_update_every=1,
+            target_update_every=20,
         )
         self._progress_last_emit_ts = 0.0
         self._progress_last_line_len = 0

@@ -35,7 +35,7 @@ def build_parser():
     parser.add_argument(
         "--spawn-interval",
         type=float,
-        default=5.5,
+        default=4.0,
         help="Interval between vehicle spawns.",
     )
     parser.add_argument(
@@ -47,7 +47,7 @@ def build_parser():
     parser.add_argument(
         "--max-sim-steps",
         type=int,
-        default=2200,
+        default=3000,
         help="Upper bound on per-episode simulation steps.",
     )
     return parser
