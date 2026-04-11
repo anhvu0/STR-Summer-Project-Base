@@ -15,6 +15,21 @@ This file is for the **next fresh assistant instance** to continue work without 
 
 ## 2) Open challenges
 
+0. **Route-application bug context (newly documented)**:
+   - **Observed runtime symptom:** repeated SUMO warnings/errors of the form:
+     - `Invalid route replacement ... No connection between edge '<A>' and edge '<B>'`
+   - **Primary cause:** the route-commit path could be built as:
+     - `[current_edge] + shortest_path(chosen_next_edge -> destination)`
+     without strictly validating `current_edge -> chosen_next_edge` as a legal immediate successor for that specific vehicle at decision time in SUMO.
+   - **Failure mode:** the same invalid action could be selected repeatedly across timesteps, causing repeated `setRoute` exceptions and poor learning signal.
+   - **Mitigation now in place (core/rl_training_pipeline.py):**
+     - SUMO-lane-link-based immediate-successor validation + topology cross-check,
+     - candidate suppression before policy selection,
+     - defensive apply-time validation with structured failure reasons,
+     - penalty transitions for failed route application,
+     - cooldown blacklist to suppress retry spam,
+     - per-episode route diagnostics counters.
+
 1. **Training objective tuning**:
    - Externality penalty may still be weak compared with deficit/arrival terms.
 2. **ETA realism**:
