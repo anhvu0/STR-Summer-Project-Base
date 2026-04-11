@@ -144,7 +144,7 @@ class target_vehicles_generator:
         deadline_time = release_time + max(base_eta * slack_factor, base_eta + 30.0)
         # Preserve current deadline logic, but add extra random slack for
         # controllable flexibility during routing/training experiments.
-        deadline_time += random.randint(0, 300)
+        deadline_time += random.randint(0, 600)
         return int(deadline_time)
 
 
