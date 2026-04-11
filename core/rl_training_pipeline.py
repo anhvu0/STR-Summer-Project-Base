@@ -292,6 +292,8 @@ class RLTrainingPipeline:
         self._distance_cache = {}
         self._eta_cache = {}
         self._route_blacklist = {}
+        self._downstream_path_cache = {}
+        self._legal_successors_cache = {}
         self.route_retry_cooldown_steps = 30
         self._curriculum = [
             {"until": 0.33, "target": 10, "random": 12, "slack": (1.35, 1.55)},
@@ -410,6 +412,10 @@ class RLTrainingPipeline:
             vclass = traci.vehicle.getVehicleClass(vehicle_id)
         except Exception:
             vclass = None
+        cache_key = (edge_id, vclass)
+        cached = self._legal_successors_cache.get(cache_key)
+        if cached is not None:
+            return set(cached)
         for lane_id in lane_ids:
             try:
                 links = traci.lane.getLinks(lane_id)
@@ -430,6 +436,7 @@ class RLTrainingPipeline:
                     except Exception:
                         pass
                 legal.add(next_edge)
+        self._legal_successors_cache[cache_key] = tuple(sorted(legal))
         return legal
 
     def _is_valid_immediate_successor(self, vehicle_id, current_edge, chosen_next_edge):
@@ -463,13 +470,12 @@ class RLTrainingPipeline:
         return successors
 
     def _has_downstream_path(self, chosen_next_edge, destination):
-        try:
-            from_edge = self.net.getEdge(chosen_next_edge)
-            to_edge = self.net.getEdge(destination)
-            path, _ = self.net.getShortestPath(from_edge, to_edge)
-            return path is not None
-        except Exception:
-            return False
+        key = (chosen_next_edge, destination)
+        if key in self._downstream_path_cache:
+            return self._downstream_path_cache[key]
+        has_path = math.isfinite(self.get_distance_to_destination(chosen_next_edge, destination))
+        self._downstream_path_cache[key] = has_path
+        return has_path
 
     def _find_traci_route_edges(self, from_edge, to_edge, vehicle_id):
         try:
@@ -544,7 +550,7 @@ class RLTrainingPipeline:
         halted = traci.edge.getLastStepHaltingNumber(edge_id)
         return float(halted) / edge_len
 
-    def build_state(self, vehicle_id, vehicle, step, current_edge, candidates, recent_edges, global_stats):
+    def build_state(self, vehicle_id, vehicle, step, current_edge, candidates, recent_edges, global_stats, lane_metric_cache=None):
         lane_idx = traci.vehicle.getLaneIndex(vehicle_id)
         n_lanes = max(traci.edge.getLaneNumber(current_edge), 1)
         lane_id = traci.vehicle.getLaneID(vehicle_id)
@@ -588,7 +594,13 @@ class RLTrainingPipeline:
         cand_vec = np.zeros((self.candidate_slots, self.candidate_feature_size), dtype=np.float32)
         mask = np.zeros((self.candidate_slots,), dtype=np.float32)
         for i, next_edge in enumerate(candidates[: self.candidate_slots]):
-            lane_m = self.compute_candidate_lane_metrics(vehicle_id, current_edge, next_edge)
+            cache_key = (vehicle_id, current_edge, next_edge)
+            if lane_metric_cache is not None and cache_key in lane_metric_cache:
+                lane_m = lane_metric_cache[cache_key]
+            else:
+                lane_m = self.compute_candidate_lane_metrics(vehicle_id, current_edge, next_edge)
+                if lane_metric_cache is not None:
+                    lane_metric_cache[cache_key] = lane_m
             density = self.connection_info.edge_vehicle_count.get(next_edge, 0) / max(self.connection_info.edge_length_dict.get(next_edge, 1.0), 1.0)
             mean_speed = traci.edge.getLastStepMeanSpeed(next_edge)
             eta = self.estimate_eta(next_edge, vehicle.destination)
@@ -768,11 +780,15 @@ class RLTrainingPipeline:
                 for step in range(self.max_simulation_steps):
                     pre_step_on_destination = set()
                     final_step = step
-                    if traci.simulation.getMinExpectedNumber() <= 0:
+                    pending = traci.simulation.getMinExpectedNumber()
+                    if pending <= 0:
                         break
+                    if step == 0 or step % 200 == 0:
+                        print(f"Episode {episode + 1}/{self.episodes} step={step} pending={pending} epsilon={self.trainer.epsilon:.4f}")
                     self.update_edge_vehicle_counts(step, every=1)
                     vehicle_ids = list(traci.vehicle.getIDList())
                     global_stats = self._global_stats(set(vehicles.keys()), vehicles, step, teleported_controlled, failed_ids)
+                    lane_metric_cache = {}
 
                     def push_nstep_transition(local_vid, transition):
                         buf = nstep_buffers[local_vid]
@@ -816,7 +832,7 @@ class RLTrainingPipeline:
                             continue
 
                         candidates = self.enumerate_candidate_next_edges(vid, edge, v.destination, step, diag=route_diag)
-                        state, mask, cand_feat = self.build_state(vid, v, step, edge, candidates, recent_edges[vid], global_stats)
+                        state, mask, cand_feat = self.build_state(vid, v, step, edge, candidates, recent_edges[vid], global_stats, lane_metric_cache=lane_metric_cache)
 
                         # Close commitments when execution outcome is known.
                         c = commitments.get(vid)
@@ -825,7 +841,14 @@ class RLTrainingPipeline:
                             time_left = max(v.deadline - step, 0.0)
                             curr_deficit = max(curr_eta - time_left, 0.0) if math.isfinite(curr_eta) else self.time_norm
                             entered_chosen = (edge == c.chosen_next_edge)
-                            lane_m = self.compute_candidate_lane_metrics(vid, c.edge, c.chosen_next_edge) if c.edge == edge else {"feasible": True}
+                            if c.edge == edge:
+                                key = (vid, c.edge, c.chosen_next_edge)
+                                lane_m = lane_metric_cache.get(key)
+                                if lane_m is None:
+                                    lane_m = self.compute_candidate_lane_metrics(vid, c.edge, c.chosen_next_edge)
+                                    lane_metric_cache[key] = lane_m
+                            else:
+                                lane_m = {"feasible": True}
                             late_impossible = (not lane_m.get("feasible", True)) and not entered_chosen
                             repeated = 1.0 if edge in list(recent_edges[vid])[:-1] else 0.0
                             if repeated > 0:
@@ -882,7 +905,11 @@ class RLTrainingPipeline:
                         if action is None or action >= len(candidates):
                             continue
                         chosen_next = candidates[action]
-                        lane_m = self.compute_candidate_lane_metrics(vid, edge, chosen_next)
+                        key = (vid, edge, chosen_next)
+                        lane_m = lane_metric_cache.get(key)
+                        if lane_m is None:
+                            lane_m = self.compute_candidate_lane_metrics(vid, edge, chosen_next)
+                            lane_metric_cache[key] = lane_m
                         if lane_m["target_lanes"] and lane_m["feasible"] and lane_m["min_lane_shifts"] > 0:
                             target_lane = min(lane_m["target_lanes"], key=lambda idx: abs(idx - traci.vehicle.getLaneIndex(vid)))
                             try:
@@ -1101,7 +1128,7 @@ class RLTrainingPipeline:
 
             self.trainer.epsilon = max(self.trainer.epsilon_min, self.trainer.epsilon * self.trainer.epsilon_decay)
             print(
-                f"Ep {episode} | arr_true={true_arrival_rate:.3f} on_time={completion_before_deadline:.3f} "
+                f"Episode {episode + 1}/{self.episodes} complete | arr_true={true_arrival_rate:.3f} on_time={completion_before_deadline:.3f} "
                 f"wrong_target={wrong_target_rate:.3f} exit_wo_dest={exit_wo_dest_rate:.3f} tele={teleport_rate:.3f} "
                 f"lane_fail={lane_failure_rate:.3f} loop={loop_rate:.3f} td_mean={self.trainer.last_td_error_stats['mean']:.4f}"
             )
