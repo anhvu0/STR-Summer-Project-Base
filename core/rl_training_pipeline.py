@@ -2,6 +2,7 @@ import math
 import os
 import random
 import sys
+import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import List, Optional
@@ -319,6 +320,8 @@ class RLTrainingPipeline:
             target_soft_tau=0.01,
             target_update_every=1,
         )
+        self._progress_last_emit_ts = 0.0
+        self._progress_last_line_len = 0
 
     def parse_sumocfg(self, sumocfg_path):
         dom = parse(sumocfg_path)
@@ -741,6 +744,42 @@ class RLTrainingPipeline:
             raise RuntimeError("Failed to generate vehicles")
         return {str(v.vehicle_id): v for v in vlist}
 
+    def _render_episode_progress(
+        self,
+        episode_idx,
+        step,
+        total_steps,
+        total_vehicles,
+        active_vehicles,
+        arrived_true_count,
+        arrived_on_time_count,
+        teleported_count,
+        failed_count,
+        force=False,
+    ):
+        now = time.time()
+        if (not force) and (now - self._progress_last_emit_ts < 0.08):
+            return
+        done_steps = min(max(step + 1, 0), max(total_steps, 1))
+        bar_width = 26
+        fill = int(bar_width * (done_steps / float(max(total_steps, 1))))
+        bar = "#" * fill + "-" * (bar_width - fill)
+        msg = (
+            f"\rEpisode {episode_idx + 1}/{self.episodes} [{bar}] {done_steps}/{total_steps} "
+            f"active={active_vehicles} total={total_vehicles} "
+            f"arrived={arrived_true_count} on_time={arrived_on_time_count} "
+            f"tele={teleported_count} failed={failed_count} eps={self.trainer.epsilon:.4f}"
+        )
+        pad = max(self._progress_last_line_len - len(msg), 0)
+        print(msg + (" " * pad), end="", flush=True)
+        self._progress_last_line_len = len(msg)
+        self._progress_last_emit_ts = now
+
+    def _end_progress_line(self):
+        if self._progress_last_line_len > 0:
+            print()
+            self._progress_last_line_len = 0
+
     def run(self):
         sumo_binary = checkBinary('sumo')
         rolling = defaultdict(lambda: deque(maxlen=self.rolling_window))
@@ -783,10 +822,20 @@ class RLTrainingPipeline:
                     pending = traci.simulation.getMinExpectedNumber()
                     if pending <= 0:
                         break
-                    if step == 0 or step % 200 == 0:
-                        print(f"Episode {episode + 1}/{self.episodes} step={step} pending={pending} epsilon={self.trainer.epsilon:.4f}")
                     self.update_edge_vehicle_counts(step, every=1)
                     vehicle_ids = list(traci.vehicle.getIDList())
+                    active_controlled = [vid for vid in vehicle_ids if vid in vehicles]
+                    self._render_episode_progress(
+                        episode_idx=episode,
+                        step=step,
+                        total_steps=self.max_simulation_steps,
+                        total_vehicles=len(vehicles),
+                        active_vehicles=len(active_controlled),
+                        arrived_true_count=len(arrived_true_dest),
+                        arrived_on_time_count=len(arrived_on_time),
+                        teleported_count=len(teleported_controlled),
+                        failed_count=len(failed_ids),
+                    )
                     global_stats = self._global_stats(set(vehicles.keys()), vehicles, step, teleported_controlled, failed_ids)
                     lane_metric_cache = {}
 
@@ -1083,6 +1132,7 @@ class RLTrainingPipeline:
 
             finally:
                 traci.close()
+                self._end_progress_line()
 
             total = max(len(vehicles), 1)
             on_time = len(arrived_on_time)
@@ -1091,6 +1141,7 @@ class RLTrainingPipeline:
             wrong_target_rate = len(wrong_target) / float(total)
             teleport_rate = len(teleported_controlled) / float(total)
             exit_wo_dest_rate = len((set(vehicles.keys()) - arrived_true_dest - teleported_controlled)) / float(total)
+            deadline_missed_count = len([vid for vid in vehicles if max(terminal_step.get(vid, final_step) - vehicles[vid].deadline, 0.0) > 0])
             avg_lateness = float(np.mean([max(terminal_step.get(vid, final_step) - vehicles[vid].deadline, 0.0) for vid in vehicles])) if vehicles else 0.0
             late_vehicles = [vid for vid in vehicles if max(terminal_step.get(vid, final_step) - vehicles[vid].deadline, 0.0) > 0]
             avg_lateness_late_only = float(np.mean([max(terminal_step.get(vid, final_step) - vehicles[vid].deadline, 0.0) for vid in late_vehicles])) if late_vehicles else 0.0
@@ -1104,6 +1155,13 @@ class RLTrainingPipeline:
 
             metrics = {
                 "episode": episode,
+                "vehicle_count_total": int(len(vehicles)),
+                "vehicle_count_arrived_true_destination": int(len(arrived_true_dest)),
+                "vehicle_count_arrived_before_deadline": int(len(arrived_on_time)),
+                "vehicle_count_wrong_target": int(len(wrong_target)),
+                "vehicle_count_teleported": int(len(teleported_controlled)),
+                "vehicle_count_failed": int(len(failed_ids)),
+                "vehicle_count_deadline_missed": int(deadline_missed_count),
                 "true_destination_arrival_rate": true_arrival_rate,
                 "completion_before_deadline_rate": completion_before_deadline,
                 "wrong_target_arrival_rate": wrong_target_rate,
@@ -1128,8 +1186,11 @@ class RLTrainingPipeline:
 
             self.trainer.epsilon = max(self.trainer.epsilon_min, self.trainer.epsilon * self.trainer.epsilon_decay)
             print(
-                f"Episode {episode + 1}/{self.episodes} complete | arr_true={true_arrival_rate:.3f} on_time={completion_before_deadline:.3f} "
-                f"wrong_target={wrong_target_rate:.3f} exit_wo_dest={exit_wo_dest_rate:.3f} tele={teleport_rate:.3f} "
+                f"Episode {episode + 1}/{self.episodes} complete | total={len(vehicles)} arr_true={len(arrived_true_dest)} "
+                f"on_time={len(arrived_on_time)} missed_deadline={deadline_missed_count} wrong_target={len(wrong_target)} "
+                f"failed={len(failed_ids)} tele={len(teleported_controlled)} | "
+                f"arr_true_rate={true_arrival_rate:.3f} on_time_rate={completion_before_deadline:.3f} "
+                f"wrong_target_rate={wrong_target_rate:.3f} exit_wo_dest_rate={exit_wo_dest_rate:.3f} tele_rate={teleport_rate:.3f} "
                 f"lane_fail={lane_failure_rate:.3f} loop={loop_rate:.3f} td_mean={self.trainer.last_td_error_stats['mean']:.4f}"
             )
             print(f"Removal causes: {dict(removal_causes)}")
