@@ -468,6 +468,20 @@ class RLTrainingPipeline:
         except Exception:
             return False
 
+    def _find_traci_route_edges(self, from_edge, to_edge, vehicle_id):
+        try:
+            vtype = traci.vehicle.getTypeID(vehicle_id)
+        except Exception:
+            vtype = ""
+        try:
+            route = traci.simulation.findRoute(from_edge, to_edge, vType=vtype)
+        except Exception:
+            return None
+        route_edges = list(getattr(route, "edges", []) or [])
+        if not route_edges:
+            return None
+        return route_edges
+
     def enumerate_candidate_next_edges(self, vehicle_id, edge_id, destination, step, diag=None):
         outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
         seen = set()
@@ -638,12 +652,13 @@ class RLTrainingPipeline:
         if chosen_next_edge not in lane_succ:
             return RouteApplyResult(applied=False, reason="lane_not_ready")
         try:
-            from_edge = self.net.getEdge(chosen_next_edge)
-            to_edge = self.net.getEdge(destination)
-            path, _ = self.net.getShortestPath(from_edge, to_edge)
-            if path is None:
+            first_hop = self._find_traci_route_edges(current_edge, chosen_next_edge, vehicle_id)
+            if not first_hop:
+                return RouteApplyResult(applied=False, reason="invalid_first_hop")
+            downstream = self._find_traci_route_edges(chosen_next_edge, destination, vehicle_id)
+            if not downstream:
                 return RouteApplyResult(applied=False, reason="downstream_path_missing")
-            route_edges = [current_edge] + [e.getID() for e in path]
+            route_edges = first_hop + downstream[1:]
             traci.vehicle.setRoute(vehicle_id, route_edges)
             return RouteApplyResult(applied=True, reason="ok", route_edges=route_edges)
         except Exception:
