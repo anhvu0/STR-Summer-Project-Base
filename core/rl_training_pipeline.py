@@ -26,6 +26,7 @@ else:
 
 from sumolib import checkBinary
 import traci
+import traci.constants as tc
 import sumolib
 
 MAX_SIMULATION_STEPS = 3000
@@ -394,7 +395,7 @@ class RLTrainingPipeline:
         if key in self._eta_cache:
             return self._eta_cache[key]
         try:
-            route = traci.simulation.findRoute(edge_id, destination_edge)
+            route = self._find_route(edge_id, destination_edge)
             edges = list(route.edges) if route and route.edges else []
             if not edges:
                 eta = math.inf
@@ -412,6 +413,19 @@ class RLTrainingPipeline:
             eta = math.inf
         self._eta_cache[key] = eta
         return eta
+
+    def _find_route(self, from_edge, to_edge, vehicle_type=""):
+        """
+        Call TraCI findRoute with explicit 5 parameters for compatibility across SUMO versions.
+        Some builds error unless all route retrieval parameters are supplied.
+        """
+        return traci.simulation.findRoute(
+            from_edge,
+            to_edge,
+            vehicle_type or "",
+            0.0,
+            tc.ROUTING_MODE_DEFAULT,
+        )
 
     def update_edge_vehicle_counts(self, step, every=1):
         if hasattr(self, "_last_density_step") and (step - self._last_density_step) < every:
@@ -480,10 +494,11 @@ class RLTrainingPipeline:
     def _build_route_via_target(self, vehicle_id, current_edge, target_edge, destination):
         # Route construction is SUMO-native to avoid illegal ad-hoc concatenation.
         try:
-            r1 = traci.simulation.findRoute(current_edge, target_edge, vType=traci.vehicle.getTypeID(vehicle_id))
+            vehicle_type = traci.vehicle.getTypeID(vehicle_id)
+            r1 = self._find_route(current_edge, target_edge, vehicle_type)
             if not r1 or not r1.edges:
                 return [], "no_valid_sumo_route_from_current"
-            r2 = traci.simulation.findRoute(target_edge, destination, vType=traci.vehicle.getTypeID(vehicle_id))
+            r2 = self._find_route(target_edge, destination, vehicle_type)
             if not r2 or not r2.edges:
                 return [], "no_valid_sumo_route_to_destination"
             merged = list(r1.edges)
@@ -500,7 +515,7 @@ class RLTrainingPipeline:
 
     def _build_keep_route(self, vehicle_id, current_edge, destination):
         try:
-            r = traci.simulation.findRoute(current_edge, destination, vType=traci.vehicle.getTypeID(vehicle_id))
+            r = self._find_route(current_edge, destination, traci.vehicle.getTypeID(vehicle_id))
             return list(r.edges) if r and r.edges else []
         except Exception:
             return []
