@@ -21,6 +21,7 @@ class QLearningPolicy(RouteController):
     def __init__(self, vehicles, connection_info, model_file, net_xml_file = net_path):
         super().__init__(connection_info)
         self.model = load_model(model_file)
+        self.model_state_size = int(self.model.input_shape[-1])
         self.vehicles = vehicles
         self.net = sumolib.net.readNet(net_xml_file)
         self._visit_count = {}
@@ -42,6 +43,54 @@ class QLearningPolicy(RouteController):
         self.score_slack = 30.0
         self.deadline_deficit_override_slack = 2.0
         self.distance_tiebreak_scale = 0.05
+        self.edge_embedding_dim = 8
+        self.local_congestion_k = 6
+        self.compact_state_size = (2 * self.edge_embedding_dim) + 6 + 3 + 3 + self.local_congestion_k
+        self.legacy_state_size = 2 + 6 + 3 + 3 + len(self.connection_info.edge_list)
+        self.use_compact_state = (self.model_state_size == self.compact_state_size)
+        self.direction_mask_start = (2 * self.edge_embedding_dim) if self.use_compact_state else 2
+        self._init_edge_embeddings(seed=1337)
+
+    def _init_edge_embeddings(self, seed=1337):
+        rng = np.random.default_rng(seed)
+        self._edge_embeddings = {}
+        for edge_id in self.connection_info.edge_list:
+            emb = rng.normal(loc=0.0, scale=0.1, size=self.edge_embedding_dim).astype(np.float32)
+            self._edge_embeddings[edge_id] = emb
+
+    def _get_edge_embedding(self, edge_id):
+        return self._edge_embeddings.get(
+            edge_id,
+            np.zeros(self.edge_embedding_dim, dtype=np.float32),
+        )
+
+    def _local_congestion_features(self, edge_id):
+        lengths = self.connection_info.edge_length_dict
+        current_density = traci.edge.getLastStepVehicleNumber(edge_id) / max(lengths.get(edge_id, 5.0), 5.0)
+        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
+        outgoing_densities = [
+            traci.edge.getLastStepVehicleNumber(next_edge) / max(lengths.get(next_edge, 5.0), 5.0)
+            for next_edge in outgoing.values()
+        ]
+
+        all_densities = [
+            traci.edge.getLastStepVehicleNumber(edge) / max(lengths.get(edge, 5.0), 5.0)
+            for edge in self.connection_info.edge_list
+        ]
+        mean_global = float(np.mean(all_densities)) if len(all_densities) > 0 else 0.0
+        std_global = float(np.std(all_densities)) if len(all_densities) > 0 else 0.0
+        mean_out = float(np.mean(outgoing_densities)) if outgoing_densities else current_density
+        max_out = float(np.max(outgoing_densities)) if outgoing_densities else current_density
+        min_out = float(np.min(outgoing_densities)) if outgoing_densities else current_density
+
+        return [
+            current_density,
+            mean_out,
+            max_out,
+            min_out,
+            current_density - mean_global,
+            std_global,
+        ]
 
 
     
@@ -306,7 +355,8 @@ class QLearningPolicy(RouteController):
     # this function reacheds the Neural Network trained before and let it make a decision for the situation now
     def act(self, state):
         act_values = self.model.predict(state, verbose=0)
-        state_vals = state[0][2:8]
+        mask_start = self.direction_mask_start
+        state_vals = state[0][mask_start:mask_start + 6]
         state_vals = state_vals.reshape(act_values.shape)
         #print(state)
         mod_values = act_values - 10000 * (1 - state_vals)
@@ -318,8 +368,12 @@ class QLearningPolicy(RouteController):
     def getState(self, vehicle_id, edge_now, destination_edge):
         en = edge_now
         state = []
-        state.append(self.connection_info.edge_index_dict[en])
-        state.append(self.connection_info.edge_index_dict[destination_edge])
+        if self.use_compact_state:
+            state.extend(self._get_edge_embedding(en).tolist())
+            state.extend(self._get_edge_embedding(destination_edge).tolist())
+        else:
+            state.append(self.connection_info.edge_index_dict[en])
+            state.append(self.connection_info.edge_index_dict[destination_edge])
         for c in self.direction_choices:
             if c in self.connection_info.outgoing_edges_dict[en].keys():
                 state.append(1)
@@ -350,10 +404,13 @@ class QLearningPolicy(RouteController):
         state.extend([lane_idx_norm, lane_count_norm, dist_to_end_norm])
         state.extend(self._compute_deadline_features(vehicle_id))
 
-        for edge_now in self.connection_info.edge_list:
-            car_num = traci.edge.getLastStepVehicleNumber(edge_now)
-            density = car_num / self.connection_info.edge_length_dict[edge_now]
-            state.append(density)
+        if self.use_compact_state:
+            state.extend(self._local_congestion_features(en))
+        else:
+            for edge_now in self.connection_info.edge_list:
+                car_num = traci.edge.getLastStepVehicleNumber(edge_now)
+                density = car_num / self.connection_info.edge_length_dict[edge_now]
+                state.append(density)
 
         state = np.reshape(state, [1, len(state)])
         return state
