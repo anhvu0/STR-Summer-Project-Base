@@ -2,6 +2,7 @@ import math
 import os
 import random
 import sys
+import inspect
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import List, Optional
@@ -219,6 +220,7 @@ class RouteApplyResult:
     applied: bool
     reason: str = "ok"
     route_edges: Optional[List[str]] = None
+    debug: Optional[dict] = None
 
 
 @dataclass
@@ -290,6 +292,9 @@ class RLTrainingPipeline:
         self._eta_cache = {}
         self._route_blacklist = {}
         self.route_retry_cooldown_steps = 30
+        self._find_route_call_shape_used = "uninitialized"
+        self._find_route_signature_text = "unknown"
+        self._find_route_success_arity = None
         self._curriculum = [
             {"until": 0.33, "target": 12, "random": 16, "slack": (1.35, 1.55)},
             {"until": 0.66, "target": 16, "random": 24, "slack": (1.20, 1.40)},
@@ -430,15 +435,130 @@ class RLTrainingPipeline:
         return legal
 
     def _is_valid_immediate_successor(self, vehicle_id, current_edge, chosen_next_edge):
-        topological = set(self.connection_info.outgoing_edges_dict.get(current_edge, {}).values())
-        if chosen_next_edge not in topological:
-            return False
         legal = self._get_vehicle_legal_successors(vehicle_id, current_edge)
         if not legal:
             return False
         if chosen_next_edge not in legal:
             return False
         return True
+
+    def print_findroute_signature_debug(self):
+        print("[findRoute debug] traci_type=", type(traci))
+        print("[findRoute debug] traci_module=", getattr(traci, "__file__", "n/a"))
+        print("[findRoute debug] simulation_type=", type(getattr(traci, "simulation", None)))
+        find_route_fn = getattr(getattr(traci, "simulation", None), "findRoute", None)
+        print("[findRoute debug] findRoute_fn=", find_route_fn)
+        if find_route_fn is None:
+            print("[findRoute debug] findRoute not available on traci.simulation")
+            return
+        try:
+            sig = str(inspect.signature(find_route_fn))
+        except Exception as exc:
+            sig = f"<signature unavailable: {exc}>"
+        self._find_route_signature_text = sig
+        print("[findRoute debug] signature=", sig)
+        try:
+            print("[findRoute debug] help=", (inspect.getdoc(find_route_fn) or "").splitlines()[:2])
+        except Exception as exc:
+            print("[findRoute debug] help unavailable:", exc)
+
+    def _extract_route_edges(self, route_obj):
+        if route_obj is None:
+            return None
+        if isinstance(route_obj, (list, tuple)):
+            if route_obj and isinstance(route_obj[0], str):
+                return list(route_obj)
+            for item in route_obj:
+                edges = self._extract_route_edges(item)
+                if edges:
+                    return edges
+            return None
+        edges = getattr(route_obj, "edges", None)
+        if edges is not None:
+            try:
+                return list(edges)
+            except Exception:
+                return None
+        return None
+
+    def _is_findroute_signature_mismatch(self, exc):
+        msg = str(exc).lower()
+        if isinstance(exc, TypeError):
+            return True
+        signature_markers = [
+            "positional argument",
+            "required argument",
+            "unexpected keyword",
+            "takes ",
+            "given",
+            "missing",
+        ]
+        return any(m in msg for m in signature_markers)
+
+    def _safe_find_route(self, from_edge, to_edge, vehicle_id=None):
+        find_route_fn = getattr(getattr(traci, "simulation", None), "findRoute", None)
+        if find_route_fn is None:
+            self._find_route_call_shape_used = "findRoute_missing"
+            return None, None
+
+        if self._find_route_signature_text == "unknown":
+            try:
+                self._find_route_signature_text = str(inspect.signature(find_route_fn))
+            except Exception as exc:
+                self._find_route_signature_text = f"<signature unavailable: {exc}>"
+
+        try:
+            vtype = traci.vehicle.getTypeID(vehicle_id) if vehicle_id is not None else ""
+        except Exception:
+            vtype = ""
+        try:
+            depart = traci.simulation.getTime()
+        except Exception:
+            depart = -1.0
+        routing_mode = getattr(getattr(traci, "constants", None), "ROUTING_MODE_DEFAULT", 0)
+        depart_pos = "base"
+        arrival_pos = "max"
+
+        arg_options = []
+        if self._find_route_success_arity is not None:
+            if self._find_route_success_arity == 7:
+                arg_options.append((from_edge, to_edge, vtype, depart, routing_mode, depart_pos, arrival_pos))
+            elif self._find_route_success_arity == 5:
+                arg_options.append((from_edge, to_edge, vtype, depart, routing_mode))
+            elif self._find_route_success_arity == 3:
+                arg_options.append((from_edge, to_edge, vtype))
+            elif self._find_route_success_arity == 2:
+                arg_options.append((from_edge, to_edge))
+        arg_options.extend([
+            (from_edge, to_edge, vtype, depart, routing_mode, depart_pos, arrival_pos),
+            (from_edge, to_edge, vtype, depart, routing_mode),
+            (from_edge, to_edge, vtype),
+            (from_edge, to_edge),
+        ])
+
+        seen_shapes = set()
+        last_exc = None
+        for args in arg_options:
+            shape = f"findRoute/{len(args)}args"
+            if shape in seen_shapes:
+                continue
+            seen_shapes.add(shape)
+            try:
+                route_obj = find_route_fn(*args)
+                self._find_route_success_arity = len(args)
+                self._find_route_call_shape_used = shape
+                return route_obj, self._extract_route_edges(route_obj)
+            except Exception as exc:
+                last_exc = exc
+                if self._is_findroute_signature_mismatch(exc):
+                    continue
+                self._find_route_call_shape_used = shape
+                return None, None
+
+        self._find_route_call_shape_used = f"signature_mismatch ({self._find_route_signature_text})"
+        if last_exc is not None:
+            return None, None
+        return None, None
 
     def _current_lane_successors(self, vehicle_id):
         try:
@@ -459,38 +579,57 @@ class RLTrainingPipeline:
                 successors.add(next_edge)
         return successors
 
-    def _has_downstream_path(self, chosen_next_edge, destination):
-        try:
-            from_edge = self.net.getEdge(chosen_next_edge)
-            to_edge = self.net.getEdge(destination)
-            path, _ = self.net.getShortestPath(from_edge, to_edge)
-            return path is not None
-        except Exception:
+    def _has_downstream_path(self, vehicle_id, chosen_next_edge, destination):
+        _, route_edges = self._safe_find_route(chosen_next_edge, destination, vehicle_id=vehicle_id)
+        if not route_edges:
             return False
+        return route_edges[0] == chosen_next_edge
 
     def enumerate_candidate_next_edges(self, vehicle_id, edge_id, destination, step, diag=None):
-        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
-        seen = set()
+        legal_successors = sorted(self._get_vehicle_legal_successors(vehicle_id, edge_id))
         candidates = []
-        for _d, nxt in outgoing.items():
-            if nxt not in seen:
-                seen.add(nxt)
-                bl_key = self._blacklist_key(vehicle_id, edge_id, nxt)
-                blocked_until = self._route_blacklist.get(bl_key, -1)
-                if blocked_until >= step:
-                    if diag is not None:
-                        diag["blacklist_hits"] += 1
-                    continue
-                if not self._is_valid_immediate_successor(vehicle_id, edge_id, nxt):
-                    if diag is not None:
-                        diag["invalid_first_hop_suppressions"] += 1
-                    continue
-                if not self._has_downstream_path(nxt, destination):
-                    if diag is not None:
-                        diag["downstream_path_failures"] += 1
-                    continue
-                candidates.append(nxt)
+        for nxt in legal_successors:
+            bl_key = self._blacklist_key(vehicle_id, edge_id, nxt)
+            blocked_until = self._route_blacklist.get(bl_key, -1)
+            if blocked_until >= step:
+                if diag is not None:
+                    diag["blacklist_hits"] += 1
+                continue
+            if not self._has_downstream_path(vehicle_id, nxt, destination):
+                if diag is not None:
+                    diag["downstream_path_missing"] += 1
+                    diag["candidate_suppressed_by_sumo_route_check"] += 1
+                continue
+            candidates.append(nxt)
         return candidates[: self.candidate_slots]
+
+    def _route_failure_diag_payload(self, vehicle_id, current_edge, chosen_next_edge, destination, exc_text=""):
+        try:
+            current_lane_id = traci.vehicle.getLaneID(vehicle_id)
+        except Exception:
+            current_lane_id = None
+        lane_successors = sorted(self._current_lane_successors(vehicle_id))
+        all_lane_successors = sorted(self._get_vehicle_legal_successors(vehicle_id, current_edge))
+        try:
+            vehicle_type = traci.vehicle.getTypeID(vehicle_id)
+        except Exception:
+            vehicle_type = "unknown"
+        return {
+            "vehicle_id": str(vehicle_id),
+            "current_edge": str(current_edge),
+            "chosen_next_edge": str(chosen_next_edge),
+            "destination": str(destination),
+            "current_lane_id": current_lane_id,
+            "current_lane_successors": lane_successors,
+            "edge_legal_successors": all_lane_successors,
+            "vehicle_type": vehicle_type,
+            "findRoute_shape": self._find_route_call_shape_used,
+            "findRoute_signature": self._find_route_signature_text,
+            "exception": exc_text,
+        }
+
+    def _log_route_application_failure(self, payload, reason):
+        print(f"[route_apply_failure] reason={reason} details={payload}")
 
     def compute_candidate_lane_metrics(self, vehicle_id, edge_id, next_edge):
         lane_ids = self.connection_info.edge_lane_ids.get(edge_id, [])
@@ -633,21 +772,27 @@ class RLTrainingPipeline:
 
     def apply_route_commitment(self, vehicle_id, current_edge, chosen_next_edge, destination):
         if not self._is_valid_immediate_successor(vehicle_id, current_edge, chosen_next_edge):
-            return RouteApplyResult(applied=False, reason="invalid_first_hop")
+            payload = self._route_failure_diag_payload(vehicle_id, current_edge, chosen_next_edge, destination)
+            self._log_route_application_failure(payload, "invalid_first_hop")
+            return RouteApplyResult(applied=False, reason="invalid_first_hop", debug=payload)
         lane_succ = self._current_lane_successors(vehicle_id)
         if chosen_next_edge not in lane_succ:
-            return RouteApplyResult(applied=False, reason="lane_not_ready")
+            payload = self._route_failure_diag_payload(vehicle_id, current_edge, chosen_next_edge, destination)
+            self._log_route_application_failure(payload, "lane_not_ready")
+            return RouteApplyResult(applied=False, reason="lane_not_ready", debug=payload)
         try:
-            from_edge = self.net.getEdge(chosen_next_edge)
-            to_edge = self.net.getEdge(destination)
-            path, _ = self.net.getShortestPath(from_edge, to_edge)
-            if path is None:
-                return RouteApplyResult(applied=False, reason="downstream_path_missing")
-            route_edges = [current_edge] + [e.getID() for e in path]
+            _, downstream_edges = self._safe_find_route(chosen_next_edge, destination, vehicle_id=vehicle_id)
+            if not downstream_edges or downstream_edges[0] != chosen_next_edge:
+                payload = self._route_failure_diag_payload(vehicle_id, current_edge, chosen_next_edge, destination)
+                self._log_route_application_failure(payload, "downstream_path_missing")
+                return RouteApplyResult(applied=False, reason="downstream_path_missing", debug=payload)
+            route_edges = [current_edge] + downstream_edges
             traci.vehicle.setRoute(vehicle_id, route_edges)
             return RouteApplyResult(applied=True, reason="ok", route_edges=route_edges)
-        except Exception:
-            return RouteApplyResult(applied=False, reason="route_set_exception")
+        except Exception as exc:
+            payload = self._route_failure_diag_payload(vehicle_id, current_edge, chosen_next_edge, destination, exc_text=str(exc))
+            self._log_route_application_failure(payload, "route_set_exception")
+            return RouteApplyResult(applied=False, reason="route_set_exception", debug=payload)
 
     def _global_stats(self, controlled_ids, vehicles, step, teleported, failed):
         behind = 0
@@ -725,6 +870,7 @@ class RLTrainingPipeline:
             vehicles = self.generate_episode_vehicles(episode_seed=(episode if self.seed_with_episode else None), curriculum_cfg=curriculum_cfg)
 
             traci.start([sumo_binary, '-c', self.sumocfg_path, '--tripinfo-output', os.path.join(self.sumocfg_dir, 'trips.trips.xml'), '--quit-on-end'])
+            self.print_findroute_signature_debug()
 
             commitments = {}
             lane_not_ready_state = {}
