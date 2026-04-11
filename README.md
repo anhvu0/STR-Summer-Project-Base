@@ -1,79 +1,103 @@
-***Selfless Traffic Routing testbed based on SUMO (STR-SUMO)***
+# STR-SUMO (Selfless Traffic Routing on SUMO)
 
-This project is built based on SUMO (https://sumo.dlr.de/docs/index.html#introduction), which offers a traffic simulation platform.
-The goal of STR-SUMO is to offer a testbed that can benchmark the performance of a routing policy under the following constraints:
-- Some vehicles are controlled by the scheudling algorithm;
-- Each controlled vehicle has three parameters: 1. start point (an edge), 2. destination (an edge), 3. time to set off, 4. deadline. When travelling from the start point to the destination from the time to set off, the time a vehicle reaches the destination should not exceed the deadline;
-The goal of the routing policy, i.e., the metrics used, includes:
-- How many vehicles have missed their deadlines -- the smaller the better;
-- What is the average time spent for all controlled vehicles -- the smaller the better.
+STR-SUMO is a simulation/testbed for **deadline-aware traffic routing** where a subset of vehicles is controlled by a routing policy and evaluated on deadline, congestion, and reliability outcomes.
 
-***pre-requisite***
+## Purpose and Scope
 
-It is recommended to use Python 3.x, the packages required are included in requirements.txt. 
-You can use pip to install them directly (for Python 3.x):
-```
-pip3 install requirements.txt
-```
-You also need to install SUMO properly: https://sumo.dlr.de/docs/Installing/index.html
+- Simulate controlled + uncontrolled traffic on SUMO road networks.
+- Assign controlled vehicles a `(start_edge, destination_edge, release_time, deadline)` contract.
+- Train/evaluate routing policies (Dijkstra baseline and RL-based).
+- Measure on-time completion, wrong-target arrivals, teleports/disappearances, and lateness-related metrics.
 
+## Brief Architecture
 
-***Layout of the repository***
+- `main.py`: baseline simulation entrypoint (non-RL).
+- `train_rl.py`: RL training entrypoint.
+- `core/rl_training_pipeline.py`: DQN training loop, reward shaping, replay, n-step handling, SUMO integration.
+- `core/target_vehicles_generation_protocols.py`: controlled vehicle generation + deadline generation.
+- `controller/`: routing policies (`RouteController`, `DijkstraController`, `QLearningController`).
+- `configurations/`: SUMO configs, route files, network files, pre-trained model artifacts.
+- `test/`: unit/integration-style scripts and small fixture assets.
 
-main.py: The entrance of the project. Can simply run it when all pre-requisites are installed using:
-```
-python3 main.py
-```
-It will show the benchmarking results of the Dijkstra routing policy for a set of vehicles sharing the same start point and the same destination.
+## Stack and Versions
 
-Next, we walk through each subdirectory.
+### Runtime used in this repo work
 
-**configurations**
+- Python: `3.10.19` (current execution runtime)
+- SUMO: required (install separately and set `SUMO_HOME`)
 
-Includes the mandatory configuration file: \*.sumocfg and \*.net.xml. Note that the \*.net.xml you specify in the sumocfg file must be placed directly in the configuration file repository.
-More maps are given in “maps" subdirectory.
+### Python packages
 
-**core**
+Use `requirements.txt` as the source of truth. Key pinned versions currently in use:
 
-Includes the core files of STR-SUMO. 
-- Util.py: includes the data structure used to store vehicle and map information;
-- network_map_data_structure.py: includes the useful operations to get infromation of the current map;
-- target_vehicles_generation_protocols.py: includes functions used to generate vehicles (including controlled vehicles' information and uncontrolled vehicles' routes)
-- STR-SUMO.py: takes in a routing policy and performs the simulation to benchmark the performance of the target policy under a given set of map and vehicle sets.
-- rl_training_pipeline.py: a Deep Q-Learning training pipeline for routing decisions.
+- `tensorflow==2.11.1`
+- `tensorflow-estimator==2.11.0`
+- `tensorboard==2.11`
+- `Keras==2.11.0`
+- `h5py==3.1.0`
+- `scipy==1.10.0`
 
+Other dependencies are listed in `requirements.txt` (mixed exact pins and minimum bounds).
 
-**controller**
+## Setup
 
-Includes different scheduling policies.
-- RouteController.py: the base class of all routing policies;
-- DijkstraController.py: the routing plicy that employs Dijkstra to find the shortest path (without considering the congestion) for each controlled vehicles;
-- QLearningController.py: a simple routing policy using a trained agent. Specifically trained for map test.net.xml.
+1. Install SUMO: https://sumo.dlr.de/docs/Installing/index.html
+2. Ensure `SUMO_HOME` is set.
+3. Install Python dependencies:
 
-**test**
-
-Includes the unit test for different core files.
-The test scripts should be placed in the main repository.
-
-***Reinforcement Learning Training Pipeline***
-
-The repository now includes a DQN-based training pipeline that spawns vehicles at a configurable interval and trains a routing policy to reach destinations efficiently.
-
-To train a model:
-```
-python3 train_rl.py --sumocfg ./test/myconfig.sumocfg --model-output ./test/rl_model.h5 --episodes 10 --spawn-interval 0.0 (Those are optional arguments. Just use train_rl.py only for default settings)
+```bash
+python -m pip install -r requirements.txt
 ```
 
-The resulting model can be used with `QLearningController.py` by pointing it to the saved model file.
+## How to Run
 
-***Contribution Guidance***
+### Baseline (Dijkstra) run
 
-**Codes**
+```bash
+python main.py
+```
 
-Please add comments for each function using the style pydoc can recognize: https://stackoverflow.com/questions/13040646/how-do-i-create-documentation-with-pydoc
+### RL training
 
-You are also recommended to add brief comments to state the function of each block of codes. Naming variables using convention lowercae_with_underscores is suggested.
+Default config:
 
-**Tests**
+```bash
+python train_rl.py
+```
 
-For important functions, please write a simple test case naming as test_function_name.py. After the test is passed, archive it in the test directory. When reviewing codes, this would be helpful for code reviewers to understand the usage of functions and to expand the tests with some border cases.
+Explicit config/model path:
+
+```bash
+python train_rl.py \
+  --sumocfg ./configurations/myconfig.sumocfg \
+  --model-output ./configurations/rl_model_4corners.h5 \
+  --episodes 10 \
+  --spawn-interval 4.0
+```
+
+### Reproducibility / seeds
+
+- The RL pipeline currently seeds by episode index (`seed_with_episode=True` in `RLTrainingPipeline`), so repeated runs with the same episode count/config are deterministic at the Python RNG level per episode.
+- Vehicle generation also accepts a seed and is fed episode seed by the pipeline.
+
+## Recent Decisions (changelog-lite)
+
+Recent RL training-loop decisions in `core/rl_training_pipeline.py`:
+
+1. Replay now supports per-transition `horizon` for n-step-consistent bootstrapping.
+2. ETA estimation is now path-based and cached (aligned with deadline model shape).
+3. Candidate masking requires lane feasibility.
+4. Commitments are recorded only when route application succeeds.
+5. Terminal handling avoids duplicate counting via `terminal_step`.
+6. Arrival accounting uses post-step arrival lists and a pre-step destination snapshot.
+7. Unresolved-vehicle lateness uses `final_step` (actual episode end), not fixed max-step.
+8. Metrics now expose:
+   - `shared_bonus_triggered`
+   - `average_deadline_lateness_late_only`
+   - `non_true_destination_non_teleport_rate`
+
+## Contribution Guidance
+
+- Keep logic localized and debugger-friendly (avoid unnecessary abstraction layers).
+- Add focused tests for changed logic where possible.
+- Prefer small, traceable edits in existing functions.
