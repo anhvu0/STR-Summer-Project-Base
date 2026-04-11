@@ -481,20 +481,6 @@ class RLTrainingPipeline:
                 return None
         return None
 
-    def _is_findroute_signature_mismatch(self, exc):
-        msg = str(exc).lower()
-        if isinstance(exc, TypeError):
-            return True
-        signature_markers = [
-            "positional argument",
-            "required argument",
-            "unexpected keyword",
-            "takes ",
-            "given",
-            "missing",
-        ]
-        return any(m in msg for m in signature_markers)
-
     def _safe_find_route(self, from_edge, to_edge, vehicle_id=None):
         find_route_fn = getattr(getattr(traci, "simulation", None), "findRoute", None)
         if find_route_fn is None:
@@ -516,49 +502,14 @@ class RLTrainingPipeline:
         except Exception:
             depart = -1.0
         routing_mode = getattr(getattr(traci, "constants", None), "ROUTING_MODE_DEFAULT", 0)
-        depart_pos = "base"
-        arrival_pos = "max"
-
-        arg_options = []
-        if self._find_route_success_arity is not None:
-            if self._find_route_success_arity == 7:
-                arg_options.append((from_edge, to_edge, vtype, depart, routing_mode, depart_pos, arrival_pos))
-            elif self._find_route_success_arity == 5:
-                arg_options.append((from_edge, to_edge, vtype, depart, routing_mode))
-            elif self._find_route_success_arity == 3:
-                arg_options.append((from_edge, to_edge, vtype))
-            elif self._find_route_success_arity == 2:
-                arg_options.append((from_edge, to_edge))
-        arg_options.extend([
-            (from_edge, to_edge, vtype, depart, routing_mode, depart_pos, arrival_pos),
-            (from_edge, to_edge, vtype, depart, routing_mode),
-            (from_edge, to_edge, vtype),
-            (from_edge, to_edge),
-        ])
-
-        seen_shapes = set()
-        last_exc = None
-        for args in arg_options:
-            shape = f"findRoute/{len(args)}args"
-            if shape in seen_shapes:
-                continue
-            seen_shapes.add(shape)
-            try:
-                route_obj = find_route_fn(*args)
-                self._find_route_success_arity = len(args)
-                self._find_route_call_shape_used = shape
-                return route_obj, self._extract_route_edges(route_obj)
-            except Exception as exc:
-                last_exc = exc
-                if self._is_findroute_signature_mismatch(exc):
-                    continue
-                self._find_route_call_shape_used = shape
-                return None, None
-
-        self._find_route_call_shape_used = f"signature_mismatch ({self._find_route_signature_text})"
-        if last_exc is not None:
+        try:
+            route_obj = find_route_fn(from_edge, to_edge, vtype, depart, routing_mode)
+            self._find_route_success_arity = 5
+            self._find_route_call_shape_used = "findRoute/5args"
+            return route_obj, self._extract_route_edges(route_obj)
+        except Exception:
+            self._find_route_call_shape_used = "findRoute/5args_failed"
             return None, None
-        return None, None
 
     def _current_lane_successors(self, vehicle_id):
         try:
