@@ -161,6 +161,7 @@ class DQNTrainer:
         next_states = np.vstack([t["next_state"] for t in samples])
         dones = np.array([t["done"] for t in samples], dtype=np.float32)
         next_masks = np.vstack([t["next_mask"] for t in samples])
+        horizons = np.array([t.get("horizon", 1) for t in samples], dtype=np.float32)
 
         q_pred = self.model(states, training=False).numpy()
         q_next_online = self.model(next_states, training=False).numpy()
@@ -179,7 +180,7 @@ class DQNTrainer:
             bootstrap[i] = q_next_target[i, best_a]
 
         target = q_pred.copy()
-        y = rewards + (1.0 - dones) * self.gamma * bootstrap
+        y = rewards + (1.0 - dones) * (self.gamma ** horizons) * bootstrap
         td_errors = y - q_pred[np.arange(self.batch_size), actions]
         target[np.arange(self.batch_size), actions] = q_pred[np.arange(self.batch_size), actions] + td_errors
 
@@ -254,7 +255,6 @@ class RLTrainingPipeline:
         self.arrival_late_reward = 80.0
         self.wrong_target_penalty = -200.0
         self.deadline_miss_terminal_scale = 0.8
-        self.global_shared_bonus = 3.0
 
         self.loop_window = 10
         self.speed_norm = 20.0
@@ -268,6 +268,7 @@ class RLTrainingPipeline:
         self.connection_info = ConnectionInfo(os.path.join(self.sumocfg_dir, self.net_file))
         self.route_helper = TrainingRouteHelper(self.connection_info)
         self._distance_cache = {}
+        self._eta_cache = {}
         self._curriculum = [
             {"until": 0.33, "target": 12, "random": 16, "slack": (1.35, 1.55)},
             {"until": 0.66, "target": 16, "random": 24, "slack": (1.20, 1.40)},
@@ -321,10 +322,27 @@ class RLTrainingPipeline:
         return dist
 
     def estimate_eta(self, edge_id, destination_edge):
-        dist = self.get_distance_to_destination(edge_id, destination_edge)
-        if not math.isfinite(dist):
-            return math.inf
-        return dist / 8.0
+        key = (edge_id, destination_edge)
+        if key in self._eta_cache:
+            return self._eta_cache[key]
+        try:
+            e0 = self.net.getEdge(edge_id)
+            e1 = self.net.getEdge(destination_edge)
+            path, _ = self.net.getShortestPath(e0, e1)
+            if path is None:
+                eta = math.inf
+            else:
+                free_flow_eta = 0.0
+                for e in path:
+                    edge_speed = max(float(e.getSpeed()), 5.0)
+                    free_flow_eta += float(e.getLength()) / edge_speed
+                junction_delay = max(len(path) - 1, 0) * 2.0
+                congestion_allowance = 6.0 + 0.10 * free_flow_eta
+                eta = free_flow_eta + junction_delay + congestion_allowance
+        except Exception:
+            eta = math.inf
+        self._eta_cache[key] = eta
+        return eta
 
     def get_teleport_ids(self):
         teleported = set()
@@ -349,6 +367,7 @@ class RLTrainingPipeline:
         self._density_vec = np.array([counts[e] / max(lengths[e], 1.0) for e in self.connection_info.edge_list], dtype=np.float32)
         self._global_density_mean = float(np.mean(self._density_vec)) if len(self._density_vec) else 0.0
         self._global_density_std = float(np.std(self._density_vec)) if len(self._density_vec) else 0.0
+        self._last_density_step = step
 
     def enumerate_candidate_next_edges(self, edge_id):
         outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
@@ -459,7 +478,7 @@ class RLTrainingPipeline:
                 dead_end,
             ], dtype=np.float32)
             # keep invalid/dead candidates masked out
-            if lane_m["min_lane_shifts"] < 99 and dead_end < 1.0:
+            if lane_m["min_lane_shifts"] < 99 and lane_m["feasible"] and dead_end < 1.0:
                 mask[i] = 1.0
 
         return np.concatenate([base, cand_vec.reshape(-1)], axis=0).reshape(1, -1), mask, cand_vec
@@ -474,7 +493,7 @@ class RLTrainingPipeline:
         t = min(0.85 * edge_len, max(45.0, 2.2 * speed + 12.0 * lane_cost + 4.0 * lanes))
         return float(t)
 
-    def should_make_decision(self, vehicle_id, edge_id, candidates, commitment, latest_density, current_density):
+    def should_make_decision(self, vehicle_id, edge_id, candidates, commitment, latest_density, current_density, candidate_densities, committed_deficit=None, candidate_deficits=None):
         if len(candidates) <= 1:
             return False
         lane_id = traci.vehicle.getLaneID(vehicle_id)
@@ -488,6 +507,12 @@ class RLTrainingPipeline:
             return True
         if abs(current_density - latest_density) > 0.10:
             return True
+        if candidate_densities:
+            best_idx = int(np.argmin(candidate_densities))
+            best_candidate_density = candidate_densities[best_idx]
+            best_candidate_deficit = candidate_deficits[best_idx] if candidate_deficits and best_idx < len(candidate_deficits) else math.inf
+            if (current_density - best_candidate_density) > 0.12 and (committed_deficit is None or best_candidate_deficit <= committed_deficit + 2.0):
+                return True
         lane_m = self.compute_candidate_lane_metrics(vehicle_id, edge_id, commitment.chosen_next_edge)
         return not lane_m["feasible"]
 
@@ -589,20 +614,50 @@ class RLTrainingPipeline:
             arrived_on_time = set()
             arrived_any = set()
             wrong_target = set()
-            exited_wo_dest = set()
             lane_failures = 0
             deficit_improvements = []
             loops = 0
             episode_return = 0.0
             removal_causes = defaultdict(int)
+            terminal_step = {}
+            final_step = 0
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
+                    pre_step_on_destination = set()
+                    final_step = step
                     if traci.simulation.getMinExpectedNumber() <= 0:
                         break
                     self.update_edge_vehicle_counts(step, every=1)
                     vehicle_ids = list(traci.vehicle.getIDList())
                     global_stats = self._global_stats(set(vehicles.keys()), vehicles, step, teleported_controlled, failed_ids)
+
+                    def push_nstep_transition(local_vid, transition):
+                        buf = nstep_buffers[local_vid]
+                        buf.append(transition)
+                        terminal = transition["done"] >= 1.0
+                        while buf and (len(buf) >= self.trainer.n_step or terminal):
+                            horizon = min(len(buf), self.trainer.n_step)
+                            first = buf[0]
+                            R = 0.0
+                            for i in range(horizon):
+                                R += (self.trainer.gamma ** i) * buf[i]["reward"]
+                            last = buf[horizon - 1]
+                            out = {
+                                "state": first["state"],
+                                "action": first["action"],
+                                "reward": R,
+                                "next_state": last["next_state"],
+                                "done": last["done"],
+                                "next_mask": last["next_mask"],
+                                "horizon": horizon,
+                            }
+                            self.trainer.remember(out)
+                            buf.popleft()
+                            if not terminal and len(buf) < self.trainer.n_step:
+                                break
+                        if terminal:
+                            buf.clear()
 
                     for vid in vehicle_ids:
                         if vid not in vehicles:
@@ -615,9 +670,7 @@ class RLTrainingPipeline:
                         recent_edges[vid].append(edge)
 
                         if edge == v.destination:
-                            arrived_true_dest.add(vid)
-                            arrived_any.add(vid)
-                            removal_causes["reached_true_destination"] += 1
+                            pre_step_on_destination.add(vid)
                             continue
 
                         candidates = self.enumerate_candidate_next_edges(edge)
@@ -661,29 +714,24 @@ class RLTrainingPipeline:
                                     "done": float(done),
                                     "next_mask": mask.reshape(1, -1)[0],
                                 }
-                                nstep_buffers[vid].append(transition)
-                                if len(nstep_buffers[vid]) == self.trainer.n_step or done:
-                                    first = nstep_buffers[vid][0]
-                                    R = 0.0
-                                    for i, t in enumerate(nstep_buffers[vid]):
-                                        R += (self.trainer.gamma ** i) * t["reward"]
-                                    out = {
-                                        "state": first["state"],
-                                        "action": first["action"],
-                                        "reward": R,
-                                        "next_state": transition["next_state"],
-                                        "done": transition["done"],
-                                        "next_mask": transition["next_mask"],
-                                    }
-                                    self.trainer.remember(out)
-                                    if nstep_buffers[vid]:
-                                        nstep_buffers[vid].popleft()
+                                push_nstep_transition(vid, transition)
                                 commitments.pop(vid, None)
                                 episode_return += reward
 
+                        candidate_densities = [
+                            self.connection_info.edge_vehicle_count.get(nxt, 0) / max(self.connection_info.edge_length_dict.get(nxt, 1.0), 1.0)
+                            for nxt in candidates
+                        ]
+                        time_left = max(v.deadline - step, 0.0)
+                        candidate_deficits = []
+                        for nxt in candidates:
+                            eta_next = self.estimate_eta(nxt, v.destination)
+                            candidate_deficits.append(max(eta_next - time_left, 0.0) if math.isfinite(eta_next) else self.time_norm)
                         prev_density = commitments[vid].chosen_density if vid in commitments else self.connection_info.edge_vehicle_count.get(edge, 0) / max(self.connection_info.edge_length_dict.get(edge, 1.0), 1.0)
-                        curr_density = self.connection_info.edge_vehicle_count.get(edge, 0) / max(self.connection_info.edge_length_dict.get(edge, 1.0), 1.0)
-                        if not self.should_make_decision(vid, edge, candidates, commitments.get(vid), prev_density, curr_density):
+                        curr_density = self.connection_info.edge_vehicle_count.get((commitments[vid].chosen_next_edge if vid in commitments else edge), 0) / max(self.connection_info.edge_length_dict.get((commitments[vid].chosen_next_edge if vid in commitments else edge), 1.0), 1.0)
+                        committed_eta = self.estimate_eta((commitments[vid].chosen_next_edge if vid in commitments else edge), v.destination)
+                        committed_deficit = max(committed_eta - time_left, 0.0) if math.isfinite(committed_eta) else self.time_norm
+                        if not self.should_make_decision(vid, edge, candidates, commitments.get(vid), prev_density, curr_density, candidate_densities, committed_deficit=committed_deficit, candidate_deficits=candidate_deficits):
                             continue
 
                         if np.sum(mask) <= 0:
@@ -700,7 +748,9 @@ class RLTrainingPipeline:
                             except Exception:
                                 pass
 
-                        self.apply_route_commitment(vid, edge, chosen_next, v.destination)
+                        applied = self.apply_route_commitment(vid, edge, chosen_next, v.destination)
+                        if not applied:
+                            continue
 
                         eta_now = self.estimate_eta(edge, v.destination)
                         time_left = max(v.deadline - step, 0.0)
@@ -722,10 +772,11 @@ class RLTrainingPipeline:
                     for aid in traci.simulation.getArrivedIDList():
                         if aid not in vehicles:
                             continue
+                        if aid in terminal_step:
+                            continue
                         v = vehicles[aid]
                         arrived_any.add(aid)
-                        last_edge = v.current_edge
-                        is_true = (last_edge == v.destination)
+                        is_true = (aid in pre_step_on_destination)
                         if is_true:
                             arrived_true_dest.add(aid)
                             if step <= v.deadline:
@@ -738,16 +789,20 @@ class RLTrainingPipeline:
                         if aid in commitments:
                             c = commitments.pop(aid)
                             lateness = max(step - v.deadline, 0.0)
+                            last_edge = v.current_edge or c.edge
                             curr_eta = self.estimate_eta(last_edge, v.destination)
                             curr_deficit = max(curr_eta - max(v.deadline - step, 0.0), 0.0) if math.isfinite(curr_eta) else self.time_norm
                             reward, done = self.compute_reward(c.prev_deficit, curr_deficit, c.chosen_density, self._global_density_mean, wrong_target=(not is_true), arrived=is_true, on_time=(step <= v.deadline), lateness=lateness)
                             transition = {"state": c.state, "action": c.action, "reward": reward, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": float(done), "next_mask": np.zeros((self.action_size,), dtype=np.float32)}
-                            self.trainer.remember(transition)
+                            push_nstep_transition(aid, transition)
                             episode_return += reward
+                        terminal_step[aid] = step
 
                     tele = self.get_teleport_ids()
                     for tid in tele:
                         if tid not in vehicles:
+                            continue
+                        if tid in terminal_step:
                             continue
                         teleported_controlled.add(tid)
                         failed_ids.add(tid)
@@ -756,8 +811,9 @@ class RLTrainingPipeline:
                             c = commitments.pop(tid)
                             reward, done = self.compute_reward(c.prev_deficit, c.prev_deficit + 5.0, c.chosen_density, self._global_density_mean, teleported=True)
                             transition = {"state": c.state, "action": c.action, "reward": reward, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": float(done), "next_mask": np.zeros((self.action_size,), dtype=np.float32)}
-                            self.trainer.remember(transition)
+                            push_nstep_transition(tid, transition)
                             episode_return += reward
+                        terminal_step[tid] = step
 
                     if step % self.train_every == 0:
                         for _ in range(self.grad_steps):
@@ -767,21 +823,46 @@ class RLTrainingPipeline:
                 controlled_ids = set(vehicles.keys())
                 disappeared = controlled_ids - set(traci.vehicle.getIDList()) - arrived_any - teleported_controlled
                 for vid in disappeared:
-                    if vid not in arrived_any and vid not in teleported_controlled:
+                    if vid not in arrived_any and vid not in teleported_controlled and vid not in terminal_step:
                         failed_ids.add(vid)
                         removal_causes["disappeared"] += 1
+                        terminal_step[vid] = final_step
 
                 for vid, c in list(commitments.items()):
+                    if vid in terminal_step:
+                        commitments.pop(vid, None)
+                        continue
                     v = vehicles[vid]
-                    late = max(MAX_SIMULATION_STEPS - v.deadline, 0.0)
+                    late = max(final_step - v.deadline, 0.0)
                     remain_dist = self.get_distance_to_destination(v.current_edge or c.edge, v.destination)
                     reward, done = self.compute_reward(c.prev_deficit, c.prev_deficit + 2.0, c.chosen_density, self._global_density_mean, deadline_missed=True, lateness=late, remain_dist=(remain_dist if math.isfinite(remain_dist) else 1000.0))
                     transition = {"state": c.state, "action": c.action, "reward": reward, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": float(done), "next_mask": np.zeros((self.action_size,), dtype=np.float32)}
-                    self.trainer.remember(transition)
+                    push_nstep_transition(vid, transition)
                     episode_return += reward
                     commitments.pop(vid, None)
                     failed_ids.add(vid)
                     removal_causes["dead_end_trapped"] += 1
+                    terminal_step[vid] = final_step
+
+                for vid, buf in list(nstep_buffers.items()):
+                    while buf:
+                        horizon = min(len(buf), self.trainer.n_step)
+                        first = buf[0]
+                        R = 0.0
+                        for i in range(horizon):
+                            R += (self.trainer.gamma ** i) * buf[i]["reward"]
+                        last = buf[horizon - 1]
+                        out = {
+                            "state": first["state"],
+                            "action": first["action"],
+                            "reward": R,
+                            "next_state": last["next_state"],
+                            "done": last["done"],
+                            "next_mask": last["next_mask"],
+                            "horizon": horizon,
+                        }
+                        self.trainer.remember(out)
+                        buf.popleft()
 
             finally:
                 traci.close()
@@ -793,16 +874,16 @@ class RLTrainingPipeline:
             wrong_target_rate = len(wrong_target) / float(total)
             teleport_rate = len(teleported_controlled) / float(total)
             exit_wo_dest_rate = len((set(vehicles.keys()) - arrived_true_dest - teleported_controlled)) / float(total)
-            avg_lateness = float(np.mean([max(step - vehicles[vid].deadline, 0.0) for vid in set(vehicles.keys()) - arrived_true_dest])) if vehicles else 0.0
+            avg_lateness = float(np.mean([max(terminal_step.get(vid, final_step) - vehicles[vid].deadline, 0.0) for vid in vehicles])) if vehicles else 0.0
+            late_vehicles = [vid for vid in vehicles if max(terminal_step.get(vid, final_step) - vehicles[vid].deadline, 0.0) > 0]
+            avg_lateness_late_only = float(np.mean([max(terminal_step.get(vid, final_step) - vehicles[vid].deadline, 0.0) for vid in late_vehicles])) if late_vehicles else 0.0
             avg_deficit_improvement = float(np.mean(deficit_improvements)) if deficit_improvements else 0.0
             lane_failure_rate = lane_failures / float(max(len(deficit_improvements), 1))
             loop_rate = loops / float(max(len(deficit_improvements), 1))
 
             rolling_baseline.append(completion_before_deadline)
             base = float(np.mean(rolling_baseline)) if rolling_baseline else completion_before_deadline
-            if completion_before_deadline > base:
-                # small shared bonus
-                self.trainer.remember({"state": np.zeros((1, self.state_size), dtype=np.float32), "action": 0, "reward": self.global_shared_bonus, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": 1.0, "next_mask": np.zeros((self.action_size,), dtype=np.float32)}, priority=0.1)
+            shared_bonus_triggered = completion_before_deadline > base
 
             metrics = {
                 "episode": episode,
@@ -810,13 +891,16 @@ class RLTrainingPipeline:
                 "completion_before_deadline_rate": completion_before_deadline,
                 "wrong_target_arrival_rate": wrong_target_rate,
                 "exit_without_destination_rate": exit_wo_dest_rate,
+                "non_true_destination_non_teleport_rate": exit_wo_dest_rate,
                 "teleport_rate": teleport_rate,
                 "average_deadline_lateness": avg_lateness,
+                "average_deadline_lateness_late_only": avg_lateness_late_only,
                 "average_deficit_improvement": avg_deficit_improvement,
                 "lane_execution_failure_rate": lane_failure_rate,
                 "loop_oscillation_rate": loop_rate,
                 "replay_td_error_stats": dict(self.trainer.last_td_error_stats),
                 "removals_by_cause": dict(removal_causes),
+                "shared_bonus_triggered": shared_bonus_triggered,
                 "episode_return": episode_return / float(total),
             }
             metrics_history.append(metrics)
