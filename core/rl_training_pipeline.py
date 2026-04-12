@@ -883,6 +883,7 @@ class RLTrainingPipeline:
                 sumo_binary,
                 "-c", self.sumocfg_path,
                 "--tripinfo-output", os.path.join(self.sumocfg_dir, "trips.trips.xml"),
+                "--time-to-teleport", "900",
                 "--quit-on-end",
             ])
 
@@ -912,146 +913,146 @@ class RLTrainingPipeline:
 
                     # Keep density features fresh for routing choices and reward.
                     self.update_edge_vehicle_counts(step, every=1)
-                    vehicle_ids = list(traci.vehicle.getIDList())
+                    active_vehicle_ids = set(traci.vehicle.getIDList())
 
-                    for vehicle_id in vehicle_ids:
+                    for vehicle_id in active_vehicle_ids:
                         if vehicle_id not in vehicles:
                             continue
+                        try:
+                            current_edge = traci.vehicle.getRoadID(vehicle_id)
+                            if current_edge not in self.connection_info.edge_index_dict:
+                                continue
 
-                        current_edge = traci.vehicle.getRoadID(vehicle_id)
-                        if current_edge not in self.connection_info.edge_index_dict:
-                            continue
+                            vehicle = vehicles[vehicle_id]
+                            vehicle.current_edge = current_edge
+                            vehicle.current_speed = traci.vehicle.getSpeed(vehicle_id)
+                            last_seen_edge_by_vehicle[vehicle_id] = current_edge
+                            recent_edge_history[vehicle_id].append(current_edge)
 
-                        vehicle = vehicles[vehicle_id]
-                        vehicle.current_edge = current_edge
-                        vehicle.current_speed = traci.vehicle.getSpeed(vehicle_id)
-                        last_seen_edge_by_vehicle[vehicle_id] = current_edge
-                        recent_edge_history[vehicle_id].append(current_edge)
+                            # arrived
+                            if current_edge == vehicle.destination:
+                                if vehicle_id not in arrived_ids:
+                                    arrived_ids.add(vehicle_id)
+                                    if step <= vehicle.deadline:
+                                        arrived_before_deadline_ids.add(vehicle_id)
+                                pending_decisions.pop(vehicle_id, None)
+                                prev_edge_by_vehicle.pop(vehicle_id, None)
+                                continue
 
-                        # arrived
-                        if current_edge == vehicle.destination:
-                            if vehicle_id not in arrived_ids:
-                                arrived_ids.add(vehicle_id)
-                                if step <= vehicle.deadline:
-                                    arrived_before_deadline_ids.add(vehicle_id)
-                            pending_decisions.pop(vehicle_id, None)
-                            prev_edge_by_vehicle.pop(vehicle_id, None)
-                            continue
+                            prev_edge = prev_edge_by_vehicle.get(vehicle_id)
+                            if vehicle_id in pending_decisions and current_edge != pending_decisions[vehicle_id].decision_edge:
+                                pending = pending_decisions.pop(vehicle_id)
+                                repeated_recent_edges = sum(1 for e in recent_edge_history[vehicle_id] if e == current_edge)
+                                mismatch = not self.decision_engine.route_matches_expected(pending, current_edge)
+                                if mismatch:
+                                    decision_metrics["route_mismatch"] += 1
+                                loop_signals = transition_signal(
+                                    recent_edge_history[vehicle_id],
+                                    current_edge,
+                                    edge_out_degree=self._edge_out_degree_map(list(recent_edge_history[vehicle_id]) + [current_edge]),
+                                )
+                                if loop_signals["aba_bounce"]:
+                                    decision_metrics["aba_bounce_events"] += 1
+                                    decision_metrics["uturn_events"] += 1
+                                if loop_signals["short_cycle"]:
+                                    decision_metrics["short_cycle_events"] += 1
+                                if loop_signals["dead_end_reentry"]:
+                                    decision_metrics["dead_end_reentry_events"] += 1
+                                ext_pen = max(self.connection_info.edge_vehicle_count.get(current_edge, 0) / max(self.connection_info.edge_length_dict.get(current_edge, 10.0), 10.0), 0.0)
+                                reward, done = self.compute_reward(
+                                    vehicle, pending.decision_edge, current_edge, step, arrived=False,
+                                    repeated_recent_edges=repeated_recent_edges,
+                                    delta_t=max(step - pending.decision_step, 1),
+                                    route_mismatch=mismatch,
+                                    uturn_repeat=loop_signals["aba_bounce"] or loop_signals["short_cycle"],
+                                    externality_penalty=ext_pen,
+                                )
+                                next_ctx = self.decision_engine.build_context(vehicle_id, current_edge, vehicle.destination, step)
+                                next_state = self.encode_state(vehicle_id, current_edge, vehicle.destination, context=next_ctx, vehicle=vehicle, step=step)
+                                self.trainer.remember(
+                                    pending.state,
+                                    pending.intended_action,
+                                    reward,
+                                    next_state,
+                                    done,
+                                    next_valid_actions=next_ctx.available_actions,
+                                    metadata={"forced": pending.context.forced_action is not None, "mismatch": mismatch},
+                                )
+                                decision_metrics["decisions_finalized"] += 1
+                                episode_return += reward
+                                if repeated_recent_edges > 1:
+                                    decision_metrics["loop_events"] += 1
 
-                        prev_edge = prev_edge_by_vehicle.get(vehicle_id)
-                        if vehicle_id in pending_decisions and current_edge != pending_decisions[vehicle_id].decision_edge:
-                            pending = pending_decisions.pop(vehicle_id)
-                            repeated_recent_edges = sum(1 for e in recent_edge_history[vehicle_id] if e == current_edge)
-                            mismatch = not self.decision_engine.route_matches_expected(pending, current_edge)
-                            if mismatch:
-                                decision_metrics["route_mismatch"] += 1
-                            loop_signals = transition_signal(
-                                recent_edge_history[vehicle_id],
-                                current_edge,
-                                edge_out_degree=self._edge_out_degree_map(list(recent_edge_history[vehicle_id]) + [current_edge]),
-                            )
-                            if loop_signals["aba_bounce"]:
-                                decision_metrics["aba_bounce_events"] += 1
-                                decision_metrics["uturn_events"] += 1
-                            if loop_signals["short_cycle"]:
-                                decision_metrics["short_cycle_events"] += 1
-                            if loop_signals["dead_end_reentry"]:
-                                decision_metrics["dead_end_reentry_events"] += 1
-                            ext_pen = max(self.connection_info.edge_vehicle_count.get(current_edge, 0) / max(self.connection_info.edge_length_dict.get(current_edge, 10.0), 10.0), 0.0)
-                            reward, done = self.compute_reward(
-                                vehicle, pending.decision_edge, current_edge, step, arrived=False,
-                                repeated_recent_edges=repeated_recent_edges,
-                                delta_t=max(step - pending.decision_step, 1),
-                                route_mismatch=mismatch,
-                                uturn_repeat=loop_signals["aba_bounce"] or loop_signals["short_cycle"],
-                                externality_penalty=ext_pen,
-                            )
-                            next_ctx = self.decision_engine.build_context(vehicle_id, current_edge, vehicle.destination, step)
-                            next_state = self.encode_state(vehicle_id, current_edge, vehicle.destination, context=next_ctx, vehicle=vehicle, step=step)
-                            self.trainer.remember(
-                                pending.state,
-                                pending.intended_action,
-                                reward,
-                                next_state,
-                                done,
-                                next_valid_actions=next_ctx.available_actions,
-                                metadata={"forced": pending.context.forced_action is not None, "mismatch": mismatch},
-                            )
-                            decision_metrics["decisions_finalized"] += 1
-                            episode_return += reward
-                            if repeated_recent_edges > 1:
-                                decision_metrics["loop_events"] += 1
-
-                        context = self.decision_engine.build_context(vehicle_id, current_edge, vehicle.destination, step)
-                        if vehicle_id in pending_decisions:
-                            decision_metrics["decisions_skipped"] += 1
-                            prev_edge_by_vehicle[vehicle_id] = current_edge
-                            continue
-
-                        state = self.encode_state(vehicle_id, current_edge, vehicle.destination, context=context, vehicle=vehicle, step=step)
-                        if context.forced_action is not None:
-                            action = context.forced_action
-                            decision_metrics["forced_actions"] += 1
-                        elif context.skip_reason:
-                            decision_metrics["decisions_skipped"] += 1
-                            prev_edge_by_vehicle[vehicle_id] = current_edge
-                            continue
-                        elif not self.decision_engine.is_decision_open(context):
-                            prev_edge_by_vehicle[vehicle_id] = current_edge
-                            continue
-                        else:
-                            action = self.trainer.select_action(state, context.available_actions)
-                            if action is None:
+                            context = self.decision_engine.build_context(vehicle_id, current_edge, vehicle.destination, step)
+                            if vehicle_id in pending_decisions:
                                 decision_metrics["decisions_skipped"] += 1
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
                                 continue
 
-                        next_edge = self.decision_engine.get_next_edge(current_edge, action)
-                        if next_edge is None:
-                            decision_metrics["safety_overrides"] += 1
-                            decision_metrics["loop_avoidance_overrides"] += 1
-                            prev_edge_by_vehicle[vehicle_id] = current_edge
-                            continue
-
-                        lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action)
-                        if lane_change_requested:
-                            decision_metrics["lane_change_attempts"] += 1
-                            if lane_change_ok:
-                                decision_metrics["lane_change_success"] += 1
+                            state = self.encode_state(vehicle_id, current_edge, vehicle.destination, context=context, vehicle=vehicle, step=step)
+                            if context.forced_action is not None:
+                                action = context.forced_action
+                                decision_metrics["forced_actions"] += 1
+                            elif context.skip_reason:
+                                decision_metrics["decisions_skipped"] += 1
+                                prev_edge_by_vehicle[vehicle_id] = current_edge
+                                continue
+                            elif not self.decision_engine.is_decision_open(context):
+                                prev_edge_by_vehicle[vehicle_id] = current_edge
+                                continue
                             else:
-                                decision_metrics["lane_change_fail"] += 1
+                                action = self.trainer.select_action(state, context.available_actions)
+                                if action is None:
+                                    decision_metrics["decisions_skipped"] += 1
+                                    prev_edge_by_vehicle[vehicle_id] = current_edge
+                                    continue
 
-                        fragment, local_target, frag_error = self.decision_engine.build_route_fragment(current_edge, action, vehicle.destination)
-                        if frag_error or local_target is None:
-                            decision_metrics["route_apply_fail"] += 1
-                            decision_metrics["fragment_build_failures"] += 1
-                            prev_edge_by_vehicle[vehicle_id] = current_edge
-                            continue
+                            next_edge = self.decision_engine.get_next_edge(current_edge, action)
+                            if next_edge is None:
+                                decision_metrics["safety_overrides"] += 1
+                                decision_metrics["loop_avoidance_overrides"] += 1
+                                prev_edge_by_vehicle[vehicle_id] = current_edge
+                                continue
 
-                        try:
+                            lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action)
+                            if lane_change_requested:
+                                decision_metrics["lane_change_attempts"] += 1
+                                if lane_change_ok:
+                                    decision_metrics["lane_change_success"] += 1
+                                else:
+                                    decision_metrics["lane_change_fail"] += 1
+
+                            fragment, local_target, frag_error = self.decision_engine.build_route_fragment(current_edge, action, vehicle.destination)
+                            if frag_error or local_target is None:
+                                decision_metrics["route_apply_fail"] += 1
+                                decision_metrics["fragment_build_failures"] += 1
+                                prev_edge_by_vehicle[vehicle_id] = current_edge
+                                continue
+
                             traci.vehicle.setVia(vehicle_id, fragment[:3] if local_target != vehicle.destination else [])
                             traci.vehicle.changeTarget(vehicle_id, vehicle.destination)
                             last_target_by_vehicle[vehicle_id] = local_target
+
+                            if vehicle_id in pending_decisions:
+                                decision_metrics["decisions_superseded"] += 1
+                            pending_decisions[vehicle_id] = PendingDecision(
+                                state=state,
+                                intended_action=action,
+                                intended_next_edge=next_edge,
+                                decision_edge=current_edge,
+                                decision_step=step,
+                                destination=vehicle.destination,
+                                context=context,
+                                lane_change_requested=lane_change_requested,
+                            )
+                            decision_metrics["decisions_opened"] += 1
+                            prev_edge_by_vehicle[vehicle_id] = current_edge
                         except traci.exceptions.TraCIException:
+                            pending_decisions.pop(vehicle_id, None)
+                            prev_edge_by_vehicle.pop(vehicle_id, None)
                             decision_metrics["route_apply_fail"] += 1
                             decision_metrics["fragment_build_failures"] += 1
-                            prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
-
-                        if vehicle_id in pending_decisions:
-                            decision_metrics["decisions_superseded"] += 1
-                        pending_decisions[vehicle_id] = PendingDecision(
-                            state=state,
-                            intended_action=action,
-                            intended_next_edge=next_edge,
-                            decision_edge=current_edge,
-                            decision_step=step,
-                            destination=vehicle.destination,
-                            context=context,
-                            lane_change_requested=lane_change_requested,
-                        )
-                        decision_metrics["decisions_opened"] += 1
-                        prev_edge_by_vehicle[vehicle_id] = current_edge
 
                     traci.simulationStep()
 
