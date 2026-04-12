@@ -9,6 +9,7 @@ else:
     sys.exit("No environment variable SUMO_HOME!")
 import traci
 import sumolib
+import random
 
 STRAIGHT = "s"
 TURN_AROUND = "t"

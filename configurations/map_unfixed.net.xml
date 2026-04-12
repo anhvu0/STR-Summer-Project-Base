@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2026-04-12T03:57:34.720990-06:00 by Eclipse SUMO netedit 1.26.0
+<!-- generated on 2026-04-12T03:50:29.165596-06:00 by Eclipse SUMO netedit 1.26.0
 <neteditConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/neteditConfiguration.xsd">
 
     <input>
-        <sumo-net-file value="/home/anhvu01212001/anhvu/STR_Project/STR-Summer-Project-Base/configurations/map2.net.xml"/>
+        <sumo-net-file value="/home/anhvu01212001/anhvu/STR_Project/STR-Summer-Project-Base/configurations/map.net.xml"/>
     </input>
 
     <output>
-        <output-file value="/home/anhvu01212001/anhvu/STR_Project/STR-Summer-Project-Base/configurations/map2.net.xml"/>
+        <output-file value="/home/anhvu01212001/anhvu/STR_Project/STR-Summer-Project-Base/configurations/map.net.xml"/>
     </output>
 
     <processing>
@@ -4295,10 +4295,10 @@
         <lane id=":5475792646_1_1" index="1" disallow="tram rail_urban rail rail_electric rail_fast ship cable_car subway" speed="27.78" length="8.40" shape="3306.83,4812.59 3310.63,4819.63"/>
     </edge>
     <edge id=":5481847055_0" function="internal">
-        <lane id=":5481847055_0_0" index="0" allow="pedestrian passenger delivery bicycle" speed="5.63" length="6.49" shape="2798.84,5496.16 2799.63,5498.11 2799.79,5499.72 2799.32,5500.97 2798.22,5501.88"/>
+        <lane id=":5481847055_0_0" index="0" allow="pedestrian delivery bicycle" speed="5.63" length="6.49" shape="2798.84,5496.16 2799.63,5498.11 2799.79,5499.72 2799.32,5500.97 2798.22,5501.88"/>
     </edge>
     <edge id=":5481847055_1" function="internal">
-        <lane id=":5481847055_1_0" index="0" allow="pedestrian passenger delivery bicycle" speed="2.98" length="2.34" shape="2798.84,5496.16 2798.76,5496.87 2798.50,5497.24 2798.05,5497.24 2797.42,5496.89"/>
+        <lane id=":5481847055_1_0" index="0" allow="pedestrian delivery bicycle" speed="2.98" length="2.34" shape="2798.84,5496.16 2798.76,5496.87 2798.50,5497.24 2798.05,5497.24 2797.42,5496.89"/>
     </edge>
     <edge id=":5481847055_2" function="internal">
         <lane id=":5481847055_2_0" index="0" allow="pedestrian passenger delivery bicycle" speed="3.90" length="2.57" shape="2796.74,5499.05 2797.31,5498.64 2797.62,5498.14 2797.65,5497.56 2797.42,5496.89"/>
@@ -4307,7 +4307,7 @@
         <lane id=":5481847055_3_0" index="0" disallow="tram rail_urban rail rail_electric rail_fast ship cable_car subway" speed="3.65" length="4.67" shape="2796.74,5499.05 2798.17,5499.20 2798.90,5499.73 2798.92,5500.62 2798.22,5501.88"/>
     </edge>
     <edge id=":5481847060_0" function="internal">
-        <lane id=":5481847060_0_0" index="0" allow="pedestrian passenger delivery bicycle" speed="5.63" length="6.43" shape="2943.37,5426.02 2942.02,5426.39 2940.73,5426.06 2939.50,5425.03 2938.34,5423.29"/>
+        <lane id=":5481847060_0_0" index="0" allow="pedestrian delivery bicycle" speed="5.63" length="6.43" shape="2943.37,5426.02 2942.02,5426.39 2940.73,5426.06 2939.50,5425.03 2938.34,5423.29"/>
     </edge>
     <edge id=":5481847060_1" function="internal">
         <lane id=":5481847060_1_0" index="0" disallow="tram rail_urban rail rail_electric rail_fast ship cable_car subway" speed="3.65" length="4.67" shape="2943.37,5426.02 2941.94,5425.87 2941.21,5425.34 2941.20,5424.45 2941.89,5423.19"/>
@@ -4316,7 +4316,7 @@
         <lane id=":5481847060_2_0" index="0" allow="pedestrian passenger delivery bicycle" speed="3.91" length="2.55" shape="2939.75,5422.53 2940.16,5423.09 2940.66,5423.39 2941.23,5423.42 2941.89,5423.19"/>
     </edge>
     <edge id=":5481847060_3" function="internal">
-        <lane id=":5481847060_3_0" index="0" allow="pedestrian passenger delivery bicycle" speed="2.98" length="2.34" shape="2939.75,5422.53 2939.68,5423.25 2939.42,5423.62 2938.98,5423.63 2938.34,5423.29"/>
+        <lane id=":5481847060_3_0" index="0" allow="pedestrian delivery bicycle" speed="2.98" length="2.34" shape="2939.75,5422.53 2939.68,5423.25 2939.42,5423.62 2938.98,5423.63 2938.34,5423.29"/>
     </edge>
     <edge id=":5481857116_0" function="internal">
         <lane id=":5481857116_0_0" index="0" allow="pedestrian delivery bicycle" speed="3.65" length="4.67" shape="3386.37,5023.97 3386.84,5022.61 3387.52,5022.02 3388.39,5022.21 3389.47,5023.17"/>
@@ -7010,7 +7010,7 @@
         <lane id="569369536_1" index="1" disallow="tram rail_urban rail rail_electric rail_fast ship cable_car subway" speed="27.78" length="22.28" shape="3310.63,4819.63 3321.22,4839.23"/>
     </edge>
     <edge id="570148130" from="5481847060" to="5481847055" priority="1" type="highway.service" shape="2941.26,5425.32 2933.67,5411.34 2891.32,5433.72 2829.37,5467.91 2793.04,5488.44 2798.89,5499.73">
-        <lane id="570148130_0" index="0" allow="pedestrian passenger delivery bicycle" speed="5.56" length="176.35" shape="2938.34,5423.29 2933.02,5413.49 2892.08,5435.13 2830.15,5469.31 2795.17,5489.07 2798.84,5496.16"/>
+        <lane id="570148130_0" index="0" allow="pedestrian delivery bicycle" speed="5.56" length="176.35" shape="2938.34,5423.29 2933.02,5413.49 2892.08,5435.13 2830.15,5469.31 2795.17,5489.07 2798.84,5496.16"/>
     </edge>
     <edge id="570150798" from="5481863722" to="5481857116" priority="1" type="highway.service" shape="3404.12,5073.00 3398.67,5061.34 3400.59,5057.14 3406.45,5054.16 3399.70,5037.28 3392.25,5040.13 3387.92,5023.57">
         <lane id="570150798_0" index="0" allow="pedestrian delivery bicycle" speed="5.56" length="64.14" shape="3401.28,5070.70 3396.91,5061.35 3399.37,5055.97 3404.42,5053.40 3398.80,5039.34 3391.15,5042.26 3386.37,5023.97"/>
