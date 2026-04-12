@@ -5,7 +5,7 @@ import numpy as np
 import traci
 import sumolib
 import math
-from collections import deque
+from collections import defaultdict, deque
 
 from xml.dom.minidom import parse
 import os
@@ -35,6 +35,13 @@ class QLearningPolicy(RouteController):
             "impossible_action_overrides": 0,
         }
         self._last_metrics_snapshot = None
+        self._distance_cache = {}
+        self._edge_lane_count_cache = {
+            edge_id: max(len(lanes), 1)
+            for edge_id, lanes in self.connection_info.edge_lane_ids.items()
+        }
+        self._route_blacklist = {}
+        self.route_retry_cooldown_steps = 20
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
         # How many actions to plan ahead each time
         self.decision_horizon = 6
@@ -47,7 +54,12 @@ class QLearningPolicy(RouteController):
         self.local_congestion_k = 6
         self.compact_state_size = (2 * self.edge_embedding_dim) + 6 + 3 + 3 + self.local_congestion_k
         self.legacy_state_size = 2 + 6 + 3 + 3 + len(self.connection_info.edge_list)
+        self.base_feature_size = 22
+        self.candidate_feature_size = 13
+        self.candidate_slots = 6
+        self.next_edge_state_size = self.base_feature_size + self.candidate_slots * self.candidate_feature_size
         self.use_compact_state = (self.model_state_size == self.compact_state_size)
+        self.use_next_edge_semantics = (self.model_state_size == self.next_edge_state_size)
         self.direction_mask_start = (2 * self.edge_embedding_dim) if self.use_compact_state else 2
         self._init_edge_embeddings(seed=1337)
 
@@ -115,15 +127,21 @@ class QLearningPolicy(RouteController):
 
     #-----------------------DEBUGGING-------------------------------------
     def _dist_to_dest(self, edge_id, dest_id):
+        key = (edge_id, dest_id)
+        if key in self._distance_cache:
+            return self._distance_cache[key]
         try:
             from_edge = self.net.getEdge(edge_id)
             to_edge = self.net.getEdge(dest_id)
             path_edges, path_cost = self.net.getShortestPath(from_edge, to_edge)
             if path_edges is None:
-                return float("inf")
-            return path_cost
+                out = float("inf")
+            else:
+                out = path_cost
         except Exception:
-            return float("inf")
+            out = float("inf")
+        self._distance_cache[key] = out
+        return out
 
     def _estimate_eta(self, edge_id, dest_id):
         dist = self._dist_to_dest(edge_id, dest_id)
@@ -134,6 +152,8 @@ class QLearningPolicy(RouteController):
 
 
     def make_decisions(self, vehicles, connection_info: ConnectionInfo):
+        if self.use_next_edge_semantics:
+            return self._make_decisions_next_edge(vehicles, connection_info)
         local_targets = {}
 
         if not hasattr(self, "_debug_net_checked"):
@@ -347,6 +367,180 @@ class QLearningPolicy(RouteController):
             #     )
             # )
 
+        return local_targets
+
+    def _lane_length(self, lane_id):
+        try:
+            return float(traci.lane.getLength(lane_id))
+        except Exception:
+            return 0.0
+
+    def _edge_from_lane_id(self, lane_id):
+        if not lane_id or "_" not in lane_id:
+            return None
+        return lane_id.rsplit("_", 1)[0]
+
+    def _legal_successors(self, edge_id):
+        legal = set()
+        for lane_id in self.connection_info.edge_lane_ids.get(edge_id, []):
+            try:
+                links = traci.lane.getLinks(lane_id)
+            except Exception:
+                links = []
+            for link in links:
+                if not link:
+                    continue
+                nxt_lane = link[0]
+                nxt_edge = self._edge_from_lane_id(nxt_lane)
+                if nxt_edge:
+                    legal.add(nxt_edge)
+        return legal
+
+    def _compute_lane_metrics(self, vehicle_id, edge_id, next_edge):
+        lane_ids = self.connection_info.edge_lane_ids.get(edge_id, [])
+        try:
+            curr_lane = traci.vehicle.getLaneIndex(vehicle_id)
+            lane_id = traci.vehicle.getLaneID(vehicle_id)
+            lane_pos = traci.vehicle.getLanePosition(vehicle_id)
+            speed = max(traci.vehicle.getSpeed(vehicle_id), 1.0)
+        except Exception:
+            return {"target_lanes": [], "min_lane_shifts": 99, "feasible": False, "score": 0.0}
+        dist_to_end = max(self._lane_length(lane_id) - lane_pos, 0.0)
+        target_lanes = []
+        for idx, ln in enumerate(lane_ids):
+            out_edges = self.connection_info.lane_outgoing_edges_dict.get(ln, {}).values()
+            if next_edge in out_edges:
+                target_lanes.append(idx)
+        if not target_lanes:
+            return {"target_lanes": [], "min_lane_shifts": 99, "feasible": False, "score": 0.0}
+        min_shift = min(abs(curr_lane - t) for t in target_lanes)
+        est_shift_distance = 18.0 * min_shift
+        comfort_budget = max(35.0, speed * 2.3)
+        feasible = dist_to_end >= est_shift_distance + 8.0
+        score = float(np.clip((dist_to_end - est_shift_distance) / comfort_budget, 0.0, 1.0))
+        return {"target_lanes": target_lanes, "min_lane_shifts": min_shift, "feasible": feasible, "score": score}
+
+    def _enumerate_next_edge_candidates(self, vehicle_id, edge_id, destination, sim_step):
+        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
+        topological = list(dict.fromkeys(outgoing.values()))
+        legal = self._legal_successors(edge_id)
+        candidates = []
+        for nxt in topological:
+            if nxt not in legal:
+                continue
+            bl_key = (str(vehicle_id), str(edge_id), str(nxt))
+            if self._route_blacklist.get(bl_key, -1) >= sim_step:
+                continue
+            if not np.isfinite(self._dist_to_dest(nxt, destination)):
+                continue
+            candidates.append(nxt)
+        return candidates[: self.candidate_slots]
+
+    def _build_next_edge_state(self, vehicle, edge_id, candidates):
+        vehicle_id = vehicle.vehicle_id
+        destination_edge = vehicle.destination
+        now = traci.simulation.getTime()
+        try:
+            lane_idx = traci.vehicle.getLaneIndex(vehicle_id)
+            lane_id = traci.vehicle.getLaneID(vehicle_id)
+            lane_pos = traci.vehicle.getLanePosition(vehicle_id)
+            speed = traci.vehicle.getSpeed(vehicle_id)
+        except Exception:
+            return np.zeros((1, self.next_edge_state_size), dtype=np.float32), np.zeros((self.candidate_slots,), dtype=np.float32)
+        n_lanes = self._edge_lane_count_cache.get(edge_id, 1)
+        dist_to_end = max(self._lane_length(lane_id) - lane_pos, 0.0)
+        time_left = max(float(vehicle.deadline) - float(now), 0.0)
+        elapsed = max(float(now) - float(vehicle.start_time), 0.0)
+        window = max(float(vehicle.deadline) - float(vehicle.start_time), 1.0)
+        eta_curr = self._estimate_eta(edge_id, destination_edge)
+        slack = (time_left - eta_curr) if np.isfinite(eta_curr) else -1200.0
+        urgency = float(np.clip(1.0 - (time_left / window), 0.0, 1.0))
+        curr_density = traci.edge.getLastStepVehicleNumber(edge_id) / max(self.connection_info.edge_length_dict.get(edge_id, 1.0), 1.0)
+        curr_mean_speed = traci.edge.getLastStepMeanSpeed(edge_id)
+        sp_dist = self._dist_to_dest(edge_id, destination_edge)
+        topo_hops = sp_dist / 120.0 if np.isfinite(sp_dist) else 10.0
+        all_densities = np.array([
+            traci.edge.getLastStepVehicleNumber(e) / max(self.connection_info.edge_length_dict.get(e, 1.0), 1.0)
+            for e in self.connection_info.edge_list
+        ], dtype=np.float32)
+        mean_density = float(np.mean(all_densities)) if len(all_densities) else 0.0
+        std_density = float(np.std(all_densities)) if len(all_densities) else 0.0
+        base = np.array([
+            lane_idx / max(n_lanes - 1, 1),
+            min(n_lanes, 6) / 6.0,
+            min(dist_to_end, 300.0) / 300.0,
+            min(speed, 20.0) / 20.0,
+            min(time_left, 1200.0) / 1200.0,
+            min(elapsed / window, 2.0) / 2.0,
+            urgency,
+            np.clip(slack / 1200.0, -1.0, 1.0),
+            np.clip(curr_density, 0.0, 2.0) / 2.0,
+            np.clip(curr_mean_speed / 20.0, 0.0, 1.5) / 1.5,
+            0.0,
+            min(len(candidates), self.candidate_slots) / float(self.candidate_slots),
+            1.0 if edge_id in self._recent_edges.get(vehicle_id, []) else 0.0,
+            np.clip((eta_curr / 1200.0) if np.isfinite(eta_curr) else 1.0, 0.0, 2.0) / 2.0,
+            np.clip((sp_dist / 3000.0) if np.isfinite(sp_dist) else 1.0, 0.0, 1.0),
+            np.clip(topo_hops / 20.0, 0.0, 1.0),
+            np.clip(mean_density, 0.0, 2.0) / 2.0,
+            np.clip(std_density, 0.0, 1.0),
+            0.0, 0.0, 0.0, 0.0,
+        ], dtype=np.float32)
+        cand_vec = np.zeros((self.candidate_slots, self.candidate_feature_size), dtype=np.float32)
+        mask = np.zeros((self.candidate_slots,), dtype=np.float32)
+        for i, next_edge in enumerate(candidates[: self.candidate_slots]):
+            lane_m = self._compute_lane_metrics(vehicle_id, edge_id, next_edge)
+            density = traci.edge.getLastStepVehicleNumber(next_edge) / max(self.connection_info.edge_length_dict.get(next_edge, 1.0), 1.0)
+            mean_speed = traci.edge.getLastStepMeanSpeed(next_edge)
+            eta = self._estimate_eta(next_edge, destination_edge)
+            deficit = max((eta - time_left), 0.0) if np.isfinite(eta) else 1200.0
+            repeated = 1.0 if next_edge in self._recent_edges.get(vehicle_id, []) else 0.0
+            dead_end = 0.0 if np.isfinite(self._dist_to_dest(next_edge, destination_edge)) else 1.0
+            cand_vec[i] = np.array([1.0, np.clip(density, 0.0, 2.0) / 2.0, np.clip(mean_speed / 20.0, 0.0, 1.5) / 1.5, np.clip((eta / 1200.0) if np.isfinite(eta) else 1.0, 0.0, 2.0) / 2.0, np.clip(deficit / 1200.0, 0.0, 1.0), np.clip(max(density - mean_density, 0.0), 0.0, 1.0), np.clip(lane_m["min_lane_shifts"] / 4.0, 0.0, 1.0), lane_m["score"], repeated, dead_end, 0.0, 0.0, 0.0], dtype=np.float32)
+            if lane_m["feasible"] and dead_end < 1.0:
+                mask[i] = 1.0
+        return np.concatenate([base, cand_vec.reshape(-1)], axis=0).reshape(1, -1), mask
+
+    def _masked_action(self, state, mask):
+        valid_idx = np.flatnonzero(mask > 0)
+        if len(valid_idx) == 0:
+            return None
+        q = self.model.predict(state, verbose=0)[0]
+        masked = np.full_like(q, -1e9)
+        masked[valid_idx] = q[valid_idx]
+        return int(np.argmax(masked))
+
+    def _make_decisions_next_edge(self, vehicles, connection_info: ConnectionInfo):
+        local_targets = {}
+        sim_step = int(traci.simulation.getTime())
+        for vehicle in vehicles:
+            edge = vehicle.current_edge
+            if edge == vehicle.destination:
+                continue
+            vid = vehicle.vehicle_id
+            if vid not in self._recent_edges:
+                self._recent_edges[vid] = deque(maxlen=self.loop_window)
+            candidates = self._enumerate_next_edge_candidates(vid, edge, vehicle.destination, sim_step)
+            if not candidates:
+                continue
+            state, mask = self._build_next_edge_state(vehicle, edge, candidates)
+            action = self._masked_action(state, mask)
+            if action is None or action >= len(candidates):
+                continue
+            chosen_next = candidates[action]
+            lane_m = self._compute_lane_metrics(vid, edge, chosen_next)
+            if lane_m["target_lanes"] and lane_m["feasible"] and lane_m["min_lane_shifts"] > 0:
+                try:
+                    curr_lane = traci.vehicle.getLaneIndex(vid)
+                    target_lane = min(lane_m["target_lanes"], key=lambda idx: abs(idx - curr_lane))
+                    traci.vehicle.changeLane(vid, int(target_lane), 20)
+                except Exception:
+                    pass
+            if not lane_m["feasible"]:
+                self._route_blacklist[(str(vid), str(edge), str(chosen_next))] = sim_step + self.route_retry_cooldown_steps
+                continue
+            self._recent_edges[vid].append(chosen_next)
+            local_targets[vid] = chosen_next
         return local_targets
 
 
