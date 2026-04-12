@@ -14,7 +14,7 @@ from keras.optimizers import Adam
 from collections import defaultdict, deque
 import random
 from controller.RouteController import RouteController
-from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision
+from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision, VehicleSnapshot
 from core.Util import ConnectionInfo
 from core.target_vehicles_generation_protocols import target_vehicles_generator
 from core.route_loop_safety import transition_signal
@@ -247,6 +247,7 @@ class RLTrainingPipeline:
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
         step_log_every=100,
+        density_refresh_every=5,
     ):
         """
         Args:
@@ -280,6 +281,7 @@ class RLTrainingPipeline:
         self.debug_exit_diagnostics = debug_exit_diagnostics
         self.debug_exit_diagnostics_limit = max(int(debug_exit_diagnostics_limit), 0)
         self.step_log_every = max(int(step_log_every), 1)
+        self.density_refresh_every = max(int(density_refresh_every), 1)
         self._distance_cache = {}
         self.progress_reward_scale = 0.80  # or 0.0 to disable progress term cheaply
         self.system_congestion_scale = 0.03  # scales marginal congestion penalty on busy edges
@@ -319,6 +321,11 @@ class RLTrainingPipeline:
         self.state_size = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 3 + self.local_congestion_k
         self.action_size = 6
         self.metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_episode_metrics.csv")
+        self._density_vec = np.zeros(len(self.connection_info.edge_list), dtype=np.float32)
+        self._density_mean = 0.0
+        self._density_std = 0.0
+        self._last_density_step = -10**9
+        self._lane_length_cache = {}
         self.trainer = DQNTrainer(
             self.state_size,
             self.action_size,
@@ -407,8 +414,8 @@ class RLTrainingPipeline:
         mean_out = float(np.mean(outgoing_densities)) if outgoing_densities else current_density
         max_out = float(np.max(outgoing_densities)) if outgoing_densities else current_density
         min_out = float(np.min(outgoing_densities)) if outgoing_densities else current_density
-        mean_global = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
-        std_global = float(np.std(self._density_vec)) if len(self._density_vec) > 0 else 0.0
+        mean_global = float(self._density_mean)
+        std_global = float(self._density_std)
 
         return np.array(
             [
@@ -452,7 +459,7 @@ class RLTrainingPipeline:
         route_file = route_file_node[0].attributes['value'].nodeValue
         return net_file, route_file
 
-    def encode_state(self, vehicle_id, edge_id, destination_edge, context=None, vehicle=None, step=None):
+    def encode_state(self, vehicle_id, edge_id, destination_edge, context=None, vehicle=None, step=None, snapshot=None):
         """
         Build a state vector for the given edge using cached per-step densities.
         """
@@ -461,7 +468,13 @@ class RLTrainingPipeline:
         state[self.edge_embedding_dim:(2 * self.edge_embedding_dim)] = self._get_edge_embedding(destination_edge)
 
         if context is None:
-            context = self.decision_engine.build_context(vehicle_id, edge_id, destination_edge, int(step or 0))
+            context = self.decision_engine.build_context(
+                vehicle_id,
+                edge_id,
+                destination_edge,
+                int(step or 0),
+                snapshot=snapshot,
+            )
         edge_mask, lane_mask, reach_mask, avail_mask = self.decision_engine.direction_masks(context)
         base = 2 * self.edge_embedding_dim
         state[base:base + 6] = np.array(edge_mask, dtype=np.float32)
@@ -481,7 +494,7 @@ class RLTrainingPipeline:
         deadline_base = lane_base + 3
         if vehicle is not None:
             if step is None:
-                step = traci.simulation.getTime()
+                step = int(snapshot.step) if snapshot is not None else 0
             deadline_window = self._deadline_window(vehicle)
             time_left = max(float(vehicle.deadline) - float(step), 0.0)
             elapsed = max(float(step) - float(vehicle.start_time), 0.0)
@@ -508,16 +521,18 @@ class RLTrainingPipeline:
         context = self.decision_engine.build_context(vehicle_id, edge_id, destination_edge, step)
         return context.available_actions
     
-    def dist_to_end(self, vehicle_id):
+    def dist_to_end(self, vehicle_id, snapshot=None):
         """
         Distance (meters) from the vehicle to the end of its current lane.
         """
+        if snapshot is not None:
+            return max(float(snapshot.dist_to_end), 0.0)
         lane_id = traci.vehicle.getLaneID(vehicle_id)
         lane_len = traci.lane.getLength(lane_id)
         lane_pos = traci.vehicle.getLanePosition(vehicle_id)
         return max(lane_len - lane_pos, 0.0)
 
-    def is_decision_point(self, edge_id, vehicle_id, dist_threshold=80.0):
+    def is_decision_point(self, edge_id, vehicle_id, dist_threshold=80.0, snapshot=None):
         """
         Make routing decisions only when it matters:
         - the edge has > 1 outgoing option (real branch), AND
@@ -526,7 +541,7 @@ class RLTrainingPipeline:
         outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
         if outgoing is None or len(outgoing) <= 1:
             return False
-        return self.dist_to_end(vehicle_id) <= dist_threshold
+        return self.dist_to_end(vehicle_id, snapshot=snapshot) <= dist_threshold
     
     def adaptive_dist_threshold(self, edge_id, max_dist=200.0, ratio=0.6, min_dist=30.0):
         """
@@ -538,7 +553,7 @@ class RLTrainingPipeline:
             return max_dist
         return max(min_dist, min(max_dist, ratio * float(edge_len)))
 
-    def is_decision_point_adaptive(self, edge_id, vehicle_id, max_dist=200.0, ratio=0.6, min_dist=30.0):
+    def is_decision_point_adaptive(self, edge_id, vehicle_id, max_dist=200.0, ratio=0.6, min_dist=30.0, snapshot=None):
         """
         Decide near junctions, but adapt threshold based on edge length so short edges are safe.
         """
@@ -547,7 +562,7 @@ class RLTrainingPipeline:
             return False
 
         dist_th = self.adaptive_dist_threshold(edge_id, max_dist=max_dist, ratio=ratio, min_dist=min_dist)
-        return self.dist_to_end(vehicle_id) <= dist_th
+        return self.dist_to_end(vehicle_id, snapshot=snapshot) <= dist_th
 
     # =========================
     # Teleport detection helpers
@@ -578,16 +593,107 @@ class RLTrainingPipeline:
 
         return teleported
 
-    def make_terminal_next_state(self, vehicle_id, edge_id, destination_edge):
-        """
-        Build a next_state even if the vehicle is in a weird edge after teleport.
-        If edge_id is unknown, fall back to a zero state (safe for training).
-        """
-        try:
-            if edge_id in self.connection_info.edge_index_dict and destination_edge in self.connection_info.edge_index_dict:
-                return self.encode_state(vehicle_id, edge_id, destination_edge)
-        except Exception:
-            pass
+    def _lane_length(self, lane_id):
+        if lane_id in self._lane_length_cache:
+            return self._lane_length_cache[lane_id]
+        lane_len = float(traci.lane.getLength(lane_id))
+        self._lane_length_cache[lane_id] = lane_len
+        return lane_len
+
+    def collect_vehicle_snapshots(self, vehicle_ids, step):
+        snapshots = {}
+        for vehicle_id in vehicle_ids:
+            edge_id = traci.vehicle.getRoadID(vehicle_id)
+            if edge_id not in self.connection_info.edge_index_dict:
+                continue
+            lane_id = traci.vehicle.getLaneID(vehicle_id)
+            lane_index = int(traci.vehicle.getLaneIndex(vehicle_id))
+            lane_position = float(traci.vehicle.getLanePosition(vehicle_id))
+            lane_length = self._lane_length(lane_id)
+            lane_count = max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1)
+            speed = max(float(traci.vehicle.getSpeed(vehicle_id)), 0.0)
+            dist_to_end = max(lane_length - lane_position, 0.0)
+            snapshots[vehicle_id] = VehicleSnapshot(
+                vehicle_id=vehicle_id,
+                step=int(step),
+                edge_id=edge_id,
+                lane_id=lane_id,
+                lane_index=lane_index,
+                lane_count=lane_count,
+                lane_position=lane_position,
+                lane_length=lane_length,
+                dist_to_end=dist_to_end,
+                speed=speed,
+            )
+        return snapshots
+
+    def cleanup_vehicle_state(
+        self,
+        vehicle_id,
+        pending_decisions,
+        prev_edge_by_vehicle,
+        last_seen_edge_by_vehicle,
+        last_target_by_vehicle,
+        recent_edge_history,
+        last_snapshot_by_vehicle,
+    ):
+        pending_decisions.pop(vehicle_id, None)
+        prev_edge_by_vehicle.pop(vehicle_id, None)
+        last_seen_edge_by_vehicle.pop(vehicle_id, None)
+        last_target_by_vehicle.pop(vehicle_id, None)
+        last_snapshot_by_vehicle.pop(vehicle_id, None)
+        recent_edge_history.pop(vehicle_id, None)
+
+    def make_terminal_next_state_from_snapshot(self, snapshot, destination_edge, vehicle=None, step=None):
+        if snapshot is None:
+            return self.make_terminal_next_state_from_edge(None, destination_edge, vehicle=vehicle, step=step)
+        return self.encode_state(
+            snapshot.vehicle_id,
+            snapshot.edge_id,
+            destination_edge,
+            context=self.decision_engine.build_context(
+                snapshot.vehicle_id,
+                snapshot.edge_id,
+                destination_edge,
+                int(step if step is not None else snapshot.step),
+                snapshot=snapshot,
+            ),
+            vehicle=vehicle,
+            step=step if step is not None else snapshot.step,
+            snapshot=snapshot,
+        )
+
+    def make_terminal_next_state_from_edge(self, edge_id, destination_edge, vehicle=None, step=None):
+        if (
+            edge_id in self.connection_info.edge_index_dict
+            and destination_edge in self.connection_info.edge_index_dict
+        ):
+            terminal_context = self.decision_engine.build_context(
+                vehicle_id="__terminal__",
+                edge_id=edge_id,
+                destination=destination_edge,
+                step=int(step or 0),
+                snapshot=VehicleSnapshot(
+                    vehicle_id="__terminal__",
+                    step=int(step or 0),
+                    edge_id=edge_id,
+                    lane_id=self.connection_info.edge_lane_ids.get(edge_id, [""])[0] if self.connection_info.edge_lane_ids.get(edge_id) else "",
+                    lane_index=0,
+                    lane_count=max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1),
+                    lane_position=0.0,
+                    lane_length=float(self.connection_info.edge_length_dict.get(edge_id, 0.0)),
+                    dist_to_end=float(self.connection_info.edge_length_dict.get(edge_id, 0.0)),
+                    speed=0.0,
+                ),
+            )
+            return self.encode_state(
+                "__terminal__",
+                edge_id,
+                destination_edge,
+                context=terminal_context,
+                vehicle=vehicle,
+                step=step,
+            )
         return np.zeros((1, self.state_size), dtype=np.float32)
 
     def _edge_out_degree_map(self, edges):
@@ -614,7 +720,7 @@ class RLTrainingPipeline:
         edge_count = self.connection_info.edge_vehicle_count.get(next_edge, 0)
         edge_len = max(self.connection_info.edge_length_dict.get(next_edge, 5.0), 5.0)
         edge_density = edge_count / edge_len
-        mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
+        mean_density = float(self._density_mean)
         marginal_pressure = max(edge_density - mean_density, 0.0)
 
         recent_penalty = 0.0
@@ -902,6 +1008,7 @@ class RLTrainingPipeline:
             controlled_ids = set(vehicles.keys())
             last_seen_edge_by_vehicle = {}
             last_target_by_vehicle = {}
+            last_snapshot_by_vehicle = {}
             tardiness_values = []
             arrived_debug_records = []
 
@@ -911,21 +1018,23 @@ class RLTrainingPipeline:
                         break
 
                     # Keep density features fresh for routing choices and reward.
-                    self.update_edge_vehicle_counts(step, every=1)
+                    self.update_edge_vehicle_counts(step, every=self.density_refresh_every)
                     vehicle_ids = list(traci.vehicle.getIDList())
+                    controlled_live_ids = [vid for vid in vehicle_ids if vid in vehicles]
+                    step_snapshots = self.collect_vehicle_snapshots(controlled_live_ids, step)
 
-                    for vehicle_id in vehicle_ids:
-                        if vehicle_id not in vehicles:
+                    for vehicle_id in controlled_live_ids:
+                        snapshot = step_snapshots.get(vehicle_id)
+                        if snapshot is None:
                             continue
 
-                        current_edge = traci.vehicle.getRoadID(vehicle_id)
-                        if current_edge not in self.connection_info.edge_index_dict:
-                            continue
+                        current_edge = snapshot.edge_id
 
                         vehicle = vehicles[vehicle_id]
                         vehicle.current_edge = current_edge
-                        vehicle.current_speed = traci.vehicle.getSpeed(vehicle_id)
+                        vehicle.current_speed = snapshot.speed
                         last_seen_edge_by_vehicle[vehicle_id] = current_edge
+                        last_snapshot_by_vehicle[vehicle_id] = snapshot
                         recent_edge_history[vehicle_id].append(current_edge)
 
                         # arrived
@@ -934,8 +1043,15 @@ class RLTrainingPipeline:
                                 arrived_ids.add(vehicle_id)
                                 if step <= vehicle.deadline:
                                     arrived_before_deadline_ids.add(vehicle_id)
-                            pending_decisions.pop(vehicle_id, None)
-                            prev_edge_by_vehicle.pop(vehicle_id, None)
+                            self.cleanup_vehicle_state(
+                                vehicle_id,
+                                pending_decisions,
+                                prev_edge_by_vehicle,
+                                last_seen_edge_by_vehicle,
+                                last_target_by_vehicle,
+                                recent_edge_history,
+                                last_snapshot_by_vehicle,
+                            )
                             continue
 
                         prev_edge = prev_edge_by_vehicle.get(vehicle_id)
@@ -966,8 +1082,22 @@ class RLTrainingPipeline:
                                 uturn_repeat=loop_signals["aba_bounce"] or loop_signals["short_cycle"],
                                 externality_penalty=ext_pen,
                             )
-                            next_ctx = self.decision_engine.build_context(vehicle_id, current_edge, vehicle.destination, step)
-                            next_state = self.encode_state(vehicle_id, current_edge, vehicle.destination, context=next_ctx, vehicle=vehicle, step=step)
+                            next_ctx = self.decision_engine.build_context(
+                                vehicle_id,
+                                current_edge,
+                                vehicle.destination,
+                                step,
+                                snapshot=snapshot,
+                            )
+                            next_state = self.encode_state(
+                                vehicle_id,
+                                current_edge,
+                                vehicle.destination,
+                                context=next_ctx,
+                                vehicle=vehicle,
+                                step=step,
+                                snapshot=snapshot,
+                            )
                             self.trainer.remember(
                                 pending.state,
                                 pending.intended_action,
@@ -982,13 +1112,27 @@ class RLTrainingPipeline:
                             if repeated_recent_edges > 1:
                                 decision_metrics["loop_events"] += 1
 
-                        context = self.decision_engine.build_context(vehicle_id, current_edge, vehicle.destination, step)
+                        context = self.decision_engine.build_context(
+                            vehicle_id,
+                            current_edge,
+                            vehicle.destination,
+                            step,
+                            snapshot=snapshot,
+                        )
                         if vehicle_id in pending_decisions:
                             decision_metrics["decisions_skipped"] += 1
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
 
-                        state = self.encode_state(vehicle_id, current_edge, vehicle.destination, context=context, vehicle=vehicle, step=step)
+                        state = self.encode_state(
+                            vehicle_id,
+                            current_edge,
+                            vehicle.destination,
+                            context=context,
+                            vehicle=vehicle,
+                            step=step,
+                            snapshot=snapshot,
+                        )
                         if context.forced_action is not None:
                             action = context.forced_action
                             decision_metrics["forced_actions"] += 1
@@ -1089,7 +1233,7 @@ class RLTrainingPipeline:
                         # Close any open transition as a terminal arrival transition so
                         # destination reward / on-time bonus are learned explicitly.
                         if arrived_vehicle_id in pending_decisions:
-                            pending = pending_decisions.pop(arrived_vehicle_id)
+                            pending = pending_decisions[arrived_vehicle_id]
                             repeated_recent_edges = sum(
                                 1 for edge in recent_edge_history[arrived_vehicle_id]
                                 if edge == last_seen_edge
@@ -1105,10 +1249,12 @@ class RLTrainingPipeline:
                                 delta_t=decision_delta_t,
                                 reached_global_destination=reached_global_destination,
                             )
-                            next_state = self.make_terminal_next_state(
-                                arrived_vehicle_id,
-                                last_seen_edge,
+                            terminal_snapshot = last_snapshot_by_vehicle.get(arrived_vehicle_id)
+                            next_state = self.make_terminal_next_state_from_snapshot(
+                                terminal_snapshot,
                                 vehicle.destination,
+                                vehicle=vehicle,
+                                step=step,
                             )
                             self.trainer.remember(
                                 pending.state,
@@ -1121,7 +1267,15 @@ class RLTrainingPipeline:
                             episode_return += reward
 
                         # No more transitions should be open once SUMO removes the vehicle.
-                        prev_edge_by_vehicle.pop(arrived_vehicle_id, None)
+                        self.cleanup_vehicle_state(
+                            arrived_vehicle_id,
+                            pending_decisions,
+                            prev_edge_by_vehicle,
+                            last_seen_edge_by_vehicle,
+                            last_target_by_vehicle,
+                            recent_edge_history,
+                            last_snapshot_by_vehicle,
+                        )
 
                     # =========================
                     # Teleport detection + terminal penalty
@@ -1137,17 +1291,17 @@ class RLTrainingPipeline:
 
                             # If we have an open transition for this vehicle, close it as terminal
                             if tid in pending_decisions:
-                                pending = pending_decisions.pop(tid)
+                                pending = pending_decisions[tid]
                                 v = vehicles[tid]
 
-                                # Try to get where it ended up; may fail if removed, so guard
-                                try:
-                                    tele_edge = traci.vehicle.getRoadID(tid)
-                                except Exception:
-                                    tele_edge = pending.decision_edge
-
                                 # Big penalty so agent learns to avoid situations leading to teleports
-                                next_state = self.make_terminal_next_state(tid, tele_edge, v.destination)
+                                terminal_snapshot = last_snapshot_by_vehicle.get(tid)
+                                next_state = self.make_terminal_next_state_from_snapshot(
+                                    terminal_snapshot,
+                                    v.destination,
+                                    vehicle=v,
+                                    step=step,
+                                )
 
                                 self.trainer.remember(
                                     pending.state,
@@ -1159,7 +1313,39 @@ class RLTrainingPipeline:
                                 )
                                 episode_return += self.teleport_penalty
 
-                            prev_edge_by_vehicle.pop(tid, None)
+                            self.cleanup_vehicle_state(
+                                tid,
+                                pending_decisions,
+                                prev_edge_by_vehicle,
+                                last_seen_edge_by_vehicle,
+                                last_target_by_vehicle,
+                                recent_edge_history,
+                                last_snapshot_by_vehicle,
+                            )
+
+                    live_after_step = set(traci.vehicle.getIDList())
+                    tracked_ids = (
+                        set(pending_decisions.keys())
+                        | set(prev_edge_by_vehicle.keys())
+                        | set(last_seen_edge_by_vehicle.keys())
+                        | set(last_target_by_vehicle.keys())
+                        | set(last_snapshot_by_vehicle.keys())
+                        | set(recent_edge_history.keys())
+                    )
+                    stale_disappeared = [
+                        vid for vid in tracked_ids
+                        if vid not in live_after_step and vid not in arrived_ids and vid not in teleported_controlled_ids
+                    ]
+                    for stale_id in stale_disappeared:
+                        self.cleanup_vehicle_state(
+                            stale_id,
+                            pending_decisions,
+                            prev_edge_by_vehicle,
+                            last_seen_edge_by_vehicle,
+                            last_target_by_vehicle,
+                            recent_edge_history,
+                            last_snapshot_by_vehicle,
+                        )
 
                     if step % self.train_every == 0:
                         for _ in range(self.grad_steps):
@@ -1345,7 +1531,13 @@ class RLTrainingPipeline:
             counts[edge] = traci.edge.getLastStepVehicleNumber(edge)
 
         self._density_vec = np.array(
-            [counts[e] / max(lengths[e], 1e-6) for e in edge_list],
+            [counts[e] / max(lengths.get(e, 1e-6), 1e-6) for e in edge_list],
             dtype=np.float32
         )
+        if len(self._density_vec) > 0:
+            self._density_mean = float(np.mean(self._density_vec))
+            self._density_std = float(np.std(self._density_vec))
+        else:
+            self._density_mean = 0.0
+            self._density_std = 0.0
         self._last_density_step = step
