@@ -5,8 +5,8 @@ The goal of STR-SUMO is to offer a testbed that can benchmark the performance of
 - Some vehicles are controlled by the scheudling algorithm;
 - Each controlled vehicle has three parameters: 1. start point (an edge), 2. destination (an edge), 3. time to set off, 4. deadline. When travelling from the start point to the destination from the time to set off, the time a vehicle reaches the destination should not exceed the deadline;
 The goal of the routing policy, i.e., the metrics used, includes:
-- How many vehicles have missed their deadlines -- the smaller the better;
-- What is the average time spent for all controlled vehicles -- the smaller the better.
+- What is the average time spent for all controlled vehicles -- the smaller the better (primary objective in RL training);
+- How many vehicles have missed their deadlines -- tracked as a diagnostic metric.
 
 ***pre-requisite***
 
@@ -57,7 +57,7 @@ The test scripts should be placed in the main repository.
 
 ***Reinforcement Learning Training Pipeline***
 
-The repository now includes a DQN-based training pipeline that spawns vehicles at a configurable interval and trains a routing policy to reach destinations efficiently.
+The repository now includes a DQN-based training pipeline that spawns vehicles at a configurable interval and trains a routing policy to reduce average travel time while still reporting deadline/on-time statistics for diagnostics.
 
 To train a model:
 ```
