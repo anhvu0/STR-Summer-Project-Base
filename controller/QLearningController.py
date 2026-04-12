@@ -120,7 +120,7 @@ class QLearningPolicy(RouteController):
         try:
             from_edge = self.net.getEdge(edge_id)
             to_edge = self.net.getEdge(dest_id)
-            path_edges, path_cost = self.net.getShortestPath(from_edge, to_edge)
+            path_edges, path_cost = self.net.getShortestPath(from_edge, to_edge, vClass="passenger")
             if path_edges is None:
                 return float("inf")
             return path_cost

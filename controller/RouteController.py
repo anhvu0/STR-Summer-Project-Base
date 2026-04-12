@@ -69,10 +69,12 @@ class RouteController(ABC):
                 net = sumolib.net.readNet(self.connection_info.net_filename)
                 from_edge = net.getEdge(current_target_edge)
                 to_edge = net.getEdge(vehicle.destination)
-                path_edges, _ = net.getShortestPath(from_edge, to_edge)
+                path_edges, _ = net.getShortestPath(from_edge, to_edge, vClass="passenger")
                 if path_edges:
                     for edge_obj in path_edges[1:]:
                         edge_id = edge_obj.getID()
+                        if not edge_obj.allows("passenger"):
+                            break
                         traversed_edges.append(edge_id)
                         path_length += float(self.connection_info.edge_length_dict.get(edge_id, 30.0))
                         current_target_edge = edge_id

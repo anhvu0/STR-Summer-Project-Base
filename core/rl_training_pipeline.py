@@ -235,6 +235,7 @@ class RLTrainingPipeline:
         target_pattern=2,
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
+        step_log_every=100,
     ):
         """
         Args:
@@ -267,6 +268,7 @@ class RLTrainingPipeline:
         self.target_pattern = target_pattern
         self.debug_exit_diagnostics = debug_exit_diagnostics
         self.debug_exit_diagnostics_limit = max(int(debug_exit_diagnostics_limit), 0)
+        self.step_log_every = max(int(step_log_every), 1)
         self._distance_cache = {}
         self.progress_reward_scale = 0.80  # or 0.0 to disable progress term cheaply
         self.system_congestion_scale = 0.10  # scales marginal congestion penalty on busy edges
@@ -315,6 +317,48 @@ class RLTrainingPipeline:
             replay_warmup=replay_warmup,
             target_update_every=200,
             target_soft_tau=1.0,
+        )
+
+    def _print_step_progress(
+        self,
+        episode,
+        step,
+        total_controlled,
+        arrived_ids,
+        arrived_before_deadline_ids,
+        decision_metrics,
+    ):
+        completion = (len(arrived_ids) / float(total_controlled)) if total_controlled > 0 else 0.0
+        on_time = (len(arrived_before_deadline_ids) / float(total_controlled)) if total_controlled > 0 else 0.0
+        failed = max(total_controlled - len(arrived_ids), 0)
+        print(
+            "[EP {:03d} | STEP {:04d}] eps={:.3f} replay={} train={} loss={} "
+            "done={}/{} ontime={}/{} fail={} open/final/skip={:.0f}/{:.0f}/{:.0f} forced={:.0f}".format(
+                episode,
+                step,
+                self.trainer.epsilon,
+                len(self.trainer.memory),
+                self.trainer.train_steps,
+                "n/a" if self.trainer.last_loss is None else f"{self.trainer.last_loss:.4f}",
+                len(arrived_ids),
+                total_controlled,
+                len(arrived_before_deadline_ids),
+                total_controlled,
+                failed,
+                decision_metrics["decisions_opened"],
+                decision_metrics["decisions_finalized"],
+                decision_metrics["decisions_skipped"],
+                decision_metrics["forced_actions"],
+            )
+        )
+        print(
+            "  rates: completion={:.1%} on_time={:.1%} override={:.1%} mismatch={} teleports={}".format(
+                completion,
+                on_time,
+                decision_metrics["safety_overrides"] / max(decision_metrics["decisions_opened"], 1.0),
+                int(decision_metrics["route_mismatch"]),
+                int(decision_metrics["teleports"]),
+            )
         )
 
     def _init_edge_embeddings(self, seed=1337):
@@ -624,7 +668,7 @@ class RLTrainingPipeline:
             self._distance_cache[key] = math.inf
             return math.inf
 
-        path_edges, path_cost = self.net.getShortestPath(from_edge, to_edge)
+        path_edges, path_cost = self.net.getShortestPath(from_edge, to_edge, vClass="passenger")
         distance = path_cost if path_edges is not None else math.inf
         self._distance_cache[key] = distance
         return distance
@@ -1053,6 +1097,7 @@ class RLTrainingPipeline:
                     teleported_ids = self.get_teleport_ids()
                     if teleported_ids:
                         episode_teleport_events += len(teleported_ids)
+                        decision_metrics["teleports"] += len(teleported_ids)
                         teleported_controlled_ids.update(tid for tid in teleported_ids if tid in vehicles)
                         for tid in list(teleported_ids):
                             if tid not in vehicles:
@@ -1087,6 +1132,16 @@ class RLTrainingPipeline:
                     if step % self.train_every == 0:
                         for _ in range(self.grad_steps):
                             self.trainer.replay()
+
+                    if step % self.step_log_every == 0:
+                        self._print_step_progress(
+                            episode=episode,
+                            step=step,
+                            total_controlled=total_controlled,
+                            arrived_ids=arrived_ids,
+                            arrived_before_deadline_ids=arrived_before_deadline_ids,
+                            decision_metrics=decision_metrics,
+                        )
 
                     # process = psutil.Process(os.getpid())
 
@@ -1123,21 +1178,20 @@ class RLTrainingPipeline:
                     self.trainer.epsilon * self.trainer.epsilon_decay
                 )
                 print(
-                    f"\nDone ep={episode} eps={self.trainer.epsilon:.4f} step={self.trainer.train_steps} "
-                    f"replay={len(self.trainer.memory)} loss={self.trainer.last_loss} "
-                    f"ret={avg_return:.3f} completion={completion_rate:.3f} on_time={on_time_rate:.3f} "
-                    f"tardy={avg_tardiness:.2f} teleports={episode_teleport_events} mismatch={decision_metrics['route_mismatch']:.0f}"
+                    f"\n[EP {episode:03d} DONE] eps={self.trainer.epsilon:.4f} train={self.trainer.train_steps} "
+                    f"replay={len(self.trainer.memory)} ret={avg_return:.3f} "
+                    f"done={len(arrived_ids)}/{total_controlled} ontime={len(arrived_before_deadline_ids)}/{total_controlled} "
+                    f"failed={max(total_controlled-len(arrived_ids),0)} avg_tardy={avg_tardiness:.2f}"
                 )
                 print(
-                    f"Rolling({len(rolling_teleport_events)}) | "
-                    f"teleport_events/ep={roll_tele_events:.3f}, "
-                    f"teleported_controlled/ep={roll_tele_ctrl:.3f}, "
-                    f"completion_before_deadline={roll_completion:.3f}, "
-                    f"avg_return={roll_return:.3f}, route_mismatch={roll_mismatch:.3f}"
+                    f"  rolling({len(rolling_teleport_events)}): completion={roll_completion:.1%} "
+                    f"avg_return={roll_return:.3f} teleports/ep={roll_tele_events:.2f} "
+                    f"teleported_ctrl/ep={roll_tele_ctrl:.2f} mismatch/ep={roll_mismatch:.2f}"
                 )
                 print(
-                    "Decision metrics | opened={:.0f} finalized={:.0f} skipped={:.0f} forced={:.0f} "
-                    "lane_change={:.0f}/{:.0f}/{:.0f} loops={:.0f} uturn={:.0f} apply_fail={:.0f} overrides={:.0f}".format(
+                    "  decisions: opened={:.0f} finalized={:.0f} skipped={:.0f} forced={:.0f} "
+                    "lane_change(a/s/f)={:.0f}/{:.0f}/{:.0f} loops={:.0f} uturn={:.0f} "
+                    "apply_fail={:.0f} overrides={:.0f} override_ratio={:.1%}".format(
                         decision_metrics["decisions_opened"],
                         decision_metrics["decisions_finalized"],
                         decision_metrics["decisions_skipped"],
@@ -1149,6 +1203,7 @@ class RLTrainingPipeline:
                         decision_metrics["uturn_events"],
                         decision_metrics["route_apply_fail"],
                         decision_metrics["safety_overrides"],
+                        decision_metrics["safety_overrides"] / max(decision_metrics["decisions_opened"], 1.0),
                     )
                 )
 

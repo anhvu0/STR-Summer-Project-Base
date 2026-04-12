@@ -65,6 +65,12 @@ class JunctionDecisionEngine:
         speed = max(traci.vehicle.getSpeed(vehicle_id), 0.0)
         return lane_id, lane_idx, lane_count, dist_to_end, speed
 
+    def _edge_allows_passenger(self, edge_id: str) -> bool:
+        try:
+            return self.net.getEdge(edge_id).allows("passenger")
+        except Exception:
+            return False
+
     def build_context(self, vehicle_id: str, edge_id: str, destination: str, step: int) -> DecisionContext:
         lane_id, lane_idx, lane_count, dist_to_end, speed = self._lane_data(vehicle_id, edge_id)
 
@@ -174,11 +180,13 @@ class JunctionDecisionEngine:
         immediate = self.get_next_edge(edge_id, action_idx)
         if immediate is None:
             return [], None, "invalid_action"
+        if not self._edge_allows_passenger(immediate):
+            return [], None, "non_passenger_edge"
 
         try:
             from_edge = self.net.getEdge(immediate)
             to_edge = self.net.getEdge(destination)
-            path_edges, _ = self.net.getShortestPath(from_edge, to_edge)
+            path_edges, _ = self.net.getShortestPath(from_edge, to_edge, vClass="passenger")
         except Exception:
             path_edges = None
 
@@ -191,6 +199,8 @@ class JunctionDecisionEngine:
         fragment = []
         cumulative = 0.0
         for edge in path_ids:
+            if not self._edge_allows_passenger(edge):
+                return [], None, "non_passenger_edge"
             fragment.append(edge)
             cumulative += float(self.connection_info.edge_length_dict.get(edge, 40.0))
             if cumulative >= horizon:
