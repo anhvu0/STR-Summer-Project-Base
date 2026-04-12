@@ -17,6 +17,7 @@ from controller.RouteController import RouteController
 from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision
 from core.Util import ConnectionInfo
 from core.target_vehicles_generation_protocols import target_vehicles_generator
+from core.route_loop_safety import transition_signal
 
 if 'SUMO_HOME' in os.environ:
     tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
@@ -589,6 +590,12 @@ class RLTrainingPipeline:
             pass
         return np.zeros((1, self.state_size), dtype=np.float32)
 
+    def _edge_out_degree_map(self, edges):
+        return {
+            edge: len(self.connection_info.outgoing_edges_dict.get(edge, {}))
+            for edge in set(edges)
+        }
+
     def _score_next_edge(self, next_edge, destination_edge, recent_edges, direction, vehicle, step):
         """
         Lower score is better with lexicographic-style priorities:
@@ -850,7 +857,10 @@ class RLTrainingPipeline:
             "episode", "epsilon", "replay", "train_steps", "mean_loss", "episode_return",
             "completion_rate", "on_time_rate", "avg_tardiness", "teleports", "teleported_controlled",
             "forced_actions", "decisions_opened", "decisions_finalized", "decisions_skipped",
-            "route_mismatch", "loop_events", "uturn_events", "safety_overrides", "override_ratio"
+            "decisions_superseded", "route_mismatch", "loop_events", "uturn_events",
+            "short_cycle_events", "aba_bounce_events", "dead_end_reentry_events",
+            "safety_overrides", "loop_avoidance_overrides", "distance_worsening_overrides",
+            "fragment_build_failures", "override_ratio"
         ]
         if not os.path.exists(self.metrics_csv_path):
             with open(self.metrics_csv_path, "w", newline="") as f:
@@ -929,22 +939,31 @@ class RLTrainingPipeline:
                             continue
 
                         prev_edge = prev_edge_by_vehicle.get(vehicle_id)
-                        if vehicle_id in pending_decisions and prev_edge is not None and prev_edge != current_edge:
+                        if vehicle_id in pending_decisions and current_edge != pending_decisions[vehicle_id].decision_edge:
                             pending = pending_decisions.pop(vehicle_id)
                             repeated_recent_edges = sum(1 for e in recent_edge_history[vehicle_id] if e == current_edge)
                             mismatch = not self.decision_engine.route_matches_expected(pending, current_edge)
                             if mismatch:
                                 decision_metrics["route_mismatch"] += 1
-                            uturn_repeat = len(recent_edge_history[vehicle_id]) >= 2 and recent_edge_history[vehicle_id][-2] == current_edge
-                            if uturn_repeat:
+                            loop_signals = transition_signal(
+                                recent_edge_history[vehicle_id],
+                                current_edge,
+                                edge_out_degree=self._edge_out_degree_map(list(recent_edge_history[vehicle_id]) + [current_edge]),
+                            )
+                            if loop_signals["aba_bounce"]:
+                                decision_metrics["aba_bounce_events"] += 1
                                 decision_metrics["uturn_events"] += 1
+                            if loop_signals["short_cycle"]:
+                                decision_metrics["short_cycle_events"] += 1
+                            if loop_signals["dead_end_reentry"]:
+                                decision_metrics["dead_end_reentry_events"] += 1
                             ext_pen = max(self.connection_info.edge_vehicle_count.get(current_edge, 0) / max(self.connection_info.edge_length_dict.get(current_edge, 10.0), 10.0), 0.0)
                             reward, done = self.compute_reward(
                                 vehicle, pending.decision_edge, current_edge, step, arrived=False,
                                 repeated_recent_edges=repeated_recent_edges,
                                 delta_t=max(step - pending.decision_step, 1),
                                 route_mismatch=mismatch,
-                                uturn_repeat=uturn_repeat,
+                                uturn_repeat=loop_signals["aba_bounce"] or loop_signals["short_cycle"],
                                 externality_penalty=ext_pen,
                             )
                             next_ctx = self.decision_engine.build_context(vehicle_id, current_edge, vehicle.destination, step)
@@ -964,26 +983,33 @@ class RLTrainingPipeline:
                                 decision_metrics["loop_events"] += 1
 
                         context = self.decision_engine.build_context(vehicle_id, current_edge, vehicle.destination, step)
-                        if context.skip_reason:
+                        if vehicle_id in pending_decisions:
                             decision_metrics["decisions_skipped"] += 1
-                            if context.forced_action is not None:
-                                decision_metrics["forced_actions"] += 1
-                            prev_edge_by_vehicle[vehicle_id] = current_edge
-                            continue
-                        if not self.decision_engine.is_decision_open(context):
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
 
                         state = self.encode_state(vehicle_id, current_edge, vehicle.destination, context=context, vehicle=vehicle, step=step)
-                        action = self.trainer.select_action(state, context.available_actions)
-                        if action is None:
+                        if context.forced_action is not None:
+                            action = context.forced_action
+                            decision_metrics["forced_actions"] += 1
+                        elif context.skip_reason:
                             decision_metrics["decisions_skipped"] += 1
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
+                        elif not self.decision_engine.is_decision_open(context):
+                            prev_edge_by_vehicle[vehicle_id] = current_edge
+                            continue
+                        else:
+                            action = self.trainer.select_action(state, context.available_actions)
+                            if action is None:
+                                decision_metrics["decisions_skipped"] += 1
+                                prev_edge_by_vehicle[vehicle_id] = current_edge
+                                continue
 
                         next_edge = self.decision_engine.get_next_edge(current_edge, action)
                         if next_edge is None:
                             decision_metrics["safety_overrides"] += 1
+                            decision_metrics["loop_avoidance_overrides"] += 1
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
 
@@ -998,6 +1024,7 @@ class RLTrainingPipeline:
                         fragment, local_target, frag_error = self.decision_engine.build_route_fragment(current_edge, action, vehicle.destination)
                         if frag_error or local_target is None:
                             decision_metrics["route_apply_fail"] += 1
+                            decision_metrics["fragment_build_failures"] += 1
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
 
@@ -1007,9 +1034,12 @@ class RLTrainingPipeline:
                             last_target_by_vehicle[vehicle_id] = local_target
                         except traci.exceptions.TraCIException:
                             decision_metrics["route_apply_fail"] += 1
+                            decision_metrics["fragment_build_failures"] += 1
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
 
+                        if vehicle_id in pending_decisions:
+                            decision_metrics["decisions_superseded"] += 1
                         pending_decisions[vehicle_id] = PendingDecision(
                             state=state,
                             intended_action=action,
@@ -1191,18 +1221,23 @@ class RLTrainingPipeline:
                     f"teleported_ctrl/ep={roll_tele_ctrl:.2f} mismatch/ep={roll_mismatch:.2f}"
                 )
                 print(
-                    "  decisions: opened={:.0f} finalized={:.0f} skipped={:.0f} forced={:.0f} "
+                    "  decisions: opened={:.0f} finalized={:.0f} skipped={:.0f} forced={:.0f} superseded={:.0f} "
                     "lane_change(a/s/f)={:.0f}/{:.0f}/{:.0f} loops={:.0f} uturn={:.0f} "
+                    "short_cycle={:.0f} aba={:.0f} dead_end_reentry={:.0f} "
                     "apply_fail={:.0f} overrides={:.0f} override_ratio={:.1%}".format(
                         decision_metrics["decisions_opened"],
                         decision_metrics["decisions_finalized"],
                         decision_metrics["decisions_skipped"],
                         decision_metrics["forced_actions"],
+                        decision_metrics["decisions_superseded"],
                         decision_metrics["lane_change_attempts"],
                         decision_metrics["lane_change_success"],
                         decision_metrics["lane_change_fail"],
                         decision_metrics["loop_events"],
                         decision_metrics["uturn_events"],
+                        decision_metrics["short_cycle_events"],
+                        decision_metrics["aba_bounce_events"],
+                        decision_metrics["dead_end_reentry_events"],
                         decision_metrics["route_apply_fail"],
                         decision_metrics["safety_overrides"],
                         decision_metrics["safety_overrides"] / max(decision_metrics["decisions_opened"], 1.0),
@@ -1282,10 +1317,17 @@ class RLTrainingPipeline:
                         "decisions_opened": decision_metrics["decisions_opened"],
                         "decisions_finalized": decision_metrics["decisions_finalized"],
                         "decisions_skipped": decision_metrics["decisions_skipped"],
+                        "decisions_superseded": decision_metrics["decisions_superseded"],
                         "route_mismatch": decision_metrics["route_mismatch"],
                         "loop_events": decision_metrics["loop_events"],
                         "uturn_events": decision_metrics["uturn_events"],
+                        "short_cycle_events": decision_metrics["short_cycle_events"],
+                        "aba_bounce_events": decision_metrics["aba_bounce_events"],
+                        "dead_end_reentry_events": decision_metrics["dead_end_reentry_events"],
                         "safety_overrides": decision_metrics["safety_overrides"],
+                        "loop_avoidance_overrides": decision_metrics["loop_avoidance_overrides"],
+                        "distance_worsening_overrides": decision_metrics["distance_worsening_overrides"],
+                        "fragment_build_failures": decision_metrics["fragment_build_failures"],
                         "override_ratio": decision_metrics["safety_overrides"] / max(decision_metrics["decisions_opened"], 1.0),
                     })
 
