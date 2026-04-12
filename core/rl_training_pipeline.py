@@ -144,6 +144,7 @@ class DQNTrainer:
 class DecisionTransition:
     state: np.ndarray
     action: int
+    decision_edge: str
     edge: str
     expected_next_edge: str
     candidate: object
@@ -329,6 +330,7 @@ class RLTrainingPipeline:
                 "recent_transitions": defaultdict(lambda: deque(maxlen=16)),
                 "mismatch_count": defaultdict(int),
                 "last_decision_step": defaultdict(lambda: -9999),
+                "last_decision_edge": {},
                 "expected_next_edge": {},
                 "open_transition": {},
             }
@@ -382,18 +384,20 @@ class RLTrainingPipeline:
 
                         histories["recent_edges"][vid].append(edge)
 
-                        expected = histories["expected_next_edge"].get(vid)
-                        if expected and edge != expected:
-                            histories["mismatch_count"][vid] += 1
-                            ep["edge_mismatches"] += 1
-                            if vid in histories["open_transition"]:
-                                histories["open_transition"][vid].mismatch_happened = True
-                        if expected and edge != histories["open_transition"].get(vid, DecisionTransition(None,0,edge,edge,None,0,np.zeros(1))).edge:
-                            histories["expected_next_edge"].pop(vid, None)
-
                         if vid in histories["open_transition"]:
                             trn = histories["open_transition"][vid]
-                            if edge != trn.edge:
+                            if edge == trn.decision_edge:
+                                aligned = self.shared.maintain_lane_alignment(vid, edge, trn.candidate)
+                                if aligned:
+                                    ep["lane_interventions"] += 1
+                            else:
+                                # Mismatch is judged only after the vehicle actually leaves
+                                # the decision edge; before that, execution is still in progress.
+                                if trn.expected_next_edge and edge != trn.expected_next_edge:
+                                    histories["mismatch_count"][vid] += 1
+                                    ep["edge_mismatches"] += 1
+                                    trn.mismatch_happened = True
+                                histories["expected_next_edge"].pop(vid, None)
                                 self._close_transition(vid, trn, vehicle, edge, step, arrived=False, teleported=False, histories=histories, ep_metrics=ep)
                                 histories["open_transition"].pop(vid, None)
 
@@ -415,9 +419,12 @@ class RLTrainingPipeline:
                             histories["open_transition"].pop(vid, None)
                             continue
 
-                        if not self.shared.is_decision_point(vid, edge):
+                        outgoing = self.connection_info.outgoing_edges_dict.get(edge, {})
+                        if len(outgoing) <= 1:
                             continue
-                        if step - histories["last_decision_step"][vid] < 4:
+                        if vid in histories["open_transition"]:
+                            continue
+                        if histories["last_decision_edge"].get(vid) == edge:
                             continue
 
                         candidates, mask = self.shared.build_candidates(
@@ -443,22 +450,17 @@ class RLTrainingPipeline:
                             mismatch_count=histories["mismatch_count"][vid],
                         )
 
-                        action = self.trainer.select_action(obs, mask)
-                        candidate = self.shared.choose_safe_candidate(candidates, mask, action)
-                        aligned = self.shared.apply_lane_alignment(vid, edge, candidate)
+                        sampled_action = self.trainer.select_action(obs, mask)
+                        candidate = self.shared.choose_safe_candidate(candidates, mask, sampled_action)
+                        executed_action = int(candidate.slot)
+                        # Replay must learn from the action actually executed after safety filtering.
+                        if executed_action != int(sampled_action):
+                            ep["forced_fallbacks"] += 1
+                        aligned = self.shared.maintain_lane_alignment(vid, edge, candidate)
                         if aligned:
                             ep["lane_interventions"] += 1
                         if (not aligned) and (not candidate.lane_supported):
                             ep["route_lane_mismatches"] += 1
-                            ep["forced_fallbacks"] += 1
-                            replacement = None
-                            for c in candidates:
-                                if c.valid and c.min_lane_shift <= 1:
-                                    replacement = c
-                                    break
-                            if replacement is not None:
-                                candidate = replacement
-                                ep["loop_recoveries"] += 1
 
                         local_target = self.shared.plan_local_target(edge, candidate.next_edge, vehicle.destination)
                         ok = self._apply_route(vid, vehicle.destination, local_target)
@@ -468,9 +470,11 @@ class RLTrainingPipeline:
                         histories["recent_transitions"][vid].append((edge, candidate.next_edge))
                         histories["expected_next_edge"][vid] = candidate.next_edge
                         histories["last_decision_step"][vid] = step
+                        histories["last_decision_edge"][vid] = edge
                         histories["open_transition"][vid] = DecisionTransition(
                             state=obs,
-                            action=action,
+                            action=executed_action,
+                            decision_edge=edge,
                             edge=edge,
                             expected_next_edge=candidate.next_edge,
                             candidate=candidate,

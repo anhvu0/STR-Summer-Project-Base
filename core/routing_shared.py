@@ -289,23 +289,31 @@ class SharedRoutingLogic:
                     best_idx = idx
         return best_idx
 
-    def apply_lane_alignment(self, vehicle_id: str, edge_id: str, candidate: RoutingCandidate) -> bool:
+    def maintain_lane_alignment(self, vehicle_id: str, edge_id: str, candidate: RoutingCandidate) -> bool:
         try:
+            # Lane control is a low-level execution helper: RL selects turn/next-edge, and this
+            # method persistently nudges toward a supporting lane over multiple simulation steps.
             lane_id, lane_idx, _cnt, dist_to_end, _len = self._lane_stats(vehicle_id, edge_id)
             if candidate.lane_supported:
                 return True
             target_lane = self.best_supporting_lane_index(edge_id, candidate.direction, candidate.next_edge, lane_idx)
             if target_lane is None:
                 return False
-            required_dist = 8.0 + 14.0 * abs(target_lane - lane_idx)
+            if lane_idx == target_lane:
+                return True
+            required_dist = 8.0 + 12.0 * abs(target_lane - lane_idx)
             if dist_to_end < required_dist:
                 return False
-            traci.vehicle.changeLane(vehicle_id, int(target_lane), 60)
+            step_lane = lane_idx + (1 if target_lane > lane_idx else -1)
+            traci.vehicle.changeLane(vehicle_id, int(step_lane), 2)
             return True
         except Exception:
             return False
 
-    def plan_local_target(self, current_edge: str, next_edge: str, destination_edge: str, horizon_m: float = 180.0) -> str:
+    def apply_lane_alignment(self, vehicle_id: str, edge_id: str, candidate: RoutingCandidate) -> bool:
+        return self.maintain_lane_alignment(vehicle_id, edge_id, candidate)
+
+    def plan_local_target(self, current_edge: str, next_edge: str, destination_edge: str, horizon_m: float = 300.0) -> str:
         if next_edge == destination_edge:
             return destination_edge
         if not math.isfinite(self.distance_to_destination(next_edge, destination_edge)):
@@ -385,7 +393,7 @@ class SharedRoutingLogic:
             reward -= 2.0
             terms["fallback_only"] = -2.0
 
-        if mismatch_happened or (expected_next_edge and current_edge != expected_next_edge):
+        if mismatch_happened:
             reward -= 4.0
             terms["mismatch"] = -4.0
 
