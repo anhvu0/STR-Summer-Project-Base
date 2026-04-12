@@ -1,8 +1,8 @@
 <configuration>
 
 <input>
-<net-file value="4corners.net.xml"/>
-<route-files value="str_sumo_4corners.rou.xml"/>
+<net-file value="map.net.xml"/>
+<route-files value="str_sumo_map.rou.xml"/>
 </input>
 <output> <netstate-dump value="test_dump.xml" /> </output>
 <time>
