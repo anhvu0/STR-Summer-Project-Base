@@ -39,8 +39,12 @@ class SharedRoutingLogic:
         self._path_cache: Dict[Tuple[str, str], List[str]] = {}
         self._outgoing_cache: Dict[str, Dict[str, str]] = connection_info.outgoing_edges_dict
 
-        # base 13 + per-slot block + mask
-        self.base_state_size = 13
+        # base features in encode_observation:
+        # - edge code (3)
+        # - destination code (3)
+        # - scalar context features (10)
+        # total = 16
+        self.base_state_size = 16
         self.state_size = self.base_state_size + (self.slot_count * self.candidate_feature_dim) + self.slot_count
 
     def _edge_code(self, edge_id: str) -> Tuple[float, float, float]:
@@ -261,6 +265,8 @@ class SharedRoutingLogic:
 
         state.extend(mask.tolist())
         arr = np.asarray(state, dtype=np.float32)
+        if arr.shape[0] != self.state_size:
+            raise ValueError(f"Encoded state size mismatch: expected {self.state_size}, got {arr.shape[0]}")
         return arr.reshape(1, -1)
 
     def choose_safe_candidate(self, candidates: List[RoutingCandidate], mask: np.ndarray, selected_slot: int) -> RoutingCandidate:
