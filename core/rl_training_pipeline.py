@@ -9,6 +9,7 @@ import os, psutil
 from xml.dom.minidom import parse
 from keras.layers import Dense
 from keras.models import Sequential, clone_model
+from keras.losses import Huber
 from keras.optimizers import Adam
 from collections import defaultdict, deque
 import random
@@ -142,7 +143,7 @@ class DQNTrainer:
         model.add(Dense(64, input_dim=self.state_size, activation='relu'))      #May increase Dense for bigger network
         model.add(Dense(64, activation='relu'))
         model.add(Dense(self.action_size, activation='linear'))
-        model.compile(loss='mse', optimizer=Adam(learning_rate = learning_rate))
+        model.compile(loss=Huber(delta=1.0), optimizer=Adam(learning_rate = learning_rate))
         return model
     
     def select_action(self, state, valid_actions):
@@ -219,10 +220,10 @@ class RLTrainingPipeline:
         spawn_interval=4.0,
         seed_with_episode=True,
         decision_horizon=6,
-        destination_reward=80.0,       #Adjustible
-        deadline_penalty=100.0,
-        on_time_arrival_bonus=40.0,
-        teleport_penalty=-100.0,
+        destination_reward=24.0,
+        deadline_penalty=20.0,
+        on_time_arrival_bonus=36.0,
+        teleport_penalty=-20.0,
         epsilon_decay=0.99,
         epsilon_min=0.10,
         gamma=0.97,
@@ -271,17 +272,19 @@ class RLTrainingPipeline:
         self.step_log_every = max(int(step_log_every), 1)
         self._distance_cache = {}
         self.progress_reward_scale = 0.80  # or 0.0 to disable progress term cheaply
-        self.system_congestion_scale = 0.10  # scales marginal congestion penalty on busy edges
+        self.system_congestion_scale = 0.03  # scales marginal congestion penalty on busy edges
         self.loop_window = 12
-        self.loop_repeat_penalty = 10.0
+        self.loop_repeat_penalty = 1.5
         # Objective priority:
         # 1) deadline feasibility (dominant)
         # 2) congestion externality (secondary)
         # 3) shortest-path distance only as weak tie-breaker
-        self.deadline_deficit_scale = 50.0
-        self.deadline_deficit_delta_scale = 25.0
+        self.deadline_deficit_scale = 1.5
+        self.deadline_deficit_delta_scale = 0.8
         self.deadline_critical_buffer = 20.0
-        self.distance_tiebreak_scale = 0.05
+        self.distance_tiebreak_scale = 0.02
+        self.reward_clip_low = -20.0
+        self.reward_clip_high = 20.0
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
@@ -713,107 +716,97 @@ class RLTrainingPipeline:
         externality_penalty=0.0,
     ):
         """
-        Compute a reward based on travel time, congestion, progress,
-        and proper dead-end handling.
+        Compute a bounded reward with clear objective priority:
+        1) arrive at true destination before deadline
+        2) avoid deadline misses / unreachable states
+        3) prefer feasible progress with mild congestion awareness.
         """
-
         deadline_window = self._deadline_window(vehicle)
         urgency = self._deadline_urgency(vehicle, step)
-        flexibility = 1.0 - urgency
         time_left = max(float(vehicle.deadline) - float(step), 0.0)
-
-        # ---- Base penalties ----
         elapsed = max(float(delta_t), 1.0)
-        time_penalty = -3.0 * elapsed
-        congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
-        edge_density = congestion / max(self.connection_info.edge_length_dict[current_edge], 5.0)
-        congestion_penalty = -edge_density * elapsed
-        # More flexible vehicles (larger deadline - start_time) should yield,
-        # so congestion penalty is stronger for them.
-        congestion_penalty *= (1.0 + flexibility)
 
-        reward = time_penalty + congestion_penalty
-        reward -= float(externality_penalty)
-
-        # ---- Marginal system congestion penalty (secondary objective) ----
-        # Penalize using edges that are denser than the current network average.
-        # This is action-sensitive (unlike a pure global constant) and better
-        # aligns local choices with global congestion relief.
-        mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
-        marginal_pressure = max(edge_density - mean_density, 0.0)
-        system_penalty = -self.system_congestion_scale * marginal_pressure * elapsed
-        reward += system_penalty
-
-        done = False
-
-        # ---- Deadline feasibility shaping (primary objective) ----
         prev_distance = self.get_distance_to_destination(prev_edge, vehicle.destination)
         curr_distance = self.get_distance_to_destination(current_edge, vehicle.destination)
         prev_eta = self._estimate_remaining_eta(prev_edge, vehicle.destination)
         curr_eta = self._estimate_remaining_eta(current_edge, vehicle.destination)
 
-        prev_deficit = max(prev_eta - (time_left + 1.0), 0.0) if math.isfinite(prev_eta) else self.deadline_deficit_scale
-        curr_deficit = max(curr_eta - time_left, 0.0) if math.isfinite(curr_eta) else self.deadline_deficit_scale
-        reward -= self.deadline_deficit_scale * curr_deficit
-        reward += self.deadline_deficit_delta_scale * (prev_deficit - curr_deficit)
+        reward = 0.0
+        done = False
 
-        if time_left < self.deadline_critical_buffer and curr_deficit > 0.0:
-            reward -= 30.0 * (1.0 + urgency) * min(curr_deficit, 2.0)
+        # Dense shaping: small living/time and congestion costs.
+        reward -= 0.15 * elapsed
+        congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
+        edge_len = max(self.connection_info.edge_length_dict.get(current_edge, 5.0), 5.0)
+        edge_density = congestion / edge_len
+        reward -= 0.05 * edge_density * elapsed
+        reward -= float(np.clip(externality_penalty, 0.0, 4.0))
 
-        # ---- Distance-only tie breaker (tertiary objective) ----
+        mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
+        marginal_pressure = max(edge_density - mean_density, 0.0)
+        reward -= self.system_congestion_scale * marginal_pressure * elapsed
+
+        # Primary shaping: deadline deficit and improvement.
+        prev_deficit = max(prev_eta - (time_left + 1.0), 0.0) if math.isfinite(prev_eta) else 6.0
+        curr_deficit = max(curr_eta - time_left, 0.0) if math.isfinite(curr_eta) else 6.0
+        reward -= self.deadline_deficit_scale * min(curr_deficit, 8.0)
+        reward += self.deadline_deficit_delta_scale * np.clip(prev_deficit - curr_deficit, -3.0, 3.0)
+
+        if (time_left < self.deadline_critical_buffer) and (curr_deficit > 0.0):
+            critical_scale = 1.0 + 0.5 * urgency
+            reward -= critical_scale * min(curr_deficit, 3.0)
+
+        # Tertiary tie-breaker: shortest-path distance progress.
         if math.isfinite(prev_distance) and math.isfinite(curr_distance):
-            progress_scale = self.distance_tiebreak_scale * self.progress_reward_scale
-            progress_reward = (prev_distance - curr_distance) * progress_scale
-            reward += progress_reward
+            progress = (prev_distance - curr_distance) * (self.distance_tiebreak_scale * self.progress_reward_scale)
+            reward += float(np.clip(progress, -1.0, 1.0))
 
-        # Penalize repeatedly entering edges seen in recent history.
+        # Safety and control quality penalties.
         if repeated_recent_edges > 0:
-            reward -= self.loop_repeat_penalty * repeated_recent_edges
+            reward -= self.loop_repeat_penalty * min(repeated_recent_edges, 3)
         if uturn_repeat:
-            reward -= 20.0
+            reward -= 3.0
         if route_mismatch:
-            reward -= 25.0
+            reward -= 4.0
         if invalid_late_turn:
-            reward -= 12.0
+            reward -= 2.0
         if route_apply_failed:
-            reward -= 18.0
+            reward -= 6.0
 
-        # If vehicle moved into a region with no path to destination
+        # Unreachable transition after a decision is strongly terminal-negative.
         if math.isfinite(prev_distance) and not math.isfinite(curr_distance):
-            reward -= 120.0
+            reward -= 12.0
             done = True
 
-        # ---- Arrival handling ----
         if arrived:
             if reached_global_destination:
                 reward += self.destination_reward
                 if step <= vehicle.deadline:
                     reward += self.on_time_arrival_bonus
+                else:
+                    reward -= 0.75 * self.deadline_penalty
             else:
-                reward -= 0.5 * self.deadline_penalty
+                reward -= 0.4 * self.deadline_penalty
             done = True
-            return reward, done
+            return self._clip_reward(reward), done
 
-        # ---- Dead-end handling ----
-        # If no outgoing edges AND this is not the destination
         outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
         if (not outgoing or len(outgoing) == 0) and current_edge != vehicle.destination:
-            dead_end_penalty = -50.0
-            reward += dead_end_penalty
+            reward -= 12.0
             done = True
 
-        # ---- Deadline handling ----
         if step > vehicle.deadline:
             reward -= self.deadline_penalty
             done = True
         else:
-            # Escalate penalty when approaching the deadline, normalized by
-            # (deadline - start_time) so strict deadlines are emphasized.
             remaining_ratio = max(float(vehicle.deadline) - float(step), 0.0) / deadline_window
             if remaining_ratio < 0.25:
-                reward -= (0.25 - remaining_ratio) * 20.0
+                reward -= (0.25 - remaining_ratio) * 2.0
 
-        return reward, done
+        return self._clip_reward(reward), done
+
+    def _clip_reward(self, reward_value):
+        return float(np.clip(reward_value, self.reward_clip_low, self.reward_clip_high))
 
     def generate_episode_vehicles(self, episode_seed=None):
         """
