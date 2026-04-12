@@ -9,7 +9,8 @@ from collections import deque
 
 from xml.dom.minidom import parse
 import os
-from core.junction_decision_engine import JunctionDecisionEngine
+from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision
+from core.route_loop_safety import transition_signal, would_worsen_distance
 
 def parse_sumocfg(sumocfg_path):
     dom = parse(sumocfg_path)
@@ -29,12 +30,15 @@ class QLearningPolicy(RouteController):
         self._visit_count = {}
         self._best_dist = {}
         self._recent_edges = {}
+        self._pending_decisions = {}
         self._metrics = {
             "decisions": 0,
             "overrides": 0,
             "loop_overrides": 0,
             "distance_overrides": 0,
             "impossible_action_overrides": 0,
+            "deadend_overrides": 0,
+            "decision_committed_skips": 0,
         }
         self._last_metrics_snapshot = None
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
@@ -132,6 +136,45 @@ class QLearningPolicy(RouteController):
         if not np.isfinite(dist):
             return float("inf")
         return float(dist) / 8.0
+
+    def _edge_out_degree(self, edge_id):
+        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
+        return len(outgoing)
+
+    def _action_safety_score(self, current_edge, next_edge, destination, recent_history):
+        edge_out_degree = {edge: self._edge_out_degree(edge) for edge in set(recent_history) | {next_edge}}
+        signals = transition_signal(recent_history, next_edge, edge_out_degree=edge_out_degree)
+        current_dist = self._dist_to_dest(current_edge, destination)
+        next_dist = self._dist_to_dest(next_edge, destination)
+        dist_worsen = would_worsen_distance(current_dist, next_dist, slack=self.score_slack)
+        trap_like = (
+            next_edge != destination
+            and self._edge_out_degree(next_edge) <= 1
+            and len(recent_history) > 0
+            and recent_history[-1] == current_edge
+        )
+        score = 0
+        if signals["short_cycle"]:
+            score += 5
+        if signals["aba_bounce"]:
+            score += 5
+        if signals["dead_end_reentry"]:
+            score += 3
+        if dist_worsen:
+            score += 2
+        if trap_like:
+            score += 4
+        return score, signals, dist_worsen, trap_like
+
+    def _finalize_commitment(self, vehicle):
+        vid = vehicle.vehicle_id
+        pending = self._pending_decisions.get(vid)
+        if not pending:
+            return
+        if vehicle.current_edge == pending.decision_edge:
+            self._metrics["decision_committed_skips"] += 1
+            return
+        self._pending_decisions.pop(vid, None)
     #----------------------------------------------------------------------
 
 
@@ -151,6 +194,14 @@ class QLearningPolicy(RouteController):
             vid = vehicle.vehicle_id
             if vid not in self._recent_edges:
                 self._recent_edges[vid] = deque(maxlen=self.loop_window)
+            self._visit_count.setdefault(vid, {})
+            self._best_dist.setdefault(vid, float("inf"))
+            self._finalize_commitment(vehicle)
+
+            if vid in self._pending_decisions:
+                # Keep commitment semantics aligned with training:
+                # one decision is open until the vehicle exits the decision edge.
+                continue
 
             step = int(traci.simulation.getTime())
             context = self.decision_engine.build_context(str(vid), start_edge, vehicle.destination, step)
@@ -172,6 +223,37 @@ class QLearningPolicy(RouteController):
                 action_idx = context.available_actions[0]
                 self._metrics["overrides"] += 1
 
+            selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
+            if selected_next_edge is None:
+                continue
+
+            if context.available_actions:
+                best_action = action_idx
+                best_score = None
+                best_reason = None
+                for candidate in context.available_actions:
+                    candidate_next = self.decision_engine.get_next_edge(start_edge, candidate)
+                    if candidate_next is None:
+                        continue
+                    score, signals, dist_worsen, trap_like = self._action_safety_score(
+                        start_edge, candidate_next, vehicle.destination, self._recent_edges[vid]
+                    )
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best_action = candidate
+                        best_reason = (signals, dist_worsen, trap_like)
+                if best_action != action_idx:
+                    self._metrics["overrides"] += 1
+                    signals, dist_worsen, trap_like = best_reason
+                    if signals["short_cycle"] or signals["aba_bounce"] or signals["dead_end_reentry"]:
+                        self._metrics["loop_overrides"] += 1
+                    if dist_worsen:
+                        self._metrics["distance_overrides"] += 1
+                    if trap_like:
+                        self._metrics["deadend_overrides"] += 1
+                    action_idx = best_action
+                    selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
+
             lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action_idx)
             if lane_change_requested and not lane_change_ok:
                 self._metrics["overrides"] += 1
@@ -186,6 +268,18 @@ class QLearningPolicy(RouteController):
             next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
             if next_edge:
                 self._recent_edges[vid].append(next_edge)
+                self._visit_count[vid][next_edge] = self._visit_count[vid].get(next_edge, 0) + 1
+                self._best_dist[vid] = min(self._best_dist[vid], self._dist_to_dest(next_edge, vehicle.destination))
+                self._pending_decisions[vid] = PendingDecision(
+                    state=None,
+                    intended_action=action_idx,
+                    intended_next_edge=next_edge,
+                    decision_edge=start_edge,
+                    decision_step=step,
+                    destination=vehicle.destination,
+                    context=context,
+                    lane_change_requested=lane_change_requested,
+                )
             local_targets[vehicle.vehicle_id] = local_target
 
         if self._metrics["decisions"] > 0:
@@ -195,6 +289,7 @@ class QLearningPolicy(RouteController):
                 self._metrics["loop_overrides"],
                 self._metrics["distance_overrides"],
                 self._metrics["impossible_action_overrides"],
+                self._metrics["deadend_overrides"],
             )
             if snapshot == self._last_metrics_snapshot:
                 return local_targets

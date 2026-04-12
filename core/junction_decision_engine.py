@@ -116,8 +116,11 @@ class JunctionDecisionEngine:
         skip_reason = None
         forced_action = None
         branch_with_choice = len(available) > 1
-        if len(edge_valid) <= 1:
+        if len(edge_valid) == 0:
             skip_reason = "no_branch"
+        elif len(edge_valid) == 1:
+            forced_action = edge_valid[0]
+            skip_reason = "forced_single_path"
         elif len(available) == 0:
             skip_reason = "too_late_or_unreachable"
         elif len(available) == 1:
@@ -182,6 +185,9 @@ class JunctionDecisionEngine:
             return [], None, "invalid_action"
         if not self._edge_allows_passenger(immediate):
             return [], None, "non_passenger_edge"
+        immediate_outgoing = self.connection_info.outgoing_edges_dict.get(immediate, {})
+        if immediate != destination and len(immediate_outgoing) == 1 and edge_id in immediate_outgoing.values():
+            return [], None, "trap_like_reversal"
 
         try:
             from_edge = self.net.getEdge(immediate)
