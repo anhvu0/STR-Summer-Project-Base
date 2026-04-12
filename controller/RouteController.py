@@ -1,5 +1,4 @@
 from abc import ABC, abstractmethod
-import random
 import os
 import sys
 from core.Util import *
@@ -47,48 +46,45 @@ class RouteController(ABC):
     def compute_local_target(self, decision_list, vehicle):
         current_target_edge = vehicle.current_edge
         try:
-            path_length = 0
-            i = 0
+            if current_target_edge == vehicle.destination:
+                return vehicle.destination
 
-            # Keep local targets far enough ahead so vehicles do not frequently
-            # complete a tiny route segment and leave simulation before reaching
-            # their true global destination.
-            horizon = max(vehicle.current_speed, 120)
-            while path_length <= horizon:
-                if current_target_edge == vehicle.destination:
-                    break
+            # deterministic, no random fallbacks in runtime-critical routing
+            path_length = 0.0
+            horizon = max(float(vehicle.current_speed), 140.0)
+            traversed_edges = [current_target_edge]
 
+            for choice in decision_list:
                 outgoing = self.connection_info.outgoing_edges_dict.get(current_target_edge, {})
-
-                # if there is nowhere to go, return current edge as target (vehicle will stop / be handled by reward)
-                if not outgoing or len(outgoing) == 0:
-                    return current_target_edge
-
-                # If decisions run out, do not pad with random moves.
-                # Random extension can route vehicles into components that do
-                # not connect to their global destination and trigger
-                # "No connection between edge ... found" warnings.
-                if i >= len(decision_list):
-                    return current_target_edge
-                else:
-                    choice = decision_list[i]
-                    # if invalid direction, fallback to a valid one instead of removing the vehicle
-                    if choice not in outgoing:
-                        choice = random.choice(list(outgoing.keys()))
-
+                if choice not in outgoing:
+                    break
                 current_target_edge = outgoing[choice]
-                path_length += self.connection_info.edge_length_dict[current_target_edge]
+                traversed_edges.append(current_target_edge)
+                path_length += float(self.connection_info.edge_length_dict.get(current_target_edge, 30.0))
+                if current_target_edge == vehicle.destination or path_length >= horizon:
+                    return current_target_edge
 
-                if i > 0 and i < len(decision_list):
-                    if decision_list[i - 1] == decision_list[i] and decision_list[i] == 't':
-                        return current_target_edge
+            # Extend deterministically via shortest path to keep fragment stable and connected.
+            try:
+                net = sumolib.net.readNet(self.connection_info.net_filename)
+                from_edge = net.getEdge(current_target_edge)
+                to_edge = net.getEdge(vehicle.destination)
+                path_edges, _ = net.getShortestPath(from_edge, to_edge)
+                if path_edges:
+                    for edge_obj in path_edges[1:]:
+                        edge_id = edge_obj.getID()
+                        traversed_edges.append(edge_id)
+                        path_length += float(self.connection_info.edge_length_dict.get(edge_id, 30.0))
+                        current_target_edge = edge_id
+                        if current_target_edge == vehicle.destination or path_length >= horizon:
+                            break
+            except Exception:
+                # Keep deterministic safe behavior; stay on last connected edge.
+                pass
 
-                i += 1
-
-            return current_target_edge
+            return current_target_edge if traversed_edges else vehicle.current_edge
 
         except Exception as e:
-            # last-resort fallback: don't kill vehicle; keep current edge
             print("compute_local_target exception:", e)
             return vehicle.current_edge
 
