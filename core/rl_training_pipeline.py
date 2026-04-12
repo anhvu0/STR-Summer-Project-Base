@@ -225,6 +225,46 @@ class LaneNotReadyState:
     chosen_next_edge: str
     lane_index: int
     distance_to_end: float
+    step: int
+
+
+@dataclass
+class VehicleDecisionContext:
+    vehicle_id: str
+    edge_id: str
+    lane_id: str
+    lane_index: int
+    lane_position: float
+    distance_to_end: float
+    speed: float
+    time_left: float
+    elapsed: float
+    slack: float
+    deadline_deficit: float
+    revisits_recent: int
+
+
+@dataclass
+class CandidateEvaluation:
+    next_edge: str
+    eta: float
+    deficit: float
+    density: float
+    lane_shift_count: int
+    lane_feasible: bool
+    downstream_ok: bool
+    repeated_edge: float
+    pressure: float
+    urgency_pressure: float
+
+
+@dataclass
+class EpisodeDiagnostics:
+    decision_reasons: defaultdict
+    commitment_lifecycle: defaultdict
+    failure_modes: defaultdict
+    fairness_penalties: List[float]
+    cooperative_signals: List[float]
 
 
 class RLTrainingPipeline:
@@ -333,6 +373,7 @@ class RLTrainingPipeline:
         self._progress_last_emit_ts = 0.0
         self._progress_last_line_len = 0
         self.progress_emit_interval_s = 0.35
+        self.step_log_every = 100
         self.edge_density_update_every = 2
         self.edge_pressure_refresh_every = 4
         self._last_edge_pressure_step = -10**9
@@ -363,6 +404,7 @@ class RLTrainingPipeline:
             edge_id: max(len(lane_ids), 1)
             for edge_id, lane_ids in self.connection_info.edge_lane_ids.items()
         }
+        self._junction_pair_memory = defaultdict(lambda: deque(maxlen=8))
 
     def parse_sumocfg(self, sumocfg_path):
         dom = parse(sumocfg_path)
@@ -842,26 +884,95 @@ class RLTrainingPipeline:
         t = min(0.85 * edge_len, max(45.0, 2.2 * speed + 12.0 * lane_cost + 4.0 * lanes))
         return float(t)
 
-    def should_make_decision(self, vehicle_id, edge_id, candidates, commitment, latest_density, current_density, candidate_densities, step, committed_deficit=None, candidate_deficits=None):
-        if len(candidates) <= 1:
+    def build_vehicle_decision_context(self, vehicle_id, vehicle, step, edge_id, recent_edges):
+        lane_id = self._vehicle_var(vehicle_id, tc.VAR_LANE_ID, traci.vehicle.getLaneID, default="")
+        lane_idx = self._vehicle_var(vehicle_id, tc.VAR_LANE_INDEX, traci.vehicle.getLaneIndex, default=0)
+        lane_pos = self._vehicle_var(vehicle_id, tc.VAR_LANEPOSITION, traci.vehicle.getLanePosition, default=0.0)
+        distance_to_end = max(self._lane_length(lane_id) - lane_pos, 0.0)
+        speed = self._vehicle_var(vehicle_id, tc.VAR_SPEED, traci.vehicle.getSpeed, default=0.0)
+        time_left = max(float(vehicle.deadline) - float(step), 0.0)
+        elapsed = max(float(step) - float(vehicle.start_time), 0.0)
+        eta = self.estimate_eta(edge_id, vehicle.destination)
+        deficit = max(eta - time_left, 0.0) if math.isfinite(eta) else self.time_norm
+        slack = (time_left - eta) if math.isfinite(eta) else -self.time_norm
+        revisits_recent = sum(1 for e in recent_edges if e == edge_id)
+        return VehicleDecisionContext(
+            vehicle_id=str(vehicle_id),
+            edge_id=edge_id,
+            lane_id=lane_id,
+            lane_index=int(lane_idx),
+            lane_position=float(lane_pos),
+            distance_to_end=float(distance_to_end),
+            speed=float(speed),
+            time_left=float(time_left),
+            elapsed=float(elapsed),
+            slack=float(slack),
+            deadline_deficit=float(deficit),
+            revisits_recent=int(revisits_recent),
+        )
+
+    def _is_junction_pair_oscillation(self, vehicle_id, edge_id):
+        hist = self._junction_pair_memory[vehicle_id]
+        hist.append(edge_id)
+        if len(hist) < 4:
             return False
+        a, b, c, d = hist[-4], hist[-3], hist[-2], hist[-1]
+        return a == c and b == d and a != b
+
+    def _evaluate_candidates(self, vehicle_id, vehicle, step, edge_id, candidates, recent_edges, cooperative_context, lane_metric_cache=None):
+        evaluations = []
+        time_left = max(float(vehicle.deadline) - float(step), 0.0)
+        for next_edge in candidates:
+            cache_key = (vehicle_id, edge_id, next_edge)
+            lane_m = lane_metric_cache.get(cache_key) if lane_metric_cache is not None else None
+            if lane_m is None:
+                lane_m = self.compute_candidate_lane_metrics(vehicle_id, edge_id, next_edge)
+                if lane_metric_cache is not None:
+                    lane_metric_cache[cache_key] = lane_m
+            eta = self.estimate_eta(next_edge, vehicle.destination)
+            deficit = max(eta - time_left, 0.0) if math.isfinite(eta) else self.time_norm
+            density = self.connection_info.edge_vehicle_count.get(next_edge, 0) / max(self.connection_info.edge_length_dict.get(next_edge, 1.0), 1.0)
+            repeated = 1.0 if next_edge in recent_edges else 0.0
+            pressure = cooperative_context["edge_pressure"].get(next_edge, 0.0)
+            urgency_pressure = pressure * min(cooperative_context["urgency_edge_demand"].get(next_edge, 4.0), 4.0)
+            evaluations.append(CandidateEvaluation(
+                next_edge=next_edge,
+                eta=float(eta if math.isfinite(eta) else self.time_norm),
+                deficit=float(deficit),
+                density=float(density),
+                lane_shift_count=int(lane_m.get("min_lane_shifts", 99)),
+                lane_feasible=bool(lane_m.get("feasible", False)),
+                downstream_ok=bool(self._has_downstream_path(next_edge, vehicle.destination)),
+                repeated_edge=float(repeated),
+                pressure=float(pressure),
+                urgency_pressure=float(urgency_pressure),
+            ))
+        return evaluations
+
+    def should_make_decision(self, vehicle_id, edge_id, candidates, commitment, current_density, candidate_densities, step, committed_deficit=None, candidate_deficits=None, lane_pending=False, oscillating=False):
+        if len(candidates) <= 1:
+            return False, "single_path"
         lane_id = self._vehicle_var(vehicle_id, tc.VAR_LANE_ID, traci.vehicle.getLaneID, default="")
         lane_pos = self._vehicle_var(vehicle_id, tc.VAR_LANEPOSITION, traci.vehicle.getLanePosition, default=0.0)
         dist_to_end = max(self._lane_length(lane_id) - lane_pos, 0.0)
         in_zone = dist_to_end <= self._commitment_threshold(vehicle_id, edge_id, candidates)
+        if oscillating:
+            return True, "oscillation_recovery"
+        if lane_pending:
+            return True, "pending_lane_alignment"
         if not in_zone:
-            return False
+            return False, "outside_decision_zone"
         if commitment is None:
-            return True
+            return True, "new_commitment"
         if commitment.edge != edge_id:
-            return True
+            return True, "edge_changed"
         # Always allow reconsideration if the committed lane maneuver became infeasible.
         lane_m = self.compute_candidate_lane_metrics(vehicle_id, edge_id, commitment.chosen_next_edge)
         if not lane_m["feasible"]:
-            return True
+            return True, "commitment_infeasible"
         # Small hold window after commit to reduce oscillatory re-decisions.
         if (step - commitment.step) < self.decision_min_hold_steps:
-            return False
+            return False, "hold_window"
         if candidate_densities:
             best_idx = int(np.argmin(candidate_densities))
             best_candidate_density = candidate_densities[best_idx]
@@ -870,8 +981,8 @@ class RLTrainingPipeline:
             deficit_gain = (committed_deficit - best_candidate_deficit) if committed_deficit is not None else math.inf
             # Reconsider only when both deficit and pressure gains are meaningful.
             if pressure_gain > self.reconsider_min_pressure_gain and deficit_gain > self.reconsider_min_deficit_gain:
-                return True
-        return False
+                return True, "meaningful_gain"
+        return False, "no_meaningful_gain"
 
     def apply_route_commitment(self, vehicle_id, current_edge, chosen_next_edge, destination):
         if not self._is_valid_immediate_successor(vehicle_id, current_edge, chosen_next_edge):
@@ -1047,6 +1158,21 @@ class RLTrainingPipeline:
             print()
             self._progress_last_line_len = 0
 
+    def _emit_step_log(self, episode, step, active_count, arrived_true, arrived_on_time, teleported, failed, route_diag):
+        if self.step_log_every <= 0:
+            return
+        if step % self.step_log_every != 0:
+            return
+        print(
+            f"\n[step] ep={episode + 1}/{self.episodes} t={step} active={active_count} "
+            f"arr_true={arrived_true} on_time={arrived_on_time} tele={teleported} failed={failed} "
+            f"eps={self.trainer.epsilon:.4f} replay={len(self.trainer.memory)} "
+            f"route_fail_recent={{lane_not_ready:{route_diag.get('lane_not_ready_count', 0)}, "
+            f"invalid_hop:{route_diag.get('invalid_first_hop_count', 0)}, "
+            f"downstream:{route_diag.get('downstream_path_failures', 0)}, "
+            f"set_exc:{route_diag.get('route_set_exceptions', 0)}}}"
+        )
+
     def run(self):
         sumo_binary = checkBinary('sumo')
         rolling = defaultdict(lambda: deque(maxlen=self.rolling_window))
@@ -1085,8 +1211,13 @@ class RLTrainingPipeline:
             final_step = 0
             route_diag = defaultdict(int)
             severe_sacrifice_counts = defaultdict(int)
-            coop_signal_values = []
-            fairness_penalties = []
+            diagnostics = EpisodeDiagnostics(
+                decision_reasons=defaultdict(int),
+                commitment_lifecycle=defaultdict(int),
+                failure_modes=defaultdict(int),
+                fairness_penalties=[],
+                cooperative_signals=[],
+            )
             fleet_feasible_fracs = []
             fleet_mean_positive_deficits = []
 
@@ -1113,6 +1244,16 @@ class RLTrainingPipeline:
                         arrived_on_time_count=len(arrived_on_time),
                         teleported_count=len(teleported_controlled),
                         failed_count=len(failed_ids),
+                    )
+                    self._emit_step_log(
+                        episode=episode,
+                        step=step,
+                        active_count=len(active_controlled),
+                        arrived_true=len(arrived_true_dest),
+                        arrived_on_time=len(arrived_on_time),
+                        teleported=len(teleported_controlled),
+                        failed=len(failed_ids),
+                        route_diag=route_diag,
                     )
                     global_stats = self._global_stats(controlled_vehicle_ids, vehicles, step, teleported_controlled, failed_ids)
                     cooperative_context = self._compute_cooperative_context(active_controlled, vehicles, step)
@@ -1160,6 +1301,7 @@ class RLTrainingPipeline:
                             continue
 
                         candidates = self.enumerate_candidate_next_edges(vid, edge, v.destination, step, diag=route_diag)
+                        decision_ctx = self.build_vehicle_decision_context(vid, v, step, edge, recent_edges[vid])
                         state, mask, cand_feat, cand_meta = self.build_state(vid, v, step, edge, candidates, recent_edges[vid], global_stats, cooperative_context, lane_metric_cache=lane_metric_cache)
 
                         # Close commitments when execution outcome is known.
@@ -1185,9 +1327,11 @@ class RLTrainingPipeline:
                             if entered_chosen or late_impossible:
                                 if entered_chosen:
                                     reward_base = self.execution_success_bonus
+                                    diagnostics.commitment_lifecycle["executed_success"] += 1
                                 else:
                                     reward_base = 0.0
                                     lane_failures += 1
+                                    diagnostics.commitment_lifecycle["lane_alignment_failed"] += 1
                                 fairness_guard = self._fairness_guardrail(vid, c.prev_deficit, curr_deficit, severe_sacrifice_counts)
                                 reward, done = self.compute_reward(
                                     c.prev_deficit,
@@ -1202,8 +1346,8 @@ class RLTrainingPipeline:
                                 reward += reward_base
                                 deficit_improvements.append(c.prev_deficit - curr_deficit)
                                 if entered_chosen:
-                                    coop_signal_values.append(c.cooperative_shaping)
-                                fairness_penalties.append(fairness_guard)
+                                    diagnostics.cooperative_signals.append(c.cooperative_shaping)
+                                diagnostics.fairness_penalties.append(fairness_guard)
                                 next_state = state
                                 transition = {
                                     "state": c.state,
@@ -1215,22 +1359,40 @@ class RLTrainingPipeline:
                                 }
                                 push_nstep_transition(vid, transition)
                                 commitments.pop(vid, None)
+                                diagnostics.commitment_lifecycle["cleared"] += 1
                                 episode_return += reward
 
-                        candidate_densities = [
-                            self.connection_info.edge_vehicle_count.get(nxt, 0) / max(self.connection_info.edge_length_dict.get(nxt, 1.0), 1.0)
-                            for nxt in candidates
-                        ]
-                        time_left = max(v.deadline - step, 0.0)
-                        candidate_deficits = []
-                        for nxt in candidates:
-                            eta_next = self.estimate_eta(nxt, v.destination)
-                            candidate_deficits.append(max(eta_next - time_left, 0.0) if math.isfinite(eta_next) else self.time_norm)
+                        candidate_eval = self._evaluate_candidates(
+                            vid, v, step, edge, candidates, recent_edges[vid], cooperative_context, lane_metric_cache=lane_metric_cache
+                        )
+                        candidate_densities = [e.density for e in candidate_eval]
+                        candidate_deficits = [e.deficit for e in candidate_eval]
+                        # Use the context-derived deadline clock consistently for all
+                        # commitment/candidate comparisons in this decision pass.
+                        time_left = decision_ctx.time_left
                         prev_density = commitments[vid].chosen_density if vid in commitments else self.connection_info.edge_vehicle_count.get(edge, 0) / max(self.connection_info.edge_length_dict.get(edge, 1.0), 1.0)
                         curr_density = self.connection_info.edge_vehicle_count.get((commitments[vid].chosen_next_edge if vid in commitments else edge), 0) / max(self.connection_info.edge_length_dict.get((commitments[vid].chosen_next_edge if vid in commitments else edge), 1.0), 1.0)
                         committed_eta = self.estimate_eta((commitments[vid].chosen_next_edge if vid in commitments else edge), v.destination)
                         committed_deficit = max(committed_eta - time_left, 0.0) if math.isfinite(committed_eta) else self.time_norm
-                        if not self.should_make_decision(vid, edge, candidates, commitments.get(vid), prev_density, curr_density, candidate_densities, step, committed_deficit=committed_deficit, candidate_deficits=candidate_deficits):
+                        oscillating = self._is_junction_pair_oscillation(vid, edge)
+                        if oscillating:
+                            route_diag["oscillation_detected"] += 1
+                        lane_pending = vid in lane_not_ready_state
+                        make_decision, decision_reason = self.should_make_decision(
+                            vid,
+                            edge,
+                            candidates,
+                            commitments.get(vid),
+                            curr_density,
+                            candidate_densities,
+                            step,
+                            committed_deficit=committed_deficit,
+                            candidate_deficits=candidate_deficits,
+                            lane_pending=lane_pending,
+                            oscillating=oscillating,
+                        )
+                        diagnostics.decision_reasons[decision_reason] += 1
+                        if not make_decision:
                             continue
 
                         if np.sum(mask) <= 0:
@@ -1288,7 +1450,9 @@ class RLTrainingPipeline:
                                     chosen_next_edge=chosen_next,
                                     lane_index=self._vehicle_var(vid, tc.VAR_LANE_INDEX, traci.vehicle.getLaneIndex, default=0),
                                     distance_to_end=max(self._lane_length(lane_id) - lane_pos, 0.0),
+                                    step=step,
                                 )
+                                diagnostics.commitment_lifecycle["lane_alignment_pending"] += 1
                                 continue
                             if apply_result.reason == "downstream_path_missing":
                                 route_diag["downstream_path_failures"] += 1
@@ -1315,10 +1479,11 @@ class RLTrainingPipeline:
                             }
                             push_nstep_transition(vid, transition)
                             episode_return += fail_penalty
+                            diagnostics.failure_modes[apply_result.reason] += 1
                             continue
 
                         lane_not_ready_state.pop(vid, None)
-                        time_left = max(v.deadline - step, 0.0)
+                        time_left = decision_ctx.time_left
                         prev_deficit = max(eta_now - time_left, 0.0) if math.isfinite(eta_now) else self.time_norm
                         chosen_density = self.connection_info.edge_vehicle_count.get(chosen_next, 0) / max(self.connection_info.edge_length_dict.get(chosen_next, 1.0), 1.0)
                         commitments[vid] = Commitment(
@@ -1332,6 +1497,7 @@ class RLTrainingPipeline:
                             candidate_repeated=(1.0 if chosen_next in recent_edges[vid] else 0.0),
                             cooperative_shaping=coop_signal,
                         )
+                        diagnostics.commitment_lifecycle["created"] += 1
 
                     traci.simulationStep()
 
@@ -1352,6 +1518,7 @@ class RLTrainingPipeline:
                             wrong_target.add(aid)
                             failed_ids.add(aid)
                             removal_causes["reached_wrong_target"] += 1
+                            diagnostics.failure_modes["wrong_target_arrival"] += 1
                         if aid in commitments:
                             c = commitments.pop(aid)
                             lateness = max(step - v.deadline, 0.0)
@@ -1360,10 +1527,11 @@ class RLTrainingPipeline:
                             curr_deficit = max(curr_eta - max(v.deadline - step, 0.0), 0.0) if math.isfinite(curr_eta) else self.time_norm
                             fairness_guard = self._fairness_guardrail(aid, c.prev_deficit, curr_deficit, severe_sacrifice_counts)
                             reward, done = self.compute_reward(c.prev_deficit, curr_deficit, c.chosen_density, self._global_density_mean, cooperative_shaping=c.cooperative_shaping, fairness_guardrail=fairness_guard, wrong_target=(not is_true), arrived=is_true, on_time=(step <= v.deadline), lateness=lateness)
-                            coop_signal_values.append(c.cooperative_shaping)
-                            fairness_penalties.append(fairness_guard)
+                            diagnostics.cooperative_signals.append(c.cooperative_shaping)
+                            diagnostics.fairness_penalties.append(fairness_guard)
                             transition = {"state": c.state, "action": c.action, "reward": reward, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": float(done), "next_mask": np.zeros((self.action_size,), dtype=np.float32)}
                             push_nstep_transition(aid, transition)
+                            diagnostics.commitment_lifecycle["terminal_arrival"] += 1
                             episode_return += reward
                         terminal_step[aid] = step
 
@@ -1376,13 +1544,15 @@ class RLTrainingPipeline:
                         teleported_controlled.add(tid)
                         failed_ids.add(tid)
                         removal_causes["teleport"] += 1
+                        diagnostics.failure_modes["teleport"] += 1
                         if tid in commitments:
                             c = commitments.pop(tid)
                             fairness_guard = self._fairness_guardrail(tid, c.prev_deficit, c.prev_deficit + 5.0, severe_sacrifice_counts)
                             reward, done = self.compute_reward(c.prev_deficit, c.prev_deficit + 5.0, c.chosen_density, self._global_density_mean, fairness_guardrail=fairness_guard, teleported=True)
-                            fairness_penalties.append(fairness_guard)
+                            diagnostics.fairness_penalties.append(fairness_guard)
                             transition = {"state": c.state, "action": c.action, "reward": reward, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": float(done), "next_mask": np.zeros((self.action_size,), dtype=np.float32)}
                             push_nstep_transition(tid, transition)
+                            diagnostics.commitment_lifecycle["terminal_teleport"] += 1
                             episode_return += reward
                         terminal_step[tid] = step
 
@@ -1396,6 +1566,7 @@ class RLTrainingPipeline:
                     if vid not in arrived_any and vid not in teleported_controlled and vid not in terminal_step:
                         failed_ids.add(vid)
                         removal_causes["disappeared"] += 1
+                        diagnostics.failure_modes["disappeared"] += 1
                         terminal_step[vid] = final_step
 
                 for vid, c in list(commitments.items()):
@@ -1407,13 +1578,15 @@ class RLTrainingPipeline:
                     remain_dist = self.get_distance_to_destination(v.current_edge or c.edge, v.destination)
                     fairness_guard = self._fairness_guardrail(vid, c.prev_deficit, c.prev_deficit + 2.0, severe_sacrifice_counts)
                     reward, done = self.compute_reward(c.prev_deficit, c.prev_deficit + 2.0, c.chosen_density, self._global_density_mean, fairness_guardrail=fairness_guard, deadline_missed=True, lateness=late, remain_dist=(remain_dist if math.isfinite(remain_dist) else 1000.0))
-                    fairness_penalties.append(fairness_guard)
+                    diagnostics.fairness_penalties.append(fairness_guard)
                     transition = {"state": c.state, "action": c.action, "reward": reward, "next_state": np.zeros((1, self.state_size), dtype=np.float32), "done": float(done), "next_mask": np.zeros((self.action_size,), dtype=np.float32)}
                     push_nstep_transition(vid, transition)
                     episode_return += reward
                     commitments.pop(vid, None)
+                    diagnostics.commitment_lifecycle["terminal_deadline"] += 1
                     failed_ids.add(vid)
                     removal_causes["dead_end_trapped"] += 1
+                    diagnostics.failure_modes["deadline_or_trapped_terminal"] += 1
                     terminal_step[vid] = final_step
 
                 for vid, buf in list(nstep_buffers.items()):
@@ -1456,8 +1629,8 @@ class RLTrainingPipeline:
             loop_rate = loops / float(max(len(deficit_improvements), 1))
             avg_fleet_feasible_fraction = float(np.mean(fleet_feasible_fracs)) if fleet_feasible_fracs else 0.0
             avg_fleet_mean_positive_deficit = float(np.mean(fleet_mean_positive_deficits)) if fleet_mean_positive_deficits else 0.0
-            avg_cooperative_signal = float(np.mean(coop_signal_values)) if coop_signal_values else 0.0
-            avg_fairness_penalty = float(np.mean(fairness_penalties)) if fairness_penalties else 0.0
+            avg_cooperative_signal = float(np.mean(diagnostics.cooperative_signals)) if diagnostics.cooperative_signals else 0.0
+            avg_fairness_penalty = float(np.mean(diagnostics.fairness_penalties)) if diagnostics.fairness_penalties else 0.0
 
             rolling_baseline.append(completion_before_deadline)
             base = float(np.mean(rolling_baseline)) if rolling_baseline else completion_before_deadline
@@ -1486,6 +1659,9 @@ class RLTrainingPipeline:
                 "replay_td_error_stats": dict(self.trainer.last_td_error_stats),
                 "removals_by_cause": dict(removal_causes),
                 "route_failure_diagnostics": dict(route_diag),
+                "decision_reason_counts": dict(diagnostics.decision_reasons),
+                "commitment_lifecycle_counts": dict(diagnostics.commitment_lifecycle),
+                "explicit_failure_modes": dict(diagnostics.failure_modes),
                 "avg_fleet_feasible_fraction": avg_fleet_feasible_fraction,
                 "avg_fleet_mean_positive_deficit": avg_fleet_mean_positive_deficit,
                 "avg_cooperative_signal": avg_cooperative_signal,
