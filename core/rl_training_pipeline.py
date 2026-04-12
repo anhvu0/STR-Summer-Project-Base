@@ -883,6 +883,7 @@ class RLTrainingPipeline:
                 sumo_binary,
                 "-c", self.sumocfg_path,
                 "--tripinfo-output", os.path.join(self.sumocfg_dir, "trips.trips.xml"),
+                "--time-to-teleport", "900",
                 "--quit-on-end",
             ])
 

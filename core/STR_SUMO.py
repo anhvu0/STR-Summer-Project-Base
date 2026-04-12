@@ -55,11 +55,11 @@ class StrSumo:
 
         step = 0
         vehicles_to_direct = [] #  the batch of controlled vehicles passed to make_decisions()
-        vehicle_IDs_in_simulation = []
+        vehicle_IDs_in_simulation = set()
 
         try:
             while traci.simulation.getMinExpectedNumber() > 0:
-                vehicle_ids = set(traci.vehicle.getIDList())
+                active_vehicle_ids = set(traci.vehicle.getIDList())
 
                 # store edge vehicle counts in connection_info.edge_vehicle_count
                 self.get_edge_vehicle_counts()
@@ -67,7 +67,8 @@ class StrSumo:
                 vehicles_to_direct = []
 
                 # iterate through vehicles currently in simulation
-                for vehicle_id in vehicle_ids:
+                for vehicle_id in active_vehicle_ids:
+                    controlled_vehicle = self.controlled_vehicles.get(vehicle_id)
 
                     #should not be added because there is no corresponding -1, this makes edge_vehicle_count becomes the total number of vehicles that used to be on this edge.
                     #self.connection_info.edge_vehicle_count[traci.vehicle.getRoadID(vehicle_id)] += 1
@@ -75,24 +76,24 @@ class StrSumo:
                     
 
                     # handle newly arrived controlled vehicles
-                    if vehicle_id not in vehicle_IDs_in_simulation and vehicle_id in self.controlled_vehicles:
-                        vehicle_IDs_in_simulation.append(vehicle_id)
+                    if vehicle_id not in vehicle_IDs_in_simulation and controlled_vehicle is not None:
+                        vehicle_IDs_in_simulation.add(vehicle_id)
                         traci.vehicle.setColor(vehicle_id, (255, 0, 0)) # set color so we can visually track controlled vehicles
-                        self.controlled_vehicles[vehicle_id].start_time = float(step)#Use the detected release time as start time
+                        controlled_vehicle.start_time = float(step)#Use the detected release time as start time
 
-                    if vehicle_id in self.controlled_vehicles.keys():
+                    if controlled_vehicle is not None:
                         current_edge = traci.vehicle.getRoadID(vehicle_id)
 
                         if current_edge not in self.connection_info.edge_index_dict.keys():
                             continue
-                        elif current_edge == self.controlled_vehicles[vehicle_id].destination:
+                        elif current_edge == controlled_vehicle.destination:
                             continue
 
-                        #print("{} now on: {}, records on {}; {} ".format(vehicle_id, current_edge, self.controlled_vehicles[vehicle_id].current_edge, current_edge!=self.controlled_vehicles[vehicle_id].current_edge))
-                        if current_edge != self.controlled_vehicles[vehicle_id].current_edge:
-                            self.controlled_vehicles[vehicle_id].current_edge = current_edge
-                            self.controlled_vehicles[vehicle_id].current_speed = traci.vehicle.getSpeed(vehicle_id)
-                            vehicles_to_direct.append(self.controlled_vehicles[vehicle_id])
+                        #print("{} now on: {}, records on {}; {} ".format(vehicle_id, current_edge, controlled_vehicle.current_edge, current_edge!=controlled_vehicle.current_edge))
+                        if current_edge != controlled_vehicle.current_edge:
+                            controlled_vehicle.current_edge = current_edge
+                            controlled_vehicle.current_speed = traci.vehicle.getSpeed(vehicle_id)
+                            vehicles_to_direct.append(controlled_vehicle)
                 #print(len(vehicles_to_direct))
                 vehicle_decisions_by_id = self.route_controller.make_decisions(vehicles_to_direct, self.connection_info)
                 for vehicle_id, local_target_edge in vehicle_decisions_by_id.items():
@@ -102,7 +103,7 @@ class StrSumo:
                     #
                     # current_edge_of_vehicle = self.controlled_vehicles[vehicle_id].current_edge
                     # target_edge = self.connection_info.outgoing_edges_dict[current_edge_of_vehicle][decision]
-                    if vehicle_id in traci.vehicle.getIDList():
+                    if vehicle_id in active_vehicle_ids:
                         #print("Changing the target of {} to {} with length {}".format(vehicle_id, local_target_edge, self.connection_info.edge_length_dict[local_target_edge]))
                         try:
                             # Keep final destination as sink and use local target as a temporary via edge.
@@ -120,6 +121,7 @@ class StrSumo:
                             continue
 
                 arrived_at_destination = traci.simulation.getArrivedIDList()
+                vehicle_IDs_in_simulation.difference_update(arrived_at_destination)
 
                 for vehicle_id in arrived_at_destination:
                     if vehicle_id in self.controlled_vehicles:
