@@ -81,7 +81,11 @@ class StrSumo:
                         self.controlled_vehicles[vehicle_id].start_time = float(step)#Use the detected release time as start time
 
                     if vehicle_id in self.controlled_vehicles.keys():
-                        current_edge = traci.vehicle.getRoadID(vehicle_id)
+                        try:
+                            current_edge = traci.vehicle.getRoadID(vehicle_id)
+                        except traci.exceptions.TraCIException:
+                            # Vehicle may have arrived/teleported right after getIDList().
+                            continue
 
                         if current_edge not in self.connection_info.edge_index_dict.keys():
                             continue
@@ -102,7 +106,7 @@ class StrSumo:
                     #
                     # current_edge_of_vehicle = self.controlled_vehicles[vehicle_id].current_edge
                     # target_edge = self.connection_info.outgoing_edges_dict[current_edge_of_vehicle][decision]
-                    if vehicle_id in traci.vehicle.getIDList():
+                    if vehicle_id in vehicle_ids:
                         #print("Changing the target of {} to {} with length {}".format(vehicle_id, local_target_edge, self.connection_info.edge_length_dict[local_target_edge]))
                         try:
                             # Keep final destination as sink and use local target as a temporary via edge.

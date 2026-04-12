@@ -883,6 +883,7 @@ class RLTrainingPipeline:
                 sumo_binary,
                 "-c", self.sumocfg_path,
                 "--tripinfo-output", os.path.join(self.sumocfg_dir, "trips.trips.xml"),
+                "--time-to-teleport", "900",
                 "--quit-on-end",
             ])
 
@@ -912,13 +913,17 @@ class RLTrainingPipeline:
 
                     # Keep density features fresh for routing choices and reward.
                     self.update_edge_vehicle_counts(step, every=1)
-                    vehicle_ids = list(traci.vehicle.getIDList())
+                    vehicle_ids = traci.vehicle.getIDList()
 
                     for vehicle_id in vehicle_ids:
                         if vehicle_id not in vehicles:
                             continue
 
-                        current_edge = traci.vehicle.getRoadID(vehicle_id)
+                        try:
+                            current_edge = traci.vehicle.getRoadID(vehicle_id)
+                        except traci.exceptions.TraCIException:
+                            # Vehicle may disappear between getIDList() and this query.
+                            continue
                         if current_edge not in self.connection_info.edge_index_dict:
                             continue
 
@@ -966,7 +971,12 @@ class RLTrainingPipeline:
                                 uturn_repeat=loop_signals["aba_bounce"] or loop_signals["short_cycle"],
                                 externality_penalty=ext_pen,
                             )
-                            next_ctx = self.decision_engine.build_context(vehicle_id, current_edge, vehicle.destination, step)
+                            try:
+                                next_ctx = self.decision_engine.build_context(vehicle_id, current_edge, vehicle.destination, step)
+                            except traci.exceptions.TraCIException:
+                                # Vehicle vanished (arrived/teleported) before context query.
+                                prev_edge_by_vehicle.pop(vehicle_id, None)
+                                continue
                             next_state = self.encode_state(vehicle_id, current_edge, vehicle.destination, context=next_ctx, vehicle=vehicle, step=step)
                             self.trainer.remember(
                                 pending.state,
@@ -982,7 +992,12 @@ class RLTrainingPipeline:
                             if repeated_recent_edges > 1:
                                 decision_metrics["loop_events"] += 1
 
-                        context = self.decision_engine.build_context(vehicle_id, current_edge, vehicle.destination, step)
+                        try:
+                            context = self.decision_engine.build_context(vehicle_id, current_edge, vehicle.destination, step)
+                        except traci.exceptions.TraCIException:
+                            # Vehicle vanished (arrived/teleported) before context query.
+                            prev_edge_by_vehicle.pop(vehicle_id, None)
+                            continue
                         if vehicle_id in pending_decisions:
                             decision_metrics["decisions_skipped"] += 1
                             prev_edge_by_vehicle[vehicle_id] = current_edge

@@ -72,7 +72,9 @@ def run_simulation(scheduler, vehicles):
     """
     traci.start([sumo_binary, "-c", "./configurations/myconfig.sumocfg", \
                  "--tripinfo-output", "./main_output/trips.trips.xml", \
-                 "--fcd-output", "./main_output/testTrace.xml","--quit-on-end"]) #The sumocfg file need to match with the one used in train_rl.py
+                 "--fcd-output", "./main_output/testTrace.xml", \
+                 "--time-to-teleport", "900", \
+                 "--quit-on-end"]) #The sumocfg file need to match with the one used in train_rl.py
     try:
         total_time, end_number, deadlines_missed = simulation.run()
         if end_number > 0:
