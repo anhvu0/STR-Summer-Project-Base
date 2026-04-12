@@ -333,6 +333,7 @@ class RLTrainingPipeline:
         self._progress_last_emit_ts = 0.0
         self._progress_last_line_len = 0
         self.progress_emit_interval_s = 0.35
+        self.step_log_every = 80
         self.edge_density_update_every = 2
         self.edge_pressure_refresh_every = 4
         self._last_edge_pressure_step = -10**9
@@ -936,6 +937,20 @@ class RLTrainingPipeline:
             return reward - (40.0 + self.deadline_miss_terminal_scale * (lateness + 0.05 * remain_dist)), True
         return reward, False
 
+    def _oscillation_score(self, recent_edges_deque):
+        seq = list(recent_edges_deque)
+        if len(seq) < 3:
+            return 0.0
+        # Junction-pair oscillation pattern (A -> B -> A) detection.
+        if seq[-1] == seq[-3] and seq[-1] != seq[-2]:
+            return 1.0
+        # Escalate if the same 2-edge ping-pong repeats in the short history.
+        if len(seq) >= 6:
+            tail = seq[-6:]
+            if tail[0] == tail[2] == tail[4] and tail[1] == tail[3] == tail[5] and tail[0] != tail[1]:
+                return 2.0
+        return 0.0
+
     def _cooperative_signal_for_choice(self, chosen_idx, candidate_meta):
         if chosen_idx < 0 or chosen_idx >= len(candidate_meta):
             return 0.0
@@ -1079,6 +1094,7 @@ class RLTrainingPipeline:
             lane_failures = 0
             deficit_improvements = []
             loops = 0
+            oscillations = 0
             episode_return = 0.0
             removal_causes = defaultdict(int)
             terminal_step = {}
@@ -1179,8 +1195,11 @@ class RLTrainingPipeline:
                                 lane_m = {"feasible": True}
                             late_impossible = (not lane_m.get("feasible", True)) and not entered_chosen
                             repeated = 1.0 if edge in list(recent_edges[vid])[:-1] else 0.0
+                            oscillation = self._oscillation_score(recent_edges[vid])
                             if repeated > 0:
                                 loops += 1
+                            if oscillation > 0:
+                                oscillations += 1
 
                             if entered_chosen or late_impossible:
                                 if entered_chosen:
@@ -1195,7 +1214,7 @@ class RLTrainingPipeline:
                                     c.chosen_density,
                                     self._global_density_mean,
                                     lane_failed=late_impossible,
-                                    repeated=repeated + c.candidate_repeated,
+                                    repeated=repeated + c.candidate_repeated + oscillation,
                                     cooperative_shaping=(c.cooperative_shaping if entered_chosen else 0.0),
                                     fairness_guardrail=fairness_guard,
                                 )
@@ -1389,6 +1408,13 @@ class RLTrainingPipeline:
                     if step % self.train_every == 0:
                         for _ in range(self.grad_steps):
                             self.trainer.replay()
+                    if step % self.step_log_every == 0:
+                        print(
+                            f"[train-step] ep={episode + 1} step={step} active={len(active_controlled)} "
+                            f"eps={self.trainer.epsilon:.4f} arrived={len(arrived_true_dest)} on_time={len(arrived_on_time)} "
+                            f"tele={len(teleported_controlled)} failed={len(failed_ids)} "
+                            f"route_fail_recent={dict(route_diag)} loops={loops} oscillations={oscillations} replay={len(self.trainer.memory)}"
+                        )
 
                 # unresolved vehicles
                 disappeared = controlled_vehicle_ids - set(traci.vehicle.getIDList()) - arrived_any - teleported_controlled
@@ -1454,6 +1480,7 @@ class RLTrainingPipeline:
             avg_deficit_improvement = float(np.mean(deficit_improvements)) if deficit_improvements else 0.0
             lane_failure_rate = lane_failures / float(max(len(deficit_improvements), 1))
             loop_rate = loops / float(max(len(deficit_improvements), 1))
+            oscillation_rate = oscillations / float(max(len(deficit_improvements), 1))
             avg_fleet_feasible_fraction = float(np.mean(fleet_feasible_fracs)) if fleet_feasible_fracs else 0.0
             avg_fleet_mean_positive_deficit = float(np.mean(fleet_mean_positive_deficits)) if fleet_mean_positive_deficits else 0.0
             avg_cooperative_signal = float(np.mean(coop_signal_values)) if coop_signal_values else 0.0
@@ -1483,6 +1510,7 @@ class RLTrainingPipeline:
                 "average_deficit_improvement": avg_deficit_improvement,
                 "lane_execution_failure_rate": lane_failure_rate,
                 "loop_oscillation_rate": loop_rate,
+                "oscillation_pattern_rate": oscillation_rate,
                 "replay_td_error_stats": dict(self.trainer.last_td_error_stats),
                 "removals_by_cause": dict(removal_causes),
                 "route_failure_diagnostics": dict(route_diag),

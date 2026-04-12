@@ -112,29 +112,23 @@ class StrSumo:
                         vehicles_to_direct.append(self.controlled_vehicles[vehicle_id])
                 #print(len(vehicles_to_direct))
                 vehicle_decisions_by_id = self.route_controller.make_decisions(vehicles_to_direct, self.connection_info)
-                for vehicle_id, local_target_edge in vehicle_decisions_by_id.items():
-                    # if decision not in self.connection_info.outgoing_edges_dict[self.controlled_vehicles[vehicle_id].current_edge]:
-                    #     raise ValueError(f'{decision} does not lead to a valid edge from edge '
-                    #                      f'{self.controlled_vehicles[vehicle_id].current_edge}')
-                    #
-                    # current_edge_of_vehicle = self.controlled_vehicles[vehicle_id].current_edge
-                    # target_edge = self.connection_info.outgoing_edges_dict[current_edge_of_vehicle][decision]
-                    if vehicle_id in vehicle_ids:
-                        #print("Changing the target of {} to {} with length {}".format(vehicle_id, local_target_edge, self.connection_info.edge_length_dict[local_target_edge]))
-                        try:
-                            # Keep final destination as sink and use local target as a temporary via edge.
-                            destination = self.controlled_vehicles[vehicle_id].destination
-                            if local_target_edge != destination:
-                                traci.vehicle.setVia(vehicle_id, [local_target_edge])
-                            else:
-                                traci.vehicle.setVia(vehicle_id, [])
-                            traci.vehicle.changeTarget(vehicle_id, destination)
-                            self.controlled_vehicles[vehicle_id].local_destination = local_target_edge
-                        except traci.exceptions.TraCIException:
-                            # If SUMO cannot build a route to this local target from
-                            # current lane/route context, keep the previous target and
-                            # retry on the next control step.
-                            continue
+                if getattr(self.route_controller, "apply_direct_routes", False):
+                    for vehicle_id, chosen_next_edge in vehicle_decisions_by_id.items():
+                        if vehicle_id in self.controlled_vehicles:
+                            self.controlled_vehicles[vehicle_id].local_destination = chosen_next_edge
+                else:
+                    for vehicle_id, local_target_edge in vehicle_decisions_by_id.items():
+                        if vehicle_id in vehicle_ids:
+                            try:
+                                destination = self.controlled_vehicles[vehicle_id].destination
+                                if local_target_edge != destination:
+                                    traci.vehicle.setVia(vehicle_id, [local_target_edge])
+                                else:
+                                    traci.vehicle.setVia(vehicle_id, [])
+                                traci.vehicle.changeTarget(vehicle_id, destination)
+                                self.controlled_vehicles[vehicle_id].local_destination = local_target_edge
+                            except traci.exceptions.TraCIException:
+                                continue
 
                 arrived_at_destination = traci.simulation.getArrivedIDList()
 
