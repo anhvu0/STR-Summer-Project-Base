@@ -225,6 +225,7 @@ class LaneNotReadyState:
     chosen_next_edge: str
     lane_index: int
     distance_to_end: float
+    step: int
 
 
 class RLTrainingPipeline:
@@ -363,6 +364,7 @@ class RLTrainingPipeline:
             edge_id: max(len(lane_ids), 1)
             for edge_id, lane_ids in self.connection_info.edge_lane_ids.items()
         }
+        self.step_log_every = 120
 
     def parse_sumocfg(self, sumocfg_path):
         dom = parse(sumocfg_path)
@@ -913,6 +915,12 @@ class RLTrainingPipeline:
             "frac_failed": (len(teleported) + len(failed)) / float(total),
         }
 
+    def _is_abab_oscillation(self, recent_edge_deque):
+        if len(recent_edge_deque) < 4:
+            return False
+        a, b, c, d = list(recent_edge_deque)[-4:]
+        return a == c and b == d and a != b
+
     def compute_reward(self, prev_deficit, curr_deficit, chosen_density, global_mean_density, lane_failed=False, repeated=0.0, cooperative_shaping=0.0, fairness_guardrail=0.0, arrived=False, on_time=False, wrong_target=False, teleported=False, deadline_missed=False, lateness=0.0, remain_dist=0.0):
         reward = 0.0
         reward += self.w_deficit_delta * (prev_deficit - curr_deficit)
@@ -1089,6 +1097,7 @@ class RLTrainingPipeline:
             fairness_penalties = []
             fleet_feasible_fracs = []
             fleet_mean_positive_deficits = []
+            oscillations = 0
 
             try:
                 for step in range(self.max_simulation_steps):
@@ -1114,6 +1123,14 @@ class RLTrainingPipeline:
                         teleported_count=len(teleported_controlled),
                         failed_count=len(failed_ids),
                     )
+                    if self.step_log_every > 0 and step % self.step_log_every == 0:
+                        print(
+                            f"\n[train-step] episode={episode + 1}/{self.episodes} step={step} "
+                            f"active={len(active_controlled)} arrived={len(arrived_true_dest)} "
+                            f"on_time={len(arrived_on_time)} teleported={len(teleported_controlled)} "
+                            f"failed={len(failed_ids)} replay={len(self.trainer.memory)} eps={self.trainer.epsilon:.4f} "
+                            f"route_fail_recent={dict(route_diag)} loops={loops} oscillations={oscillations}"
+                        )
                     global_stats = self._global_stats(controlled_vehicle_ids, vehicles, step, teleported_controlled, failed_ids)
                     cooperative_context = self._compute_cooperative_context(active_controlled, vehicles, step)
                     fleet_feasible_fracs.append(cooperative_context["fleet_feasible_fraction"])
@@ -1179,8 +1196,11 @@ class RLTrainingPipeline:
                                 lane_m = {"feasible": True}
                             late_impossible = (not lane_m.get("feasible", True)) and not entered_chosen
                             repeated = 1.0 if edge in list(recent_edges[vid])[:-1] else 0.0
+                            oscillating = 1.0 if self._is_abab_oscillation(recent_edges[vid]) else 0.0
                             if repeated > 0:
                                 loops += 1
+                            if oscillating > 0:
+                                oscillations += 1
 
                             if entered_chosen or late_impossible:
                                 if entered_chosen:
@@ -1195,7 +1215,7 @@ class RLTrainingPipeline:
                                     c.chosen_density,
                                     self._global_density_mean,
                                     lane_failed=late_impossible,
-                                    repeated=repeated + c.candidate_repeated,
+                                    repeated=repeated + oscillating + c.candidate_repeated,
                                     cooperative_shaping=(c.cooperative_shaping if entered_chosen else 0.0),
                                     fairness_guardrail=fairness_guard,
                                 )
@@ -1272,7 +1292,8 @@ class RLTrainingPipeline:
                             dist_to_end = max(self._lane_length(lane_id) - lane_pos, 0.0)
                             progressed = dist_to_end < (blocked.distance_to_end - 1.0)
                             lane_changed = curr_lane_idx != blocked.lane_index
-                            if not (progressed or lane_changed):
+                            cooldown_elapsed = (step - blocked.step) >= 3
+                            if not (progressed or lane_changed or cooldown_elapsed):
                                 route_diag["lane_not_ready_retry_suppressed"] += 1
                                 continue
 
@@ -1288,6 +1309,7 @@ class RLTrainingPipeline:
                                     chosen_next_edge=chosen_next,
                                     lane_index=self._vehicle_var(vid, tc.VAR_LANE_INDEX, traci.vehicle.getLaneIndex, default=0),
                                     distance_to_end=max(self._lane_length(lane_id) - lane_pos, 0.0),
+                                    step=step,
                                 )
                                 continue
                             if apply_result.reason == "downstream_path_missing":
@@ -1454,6 +1476,7 @@ class RLTrainingPipeline:
             avg_deficit_improvement = float(np.mean(deficit_improvements)) if deficit_improvements else 0.0
             lane_failure_rate = lane_failures / float(max(len(deficit_improvements), 1))
             loop_rate = loops / float(max(len(deficit_improvements), 1))
+            oscillation_rate = oscillations / float(max(len(deficit_improvements), 1))
             avg_fleet_feasible_fraction = float(np.mean(fleet_feasible_fracs)) if fleet_feasible_fracs else 0.0
             avg_fleet_mean_positive_deficit = float(np.mean(fleet_mean_positive_deficits)) if fleet_mean_positive_deficits else 0.0
             avg_cooperative_signal = float(np.mean(coop_signal_values)) if coop_signal_values else 0.0
@@ -1483,6 +1506,7 @@ class RLTrainingPipeline:
                 "average_deficit_improvement": avg_deficit_improvement,
                 "lane_execution_failure_rate": lane_failure_rate,
                 "loop_oscillation_rate": loop_rate,
+                "abab_oscillation_rate": oscillation_rate,
                 "replay_td_error_stats": dict(self.trainer.last_td_error_stats),
                 "removals_by_cause": dict(removal_causes),
                 "route_failure_diagnostics": dict(route_diag),
