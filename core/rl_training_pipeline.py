@@ -231,15 +231,15 @@ class RLTrainingPipeline:
         episodes=10,
         spawn_interval=4.0,
         seed_with_episode=True,
-        destination_reward=24.0,
-        teleport_penalty=-20.0,
+        destination_reward=50.0,
+        teleport_penalty=-40.0,
         epsilon_decay=0.99,
         epsilon_min=0.08,
         gamma=0.97,
         replay_capacity=5000,
         batch_size=128,
-        replay_warmup=1000,
-        train_every=40,
+        replay_warmup=256,
+        train_every=6,
         grad_steps=1,
         rolling_window=100,
         use_double_dqn=True,
@@ -289,17 +289,17 @@ class RLTrainingPipeline:
         self.route_difficulty_scale_min = float(np.clip(route_difficulty_scale_min, 0.05, 1.0))
         self.route_difficulty_scale_max = float(np.clip(route_difficulty_scale_max, self.route_difficulty_scale_min, 1.0))
         self._distance_cache = {}
-        self.progress_reward_scale = 0.80  # or 0.0 to disable progress term cheaply
-        self.system_congestion_scale = 0.03  # scales marginal congestion penalty on busy edges
+        self.progress_reward_scale = 1.00
+        self.system_congestion_scale = 0.015
         self.loop_window = 12
         self.loop_repeat_penalty = 1.5
         # Objective priority:
         # 1) minimize travel time (dominant)
         # 2) congestion externality (secondary)
         # 3) shortest-path distance as tie-breaker
-        self.travel_time_penalty = 0.15
-        self.eta_progress_scale = 0.2
-        self.distance_tiebreak_scale = 0.02
+        self.travel_time_penalty = 0.05
+        self.eta_progress_scale = 0.65
+        self.distance_tiebreak_scale = 0.06
         self.reward_clip_low = -20.0
         self.reward_clip_high = 20.0
 
@@ -740,8 +740,8 @@ class RLTrainingPipeline:
         congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
         edge_len = max(self.connection_info.edge_length_dict.get(current_edge, 5.0), 5.0)
         edge_density = congestion / edge_len
-        reward -= 0.05 * edge_density * elapsed
-        reward -= float(np.clip(externality_penalty, 0.0, 4.0))
+        reward -= 0.015 * edge_density * elapsed
+        reward -= float(np.clip(externality_penalty, 0.0, 1.5))
 
         mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
         marginal_pressure = max(edge_density - mean_density, 0.0)
@@ -832,9 +832,9 @@ class RLTrainingPipeline:
             "safety_overrides", "loop_avoidance_overrides", "distance_worsening_overrides",
             "fragment_build_failures", "override_ratio"
         ]
-        if not os.path.exists(self.metrics_csv_path):
-            with open(self.metrics_csv_path, "w", newline="") as f:
-                csv.DictWriter(f, fieldnames=csv_fields).writeheader()
+        # Rewrite metrics each new training session to avoid schema drift/appending old runs.
+        with open(self.metrics_csv_path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=csv_fields).writeheader()
 
         # MAX_CACHE_SIZE = 5000
 
@@ -859,9 +859,6 @@ class RLTrainingPipeline:
             simulation_step = traci.simulationStep
             simulation_get_arrived_ids = traci.simulation.getArrivedIDList
             vehicle_get_ids = traci.vehicle.getIDList
-            vehicle_set_via = traci.vehicle.setVia
-            vehicle_change_target = traci.vehicle.changeTarget
-
             pending_decisions = {}
             recent_edge_history = defaultdict(lambda: deque(maxlen=self.loop_window))
             prev_edge_by_vehicle = {}
@@ -879,6 +876,8 @@ class RLTrainingPipeline:
             last_target_by_vehicle = {}
             last_snapshot_by_vehicle = {}
             completed_travel_times = []
+            completed_travel_time_ids = set()
+            terminal_recorded_ids = set()
             arrived_debug_records = []
 
             try:
@@ -906,20 +905,10 @@ class RLTrainingPipeline:
                         last_snapshot_by_vehicle[vehicle_id] = snapshot
                         recent_edge_history[vehicle_id].append(current_edge)
 
-                        # arrived
+                        # Do not cleanup pre-step destination reaches yet; terminal transition
+                        # must be written exactly once before any state is removed.
                         if current_edge == vehicle.destination:
-                            if vehicle_id not in arrived_ids:
-                                arrived_ids.add(vehicle_id)
-                                completed_travel_times.append(max(float(step) - float(vehicle.start_time), 0.0))
-                            self.cleanup_vehicle_state(
-                                vehicle_id,
-                                pending_decisions,
-                                prev_edge_by_vehicle,
-                                last_seen_edge_by_vehicle,
-                                last_target_by_vehicle,
-                                recent_edge_history,
-                                last_snapshot_by_vehicle,
-                            )
+                            arrived_ids.add(vehicle_id)
                             continue
 
                         prev_edge = prev_edge_by_vehicle.get(vehicle_id)
@@ -1029,39 +1018,50 @@ class RLTrainingPipeline:
                         if lane_change_requested:
                             decision_metrics["lane_change_attempts"] += 1
                             if lane_change_ok:
+                                # If lane change is needed, request now but defer route commit
+                                # until the action is lane-feasible-now on a later step.
                                 decision_metrics["lane_change_success"] += 1
-                            else:
-                                decision_metrics["lane_change_fail"] += 1
+                                prev_edge_by_vehicle[vehicle_id] = current_edge
+                                continue
+                            decision_metrics["lane_change_fail"] += 1
+                            fallback_actions = list(context.lane_feasible_now_actions)
+                            if not fallback_actions:
+                                prev_edge_by_vehicle[vehicle_id] = current_edge
+                                continue
+                            action = self.trainer.select_action(state, fallback_actions)
+                            if action is None:
+                                prev_edge_by_vehicle[vehicle_id] = current_edge
+                                continue
+                            next_edge = self.decision_engine.get_next_edge(current_edge, action)
+                            if next_edge is None:
+                                prev_edge_by_vehicle[vehicle_id] = current_edge
+                                continue
 
-                        fragment, local_target, frag_error = self.decision_engine.build_route_fragment(current_edge, action, vehicle.destination)
-                        if frag_error or local_target is None:
+                        full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
+                            vehicle_id,
+                            current_edge,
+                            action,
+                            vehicle.destination,
+                        )
+                        if apply_error:
                             decision_metrics["route_apply_fail"] += 1
                             decision_metrics["fragment_build_failures"] += 1
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
-
-                        try:
-                            vehicle_set_via(vehicle_id, fragment[:3] if local_target != vehicle.destination else [])
-                            vehicle_change_target(vehicle_id, vehicle.destination)
-                            last_target_by_vehicle[vehicle_id] = local_target
-                        except traci.exceptions.TraCIException:
-                            decision_metrics["route_apply_fail"] += 1
-                            decision_metrics["fragment_build_failures"] += 1
-                            prev_edge_by_vehicle[vehicle_id] = current_edge
-                            continue
+                        last_target_by_vehicle[vehicle_id] = full_route[-1] if full_route else vehicle.destination
 
                         if vehicle_id in pending_decisions:
                             decision_metrics["decisions_superseded"] += 1
                         pending_decisions[vehicle_id] = PendingDecision(
                             state=state,
                             intended_action=action,
-                            intended_next_edge=next_edge,
+                            intended_next_edge=committed_next_edge,
                             decision_edge=current_edge,
                             decision_step=step,
                             destination=vehicle.destination,
                             context=context,
                             lane_change_requested=lane_change_requested,
-                            route_fragment=list(fragment),
+                            route_fragment=list(full_route[1:]) if full_route else [],
                         )
                         decision_metrics["decisions_opened"] += 1
                         prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -1071,26 +1071,29 @@ class RLTrainingPipeline:
                     # Vehicles removed by SUMO because they reached their current route target.
                     # This is where we can tell whether they ended at the global destination
                     # or were terminated at an intermediate/local target.
-                    arrived_this_step = simulation_get_arrived_ids()
-                    for arrived_vehicle_id in arrived_this_step:
+                    arrived_this_step = set(simulation_get_arrived_ids())
+                    live_after_step = set(vehicle_get_ids())
+                    destination_live_ids = {
+                        vid for vid in controlled_live_ids
+                        if vid in live_after_step and vid in vehicles
+                        and last_seen_edge_by_vehicle.get(vid) == vehicles[vid].destination
+                    }
+                    for arrived_vehicle_id in (arrived_this_step | destination_live_ids):
                         if arrived_vehicle_id not in vehicles:
                             continue
 
                         vehicle = vehicles[arrived_vehicle_id]
-                        arrived_ids.add(arrived_vehicle_id)
+                        already_terminal = arrived_vehicle_id in terminal_recorded_ids
 
                         last_seen_edge = last_seen_edge_by_vehicle.get(arrived_vehicle_id, "<unknown>")
-                        # TraCI "arrived" means the vehicle reached its current route target.
-                        # In this pipeline route targets are set with changeTarget(destination),
-                        # so arrivals are global-destination arrivals by target semantics even
-                        # when the pre-step cached edge is stale.
-                        reached_global_destination = True
+                        reached_global_destination = (last_seen_edge == vehicle.destination)
                         observed_destination_edge = (last_seen_edge == vehicle.destination)
                         if not observed_destination_edge:
                             decision_metrics["arrived_with_stale_pre_step_edge"] += 1
 
-                        arrived_global_destination_ids.add(arrived_vehicle_id)
-                        completed_travel_times.append(max(float(step) - float(vehicle.start_time), 0.0))
+                        if reached_global_destination:
+                            arrived_ids.add(arrived_vehicle_id)
+                            arrived_global_destination_ids.add(arrived_vehicle_id)
 
                         debug_record = {
                             "vehicle_id": arrived_vehicle_id,
@@ -1101,10 +1104,11 @@ class RLTrainingPipeline:
                             "reached_global_destination": reached_global_destination,
                         }
                         arrived_debug_records.append(debug_record)
+                        if reached_global_destination and arrived_vehicle_id not in completed_travel_time_ids:
+                            completed_travel_time_ids.add(arrived_vehicle_id)
+                            completed_travel_times.append(max(float(step) - float(vehicle.start_time), 0.0))
 
-                        # Close any open transition as a terminal arrival transition so
-                        # destination reward / on-time bonus are learned explicitly.
-                        if arrived_vehicle_id in pending_decisions:
+                        if (not already_terminal) and (arrived_vehicle_id in pending_decisions):
                             pending = pending_decisions[arrived_vehicle_id]
                             repeated_recent_edges = sum(
                                 1 for edge in recent_edge_history[arrived_vehicle_id]
@@ -1136,17 +1140,20 @@ class RLTrainingPipeline:
                                 next_valid_actions=[],
                             )
                             episode_return += reward
+                            decision_metrics["decisions_finalized"] += 1
+                            terminal_recorded_ids.add(arrived_vehicle_id)
 
-                        # No more transitions should be open once SUMO removes the vehicle.
-                        self.cleanup_vehicle_state(
-                            arrived_vehicle_id,
-                            pending_decisions,
-                            prev_edge_by_vehicle,
-                            last_seen_edge_by_vehicle,
-                            last_target_by_vehicle,
-                            recent_edge_history,
-                            last_snapshot_by_vehicle,
-                        )
+                        # Only cleanup when SUMO removed vehicle or it has no pending transition.
+                        if (arrived_vehicle_id not in live_after_step) or (arrived_vehicle_id not in pending_decisions):
+                            self.cleanup_vehicle_state(
+                                arrived_vehicle_id,
+                                pending_decisions,
+                                prev_edge_by_vehicle,
+                                last_seen_edge_by_vehicle,
+                                last_target_by_vehicle,
+                                recent_edge_history,
+                                last_snapshot_by_vehicle,
+                            )
 
                     # =========================
                     # Teleport detection + terminal penalty
@@ -1183,6 +1190,8 @@ class RLTrainingPipeline:
                                     next_valid_actions=[],
                                 )
                                 episode_return += self.teleport_penalty
+                                terminal_recorded_ids.add(tid)
+                                decision_metrics["decisions_finalized"] += 1
 
                             self.cleanup_vehicle_state(
                                 tid,
@@ -1194,7 +1203,6 @@ class RLTrainingPipeline:
                                 last_snapshot_by_vehicle,
                             )
 
-                    live_after_step = set(vehicle_get_ids())
                     tracked_ids = (
                         set(pending_decisions.keys())
                         | set(prev_edge_by_vehicle.keys())
@@ -1360,7 +1368,7 @@ class RLTrainingPipeline:
                 traci.close()
                 with open(self.metrics_csv_path, "a", newline="") as f:
                     writer = csv.DictWriter(f, fieldnames=csv_fields)
-                    writer.writerow({
+                    row = {
                         "episode": episode,
                         "epsilon": self.trainer.epsilon,
                         "replay": len(self.trainer.memory),
@@ -1389,7 +1397,10 @@ class RLTrainingPipeline:
                         "distance_worsening_overrides": decision_metrics["distance_worsening_overrides"],
                         "fragment_build_failures": decision_metrics["fragment_build_failures"],
                         "override_ratio": decision_metrics["safety_overrides"] / max(decision_metrics["decisions_opened"], 1.0),
-                    })
+                    }
+                    if set(row.keys()) != set(csv_fields):
+                        raise ValueError("rl_episode_metrics.csv row schema does not match header")
+                    writer.writerow(row)
 
         self.trainer.model.save(self.model_output_path)
 
