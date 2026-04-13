@@ -103,7 +103,7 @@ if __name__ == "__main__":
     route_file_attr = route_file_node[0].attributes
     route_file = "./configurations/"+route_file_attr['value'].nodeValue
     # Pattern 2: multiple origins with one shared destination.
-    vehicles = get_controlled_vehicles(route_file, init_connection_info, 100, 150, pattern=2)
+    vehicles = get_controlled_vehicles(route_file, init_connection_info, 50, 50, pattern=2)
     #print the controlled vehicles generated
     for vid, v in vehicles.items():
         print("id: {}, destination: {}, start time:{}, deadline: {};".format(vid, \
