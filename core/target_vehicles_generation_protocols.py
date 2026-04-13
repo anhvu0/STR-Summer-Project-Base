@@ -516,12 +516,22 @@ class target_vehicles_generator:
                 param_dest = random.choice(dest_edges)
             result_dict = self.generate_target_vehicles(num_target_vehicles, target_xml_file, (param_start, param_dest))
         elif pattern==2:
-            param_start = __random_choices_with_rp__(spawn_edges, num_target_vehicles * 2)
-            param_dest = random.choice(dest_edges)
-            # all pairs must be valid
-            while not validate_path_start_points(self.net, param_start, param_dest):
-                param_start = __random_choices_with_rp__(spawn_edges, num_target_vehicles * 2)
-                param_dest = random.choice(dest_edges)
+            # Build exactly num_target_vehicles valid starts for one shared destination.
+            # Keep deterministic behavior under the provided seed by relying on random.choice.
+            max_attempts = 500
+            param_dest = None
+            param_start = None
+            for _ in range(max_attempts):
+                candidate_dest = random.choice(dest_edges)
+                valid_starts = [s for s in spawn_edges if validate_path(self.net, s, candidate_dest)]
+                if not valid_starts:
+                    continue
+                param_dest = candidate_dest
+                param_start = __random_choices_with_rp__(valid_starts, num_target_vehicles)
+                break
+            if param_dest is None or param_start is None:
+                print("ERROR: Failed to find a shared destination with valid starts.")
+                return None
             result_dict = self.generate_target_vehicles(num_target_vehicles, target_xml_file, (param_start, param_dest))
         elif pattern == 3:
             param_start = []
@@ -635,14 +645,10 @@ def validate_path_start_points(net, start_points, destination):
         using the shortest path algorithm offered by @net; returns True if such a path
         exists, and False otherwise.
     """
-    num = 0
     for s in start_points:
         shortest_path = net.getShortestPath(s, destination)
-        if shortest_path[0]==None:
+        if shortest_path[0] == None:
             return False
-        num += 1
-        if num >= len(start_points)/2:
-            return True
     return True
 
 def validate_path_starts_ends(net, start_points, destinations):

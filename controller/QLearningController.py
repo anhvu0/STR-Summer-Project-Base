@@ -218,54 +218,38 @@ class QLearningPolicy(RouteController):
 
             if action_idx not in context.available_actions:
                 self._metrics["impossible_action_overrides"] += 1
-                if not context.available_actions:
-                    continue
-                action_idx = context.available_actions[0]
-                self._metrics["overrides"] += 1
+                continue
 
             selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
             if selected_next_edge is None:
                 continue
 
-            if context.available_actions:
-                best_action = action_idx
-                best_score = None
-                best_reason = None
-                for candidate in context.available_actions:
-                    candidate_next = self.decision_engine.get_next_edge(start_edge, candidate)
-                    if candidate_next is None:
-                        continue
-                    score, signals, dist_worsen, trap_like = self._action_safety_score(
-                        start_edge, candidate_next, vehicle.destination, self._recent_edges[vid]
-                    )
-                    if best_score is None or score < best_score:
-                        best_score = score
-                        best_action = candidate
-                        best_reason = (signals, dist_worsen, trap_like)
-                if best_action != action_idx:
-                    self._metrics["overrides"] += 1
-                    signals, dist_worsen, trap_like = best_reason
-                    if signals["short_cycle"] or signals["aba_bounce"] or signals["dead_end_reentry"]:
-                        self._metrics["loop_overrides"] += 1
-                    if dist_worsen:
-                        self._metrics["distance_overrides"] += 1
-                    if trap_like:
-                        self._metrics["deadend_overrides"] += 1
-                    action_idx = best_action
-                    selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
-
             lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action_idx)
-            if lane_change_requested and not lane_change_ok:
-                self._metrics["overrides"] += 1
+            if lane_change_requested:
+                # Match training commit semantics: if lane change is required,
+                # request it first and wait to commit until lane-feasible-now.
+                if lane_change_ok:
+                    continue
+                fallback_actions = list(context.lane_feasible_now_actions)
+                if not fallback_actions:
+                    continue
+                state = self.getState(vid, start_edge, vehicle.destination, context=context)
+                action_idx = self.act(state, available_actions=fallback_actions)
+                selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
+                if selected_next_edge is None:
+                    continue
 
-            fragment, local_target, frag_error = self.decision_engine.build_route_fragment(
-                start_edge, action_idx, vehicle.destination
+            full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
+                str(vid),
+                start_edge,
+                action_idx,
+                vehicle.destination,
             )
-            if frag_error or local_target is None:
+            if apply_error:
                 self._metrics["overrides"] += 1
                 continue
 
-            next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
+            next_edge = committed_next_edge
             if next_edge:
                 self._recent_edges[vid].append(next_edge)
                 self._visit_count[vid][next_edge] = self._visit_count[vid].get(next_edge, 0) + 1
@@ -279,8 +263,9 @@ class QLearningPolicy(RouteController):
                     destination=vehicle.destination,
                     context=context,
                     lane_change_requested=lane_change_requested,
+                    route_fragment=list(full_route[1:]) if full_route else [],
                 )
-            local_targets[vehicle.vehicle_id] = local_target
+            # Route already committed directly via shared apply_route_decision.
 
         if self._metrics["decisions"] > 0:
             snapshot = (

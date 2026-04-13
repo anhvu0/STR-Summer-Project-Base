@@ -248,6 +248,52 @@ class JunctionDecisionEngine:
         local_target = fragment[-1]
         return fragment, local_target, None
 
+    def build_full_route(self, edge_id: str, action_idx: int, destination: str):
+        """
+        Build a contiguous SUMO route that starts at the current edge and follows
+        the chosen immediate next edge all the way to the true destination.
+        """
+        immediate = self.get_next_edge(edge_id, action_idx)
+        if immediate is None:
+            return [], None, "invalid_action"
+        if not self._edge_allows_passenger(immediate):
+            return [], None, "non_passenger_edge"
+
+        try:
+            from_edge = self.net.getEdge(immediate)
+            to_edge = self.net.getEdge(destination)
+            path_edges, _ = self.net.getShortestPath(from_edge, to_edge, vClass="passenger")
+        except Exception:
+            path_edges = None
+
+        if not path_edges:
+            if immediate == destination:
+                return [edge_id, immediate], immediate, None
+            return [], None, "unreachable_destination"
+
+        suffix = [edge.getID() for edge in path_edges]
+        for edge in suffix:
+            if not self._edge_allows_passenger(edge):
+                return [], None, "non_passenger_edge"
+
+        full_route = [edge_id] + suffix
+        return full_route, immediate, None
+
+    def apply_route_decision(self, vehicle_id: str, edge_id: str, action_idx: int, destination: str):
+        """
+        Shared route application for training + inference.
+        Applies one contiguous route via setRoute(...) to avoid split
+        semantics from mixing short via fragments with global retargeting.
+        """
+        full_route, immediate, error = self.build_full_route(edge_id, action_idx, destination)
+        if error:
+            return None, None, error
+        try:
+            traci.vehicle.setRoute(vehicle_id, full_route)
+        except traci.TraCIException:
+            return None, None, "route_apply_failed"
+        return full_route, immediate, None
+
     def route_matches_expected(self, pending: PendingDecision, actual_next_edge: str) -> bool:
         if pending.intended_next_edge == actual_next_edge:
             return True
