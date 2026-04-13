@@ -307,6 +307,7 @@ class RLTrainingPipeline:
         self.distance_tiebreak_scale = 0.06
         self.reward_clip_low = -20.0
         self.reward_clip_high = 20.0
+        self.pending_timeout_penalty = -8.0
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
@@ -888,6 +889,28 @@ class RLTrainingPipeline:
     def _clip_reward(self, reward_value):
         return float(np.clip(reward_value, self.reward_clip_low, self.reward_clip_high))
 
+    def compute_pending_step_reward(self, vehicle, edge_id, elapsed, externality_penalty=0.0):
+        """
+        Dense reward used while a decision is pending and has not finalized yet.
+        Keeps the training objective travel-time centric without waiting for an edge transition.
+        """
+        elapsed = max(float(elapsed), 0.0)
+        if elapsed <= 0.0:
+            return 0.0
+        time_cost_scale = self._get_route_difficulty_scale(vehicle, edge_id)
+        reward = -self.travel_time_penalty * time_cost_scale * elapsed
+
+        congestion = self.connection_info.edge_vehicle_count.get(edge_id, 0)
+        edge_len = max(self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0)
+        edge_density = congestion / edge_len
+        reward -= 0.015 * edge_density * elapsed
+        reward -= float(np.clip(externality_penalty, 0.0, 1.5))
+
+        mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
+        marginal_pressure = max(edge_density - mean_density, 0.0)
+        reward -= self.system_congestion_scale * marginal_pressure * elapsed
+        return self._clip_reward(reward)
+
     def generate_episode_vehicles(self, episode_seed=None):
         """
         Generate controlled and uncontrolled vehicles for one training episode.
@@ -1051,9 +1074,9 @@ class RLTrainingPipeline:
                             prev_eta = self._estimate_remaining_eta(pending.decision_edge, vehicle.destination)
                             curr_eta = self._estimate_remaining_eta(current_edge, vehicle.destination)
                             reward, done = self.compute_reward(
-                                vehicle, pending.decision_edge, current_edge, step, arrived=False,
+                                vehicle, pending.last_credit_edge, current_edge, step, arrived=False,
                                 repeated_recent_edges=repeated_recent_edges,
-                                delta_t=max(step - pending.decision_step, 1),
+                                delta_t=max(step - pending.last_credit_step, 1),
                                 route_mismatch=mismatch,
                                 uturn_repeat=loop_signals["aba_bounce"] or loop_signals["short_cycle"],
                                 externality_penalty=ext_pen,
@@ -1120,6 +1143,50 @@ class RLTrainingPipeline:
                                 externality_penalty=ext_pen,
                                 marginal_pressure=marginal_pressure,
                             ))
+                        elif vehicle_id in pending_decisions:
+                            pending = pending_decisions[vehicle_id]
+                            elapsed_pending = max(step - pending.last_credit_step, 0)
+                            if elapsed_pending > 0:
+                                ext_pen = max(
+                                    self.connection_info.edge_vehicle_count.get(current_edge, 0)
+                                    / max(self.connection_info.edge_length_dict.get(current_edge, 10.0), 10.0),
+                                    0.0,
+                                )
+                                pending_reward = self.compute_pending_step_reward(
+                                    vehicle,
+                                    current_edge,
+                                    elapsed=elapsed_pending,
+                                    externality_penalty=ext_pen,
+                                )
+                                next_ctx = self.decision_engine.build_context(
+                                    vehicle_id,
+                                    current_edge,
+                                    vehicle.destination,
+                                    step,
+                                    snapshot=snapshot,
+                                )
+                                next_state = self.encode_state(
+                                    vehicle_id,
+                                    current_edge,
+                                    vehicle.destination,
+                                    context=next_ctx,
+                                    vehicle=vehicle,
+                                    step=step,
+                                    snapshot=snapshot,
+                                )
+                                self.trainer.remember(
+                                    pending.state,
+                                    pending.intended_action,
+                                    pending_reward,
+                                    next_state,
+                                    False,
+                                    next_valid_actions=next_ctx.available_actions,
+                                    metadata={"interim_pending_credit": True},
+                                )
+                                episode_return += pending_reward
+                                pending.state = next_state
+                                pending.last_credit_edge = current_edge
+                                pending.last_credit_step = step
 
                         context = self.decision_engine.build_context(
                             vehicle_id,
@@ -1220,6 +1287,8 @@ class RLTrainingPipeline:
                             intended_next_edge=committed_next_edge,
                             decision_edge=current_edge,
                             decision_step=step,
+                            last_credit_edge=current_edge,
+                            last_credit_step=step,
                             destination=vehicle.destination,
                             context=context,
                             lane_change_requested=lane_change_requested,
@@ -1277,19 +1346,18 @@ class RLTrainingPipeline:
                                 1 for edge in recent_edge_history[arrived_vehicle_id]
                                 if edge == last_seen_edge
                             )
-                            decision_delta_t = max(step - pending.decision_step, 1)
                             prev_distance = self.get_distance_to_destination(pending.decision_edge, vehicle.destination)
                             curr_distance = self.get_distance_to_destination(vehicle.destination, vehicle.destination)
                             prev_eta = self._estimate_remaining_eta(pending.decision_edge, vehicle.destination)
                             curr_eta = self._estimate_remaining_eta(vehicle.destination, vehicle.destination)
                             reward, done = self.compute_reward(
                                 vehicle,
-                                pending.decision_edge,
+                                pending.last_credit_edge,
                                 vehicle.destination,
                                 step,
                                 arrived=True,
                                 repeated_recent_edges=repeated_recent_edges,
-                                delta_t=decision_delta_t,
+                                delta_t=max(step - pending.last_credit_step, 1),
                                 reached_global_destination=reached_global_destination,
                             )
                             next_state = self.make_terminal_next_state_from_edge(
@@ -1460,13 +1528,44 @@ class RLTrainingPipeline:
                     for vid in alive_at_step_cap_ids:
                         if vid in pending_decisions:
                             pending = pending_decisions[vid]
+                            timeout_vehicle = vehicles[vid]
+                            timeout_snapshot = last_snapshot_by_vehicle.get(vid)
+                            timeout_next_state = self.make_terminal_next_state_from_snapshot(
+                                timeout_snapshot,
+                                timeout_vehicle.destination,
+                                vehicle=timeout_vehicle,
+                                step=last_step_executed,
+                            )
+                            timeout_edge = last_seen_edge_by_vehicle.get(vid, pending.last_credit_edge)
+                            timeout_elapsed = max(last_step_executed - pending.last_credit_step, 0)
+                            timeout_reward = self.compute_pending_step_reward(
+                                timeout_vehicle,
+                                timeout_edge,
+                                elapsed=timeout_elapsed,
+                            ) + self.pending_timeout_penalty
+                            timeout_reward = self._clip_reward(timeout_reward)
+                            self.trainer.remember(
+                                pending.state,
+                                pending.intended_action,
+                                timeout_reward,
+                                timeout_next_state,
+                                True,
+                                next_valid_actions=[],
+                                metadata={"timeout": True},
+                            )
+                            episode_return += timeout_reward
+                            decision_metrics["decisions_finalized"] += 1
+                            finalized_decision_rewards.append(float(timeout_reward))
+                            decision_latency_steps.append(float(max(last_step_executed - pending.decision_step, 0)))
                             decision_debug_rows.append(self._build_decision_debug_row(
                                 episode=episode,
                                 step=last_step_executed,
                                 pending=pending,
-                                actual_next_edge="",
-                                finalized=0,
+                                actual_next_edge=timeout_edge,
+                                finalized=1,
                                 finalize_delay_steps=max(last_step_executed - pending.decision_step, 0),
+                                reward=timeout_reward,
+                                done=1,
                             ))
                 completion_rate = (
                     len(arrived_ids) / float(total_controlled)
