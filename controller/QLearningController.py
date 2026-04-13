@@ -33,11 +33,8 @@ class QLearningPolicy(RouteController):
         self._pending_decisions = {}
         self._metrics = {
             "decisions": 0,
-            "overrides": 0,
-            "loop_overrides": 0,
-            "distance_overrides": 0,
+            "soft_guidance_applied": 0,
             "impossible_action_overrides": 0,
-            "deadend_overrides": 0,
             "decision_committed_skips": 0,
         }
         self._last_metrics_snapshot = None
@@ -166,6 +163,24 @@ class QLearningPolicy(RouteController):
             score += 4
         return score, signals, dist_worsen, trap_like
 
+    def _select_action_with_soft_guidance(self, state, context, vehicle):
+        q_values = self.model.predict(state, verbose=0)[0]
+        available = list(context.available_actions)
+        if not available:
+            return None
+        masked = np.full_like(q_values, -1e9, dtype=np.float32)
+        masked[available] = q_values[available]
+        for action_idx in available:
+            next_edge = self.decision_engine.get_next_edge(context.edge_id, action_idx)
+            if next_edge is None:
+                continue
+            score, *_ = self._action_safety_score(
+                context.edge_id, next_edge, vehicle.destination, self._recent_edges[vehicle.vehicle_id]
+            )
+            masked[action_idx] -= (0.15 * float(score))
+        self._metrics["soft_guidance_applied"] += 1
+        return int(np.argmax(masked))
+
     def _finalize_commitment(self, vehicle):
         vid = vehicle.vehicle_id
         pending = self._pending_decisions.get(vid)
@@ -213,56 +228,26 @@ class QLearningPolicy(RouteController):
                 continue
             else:
                 state = self.getState(vid, start_edge, vehicle.destination, context=context)
-                action_idx = self.act(state, available_actions=context.available_actions)
+                action_idx = self._select_action_with_soft_guidance(state, context, vehicle)
                 self._metrics["decisions"] += 1
 
-            if action_idx not in context.available_actions:
+            if action_idx is None or action_idx not in context.available_actions:
                 self._metrics["impossible_action_overrides"] += 1
-                if not context.available_actions:
-                    continue
-                action_idx = context.available_actions[0]
-                self._metrics["overrides"] += 1
+                continue
 
             selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
             if selected_next_edge is None:
                 continue
 
-            if context.available_actions:
-                best_action = action_idx
-                best_score = None
-                best_reason = None
-                for candidate in context.available_actions:
-                    candidate_next = self.decision_engine.get_next_edge(start_edge, candidate)
-                    if candidate_next is None:
-                        continue
-                    score, signals, dist_worsen, trap_like = self._action_safety_score(
-                        start_edge, candidate_next, vehicle.destination, self._recent_edges[vid]
-                    )
-                    if best_score is None or score < best_score:
-                        best_score = score
-                        best_action = candidate
-                        best_reason = (signals, dist_worsen, trap_like)
-                if best_action != action_idx:
-                    self._metrics["overrides"] += 1
-                    signals, dist_worsen, trap_like = best_reason
-                    if signals["short_cycle"] or signals["aba_bounce"] or signals["dead_end_reentry"]:
-                        self._metrics["loop_overrides"] += 1
-                    if dist_worsen:
-                        self._metrics["distance_overrides"] += 1
-                    if trap_like:
-                        self._metrics["deadend_overrides"] += 1
-                    action_idx = best_action
-                    selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
-
             lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action_idx)
             if lane_change_requested and not lane_change_ok:
-                self._metrics["overrides"] += 1
+                self._metrics["impossible_action_overrides"] += 1
 
             fragment, local_target, frag_error = self.decision_engine.build_route_fragment(
                 start_edge, action_idx, vehicle.destination
             )
             if frag_error or local_target is None:
-                self._metrics["overrides"] += 1
+                self._metrics["impossible_action_overrides"] += 1
                 continue
 
             next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
@@ -285,17 +270,14 @@ class QLearningPolicy(RouteController):
         if self._metrics["decisions"] > 0:
             snapshot = (
                 self._metrics["decisions"],
-                self._metrics["overrides"],
-                self._metrics["loop_overrides"],
-                self._metrics["distance_overrides"],
+                self._metrics["soft_guidance_applied"],
                 self._metrics["impossible_action_overrides"],
-                self._metrics["deadend_overrides"],
             )
             if snapshot == self._last_metrics_snapshot:
                 return local_targets
 
             self._last_metrics_snapshot = snapshot
-            ratio = self._metrics["overrides"] / float(self._metrics["decisions"])
+            ratio = self._metrics["impossible_action_overrides"] / float(self._metrics["decisions"])
             # print(
             #     "[Q-METRICS] decisions={} overrides={} override_ratio={:.2%} "
             #     "loop_overrides={} distance_overrides={} impossible_action_overrides={}".format(
