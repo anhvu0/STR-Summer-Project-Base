@@ -37,6 +37,7 @@ class PendingDecision:
     context: DecisionContext
     lane_change_requested: bool
     route_fragment: List[str] = field(default_factory=list)
+    metadata: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
