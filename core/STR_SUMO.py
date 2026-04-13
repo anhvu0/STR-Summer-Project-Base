@@ -95,7 +95,7 @@ class StrSumo:
                             vehicles_to_direct.append(self.controlled_vehicles[vehicle_id])
                 #print(len(vehicles_to_direct))
                 vehicle_decisions_by_id = self.route_controller.make_decisions(vehicles_to_direct, self.connection_info)
-                for vehicle_id, local_target_edge in vehicle_decisions_by_id.items():
+                for vehicle_id, route_decision in vehicle_decisions_by_id.items():
                     # if decision not in self.connection_info.outgoing_edges_dict[self.controlled_vehicles[vehicle_id].current_edge]:
                     #     raise ValueError(f'{decision} does not lead to a valid edge from edge '
                     #                      f'{self.controlled_vehicles[vehicle_id].current_edge}')
@@ -105,14 +105,20 @@ class StrSumo:
                     if vehicle_id in traci.vehicle.getIDList():
                         #print("Changing the target of {} to {} with length {}".format(vehicle_id, local_target_edge, self.connection_info.edge_length_dict[local_target_edge]))
                         try:
-                            # Keep final destination as sink and use local target as a temporary via edge.
-                            destination = self.controlled_vehicles[vehicle_id].destination
-                            if local_target_edge != destination:
-                                traci.vehicle.setVia(vehicle_id, [local_target_edge])
+                            if isinstance(route_decision, (list, tuple)) and len(route_decision) >= 2:
+                                # Preferred path: apply one contiguous explicit route.
+                                traci.vehicle.setRoute(vehicle_id, list(route_decision))
+                                self.controlled_vehicles[vehicle_id].local_destination = route_decision[-1]
                             else:
-                                traci.vehicle.setVia(vehicle_id, [])
-                            traci.vehicle.changeTarget(vehicle_id, destination)
-                            self.controlled_vehicles[vehicle_id].local_destination = local_target_edge
+                                # Backward-compatible fallback for legacy controllers.
+                                destination = self.controlled_vehicles[vehicle_id].destination
+                                local_target_edge = route_decision
+                                if local_target_edge != destination:
+                                    traci.vehicle.setVia(vehicle_id, [local_target_edge])
+                                else:
+                                    traci.vehicle.setVia(vehicle_id, [])
+                                traci.vehicle.changeTarget(vehicle_id, destination)
+                                self.controlled_vehicles[vehicle_id].local_destination = local_target_edge
                         except traci.exceptions.TraCIException:
                             # If SUMO cannot build a route to this local target from
                             # current lane/route context, keep the previous target and
