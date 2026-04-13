@@ -37,6 +37,7 @@ class PendingDecision:
     context: DecisionContext
     lane_change_requested: bool
     route_fragment: List[str] = field(default_factory=list)
+    system_cost_baseline: float = 0.0
 
 
 @dataclass
@@ -138,7 +139,8 @@ class JunctionDecisionEngine:
                     available.append(idx)
                     continue
                 shift = required_shift.get(idx, 999)
-                if shift < 999 and lane_change_budget >= shift * self.lane_change_margin_m and dist_to_end >= reaction_distance:
+                adaptive_reaction = reaction_distance + (max(shift, 0) * self.lane_change_margin_m * 0.45)
+                if shift < 999 and lane_change_budget >= shift * self.lane_change_margin_m and dist_to_end >= adaptive_reaction:
                     available.append(idx)
 
         available = sorted(set(available))
@@ -254,6 +256,24 @@ class JunctionDecisionEngine:
         if pending.route_fragment and actual_next_edge in pending.route_fragment:
             return True
         return False
+
+    def infer_executed_action(self, pending: PendingDecision, actual_next_edge: str) -> Optional[int]:
+        """
+        Infer which action was actually executed after a mismatch.
+        Returns an action idx only when inference is reliable.
+        """
+        outgoing = self.connection_info.outgoing_edges_dict.get(pending.decision_edge, {})
+        candidates = []
+        for action_idx in pending.context.edge_valid_actions:
+            direction = self.direction_choices[action_idx]
+            if outgoing.get(direction) == actual_next_edge:
+                candidates.append(action_idx)
+        if len(candidates) != 1:
+            return None
+        inferred = candidates[0]
+        if inferred not in pending.context.reachable_with_lane_change_actions:
+            return None
+        return inferred
 
     def direction_masks(self, context: DecisionContext):
         edge_mask = [1.0 if i in context.edge_valid_actions else 0.0 for i in range(len(self.direction_choices))]
