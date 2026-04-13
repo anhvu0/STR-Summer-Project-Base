@@ -29,14 +29,31 @@ class DecisionContext:
 @dataclass
 class PendingDecision:
     state: object
-    intended_action: int
-    intended_next_edge: str
+    chosen_action: int
+    executed_action: Optional[int]
+    intended_next_edge: Optional[str]
     decision_edge: str
     decision_step: int
     destination: str
     context: DecisionContext
     lane_change_requested: bool
+    lane_change_ok: bool = True
+    intervention_type: str = "none"
     route_fragment: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ActionExecutionResult:
+    chosen_action: int
+    executed_action: Optional[int]
+    executed_next_edge: Optional[str]
+    intervention_type: str
+    lane_change_requested: bool
+    lane_change_ok: bool
+    committed_decision: bool
+    route_fragment: List[str] = field(default_factory=list)
+    local_target: Optional[str] = None
+    error: Optional[str] = None
 
 
 @dataclass
@@ -254,6 +271,85 @@ class JunctionDecisionEngine:
         if pending.route_fragment and actual_next_edge in pending.route_fragment:
             return True
         return False
+
+    def ordered_fallback_actions(self, context: DecisionContext, exclude_action: Optional[int] = None) -> List[int]:
+        candidates = [a for a in context.available_actions if a != exclude_action]
+        lane_now = set(context.lane_feasible_now_actions)
+        return sorted(
+            candidates,
+            key=lambda action: (
+                0 if action in lane_now else 1,
+                context.required_lane_shift.get(action, 999),
+                action,
+            ),
+        )
+
+    def attempt_execute_action(
+        self,
+        context: DecisionContext,
+        chosen_action: int,
+        destination: str,
+        fallback_actions: Optional[List[int]] = None,
+    ) -> ActionExecutionResult:
+        chosen_lane_change_requested = False
+        chosen_lane_change_ok = True
+        chosen_error = None
+
+        candidates = [chosen_action]
+        fallback_order = fallback_actions if fallback_actions is not None else self.ordered_fallback_actions(context, exclude_action=chosen_action)
+        for action in fallback_order:
+            if action != chosen_action:
+                candidates.append(action)
+
+        for idx, action in enumerate(candidates):
+            lane_change_requested, lane_change_ok = self.try_request_lane_change(context, action)
+            if idx == 0:
+                chosen_lane_change_requested = lane_change_requested
+                chosen_lane_change_ok = lane_change_ok
+                if lane_change_requested and not lane_change_ok:
+                    chosen_error = "impossible_lane_change"
+                    continue
+            elif lane_change_requested and not lane_change_ok:
+                continue
+
+            next_edge = self.get_next_edge(context.edge_id, action)
+            if next_edge is None:
+                if idx == 0:
+                    chosen_error = "invalid_action"
+                continue
+
+            fragment, local_target, frag_error = self.build_route_fragment(context.edge_id, action, destination)
+            if frag_error or local_target is None:
+                if idx == 0:
+                    chosen_error = frag_error or "fragment_error"
+                continue
+
+            intervention = "none" if action == chosen_action else "fallback_applied"
+            return ActionExecutionResult(
+                chosen_action=chosen_action,
+                executed_action=action,
+                executed_next_edge=next_edge,
+                intervention_type=intervention,
+                lane_change_requested=chosen_lane_change_requested,
+                lane_change_ok=chosen_lane_change_ok,
+                committed_decision=True,
+                route_fragment=list(fragment),
+                local_target=local_target,
+                error=None,
+            )
+
+        return ActionExecutionResult(
+            chosen_action=chosen_action,
+            executed_action=None,
+            executed_next_edge=None,
+            intervention_type="skip_infeasible_action",
+            lane_change_requested=chosen_lane_change_requested,
+            lane_change_ok=chosen_lane_change_ok,
+            committed_decision=False,
+            route_fragment=[],
+            local_target=None,
+            error=chosen_error or "no_safe_fallback",
+        )
 
     def direction_masks(self, context: DecisionContext):
         edge_mask = [1.0 if i in context.edge_valid_actions else 0.0 for i in range(len(self.direction_choices))]
