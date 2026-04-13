@@ -83,8 +83,8 @@ class DQNTrainer:
         epsilon=1.0,
         epsilon_decay=0.995,
         epsilon_min=0.05,
-        replay_capacity=2000,
-        batch_size=64,
+        replay_capacity=10000,
+        batch_size=128,
         replay_warmup=1000,
         target_update_every=200,
         target_soft_tau=1.0,
@@ -141,7 +141,7 @@ class DQNTrainer:
 
     def build_model(self, learning_rate):
         model = Sequential()
-        model.add(Dense(64, input_dim=self.state_size, activation='relu'))      #May increase Dense for bigger network
+        model.add(Dense(128, input_dim=self.state_size, activation='relu'))      #May increase Dense for bigger network
         model.add(Dense(64, activation='relu'))
         model.add(Dense(self.action_size, activation='linear'))
         model.compile(loss=Huber(delta=1.0), optimizer=Adam(learning_rate = learning_rate))
@@ -237,8 +237,8 @@ class RLTrainingPipeline:
         epsilon_decay=0.995,
         epsilon_min=0.05,
         gamma=0.97,
-        replay_capacity=2000,
-        batch_size=64,
+        replay_capacity=10000,
+        batch_size=128,
         replay_warmup=1000,
         train_every=40,
         grad_steps=1,
