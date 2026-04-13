@@ -258,11 +258,11 @@ class RLTrainingPipeline:
             seed_with_episode: Whether to use the episode number as random seed.
             decision_horizon: Number of actions to pad a decision list.
             destination_reward: Reward when reaching the destination.
-            deadline_penalty: Penalty when missing the deadline.
-            on_time_arrival_bonus: Extra reward for arriving before deadline.
+            deadline_penalty: Legacy argument kept for backward compatibility.
+            on_time_arrival_bonus: Legacy argument kept for backward compatibility.
             teleport_penalty: Terminal penalty for teleport events.
             target_pattern: Vehicle generation pattern. 2 means varied origins
-                and one shared destination (helps controlled deadline comparison).
+                and one shared destination (helps controlled travel-time comparison).
         """
         self.sumocfg_path = sumocfg_path
         self.model_output_path = model_output_path
@@ -288,12 +288,11 @@ class RLTrainingPipeline:
         self.loop_window = 12
         self.loop_repeat_penalty = 1.5
         # Objective priority:
-        # 1) deadline feasibility (dominant)
+        # 1) minimize travel time (dominant)
         # 2) congestion externality (secondary)
-        # 3) shortest-path distance only as weak tie-breaker
-        self.deadline_deficit_scale = 1.5
-        self.deadline_deficit_delta_scale = 0.8
-        self.deadline_critical_buffer = 20.0
+        # 3) shortest-path distance as tie-breaker
+        self.travel_time_penalty = 0.15
+        self.eta_progress_scale = 0.2
         self.distance_tiebreak_scale = 0.02
         self.reward_clip_low = -20.0
         self.reward_clip_high = 20.0
@@ -313,7 +312,7 @@ class RLTrainingPipeline:
 
         # state = [edge_embedding, destination_embedding]
         #         + edge/lane/reachable/available feasibility masks (4*6)
-        #         + commit flag + 3 lane features + 3 deadline/time features
+        #         + commit flag + 3 lane features + 3 travel-time features
         #         + local congestion summary
         self.edge_embedding_dim = 8
         self.local_congestion_k = 6
@@ -346,15 +345,13 @@ class RLTrainingPipeline:
         step,
         total_controlled,
         arrived_ids,
-        arrived_before_deadline_ids,
         decision_metrics,
     ):
         completion = (len(arrived_ids) / float(total_controlled)) if total_controlled > 0 else 0.0
-        on_time = (len(arrived_before_deadline_ids) / float(total_controlled)) if total_controlled > 0 else 0.0
         failed = max(total_controlled - len(arrived_ids), 0)
         print(
             "[EP {:03d} | STEP {:04d}] eps={:.3f} replay={} train={} loss={} "
-            "done={}/{} ontime={}/{} fail={} open/final/skip={:.0f}/{:.0f}/{:.0f} forced={:.0f}".format(
+            "done={}/{} fail={} open/final/skip={:.0f}/{:.0f}/{:.0f} forced={:.0f}".format(
                 episode,
                 step,
                 self.trainer.epsilon,
@@ -362,8 +359,6 @@ class RLTrainingPipeline:
                 self.trainer.train_steps,
                 "n/a" if self.trainer.last_loss is None else f"{self.trainer.last_loss:.4f}",
                 len(arrived_ids),
-                total_controlled,
-                len(arrived_before_deadline_ids),
                 total_controlled,
                 failed,
                 decision_metrics["decisions_opened"],
@@ -373,9 +368,8 @@ class RLTrainingPipeline:
             )
         )
         print(
-            "  rates: completion={:.1%} on_time={:.1%} override={:.1%} mismatch={} teleports={}".format(
+            "  rates: completion={:.1%} override={:.1%} mismatch={} teleports={}".format(
                 completion,
-                on_time,
                 decision_metrics["safety_overrides"] / max(decision_metrics["decisions_opened"], 1.0),
                 int(decision_metrics["route_mismatch"]),
                 int(decision_metrics["teleports"]),
@@ -430,25 +424,6 @@ class RLTrainingPipeline:
             dtype=np.float32,
         )
 
-    def _deadline_window(self, vehicle):
-        """
-        Return a strictly positive scheduling window based on
-        (deadline - start_time).
-        """
-        return max(float(vehicle.deadline) - float(vehicle.start_time), 1.0)
-
-    def _deadline_urgency(self, vehicle, step):
-        """
-        Convert deadline flexibility into an urgency score in [0, 1].
-
-        Vehicles with smaller (deadline - start_time) or little time left
-        have higher urgency and should be prioritized.
-        """
-        deadline_window = self._deadline_window(vehicle)
-        time_left = max(float(vehicle.deadline) - float(step), 0.0)
-        # 1.0 means no slack left, 0.0 means fully relaxed.
-        return 1.0 - min(time_left / deadline_window, 1.0)
-
     def parse_sumocfg(self, sumocfg_path):
         """
         Parse the SUMO config file and return net and route filenames.
@@ -491,19 +466,23 @@ class RLTrainingPipeline:
         dist_to_end = context.dist_to_end
         state[lane_base + 2] = min(dist_to_end, 200.0) / 200.0
 
-        # deadline/time features (normalized)
+        # Travel-time objective features (normalized)
         deadline_base = lane_base + 3
         if vehicle is not None:
             if step is None:
                 step = int(snapshot.step) if snapshot is not None else 0
-            deadline_window = self._deadline_window(vehicle)
-            time_left = max(float(vehicle.deadline) - float(step), 0.0)
             elapsed = max(float(step) - float(vehicle.start_time), 0.0)
-            urgency = self._deadline_urgency(vehicle, step)
+            remaining_eta = self._estimate_remaining_eta(edge_id, destination_edge)
+            density = self.connection_info.edge_vehicle_count.get(edge_id, 0) / max(
+                self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0
+            )
 
-            state[deadline_base + 0] = min(time_left / deadline_window, 1.0)
-            state[deadline_base + 1] = min(elapsed / deadline_window, 1.0)
-            state[deadline_base + 2] = urgency
+            state[deadline_base + 0] = min(elapsed / float(MAX_SIMULATION_STEPS), 1.0)
+            state[deadline_base + 1] = (
+                min(float(remaining_eta) / float(MAX_SIMULATION_STEPS), 1.0)
+                if math.isfinite(remaining_eta) else 1.0
+            )
+            state[deadline_base + 2] = min(float(density), 1.0)
 
         state[deadline_base + 3:] = self._local_congestion_features(edge_id)
         return state.reshape(1, -1)
@@ -706,7 +685,7 @@ class RLTrainingPipeline:
     def _score_next_edge(self, next_edge, destination_edge, recent_edges, direction, vehicle, step):
         """
         Lower score is better with lexicographic-style priorities:
-        1) deadline feasibility deficit
+        1) ETA to destination
         2) congestion externality
         3) distance tie-breaker
         """
@@ -714,9 +693,8 @@ class RLTrainingPipeline:
         if not math.isfinite(distance):
             return math.inf
 
-        time_left = max(float(vehicle.deadline) - float(step), 0.0)
         eta = self._estimate_remaining_eta(next_edge, destination_edge)
-        deadline_deficit = max(eta - time_left, 0.0) if math.isfinite(eta) else 9999.0
+        eta_cost = eta if math.isfinite(eta) else 9999.0
 
         edge_count = self.connection_info.edge_vehicle_count.get(next_edge, 0)
         edge_len = max(self.connection_info.edge_length_dict.get(next_edge, 5.0), 5.0)
@@ -730,7 +708,7 @@ class RLTrainingPipeline:
 
         turnaround_penalty = 25.0 if direction == 't' else 0.0
         return (
-            (self.deadline_deficit_scale * deadline_deficit)
+            (eta_cost)
             + (self.system_congestion_scale * 100.0 * marginal_pressure)
             + (self.distance_tiebreak_scale * float(distance))
             + recent_penalty
@@ -840,13 +818,10 @@ class RLTrainingPipeline:
     ):
         """
         Compute a bounded reward with clear objective priority:
-        1) arrive at true destination before deadline
-        2) avoid deadline misses / unreachable states
-        3) prefer feasible progress with mild congestion awareness.
+        1) minimize travel time (per-step cost)
+        2) complete trips successfully
+        3) prefer progress with mild congestion awareness.
         """
-        deadline_window = self._deadline_window(vehicle)
-        urgency = self._deadline_urgency(vehicle, step)
-        time_left = max(float(vehicle.deadline) - float(step), 0.0)
         elapsed = max(float(delta_t), 1.0)
 
         prev_distance = self.get_distance_to_destination(prev_edge, vehicle.destination)
@@ -858,7 +833,7 @@ class RLTrainingPipeline:
         done = False
 
         # Dense shaping: small living/time and congestion costs.
-        reward -= 0.15 * elapsed
+        reward -= self.travel_time_penalty * elapsed
         congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
         edge_len = max(self.connection_info.edge_length_dict.get(current_edge, 5.0), 5.0)
         edge_density = congestion / edge_len
@@ -869,15 +844,9 @@ class RLTrainingPipeline:
         marginal_pressure = max(edge_density - mean_density, 0.0)
         reward -= self.system_congestion_scale * marginal_pressure * elapsed
 
-        # Primary shaping: deadline deficit and improvement.
-        prev_deficit = max(prev_eta - (time_left + 1.0), 0.0) if math.isfinite(prev_eta) else 6.0
-        curr_deficit = max(curr_eta - time_left, 0.0) if math.isfinite(curr_eta) else 6.0
-        reward -= self.deadline_deficit_scale * min(curr_deficit, 8.0)
-        reward += self.deadline_deficit_delta_scale * np.clip(prev_deficit - curr_deficit, -3.0, 3.0)
-
-        if (time_left < self.deadline_critical_buffer) and (curr_deficit > 0.0):
-            critical_scale = 1.0 + 0.5 * urgency
-            reward -= critical_scale * min(curr_deficit, 3.0)
+        # Progress shaping using ETA and distance improvement.
+        if math.isfinite(prev_eta) and math.isfinite(curr_eta):
+            reward += self.eta_progress_scale * np.clip(prev_eta - curr_eta, -3.0, 3.0)
 
         # Tertiary tie-breaker: shortest-path distance progress.
         if math.isfinite(prev_distance) and math.isfinite(curr_distance):
@@ -904,12 +873,10 @@ class RLTrainingPipeline:
         if arrived:
             if reached_global_destination:
                 reward += self.destination_reward
-                if step <= vehicle.deadline:
-                    reward += self.on_time_arrival_bonus
-                else:
-                    reward -= 0.75 * self.deadline_penalty
+                speed_bonus = max(0.0, 1.0 - (float(step) / float(MAX_SIMULATION_STEPS)))
+                reward += 3.0 * speed_bonus
             else:
-                reward -= 0.4 * self.deadline_penalty
+                reward -= 8.0
             done = True
             return self._clip_reward(reward), done
 
@@ -917,14 +884,6 @@ class RLTrainingPipeline:
         if (not outgoing or len(outgoing) == 0) and current_edge != vehicle.destination:
             reward -= 12.0
             done = True
-
-        if step > vehicle.deadline:
-            reward -= self.deadline_penalty
-            done = True
-        else:
-            remaining_ratio = max(float(vehicle.deadline) - float(step), 0.0) / deadline_window
-            if remaining_ratio < 0.25:
-                reward -= (0.25 - remaining_ratio) * 2.0
 
         return self._clip_reward(reward), done
 
@@ -959,10 +918,11 @@ class RLTrainingPipeline:
         rolling_teleported_controlled = deque(maxlen=self.rolling_window)
         rolling_completion_rate = deque(maxlen=self.rolling_window)
         rolling_avg_return = deque(maxlen=self.rolling_window)
+        rolling_avg_travel_time = deque(maxlen=self.rolling_window)
         rolling_mismatch = deque(maxlen=self.rolling_window)
         csv_fields = [
             "episode", "epsilon", "replay", "train_steps", "mean_loss", "episode_return",
-            "completion_rate", "on_time_rate", "avg_tardiness", "teleports", "teleported_controlled",
+            "completion_rate", "avg_travel_time", "p50_travel_time", "p90_travel_time", "teleports", "teleported_controlled",
             "forced_actions", "decisions_opened", "decisions_finalized", "decisions_skipped",
             "decisions_superseded", "route_mismatch", "loop_events", "uturn_events",
             "short_cycle_events", "aba_bounce_events", "dead_end_reentry_events",
@@ -1002,7 +962,6 @@ class RLTrainingPipeline:
             episode_teleport_events = 0
             teleported_controlled_ids = set()
             arrived_ids = set()
-            arrived_before_deadline_ids = set()
             arrived_global_destination_ids = set()
             exited_without_destination_ids = set()
             total_controlled = len(vehicles)
@@ -1010,7 +969,7 @@ class RLTrainingPipeline:
             last_seen_edge_by_vehicle = {}
             last_target_by_vehicle = {}
             last_snapshot_by_vehicle = {}
-            tardiness_values = []
+            completed_travel_times = []
             arrived_debug_records = []
 
             try:
@@ -1042,8 +1001,7 @@ class RLTrainingPipeline:
                         if current_edge == vehicle.destination:
                             if vehicle_id not in arrived_ids:
                                 arrived_ids.add(vehicle_id)
-                                if step <= vehicle.deadline:
-                                    arrived_before_deadline_ids.add(vehicle_id)
+                                completed_travel_times.append(max(float(step) - float(vehicle.start_time), 0.0))
                             self.cleanup_vehicle_state(
                                 vehicle_id,
                                 pending_decisions,
@@ -1223,9 +1181,7 @@ class RLTrainingPipeline:
                             decision_metrics["arrived_with_stale_pre_step_edge"] += 1
 
                         arrived_global_destination_ids.add(arrived_vehicle_id)
-                        if step <= vehicle.deadline:
-                            arrived_before_deadline_ids.add(arrived_vehicle_id)
-                        tardiness_values.append(max(step - vehicle.deadline, 0.0))
+                        completed_travel_times.append(max(float(step) - float(vehicle.start_time), 0.0))
 
                         debug_record = {
                             "vehicle_id": arrived_vehicle_id,
@@ -1363,7 +1319,6 @@ class RLTrainingPipeline:
                             step=step,
                             total_controlled=total_controlled,
                             arrived_ids=arrived_ids,
-                            arrived_before_deadline_ids=arrived_before_deadline_ids,
                             decision_metrics=decision_metrics,
                         )
 
@@ -1378,23 +1333,26 @@ class RLTrainingPipeline:
 
             finally:
                 completion_rate = (
-                    len(arrived_before_deadline_ids) / float(total_controlled)
+                    len(arrived_ids) / float(total_controlled)
                     if total_controlled > 0 else 0.0
                 )
-                on_time_rate = len(arrived_before_deadline_ids) / max(len(arrived_ids), 1)
-                avg_tardiness = float(np.mean(tardiness_values)) if tardiness_values else 0.0
+                avg_travel_time = float(np.mean(completed_travel_times)) if completed_travel_times else 0.0
+                p50_travel_time = float(np.percentile(completed_travel_times, 50)) if completed_travel_times else 0.0
+                p90_travel_time = float(np.percentile(completed_travel_times, 90)) if completed_travel_times else 0.0
                 avg_return = episode_return / float(total_controlled) if total_controlled > 0 else 0.0
 
                 rolling_teleport_events.append(float(episode_teleport_events))
                 rolling_teleported_controlled.append(float(len(teleported_controlled_ids)))
                 rolling_completion_rate.append(float(completion_rate))
                 rolling_avg_return.append(float(avg_return))
+                rolling_avg_travel_time.append(float(avg_travel_time))
                 rolling_mismatch.append(float(decision_metrics["route_mismatch"]))
 
                 roll_tele_events = sum(rolling_teleport_events) / len(rolling_teleport_events)
                 roll_tele_ctrl = sum(rolling_teleported_controlled) / len(rolling_teleported_controlled)
                 roll_completion = sum(rolling_completion_rate) / len(rolling_completion_rate)
                 roll_return = sum(rolling_avg_return) / len(rolling_avg_return)
+                roll_avg_travel_time = sum(rolling_avg_travel_time) / len(rolling_avg_travel_time)
                 roll_mismatch = sum(rolling_mismatch) / len(rolling_mismatch)
 
                 self.trainer.epsilon = max(
@@ -1404,12 +1362,13 @@ class RLTrainingPipeline:
                 print(
                     f"\n[EP {episode:03d} DONE] eps={self.trainer.epsilon:.4f} train={self.trainer.train_steps} "
                     f"replay={len(self.trainer.memory)} ret={avg_return:.3f} "
-                    f"done={len(arrived_ids)}/{total_controlled} ontime={len(arrived_before_deadline_ids)}/{total_controlled} "
-                    f"failed={max(total_controlled-len(arrived_ids),0)} avg_tardy={avg_tardiness:.2f}"
+                    f"done={len(arrived_ids)}/{total_controlled} "
+                    f"failed={max(total_controlled-len(arrived_ids),0)} avg_tt={avg_travel_time:.2f} "
+                    f"p50_tt={p50_travel_time:.2f} p90_tt={p90_travel_time:.2f}"
                 )
                 print(
                     f"  rolling({len(rolling_teleport_events)}): completion={roll_completion:.1%} "
-                    f"avg_return={roll_return:.3f} teleports/ep={roll_tele_events:.2f} "
+                    f"avg_return={roll_return:.3f} avg_tt={roll_avg_travel_time:.2f} teleports/ep={roll_tele_events:.2f} "
                     f"teleported_ctrl/ep={roll_tele_ctrl:.2f} mismatch/ep={roll_mismatch:.2f}"
                 )
                 print(
@@ -1445,7 +1404,6 @@ class RLTrainingPipeline:
                     f"Controlled exit diagnostics | "
                     f"arrived={len(arrived_global_destination_ids)}/{total_controlled}, "
                     f"arrived_any_target={len(arrived_ids)}/{total_controlled}, "
-                    f"arrived_before_deadline={len(arrived_before_deadline_ids)}/{total_controlled}, "
                     f"teleported_controlled={len(teleported_controlled_ids)}/{total_controlled}, "
                     f"exited_without_destination={len(exited_without_destination_ids)}/{total_controlled}"
                 )
@@ -1501,8 +1459,9 @@ class RLTrainingPipeline:
                         "mean_loss": self.trainer.last_loss if self.trainer.last_loss is not None else "",
                         "episode_return": avg_return,
                         "completion_rate": completion_rate,
-                        "on_time_rate": on_time_rate,
-                        "avg_tardiness": avg_tardiness,
+                        "avg_travel_time": avg_travel_time,
+                        "p50_travel_time": p50_travel_time,
+                        "p90_travel_time": p90_travel_time,
                         "teleports": episode_teleport_events,
                         "teleported_controlled": len(teleported_controlled_ids),
                         "forced_actions": decision_metrics["forced_actions"],

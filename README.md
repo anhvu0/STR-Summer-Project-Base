@@ -3,10 +3,11 @@
 This project is built based on SUMO (https://sumo.dlr.de/docs/index.html#introduction), which offers a traffic simulation platform.
 The goal of STR-SUMO is to offer a testbed that can benchmark the performance of a routing policy under the following constraints:
 - Some vehicles are controlled by the scheudling algorithm;
-- Each controlled vehicle has three parameters: 1. start point (an edge), 2. destination (an edge), 3. time to set off, 4. deadline. When travelling from the start point to the destination from the time to set off, the time a vehicle reaches the destination should not exceed the deadline;
+- Each controlled vehicle has the key trip parameters: 1. start point (an edge), 2. destination (an edge), 3. time to set off (deadline fields may still exist in legacy scenarios for compatibility).
 The goal of the routing policy, i.e., the metrics used, includes:
-- How many vehicles have missed their deadlines -- the smaller the better;
-- What is the average time spent for all controlled vehicles -- the smaller the better.
+- Average travel time of controlled vehicles -- the smaller the better;
+- Tail travel-time metrics such as p50/p90 travel time -- the smaller the better;
+- Completion rate and robustness signals (teleports/loops/mismatches) for training stability.
 
 ***pre-requisite***
 
@@ -57,7 +58,15 @@ The test scripts should be placed in the main repository.
 
 ***Reinforcement Learning Training Pipeline***
 
-The repository now includes a DQN-based training pipeline that spawns vehicles at a configurable interval and trains a routing policy to reach destinations efficiently.
+The repository includes a DQN-based training pipeline that spawns vehicles at a configurable interval and trains a routing policy for **system-wide travel-time efficiency**.
+
+Current high-level architecture/flow:
+1. Build lane/junction-feasible action sets with `JunctionDecisionEngine`.
+2. Encode state with edge embeddings, feasibility masks, lane features, travel-time features, and local congestion features.
+3. Use DQN (with target network + replay buffer) to choose feasible routing actions.
+4. Apply route fragments and finalize transitions when vehicles move to the next edge.
+5. Optimize reward for lower trip time while penalizing congestion externalities and unsafe/unstable control outcomes.
+6. Track episode metrics including `completion_rate`, `avg_travel_time`, `p50_travel_time`, and `p90_travel_time`.
 
 To train a model:
 ```
