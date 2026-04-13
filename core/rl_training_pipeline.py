@@ -1037,6 +1037,8 @@ class RLTrainingPipeline:
             "forced_actions", "decisions_opened", "decisions_finalized", "decisions_skipped",
             "decisions_superseded", "route_mismatch", "loop_events", "uturn_events",
             "short_cycle_events", "aba_bounce_events", "dead_end_reentry_events",
+            "infeasible_chosen_actions", "fallback_executed", "skipped_commitments",
+            "committed_match", "committed_mismatch", "fallback_commit_mismatch",
             "safety_overrides", "loop_avoidance_overrides", "distance_worsening_overrides",
             "fragment_build_failures", "override_ratio"
         ]
@@ -1137,15 +1139,16 @@ class RLTrainingPipeline:
                             )
                             continue
 
-                        prev_edge = prev_edge_by_vehicle.get(vehicle_id)
                         if vehicle_id in pending_decisions and current_edge != pending_decisions[vehicle_id].decision_edge:
                             pending = pending_decisions.pop(vehicle_id)
                             repeated_recent_edges = sum(1 for e in recent_edge_history[vehicle_id] if e == current_edge)
                             mismatch = not self.decision_engine.route_matches_expected(pending, current_edge)
                             if mismatch:
                                 decision_metrics["route_mismatch"] += 1
-                            action_for_replay = pending.intended_action
-                            if mismatch:
+                            action_for_replay = pending.executed_action
+                            if mismatch and pending.executed_action != pending.chosen_action:
+                                decision_metrics["fallback_commit_mismatch"] += 1
+                            elif mismatch:
                                 inferred_action = self.decision_engine.infer_executed_action(pending, current_edge)
                                 if inferred_action is None:
                                     decision_metrics["dropped_mismatch_transitions"] += 1
@@ -1202,9 +1205,16 @@ class RLTrainingPipeline:
                                 metadata={
                                     "forced": pending.context.forced_action is not None,
                                     "mismatch": mismatch,
+                                    "chosen_action": pending.chosen_action,
+                                    "executed_action": pending.executed_action,
+                                    "intervention_type": pending.intervention_type,
                                     "priority": 2.0 if mismatch else 1.0,
                                 },
                             )
+                            if mismatch:
+                                decision_metrics["committed_mismatch"] += 1
+                            else:
+                                decision_metrics["committed_match"] += 1
                             decision_metrics["decisions_finalized"] += 1
                             episode_return += reward
                             if repeated_recent_edges > 1:
@@ -1254,36 +1264,78 @@ class RLTrainingPipeline:
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
                                 continue
 
-                        next_edge = self.decision_engine.get_next_edge(current_edge, action)
+                        def try_commit_action(action_idx):
+                            next_edge_candidate = self.decision_engine.get_next_edge(current_edge, action_idx)
+                            if next_edge_candidate is None:
+                                return None
+                            lane_change_requested_, lane_change_ok_ = self.decision_engine.try_request_lane_change(context, action_idx)
+                            if lane_change_requested_:
+                                decision_metrics["lane_change_attempts"] += 1
+                                if lane_change_ok_:
+                                    decision_metrics["lane_change_success"] += 1
+                                else:
+                                    decision_metrics["lane_change_fail"] += 1
+                                    return None
+                            fragment_, local_target_, frag_error_ = self.decision_engine.build_route_fragment(
+                                current_edge, action_idx, vehicle.destination
+                            )
+                            if frag_error_ or local_target_ is None:
+                                decision_metrics["route_apply_fail"] += 1
+                                decision_metrics["fragment_build_failures"] += 1
+                                return None
+                            try:
+                                via_fragment = list(fragment_[: self.route_fragment_max_edges])
+                                vehicle_set_via(vehicle_id, via_fragment if local_target_ != vehicle.destination else [])
+                                vehicle_change_target(vehicle_id, vehicle.destination)
+                                last_target_by_vehicle[vehicle_id] = local_target_
+                            except traci.exceptions.TraCIException:
+                                decision_metrics["route_apply_fail"] += 1
+                                decision_metrics["fragment_build_failures"] += 1
+                                return None
+                            return {
+                                "action": action_idx,
+                                "next_edge": next_edge_candidate,
+                                "lane_change_requested": lane_change_requested_,
+                                "fragment": list(fragment_),
+                            }
+
+                        commit_result = try_commit_action(action)
+                        if commit_result is None:
+                            decision_metrics["infeasible_chosen_actions"] += 1
+                            decision_metrics["safety_overrides"] += 1
+                            decision_metrics["loop_avoidance_overrides"] += 1
+                            penalty_reward = -3.0
+                            self.trainer.remember(
+                                state,
+                                action,
+                                penalty_reward,
+                                state,
+                                False,
+                                next_valid_actions=context.available_actions,
+                                metadata={
+                                    "priority": 2.5,
+                                    "infeasible_choice": True,
+                                    "committed_decision": False,
+                                    "chosen_action": action,
+                                },
+                            )
+                            episode_return += penalty_reward
+                            fallback_result = None
+                            for fallback_action in self.decision_engine.fallback_candidates(context, action):
+                                fallback_result = try_commit_action(fallback_action)
+                                if fallback_result is not None:
+                                    break
+                            if fallback_result is None:
+                                decision_metrics["skipped_commitments"] += 1
+                                prev_edge_by_vehicle[vehicle_id] = current_edge
+                                continue
+                            decision_metrics["fallback_executed"] += 1
+                            commit_result = fallback_result
+
+                        next_edge = commit_result["next_edge"]
                         if next_edge is None:
                             decision_metrics["safety_overrides"] += 1
                             decision_metrics["loop_avoidance_overrides"] += 1
-                            prev_edge_by_vehicle[vehicle_id] = current_edge
-                            continue
-
-                        lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action)
-                        if lane_change_requested:
-                            decision_metrics["lane_change_attempts"] += 1
-                            if lane_change_ok:
-                                decision_metrics["lane_change_success"] += 1
-                            else:
-                                decision_metrics["lane_change_fail"] += 1
-
-                        fragment, local_target, frag_error = self.decision_engine.build_route_fragment(current_edge, action, vehicle.destination)
-                        if frag_error or local_target is None:
-                            decision_metrics["route_apply_fail"] += 1
-                            decision_metrics["fragment_build_failures"] += 1
-                            prev_edge_by_vehicle[vehicle_id] = current_edge
-                            continue
-
-                        try:
-                            via_fragment = list(fragment[: self.route_fragment_max_edges])
-                            vehicle_set_via(vehicle_id, via_fragment if local_target != vehicle.destination else [])
-                            vehicle_change_target(vehicle_id, vehicle.destination)
-                            last_target_by_vehicle[vehicle_id] = local_target
-                        except traci.exceptions.TraCIException:
-                            decision_metrics["route_apply_fail"] += 1
-                            decision_metrics["fragment_build_failures"] += 1
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
 
@@ -1291,14 +1343,17 @@ class RLTrainingPipeline:
                             decision_metrics["decisions_superseded"] += 1
                         pending_decisions[vehicle_id] = PendingDecision(
                             state=state,
-                            intended_action=action,
-                            intended_next_edge=next_edge,
+                            chosen_action=action,
+                            executed_action=commit_result["action"],
+                            committed_decision=True,
+                            intervention_type="fallback_executed" if commit_result["action"] != action else "none",
+                            expected_next_edge=next_edge,
                             decision_edge=current_edge,
                             decision_step=step,
                             destination=vehicle.destination,
                             context=context,
-                            lane_change_requested=lane_change_requested,
-                            route_fragment=list(fragment),
+                            lane_change_requested=commit_result["lane_change_requested"],
+                            route_fragment=list(commit_result["fragment"]),
                             system_cost_baseline=step_system_cost,
                         )
                         decision_metrics["decisions_opened"] += 1
@@ -1367,7 +1422,7 @@ class RLTrainingPipeline:
                             )
                             self.trainer.remember(
                                 pending.state,
-                                pending.intended_action,
+                                pending.executed_action,
                                 reward,
                                 next_state,
                                 done,
@@ -1414,7 +1469,7 @@ class RLTrainingPipeline:
 
                                 self.trainer.remember(
                                     pending.state,
-                                    pending.intended_action,
+                                    pending.executed_action,
                                     self.teleport_penalty,
                                     next_state,
                                     True,
@@ -1459,7 +1514,7 @@ class RLTrainingPipeline:
                             )
                             self.trainer.remember(
                                 pending.state,
-                                pending.intended_action,
+                                pending.executed_action,
                                 self.unfinished_exit_penalty,
                                 next_state,
                                 True,
@@ -1544,6 +1599,7 @@ class RLTrainingPipeline:
                 )
                 print(
                     "  decisions: opened={:.0f} finalized={:.0f} skipped={:.0f} forced={:.0f} superseded={:.0f} "
+                    "infeasible={:.0f} fallback={:.0f} skipped_commit={:.0f} committed(match/mismatch)={:.0f}/{:.0f} "
                     "lane_change(a/s/f)={:.0f}/{:.0f}/{:.0f} loops={:.0f} uturn={:.0f} "
                     "short_cycle={:.0f} aba={:.0f} dead_end_reentry={:.0f} "
                     "apply_fail={:.0f} overrides={:.0f} override_ratio={:.1%}".format(
@@ -1552,6 +1608,11 @@ class RLTrainingPipeline:
                         decision_metrics["decisions_skipped"],
                         decision_metrics["forced_actions"],
                         decision_metrics["decisions_superseded"],
+                        decision_metrics["infeasible_chosen_actions"],
+                        decision_metrics["fallback_executed"],
+                        decision_metrics["skipped_commitments"],
+                        decision_metrics["committed_match"],
+                        decision_metrics["committed_mismatch"],
                         decision_metrics["lane_change_attempts"],
                         decision_metrics["lane_change_success"],
                         decision_metrics["lane_change_fail"],
@@ -1658,6 +1719,12 @@ class RLTrainingPipeline:
                         "short_cycle_events": decision_metrics["short_cycle_events"],
                         "aba_bounce_events": decision_metrics["aba_bounce_events"],
                         "dead_end_reentry_events": decision_metrics["dead_end_reentry_events"],
+                        "infeasible_chosen_actions": decision_metrics["infeasible_chosen_actions"],
+                        "fallback_executed": decision_metrics["fallback_executed"],
+                        "skipped_commitments": decision_metrics["skipped_commitments"],
+                        "committed_match": decision_metrics["committed_match"],
+                        "committed_mismatch": decision_metrics["committed_mismatch"],
+                        "fallback_commit_mismatch": decision_metrics["fallback_commit_mismatch"],
                         "safety_overrides": decision_metrics["safety_overrides"],
                         "loop_avoidance_overrides": decision_metrics["loop_avoidance_overrides"],
                         "distance_worsening_overrides": decision_metrics["distance_worsening_overrides"],

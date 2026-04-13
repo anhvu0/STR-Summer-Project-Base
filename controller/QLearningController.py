@@ -9,7 +9,7 @@ from collections import deque
 
 from xml.dom.minidom import parse
 import os
-from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision
+from core.junction_decision_engine import JunctionDecisionEngine
 from core.route_loop_safety import transition_signal, would_worsen_distance
 
 def parse_sumocfg(sumocfg_path):
@@ -30,12 +30,10 @@ class QLearningPolicy(RouteController):
         self._visit_count = {}
         self._best_dist = {}
         self._recent_edges = {}
-        self._pending_decisions = {}
         self._metrics = {
             "decisions": 0,
             "soft_guidance_applied": 0,
             "impossible_action_overrides": 0,
-            "decision_committed_skips": 0,
         }
         self._last_metrics_snapshot = None
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
@@ -181,15 +179,6 @@ class QLearningPolicy(RouteController):
         self._metrics["soft_guidance_applied"] += 1
         return int(np.argmax(masked))
 
-    def _finalize_commitment(self, vehicle):
-        vid = vehicle.vehicle_id
-        pending = self._pending_decisions.get(vid)
-        if not pending:
-            return
-        if vehicle.current_edge == pending.decision_edge:
-            self._metrics["decision_committed_skips"] += 1
-            return
-        self._pending_decisions.pop(vid, None)
     #----------------------------------------------------------------------
 
 
@@ -211,13 +200,6 @@ class QLearningPolicy(RouteController):
                 self._recent_edges[vid] = deque(maxlen=self.loop_window)
             self._visit_count.setdefault(vid, {})
             self._best_dist.setdefault(vid, float("inf"))
-            self._finalize_commitment(vehicle)
-
-            if vid in self._pending_decisions:
-                # Keep commitment semantics aligned with training:
-                # one decision is open until the vehicle exits the decision edge.
-                continue
-
             step = int(traci.simulation.getTime())
             context = self.decision_engine.build_context(str(vid), start_edge, vehicle.destination, step)
 
@@ -242,6 +224,7 @@ class QLearningPolicy(RouteController):
             lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action_idx)
             if lane_change_requested and not lane_change_ok:
                 self._metrics["impossible_action_overrides"] += 1
+                continue
 
             fragment, local_target, frag_error = self.decision_engine.build_route_fragment(
                 start_edge, action_idx, vehicle.destination
@@ -255,16 +238,6 @@ class QLearningPolicy(RouteController):
                 self._recent_edges[vid].append(next_edge)
                 self._visit_count[vid][next_edge] = self._visit_count[vid].get(next_edge, 0) + 1
                 self._best_dist[vid] = min(self._best_dist[vid], self._dist_to_dest(next_edge, vehicle.destination))
-                self._pending_decisions[vid] = PendingDecision(
-                    state=None,
-                    intended_action=action_idx,
-                    intended_next_edge=next_edge,
-                    decision_edge=start_edge,
-                    decision_step=step,
-                    destination=vehicle.destination,
-                    context=context,
-                    lane_change_requested=lane_change_requested,
-                )
             local_targets[vehicle.vehicle_id] = local_target
 
         if self._metrics["decisions"] > 0:

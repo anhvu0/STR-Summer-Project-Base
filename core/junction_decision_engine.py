@@ -29,8 +29,11 @@ class DecisionContext:
 @dataclass
 class PendingDecision:
     state: object
-    intended_action: int
-    intended_next_edge: str
+    chosen_action: int
+    executed_action: int
+    committed_decision: bool
+    intervention_type: str
+    expected_next_edge: str
     decision_edge: str
     decision_step: int
     destination: str
@@ -251,7 +254,7 @@ class JunctionDecisionEngine:
         return fragment, local_target, None
 
     def route_matches_expected(self, pending: PendingDecision, actual_next_edge: str) -> bool:
-        if pending.intended_next_edge == actual_next_edge:
+        if pending.expected_next_edge == actual_next_edge:
             return True
         if pending.route_fragment and actual_next_edge in pending.route_fragment:
             return True
@@ -274,6 +277,9 @@ class JunctionDecisionEngine:
         if inferred not in pending.context.reachable_with_lane_change_actions:
             return None
         return inferred
+
+    def fallback_candidates(self, context: DecisionContext, chosen_action: int) -> List[int]:
+        return [a for a in context.available_actions if a != chosen_action]
 
     def direction_masks(self, context: DecisionContext):
         edge_mask = [1.0 if i in context.edge_valid_actions else 0.0 for i in range(len(self.direction_choices))]
