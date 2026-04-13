@@ -36,6 +36,21 @@ class PendingDecision:
     destination: str
     context: DecisionContext
     lane_change_requested: bool
+    route_fragment: List[str] = field(default_factory=list)
+
+
+@dataclass
+class VehicleSnapshot:
+    vehicle_id: str
+    step: int
+    edge_id: str
+    lane_id: str
+    lane_index: int
+    lane_count: int
+    lane_position: float
+    lane_length: float
+    dist_to_end: float
+    speed: float
 
 
 class JunctionDecisionEngine:
@@ -55,10 +70,18 @@ class JunctionDecisionEngine:
         self.commit_min_distance = 14.0
         self.default_fragment_horizon_m = 180.0
 
-    def _lane_data(self, vehicle_id: str, edge_id: str):
+    def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
+        if snapshot is not None:
+            return (
+                snapshot.lane_id,
+                int(snapshot.lane_index),
+                max(int(snapshot.lane_count), 1),
+                max(float(snapshot.dist_to_end), 0.0),
+                max(float(snapshot.speed), 0.0),
+            )
         lane_id = traci.vehicle.getLaneID(vehicle_id)
         lane_idx = traci.vehicle.getLaneIndex(vehicle_id)
-        lane_count = max(traci.edge.getLaneNumber(edge_id), 1)
+        lane_count = max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1)
         lane_len = traci.lane.getLength(lane_id)
         lane_pos = traci.vehicle.getLanePosition(vehicle_id)
         dist_to_end = max(lane_len - lane_pos, 0.0)
@@ -71,8 +94,15 @@ class JunctionDecisionEngine:
         except Exception:
             return False
 
-    def build_context(self, vehicle_id: str, edge_id: str, destination: str, step: int) -> DecisionContext:
-        lane_id, lane_idx, lane_count, dist_to_end, speed = self._lane_data(vehicle_id, edge_id)
+    def build_context(
+        self,
+        vehicle_id: str,
+        edge_id: str,
+        destination: str,
+        step: int,
+        snapshot: Optional[VehicleSnapshot] = None,
+    ) -> DecisionContext:
+        lane_id, lane_idx, lane_count, dist_to_end, speed = self._lane_data(vehicle_id, edge_id, snapshot=snapshot)
 
         outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
         edge_valid = [i for i, d in enumerate(self.direction_choices) if d in outgoing]
@@ -219,7 +249,11 @@ class JunctionDecisionEngine:
         return fragment, local_target, None
 
     def route_matches_expected(self, pending: PendingDecision, actual_next_edge: str) -> bool:
-        return pending.intended_next_edge == actual_next_edge
+        if pending.intended_next_edge == actual_next_edge:
+            return True
+        if pending.route_fragment and actual_next_edge in pending.route_fragment:
+            return True
+        return False
 
     def direction_masks(self, context: DecisionContext):
         edge_mask = [1.0 if i in context.edge_valid_actions else 0.0 for i in range(len(self.direction_choices))]
