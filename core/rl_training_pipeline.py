@@ -4,8 +4,6 @@ import sys
 import math
 import csv
 
-import os, psutil
-
 from xml.dom.minidom import parse
 from keras.layers import Dense
 from keras.models import Sequential, clone_model
@@ -233,10 +231,7 @@ class RLTrainingPipeline:
         episodes=10,
         spawn_interval=4.0,
         seed_with_episode=True,
-        decision_horizon=6,
         destination_reward=24.0,
-        deadline_penalty=20.0,
-        on_time_arrival_bonus=36.0,
         teleport_penalty=-20.0,
         epsilon_decay=0.99,
         epsilon_min=0.08,
@@ -265,10 +260,7 @@ class RLTrainingPipeline:
             episodes: Number of training episodes.
             spawn_interval: Interval between vehicle spawns.
             seed_with_episode: Whether to use the episode number as random seed.
-            decision_horizon: Number of actions to pad a decision list.
             destination_reward: Reward when reaching the destination.
-            deadline_penalty: Legacy argument kept for backward compatibility.
-            on_time_arrival_bonus: Legacy argument kept for backward compatibility.
             teleport_penalty: Terminal penalty for teleport events.
             use_double_dqn: Enable Double-DQN bootstrap action selection.
             target_pattern: Vehicle generation pattern. 2 means varied origins
@@ -282,10 +274,7 @@ class RLTrainingPipeline:
         self.episodes = episodes
         self.spawn_interval = spawn_interval
         self.seed_with_episode = seed_with_episode
-        self.decision_horizon = decision_horizon
         self.destination_reward = destination_reward
-        self.deadline_penalty = deadline_penalty
-        self.on_time_arrival_bonus = on_time_arrival_bonus
         self.teleport_penalty = teleport_penalty
         self.train_every = train_every
         self.grad_steps = grad_steps
@@ -508,7 +497,7 @@ class RLTrainingPipeline:
         state[lane_base + 2] = min(dist_to_end, 200.0) / 200.0
 
         # Travel-time objective features (normalized)
-        deadline_base = lane_base + 3
+        objective_base = lane_base + 3
         if vehicle is not None:
             if step is None:
                 step = int(snapshot.step) if snapshot is not None else 0
@@ -518,25 +507,15 @@ class RLTrainingPipeline:
                 self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0
             )
 
-            state[deadline_base + 0] = min(elapsed / float(MAX_SIMULATION_STEPS), 1.0)
-            state[deadline_base + 1] = (
+            state[objective_base + 0] = min(elapsed / float(MAX_SIMULATION_STEPS), 1.0)
+            state[objective_base + 1] = (
                 min(float(remaining_eta) / float(MAX_SIMULATION_STEPS), 1.0)
                 if math.isfinite(remaining_eta) else 1.0
             )
-            state[deadline_base + 2] = min(float(density), 1.0)
+            state[objective_base + 2] = min(float(density), 1.0)
 
-        state[deadline_base + 3:] = self._local_congestion_features(edge_id)
+        state[objective_base + 3:] = self._local_congestion_features(edge_id)
         return state.reshape(1, -1)
-
-    def valid_actions(self, edge_id):
-        """
-        Return action indices that are valid from the current edge.
-        """
-        valid = []
-        for idx, choice in enumerate(self.route_helper.direction_choices):
-            if choice in self.connection_info.outgoing_edges_dict[edge_id]:
-                valid.append(idx)
-        return valid
     
     def valid_actions_for_vehicle(self, vehicle_id, edge_id, destination_edge, step):
         context = self.decision_engine.build_context(vehicle_id, edge_id, destination_edge, step)
@@ -553,37 +532,6 @@ class RLTrainingPipeline:
         lane_pos = traci.vehicle.getLanePosition(vehicle_id)
         return max(lane_len - lane_pos, 0.0)
 
-    def is_decision_point(self, edge_id, vehicle_id, dist_threshold=80.0, snapshot=None):
-        """
-        Make routing decisions only when it matters:
-        - the edge has > 1 outgoing option (real branch), AND
-        - the vehicle is close enough to the junction (within dist_threshold meters)
-        """
-        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
-        if outgoing is None or len(outgoing) <= 1:
-            return False
-        return self.dist_to_end(vehicle_id, snapshot=snapshot) <= dist_threshold
-    
-    def adaptive_dist_threshold(self, edge_id, max_dist=200.0, ratio=0.6, min_dist=30.0):
-        """
-        Adaptive threshold: decide when within min(max_dist, ratio * edge_length),
-        clamped to at least min_dist.
-        """
-        edge_len = self.connection_info.edge_length_dict.get(edge_id, None)
-        if edge_len is None:
-            return max_dist
-        return max(min_dist, min(max_dist, ratio * float(edge_len)))
-
-    def is_decision_point_adaptive(self, edge_id, vehicle_id, max_dist=200.0, ratio=0.6, min_dist=30.0, snapshot=None):
-        """
-        Decide near junctions, but adapt threshold based on edge length so short edges are safe.
-        """
-        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
-        if not outgoing or len(outgoing) <= 1:
-            return False
-
-        dist_th = self.adaptive_dist_threshold(edge_id, max_dist=max_dist, ratio=ratio, min_dist=min_dist)
-        return self.dist_to_end(vehicle_id, snapshot=snapshot) <= dist_th
 
     # =========================
     # Teleport detection helpers
@@ -723,39 +671,6 @@ class RLTrainingPipeline:
             for edge in set(edges)
         }
 
-    def _score_next_edge(self, next_edge, destination_edge, recent_edges, direction, vehicle, step):
-        """
-        Lower score is better with lexicographic-style priorities:
-        1) ETA to destination
-        2) congestion externality
-        3) distance tie-breaker
-        """
-        distance = self.get_distance_to_destination(next_edge, destination_edge)
-        if not math.isfinite(distance):
-            return math.inf
-
-        eta = self._estimate_remaining_eta(next_edge, destination_edge)
-        eta_cost = eta if math.isfinite(eta) else 9999.0
-
-        edge_count = self.connection_info.edge_vehicle_count.get(next_edge, 0)
-        edge_len = max(self.connection_info.edge_length_dict.get(next_edge, 5.0), 5.0)
-        edge_density = edge_count / edge_len
-        mean_density = float(self._density_mean)
-        marginal_pressure = max(edge_density - mean_density, 0.0)
-
-        recent_penalty = 0.0
-        if recent_edges:
-            recent_penalty += 40.0 * sum(1 for e in recent_edges if e == next_edge)
-
-        turnaround_penalty = 25.0 if direction == 't' else 0.0
-        return (
-            (eta_cost)
-            + (self.system_congestion_scale * 100.0 * marginal_pressure)
-            + (self.distance_tiebreak_scale * float(distance))
-            + recent_penalty
-            + turnaround_penalty
-        )
-
     def _estimate_remaining_eta(self, edge_id, destination_edge):
         """
         Estimate travel time from edge_id to destination using shortest-path
@@ -765,37 +680,6 @@ class RLTrainingPipeline:
         if not math.isfinite(distance):
             return math.inf
         return float(distance) / 8.0
-
-    def build_decision_list(self, edge_id, initial_action, vehicle, recent_edges, sim_step):
-        """
-        Build a decision list with RL-driven control.
-        We intentionally avoid heuristic horizon takeover during training.
-        """
-        decision_list = []
-        current_edge = edge_id
-
-        for _ in range(1):
-            outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
-            if not outgoing:
-                break
-
-            action = initial_action
-            valid_actions = self.valid_actions(current_edge)
-            if action not in valid_actions:
-                break
-            direction = self.route_helper.direction_choices[action]
-
-            if direction not in outgoing:
-                break
-
-            decision_list.append(direction)
-            current_edge = outgoing[direction]
-
-            if current_edge == vehicle.destination:
-                break
-
-        return decision_list
-    
 
     def get_distance_to_destination(self, edge_id, destination_edge):
         """
@@ -818,29 +702,6 @@ class RLTrainingPipeline:
         self._distance_cache[key] = distance
         return distance
     
-    def ensure_lane_for_direction(self, vehicle_id, edge_id, direction, min_dist=40.0, duration=50):
-        """
-        If current lane cannot do 'direction', try to change into a lane that can,
-        as long as we aren't too close to the junction end.
-        """
-        lane_id = traci.vehicle.getLaneID(vehicle_id)
-        lane_pos = traci.vehicle.getLanePosition(vehicle_id)
-        lane_len = traci.lane.getLength(lane_id)
-        dist_to_end = lane_len - lane_pos
-
-        if dist_to_end < min_dist:
-            return  # too late
-
-        lane_ids = self.connection_info.edge_lane_ids.get(edge_id, [])
-        for target_lane_index, ln_id in enumerate(lane_ids):
-            lane_map = self.connection_info.lane_outgoing_edges_dict.get(ln_id, {})
-            if direction in lane_map:
-                curr_idx = traci.vehicle.getLaneIndex(vehicle_id)
-                if curr_idx != target_lane_index:
-                    traci.vehicle.changeLane(vehicle_id, target_lane_index, duration)
-                return
-
-
     def compute_reward(
         self,
         vehicle,
