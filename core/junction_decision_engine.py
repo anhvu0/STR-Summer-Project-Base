@@ -33,6 +33,8 @@ class PendingDecision:
     intended_next_edge: str
     decision_edge: str
     decision_step: int
+    last_credit_edge: str
+    last_credit_step: int
     destination: str
     context: DecisionContext
     lane_change_requested: bool
