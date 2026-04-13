@@ -3,6 +3,7 @@ import os
 import sys
 import math
 import csv
+import json
 
 from xml.dom.minidom import parse
 from keras.layers import Dense
@@ -254,6 +255,7 @@ class RLTrainingPipeline:
         route_difficulty_eta_floor=60.0,
         route_difficulty_scale_min=0.35,
         route_difficulty_scale_max=1.0,
+        decision_debug_csv_path=None,
     ):
         """
         Args:
@@ -290,6 +292,7 @@ class RLTrainingPipeline:
         self.route_difficulty_eta_floor = max(float(route_difficulty_eta_floor), 1.0)
         self.route_difficulty_scale_min = float(np.clip(route_difficulty_scale_min, 0.05, 1.0))
         self.route_difficulty_scale_max = float(np.clip(route_difficulty_scale_max, self.route_difficulty_scale_min, 1.0))
+        self.decision_debug_csv_path = decision_debug_csv_path
         self._distance_cache = {}
         self.progress_reward_scale = 1.00
         self.system_congestion_scale = 0.015
@@ -347,6 +350,91 @@ class RLTrainingPipeline:
             target_soft_tau=1.0,
             use_double_dqn=use_double_dqn,
         )
+        self._decision_debug_fields = [
+            "episode", "step", "vehicle_id", "decision_edge", "action", "action_source", "available_actions",
+            "forced_action", "lane_feasible_now_actions", "reachable_with_lane_change_actions",
+            "commit_window", "dist_to_end", "intended_next_edge", "actual_next_edge", "finalized",
+            "finalize_delay_steps", "reward", "done", "route_mismatch", "teleported",
+            "reached_global_destination", "prev_eta", "curr_eta", "prev_distance", "curr_distance",
+            "edge_density", "mean_density", "externality_penalty", "marginal_pressure",
+        ]
+
+    def _ensure_decision_debug_csv_header(self):
+        if not self.decision_debug_csv_path:
+            return
+        if not os.path.isabs(self.decision_debug_csv_path):
+            self.decision_debug_csv_path = os.path.join(self.sumocfg_dir, self.decision_debug_csv_path)
+        if not os.path.exists(self.decision_debug_csv_path):
+            with open(self.decision_debug_csv_path, "w", newline="") as f:
+                csv.DictWriter(f, fieldnames=self._decision_debug_fields).writeheader()
+
+    def _append_decision_debug_row(self, row):
+        if not self.decision_debug_csv_path:
+            return
+        with open(self.decision_debug_csv_path, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=self._decision_debug_fields).writerow(row)
+
+    def _append_decision_debug_rows(self, rows):
+        if not self.decision_debug_csv_path or not rows:
+            return
+        with open(self.decision_debug_csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self._decision_debug_fields)
+            writer.writerows(rows)
+
+    def _build_decision_debug_row(
+        self,
+        episode,
+        step,
+        pending,
+        actual_next_edge,
+        finalized,
+        finalize_delay_steps,
+        reward="",
+        done="",
+        route_mismatch="",
+        teleported=0,
+        reached_global_destination=0,
+        prev_eta="",
+        curr_eta="",
+        prev_distance="",
+        curr_distance="",
+        edge_density="",
+        mean_density="",
+        externality_penalty="",
+        marginal_pressure="",
+    ):
+        context = pending.context
+        return {
+            "episode": episode,
+            "step": step,
+            "vehicle_id": context.vehicle_id,
+            "decision_edge": pending.decision_edge,
+            "action": pending.intended_action,
+            "action_source": pending.metadata.get("action_source", ""),
+            "available_actions": json.dumps(context.available_actions),
+            "forced_action": context.forced_action if context.forced_action is not None else "",
+            "lane_feasible_now_actions": json.dumps(context.lane_feasible_now_actions),
+            "reachable_with_lane_change_actions": json.dumps(context.reachable_with_lane_change_actions),
+            "commit_window": int(bool(context.commit_window)),
+            "dist_to_end": float(context.dist_to_end),
+            "intended_next_edge": pending.intended_next_edge,
+            "actual_next_edge": actual_next_edge,
+            "finalized": int(bool(finalized)),
+            "finalize_delay_steps": finalize_delay_steps,
+            "reward": reward,
+            "done": done,
+            "route_mismatch": route_mismatch,
+            "teleported": teleported,
+            "reached_global_destination": reached_global_destination,
+            "prev_eta": prev_eta,
+            "curr_eta": curr_eta,
+            "prev_distance": prev_distance,
+            "curr_distance": curr_distance,
+            "edge_density": edge_density,
+            "mean_density": mean_density,
+            "externality_penalty": externality_penalty,
+            "marginal_pressure": marginal_pressure,
+        }
 
     def _get_route_difficulty_scale(self, vehicle, reference_edge):
         """
@@ -838,11 +926,17 @@ class RLTrainingPipeline:
             "short_cycle_events", "aba_bounce_events", "dead_end_reentry_events",
             "safety_overrides", "loop_avoidance_overrides", "distance_worsening_overrides",
             "fragment_build_failures", "fallback_overrides", "deferred_lane_change_actions",
-            "exploration_actions", "policy_actions", "override_ratio"
+            "exploration_actions", "policy_actions", "override_ratio",
+            "timeout_unfinished_controlled", "exited_without_destination", "arrived_non_global_target",
+            "alive_at_step_cap", "decision_pending_at_episode_end", "mean_decision_latency_steps",
+            "mean_reward_per_finalized_decision", "mean_route_difficulty_eta", "p50_route_difficulty_eta",
+            "p90_route_difficulty_eta", "fail_teleport", "fail_timeout", "fail_removed_non_destination",
+            "fail_unreachable_transition", "fail_dead_end_no_outgoing",
         ]
         # Rewrite metrics each new training session to avoid schema drift/appending old runs.
         with open(self.metrics_csv_path, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=csv_fields).writeheader()
+        self._ensure_decision_debug_csv_header()
 
         # MAX_CACHE_SIZE = 5000
 
@@ -887,11 +981,19 @@ class RLTrainingPipeline:
             completed_travel_time_ids = set()
             terminal_recorded_ids = set()
             arrived_debug_records = []
+            decision_latency_steps = []
+            finalized_decision_rewards = []
+            route_difficulty_etas = []
+            last_step_executed = -1
+            alive_at_step_cap_ids = set()
+            pending_debug_logged_ids = set()
+            decision_debug_rows = []
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
                     if simulation_get_min_expected() <= 0:
                         break
+                    last_step_executed = step
 
                     # Keep density features fresh for routing choices and reward.
                     self.update_edge_vehicle_counts(step, every=self.density_refresh_every)
@@ -909,6 +1011,11 @@ class RLTrainingPipeline:
                         vehicle = vehicles[vehicle_id]
                         vehicle.current_edge = current_edge
                         vehicle.current_speed = snapshot.speed
+                        if getattr(vehicle, "_route_difficulty_eta_logged", False) is False:
+                            eta0 = self._estimate_remaining_eta(current_edge, vehicle.destination)
+                            if math.isfinite(eta0):
+                                route_difficulty_etas.append(float(eta0))
+                            vehicle._route_difficulty_eta_logged = True
                         last_seen_edge_by_vehicle[vehicle_id] = current_edge
                         last_snapshot_by_vehicle[vehicle_id] = snapshot
                         recent_edge_history[vehicle_id].append(current_edge)
@@ -939,6 +1046,10 @@ class RLTrainingPipeline:
                             if loop_signals["dead_end_reentry"]:
                                 decision_metrics["dead_end_reentry_events"] += 1
                             ext_pen = max(self.connection_info.edge_vehicle_count.get(current_edge, 0) / max(self.connection_info.edge_length_dict.get(current_edge, 10.0), 10.0), 0.0)
+                            prev_distance = self.get_distance_to_destination(pending.decision_edge, vehicle.destination)
+                            curr_distance = self.get_distance_to_destination(current_edge, vehicle.destination)
+                            prev_eta = self._estimate_remaining_eta(pending.decision_edge, vehicle.destination)
+                            curr_eta = self._estimate_remaining_eta(current_edge, vehicle.destination)
                             reward, done = self.compute_reward(
                                 vehicle, pending.decision_edge, current_edge, step, arrived=False,
                                 repeated_recent_edges=repeated_recent_edges,
@@ -973,9 +1084,42 @@ class RLTrainingPipeline:
                                 metadata={"forced": pending.context.forced_action is not None, "mismatch": mismatch},
                             )
                             decision_metrics["decisions_finalized"] += 1
+                            decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
+                            finalized_decision_rewards.append(float(reward))
                             episode_return += reward
                             if repeated_recent_edges > 1:
                                 decision_metrics["loop_events"] += 1
+                            if math.isfinite(prev_distance) and (not math.isfinite(curr_distance)):
+                                decision_metrics["fail_unreachable_transition"] += 1
+                            outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
+                            if (not outgoing or len(outgoing) == 0) and current_edge != vehicle.destination:
+                                decision_metrics["fail_dead_end_no_outgoing"] += 1
+                            edge_density = self.connection_info.edge_vehicle_count.get(current_edge, 0) / max(
+                                self.connection_info.edge_length_dict.get(current_edge, 5.0), 5.0
+                            )
+                            mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
+                            marginal_pressure = max(edge_density - mean_density, 0.0)
+                            decision_debug_rows.append(self._build_decision_debug_row(
+                                episode=episode,
+                                step=step,
+                                pending=pending,
+                                actual_next_edge=current_edge,
+                                finalized=1,
+                                finalize_delay_steps=max(step - pending.decision_step, 0),
+                                reward=reward,
+                                done=int(bool(done)),
+                                route_mismatch=int(bool(mismatch)),
+                                teleported=0,
+                                reached_global_destination=0,
+                                prev_eta=prev_eta if math.isfinite(prev_eta) else "",
+                                curr_eta=curr_eta if math.isfinite(curr_eta) else "",
+                                prev_distance=prev_distance if math.isfinite(prev_distance) else "",
+                                curr_distance=curr_distance if math.isfinite(curr_distance) else "",
+                                edge_density=edge_density,
+                                mean_density=mean_density,
+                                externality_penalty=ext_pen,
+                                marginal_pressure=marginal_pressure,
+                            ))
 
                         context = self.decision_engine.build_context(
                             vehicle_id,
@@ -998,6 +1142,7 @@ class RLTrainingPipeline:
                             step=step,
                             snapshot=snapshot,
                         )
+                        action_source = "forced" if context.forced_action is not None else ""
                         if context.forced_action is not None:
                             action = context.forced_action
                             decision_metrics["forced_actions"] += 1
@@ -1047,6 +1192,7 @@ class RLTrainingPipeline:
                             if action is None:
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
                                 continue
+                            action_source = "fallback"
                             decision_metrics["fallback_overrides"] += 1
                             next_edge = self.decision_engine.get_next_edge(current_edge, action)
                             if next_edge is None:
@@ -1078,6 +1224,7 @@ class RLTrainingPipeline:
                             context=context,
                             lane_change_requested=lane_change_requested,
                             route_fragment=list(full_route[1:]) if full_route else [],
+                            metadata={"action_source": action_source},
                         )
                         decision_metrics["decisions_opened"] += 1
                         prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -1131,6 +1278,10 @@ class RLTrainingPipeline:
                                 if edge == last_seen_edge
                             )
                             decision_delta_t = max(step - pending.decision_step, 1)
+                            prev_distance = self.get_distance_to_destination(pending.decision_edge, vehicle.destination)
+                            curr_distance = self.get_distance_to_destination(vehicle.destination, vehicle.destination)
+                            prev_eta = self._estimate_remaining_eta(pending.decision_edge, vehicle.destination)
+                            curr_eta = self._estimate_remaining_eta(vehicle.destination, vehicle.destination)
                             reward, done = self.compute_reward(
                                 vehicle,
                                 pending.decision_edge,
@@ -1157,7 +1308,28 @@ class RLTrainingPipeline:
                             )
                             episode_return += reward
                             decision_metrics["decisions_finalized"] += 1
+                            decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
+                            finalized_decision_rewards.append(float(reward))
                             terminal_recorded_ids.add(arrived_vehicle_id)
+                            decision_debug_rows.append(self._build_decision_debug_row(
+                                episode=episode,
+                                step=step,
+                                pending=pending,
+                                actual_next_edge=vehicle.destination,
+                                finalized=1,
+                                finalize_delay_steps=max(step - pending.decision_step, 0),
+                                reward=reward,
+                                done=int(bool(done)),
+                                route_mismatch=0,
+                                teleported=0,
+                                reached_global_destination=int(bool(reached_global_destination)),
+                                prev_eta=prev_eta if math.isfinite(prev_eta) else "",
+                                curr_eta=curr_eta if math.isfinite(curr_eta) else "",
+                                prev_distance=prev_distance if math.isfinite(prev_distance) else "",
+                                curr_distance=curr_distance if math.isfinite(curr_distance) else "",
+                                externality_penalty=0.0,
+                            ))
+                            pending_debug_logged_ids.add(arrived_vehicle_id)
 
                         # Only cleanup when SUMO removed vehicle or it has no pending transition.
                         if (arrived_vehicle_id not in live_after_step) or (arrived_vehicle_id not in pending_decisions):
@@ -1208,6 +1380,22 @@ class RLTrainingPipeline:
                                 episode_return += self.teleport_penalty
                                 terminal_recorded_ids.add(tid)
                                 decision_metrics["decisions_finalized"] += 1
+                                decision_metrics["fail_teleport"] += 1
+                                decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
+                                finalized_decision_rewards.append(float(self.teleport_penalty))
+                                decision_debug_rows.append(self._build_decision_debug_row(
+                                    episode=episode,
+                                    step=step,
+                                    pending=pending,
+                                    actual_next_edge="",
+                                    finalized=1,
+                                    finalize_delay_steps=max(step - pending.decision_step, 0),
+                                    reward=self.teleport_penalty,
+                                    done=1,
+                                    route_mismatch="",
+                                    teleported=1,
+                                    reached_global_destination=0,
+                                ))
 
                             self.cleanup_vehicle_state(
                                 tid,
@@ -1232,6 +1420,7 @@ class RLTrainingPipeline:
                         if vid not in live_after_step and vid not in arrived_ids and vid not in teleported_controlled_ids
                     ]
                     for stale_id in stale_disappeared:
+                        decision_metrics["fail_removed_non_destination"] += 1
                         self.cleanup_vehicle_state(
                             stale_id,
                             pending_decisions,
@@ -1265,6 +1454,20 @@ class RLTrainingPipeline:
                     #     )
 
             finally:
+                if last_step_executed >= (MAX_SIMULATION_STEPS - 1):
+                    alive_at_step_cap_ids = {vid for vid in vehicle_get_ids() if vid in vehicles}
+                    decision_metrics["fail_timeout"] += len(alive_at_step_cap_ids)
+                    for vid in alive_at_step_cap_ids:
+                        if vid in pending_decisions:
+                            pending = pending_decisions[vid]
+                            decision_debug_rows.append(self._build_decision_debug_row(
+                                episode=episode,
+                                step=last_step_executed,
+                                pending=pending,
+                                actual_next_edge="",
+                                finalized=0,
+                                finalize_delay_steps=max(last_step_executed - pending.decision_step, 0),
+                            ))
                 completion_rate = (
                     len(arrived_ids) / float(total_controlled)
                     if total_controlled > 0 else 0.0
@@ -1273,6 +1476,21 @@ class RLTrainingPipeline:
                 p50_travel_time = float(np.percentile(completed_travel_times, 50)) if completed_travel_times else 0.0
                 p90_travel_time = float(np.percentile(completed_travel_times, 90)) if completed_travel_times else 0.0
                 avg_return = episode_return / float(total_controlled) if total_controlled > 0 else 0.0
+                mean_decision_latency_steps = (
+                    float(np.mean(decision_latency_steps)) if decision_latency_steps else 0.0
+                )
+                mean_reward_per_finalized_decision = (
+                    float(np.mean(finalized_decision_rewards)) if finalized_decision_rewards else 0.0
+                )
+                mean_route_difficulty_eta = (
+                    float(np.mean(route_difficulty_etas)) if route_difficulty_etas else 0.0
+                )
+                p50_route_difficulty_eta = (
+                    float(np.percentile(route_difficulty_etas, 50)) if route_difficulty_etas else 0.0
+                )
+                p90_route_difficulty_eta = (
+                    float(np.percentile(route_difficulty_etas, 90)) if route_difficulty_etas else 0.0
+                )
 
                 rolling_teleport_events.append(float(episode_teleport_events))
                 rolling_teleported_controlled.append(float(len(teleported_controlled_ids)))
@@ -1349,6 +1567,9 @@ class RLTrainingPipeline:
                 exited_without_destination_ids.update(
                     controlled_ids - arrived_ids - teleported_controlled_ids
                 )
+                arrived_non_global_target = sum(
+                    1 for record in arrived_debug_records if not record["reached_global_destination"]
+                )
                 print(
                     f"Controlled exit diagnostics | "
                     f"arrived={len(arrived_global_destination_ids)}/{total_controlled}, "
@@ -1358,10 +1579,7 @@ class RLTrainingPipeline:
                 )
 
                 if self.debug_exit_diagnostics:
-                    mismatched_arrivals = [
-                        record for record in arrived_debug_records
-                        if not record["reached_global_destination"]
-                    ]
+                    mismatched_arrivals = [record for record in arrived_debug_records if not record["reached_global_destination"]]
                     print(
                         f"Arrival debug | total_arrived={len(arrived_debug_records)}, "
                         f"arrived_at_non_global_target={len(mismatched_arrivals)}"
@@ -1397,6 +1615,18 @@ class RLTrainingPipeline:
                             "  EXITED_WITHOUT_DEST ... "
                             f"{len(exited_without_destination_ids) - self.debug_exit_diagnostics_limit} more vehicles"
                         )
+                for vid, pending in pending_decisions.items():
+                    if vid in pending_debug_logged_ids:
+                        continue
+                    decision_debug_rows.append(self._build_decision_debug_row(
+                        episode=episode,
+                        step=last_step_executed,
+                        pending=pending,
+                        actual_next_edge="",
+                        finalized=0,
+                        finalize_delay_steps=max(last_step_executed - pending.decision_step, 0),
+                    ))
+                self._append_decision_debug_rows(decision_debug_rows)
                 traci.close()
                 with open(self.metrics_csv_path, "a", newline="") as f:
                     writer = csv.DictWriter(f, fieldnames=csv_fields)
@@ -1437,6 +1667,21 @@ class RLTrainingPipeline:
                             + decision_metrics["fallback_overrides"]
                             + decision_metrics["route_apply_fail"]
                         ) / max(decision_metrics["decisions_opened"], 1.0),
+                        "timeout_unfinished_controlled": len(alive_at_step_cap_ids),
+                        "exited_without_destination": len(exited_without_destination_ids),
+                        "arrived_non_global_target": arrived_non_global_target,
+                        "alive_at_step_cap": len(alive_at_step_cap_ids),
+                        "decision_pending_at_episode_end": len(pending_decisions),
+                        "mean_decision_latency_steps": mean_decision_latency_steps,
+                        "mean_reward_per_finalized_decision": mean_reward_per_finalized_decision,
+                        "mean_route_difficulty_eta": mean_route_difficulty_eta,
+                        "p50_route_difficulty_eta": p50_route_difficulty_eta,
+                        "p90_route_difficulty_eta": p90_route_difficulty_eta,
+                        "fail_teleport": decision_metrics["fail_teleport"],
+                        "fail_timeout": decision_metrics["fail_timeout"],
+                        "fail_removed_non_destination": decision_metrics["fail_removed_non_destination"],
+                        "fail_unreachable_transition": decision_metrics["fail_unreachable_transition"],
+                        "fail_dead_end_no_outgoing": decision_metrics["fail_dead_end_no_outgoing"],
                     }
                     if set(row.keys()) != set(csv_fields):
                         raise ValueError("rl_episode_metrics.csv row schema does not match header")
