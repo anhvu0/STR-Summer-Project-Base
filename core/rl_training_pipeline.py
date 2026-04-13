@@ -88,6 +88,7 @@ class DQNTrainer:
         replay_warmup=1000,
         target_update_every=200,
         target_soft_tau=1.0,
+        use_double_dqn=True,
     ):
         """
         :param learning_rate: Can be adjusted for further optimization
@@ -95,6 +96,7 @@ class DQNTrainer:
         :param epsilon: 1.0 allows free exploration
         :param epsilon_decay: epsilon value in next episode
         :param epsilon_min: minimum epsilon to ensure that there's still some chance for free exploration later
+        :param use_double_dqn: If True, use online argmax + target evaluation for bootstrapping.
         """
         self.state_size = state_size
         self.action_size = action_size
@@ -106,6 +108,7 @@ class DQNTrainer:
         self.replay_warmup = max(int(replay_warmup), self.batch_size)
         self.target_update_every = max(int(target_update_every), 1)
         self.target_soft_tau = float(np.clip(target_soft_tau, 0.0, 1.0))
+        self.use_double_dqn = bool(use_double_dqn)
         self.memory = ReplayBuffer(replay_capacity)
         self.model = self.build_model(learning_rate)
         self.target_model = self._build_target_model()
@@ -183,10 +186,10 @@ class DQNTrainer:
         next_valid_actions_batch = [s[5] for s in minibatch]
         batch_len = states.shape[0]
 
-        # NOTE: This keeps Double-DQN's two-network setup intact.
-        # We only fuse ONLINE model inference calls (q(s), q_online(s'))
-        # for speed. Target values are still evaluated by TARGET model.
-        # So this is not switching from two networks to one network.
+        # Keep keras inference pattern fast:
+        # - Fuse ONLINE model calls for q(s) and q_online(s') in one pass.
+        # - Use TARGET model only for bootstrap values.
+        # This preserves Double-DQN behavior when enabled.
         stacked_states = np.vstack((states, next_states))
         q_all_online = self.model(stacked_states, training=False).numpy()
         q = q_all_online[:batch_len]
@@ -199,8 +202,9 @@ class DQNTrainer:
                 continue
             valid_action_mask[idx, valid_actions] = True
 
-        masked_online = np.where(valid_action_mask, q_next_online, -1e9)
-        best_next_actions = np.argmax(masked_online, axis=1)
+        selection_q = q_next_online if self.use_double_dqn else q_next_target
+        masked_selection_q = np.where(valid_action_mask, selection_q, -1e9)
+        best_next_actions = np.argmax(masked_selection_q, axis=1)
         bootstrap_values = q_next_target[np.arange(batch_len), best_next_actions]
         bootstrap_values[~valid_action_mask.any(axis=1)] = 0.0
 
@@ -243,6 +247,7 @@ class RLTrainingPipeline:
         train_every=40,
         grad_steps=1,
         rolling_window=100,
+        use_double_dqn=True,
         target_pattern=2,
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
@@ -265,6 +270,7 @@ class RLTrainingPipeline:
             deadline_penalty: Legacy argument kept for backward compatibility.
             on_time_arrival_bonus: Legacy argument kept for backward compatibility.
             teleport_penalty: Terminal penalty for teleport events.
+            use_double_dqn: Enable Double-DQN bootstrap action selection.
             target_pattern: Vehicle generation pattern. 2 means varied origins
                 and one shared destination (helps controlled travel-time comparison).
             normalize_per_step_cost_by_route_difficulty: If True, scales only the
@@ -348,6 +354,7 @@ class RLTrainingPipeline:
             replay_warmup=replay_warmup,
             target_update_every=200,
             target_soft_tau=1.0,
+            use_double_dqn=use_double_dqn,
         )
 
     def _get_route_difficulty_scale(self, vehicle, reference_edge):
