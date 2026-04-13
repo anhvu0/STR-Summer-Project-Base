@@ -248,6 +248,10 @@ class RLTrainingPipeline:
         debug_exit_diagnostics_limit=20,
         step_log_every=100,
         density_refresh_every=5,
+        normalize_per_step_cost_by_route_difficulty=False,
+        route_difficulty_eta_floor=60.0,
+        route_difficulty_scale_min=0.35,
+        route_difficulty_scale_max=1.0,
     ):
         """
         Args:
@@ -263,6 +267,9 @@ class RLTrainingPipeline:
             teleport_penalty: Terminal penalty for teleport events.
             target_pattern: Vehicle generation pattern. 2 means varied origins
                 and one shared destination (helps controlled travel-time comparison).
+            normalize_per_step_cost_by_route_difficulty: If True, scales only the
+                per-step travel-time cost by estimated O-D ETA so very long routes
+                are not structurally over-penalized.
         """
         self.sumocfg_path = sumocfg_path
         self.model_output_path = model_output_path
@@ -282,6 +289,10 @@ class RLTrainingPipeline:
         self.debug_exit_diagnostics_limit = max(int(debug_exit_diagnostics_limit), 0)
         self.step_log_every = max(int(step_log_every), 1)
         self.density_refresh_every = max(int(density_refresh_every), 1)
+        self.normalize_per_step_cost_by_route_difficulty = bool(normalize_per_step_cost_by_route_difficulty)
+        self.route_difficulty_eta_floor = max(float(route_difficulty_eta_floor), 1.0)
+        self.route_difficulty_scale_min = float(np.clip(route_difficulty_scale_min, 0.05, 1.0))
+        self.route_difficulty_scale_max = float(np.clip(route_difficulty_scale_max, self.route_difficulty_scale_min, 1.0))
         self._distance_cache = {}
         self.progress_reward_scale = 0.80  # or 0.0 to disable progress term cheaply
         self.system_congestion_scale = 0.03  # scales marginal congestion penalty on busy edges
@@ -338,6 +349,29 @@ class RLTrainingPipeline:
             target_update_every=200,
             target_soft_tau=1.0,
         )
+
+    def _get_route_difficulty_scale(self, vehicle, reference_edge):
+        """
+        Return a multiplicative scale in [route_difficulty_scale_min, route_difficulty_scale_max]
+        used for the per-step travel-time component only.
+        """
+        if not self.normalize_per_step_cost_by_route_difficulty:
+            return 1.0
+
+        cached_scale = getattr(vehicle, "route_difficulty_scale", None)
+        if cached_scale is not None:
+            return float(cached_scale)
+
+        eta = self._estimate_remaining_eta(reference_edge, vehicle.destination)
+        if not math.isfinite(eta):
+            scale = 1.0
+        else:
+            # Harder/longer O-D pairs (larger ETA) receive a smaller per-step weight.
+            normalized = self.route_difficulty_eta_floor / max(float(eta), self.route_difficulty_eta_floor)
+            scale = float(np.clip(normalized, self.route_difficulty_scale_min, self.route_difficulty_scale_max))
+
+        vehicle.route_difficulty_scale = scale
+        return scale
 
     def _print_step_progress(
         self,
@@ -833,7 +867,8 @@ class RLTrainingPipeline:
         done = False
 
         # Dense shaping: small living/time and congestion costs.
-        reward -= self.travel_time_penalty * elapsed
+        time_cost_scale = self._get_route_difficulty_scale(vehicle, prev_edge)
+        reward -= self.travel_time_penalty * time_cost_scale * elapsed
         congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
         edge_len = max(self.connection_info.edge_length_dict.get(current_edge, 5.0), 5.0)
         edge_density = congestion / edge_len
@@ -952,6 +987,12 @@ class RLTrainingPipeline:
                 "--tripinfo-output", os.path.join(self.sumocfg_dir, "trips.trips.xml"),
                 "--quit-on-end",
             ])
+            simulation_get_min_expected = traci.simulation.getMinExpectedNumber
+            simulation_step = traci.simulationStep
+            simulation_get_arrived_ids = traci.simulation.getArrivedIDList
+            vehicle_get_ids = traci.vehicle.getIDList
+            vehicle_set_via = traci.vehicle.setVia
+            vehicle_change_target = traci.vehicle.changeTarget
 
             pending_decisions = {}
             recent_edge_history = defaultdict(lambda: deque(maxlen=self.loop_window))
@@ -974,12 +1015,12 @@ class RLTrainingPipeline:
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
-                    if traci.simulation.getMinExpectedNumber() <= 0:
+                    if simulation_get_min_expected() <= 0:
                         break
 
                     # Keep density features fresh for routing choices and reward.
                     self.update_edge_vehicle_counts(step, every=self.density_refresh_every)
-                    vehicle_ids = list(traci.vehicle.getIDList())
+                    vehicle_ids = list(vehicle_get_ids())
                     controlled_live_ids = [vid for vid in vehicle_ids if vid in vehicles]
                     step_snapshots = self.collect_vehicle_snapshots(controlled_live_ids, step)
 
@@ -1132,8 +1173,8 @@ class RLTrainingPipeline:
                             continue
 
                         try:
-                            traci.vehicle.setVia(vehicle_id, fragment[:3] if local_target != vehicle.destination else [])
-                            traci.vehicle.changeTarget(vehicle_id, vehicle.destination)
+                            vehicle_set_via(vehicle_id, fragment[:3] if local_target != vehicle.destination else [])
+                            vehicle_change_target(vehicle_id, vehicle.destination)
                             last_target_by_vehicle[vehicle_id] = local_target
                         except traci.exceptions.TraCIException:
                             decision_metrics["route_apply_fail"] += 1
@@ -1157,12 +1198,12 @@ class RLTrainingPipeline:
                         decision_metrics["decisions_opened"] += 1
                         prev_edge_by_vehicle[vehicle_id] = current_edge
 
-                    traci.simulationStep()
+                    simulation_step()
 
                     # Vehicles removed by SUMO because they reached their current route target.
                     # This is where we can tell whether they ended at the global destination
                     # or were terminated at an intermediate/local target.
-                    arrived_this_step = traci.simulation.getArrivedIDList()
+                    arrived_this_step = simulation_get_arrived_ids()
                     for arrived_vehicle_id in arrived_this_step:
                         if arrived_vehicle_id not in vehicles:
                             continue
@@ -1285,7 +1326,7 @@ class RLTrainingPipeline:
                                 last_snapshot_by_vehicle,
                             )
 
-                    live_after_step = set(traci.vehicle.getIDList())
+                    live_after_step = set(vehicle_get_ids())
                     tracked_ids = (
                         set(pending_decisions.keys())
                         | set(prev_edge_by_vehicle.keys())
