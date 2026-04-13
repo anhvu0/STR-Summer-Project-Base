@@ -300,17 +300,18 @@ class RLTrainingPipeline:
         self.route_difficulty_scale_min = float(np.clip(route_difficulty_scale_min, 0.05, 1.0))
         self.route_difficulty_scale_max = float(np.clip(route_difficulty_scale_max, self.route_difficulty_scale_min, 1.0))
         self._distance_cache = {}
-        self.progress_reward_scale = 0.80  # or 0.0 to disable progress term cheaply
-        self.system_congestion_scale = 0.03  # scales marginal congestion penalty on busy edges
+        self.progress_reward_scale = 0.45  # keep progress shaping secondary to travel-time minimization
+        self.system_congestion_scale = 0.12  # stronger marginal-pressure signal for selfless routing
+        self.social_congestion_scale = 0.20  # penalize choosing edges that add congestion externality
         self.loop_window = 12
         self.loop_repeat_penalty = 1.5
         # Objective priority:
         # 1) minimize travel time (dominant)
         # 2) congestion externality (secondary)
         # 3) shortest-path distance as tie-breaker
-        self.travel_time_penalty = 0.15
-        self.eta_progress_scale = 0.2
-        self.distance_tiebreak_scale = 0.02
+        self.travel_time_penalty = 0.22
+        self.eta_progress_scale = 0.10
+        self.distance_tiebreak_scale = 0.01
         self.reward_clip_low = -20.0
         self.reward_clip_high = 20.0
 
@@ -879,21 +880,24 @@ class RLTrainingPipeline:
         congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
         edge_len = max(self.connection_info.edge_length_dict.get(current_edge, 5.0), 5.0)
         edge_density = congestion / edge_len
-        reward -= 0.05 * edge_density * elapsed
-        reward -= float(np.clip(externality_penalty, 0.0, 4.0))
+        reward -= 0.08 * edge_density * elapsed
+        reward -= self.social_congestion_scale * float(np.clip(externality_penalty, 0.0, 4.0))
 
         mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
         marginal_pressure = max(edge_density - mean_density, 0.0)
         reward -= self.system_congestion_scale * marginal_pressure * elapsed
+        # Quadratic term increases penalty on heavily congested links and
+        # encourages load-spreading when several routes are feasible.
+        reward -= 0.04 * (edge_density ** 2) * elapsed
 
         # Progress shaping using ETA and distance improvement.
         if math.isfinite(prev_eta) and math.isfinite(curr_eta):
-            reward += self.eta_progress_scale * np.clip(prev_eta - curr_eta, -3.0, 3.0)
+            reward += self.eta_progress_scale * np.clip(prev_eta - curr_eta, -2.0, 2.0)
 
         # Tertiary tie-breaker: shortest-path distance progress.
         if math.isfinite(prev_distance) and math.isfinite(curr_distance):
             progress = (prev_distance - curr_distance) * (self.distance_tiebreak_scale * self.progress_reward_scale)
-            reward += float(np.clip(progress, -1.0, 1.0))
+            reward += float(np.clip(progress, -0.4, 0.4))
 
         # Safety and control quality penalties.
         if repeated_recent_edges > 0:
