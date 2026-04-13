@@ -33,7 +33,7 @@ import sumolib
 In this file, we build a DQN network
 """
 
-MAX_SIMULATION_STEPS = 3000 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
+MAX_SIMULATION_STEPS = 2000 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
 
 class ReplayBuffer:
     """
@@ -81,9 +81,9 @@ class DQNTrainer:
         learning_rate=0.001,
         gamma=0.95,
         epsilon=1.0,
-        epsilon_decay=0.995,
-        epsilon_min=0.05,
-        replay_capacity=10000,
+        epsilon_decay=0.99,
+        epsilon_min=0.08,
+        replay_capacity=5000,
         batch_size=128,
         replay_warmup=1000,
         target_update_every=200,
@@ -238,10 +238,10 @@ class RLTrainingPipeline:
         deadline_penalty=20.0,
         on_time_arrival_bonus=36.0,
         teleport_penalty=-20.0,
-        epsilon_decay=0.995,
-        epsilon_min=0.05,
+        epsilon_decay=0.99,
+        epsilon_min=0.08,
         gamma=0.97,
-        replay_capacity=10000,
+        replay_capacity=5000,
         batch_size=128,
         replay_warmup=1000,
         train_every=40,
