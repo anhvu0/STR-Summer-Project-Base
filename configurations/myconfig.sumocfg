@@ -1,8 +1,8 @@
 <configuration>
 
 <input>
-<net-file value="map.net.xml"/>
-<route-files value="str_sumo_map.rou.xml"/>
+<net-file value="./maps/map.net.xml"/>
+<route-files value="./rou/str_sumo_map.rou.xml"/>
 </input>
 <output> <netstate-dump value="test_dump.xml" /> </output>
 <time>
