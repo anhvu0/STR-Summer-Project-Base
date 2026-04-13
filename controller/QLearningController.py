@@ -39,6 +39,13 @@ class QLearningPolicy(RouteController):
             "impossible_action_overrides": 0,
             "deadend_overrides": 0,
             "decision_committed_skips": 0,
+            "chosen_infeasible_count": 0,
+            "fallback_applied_count": 0,
+            "fallback_failed_count": 0,
+            "skipped_due_to_infeasibility": 0,
+            "provisional_decisions": 0,
+            "provisional_committed_count": 0,
+            "provisional_aborted_count": 0,
         }
         self._last_metrics_snapshot = None
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
@@ -166,15 +173,45 @@ class QLearningPolicy(RouteController):
             score += 4
         return score, signals, dist_worsen, trap_like
 
-    def _finalize_commitment(self, vehicle):
+    def _advance_pending_lifecycle(self, vehicle, context, step):
         vid = vehicle.vehicle_id
         pending = self._pending_decisions.get(vid)
         if not pending:
-            return
+            return False
+        if vehicle.current_edge != pending.decision_edge:
+            if not pending.committed:
+                self._metrics["provisional_aborted_count"] += 1
+            self._pending_decisions.pop(vid, None)
+            return False
+        if (not pending.committed) and self.decision_engine.can_commit_provisional(
+            context,
+            pending.executed_action,
+            pending.decision_step,
+            step,
+        ):
+            pending.committed = True
+            pending.commit_step = int(step)
+            self._metrics["provisional_committed_count"] += 1
         if vehicle.current_edge == pending.decision_edge:
             self._metrics["decision_committed_skips"] += 1
-            return
-        self._pending_decisions.pop(vid, None)
+            return True
+        return False
+
+    def _ordered_fallback_actions(self, context, chosen_action, current_edge, destination, recent_history):
+        scored = []
+        for action in self.decision_engine.ordered_fallback_actions(context, exclude_action=chosen_action):
+            candidate_next = self.decision_engine.get_next_edge(current_edge, action)
+            if candidate_next is None:
+                continue
+            score, _, _, _ = self._action_safety_score(
+                current_edge,
+                candidate_next,
+                destination,
+                recent_history,
+            )
+            scored.append((score, action))
+        scored.sort(key=lambda item: (item[0], item[1]))
+        return [action for _, action in scored]
     #----------------------------------------------------------------------
 
 
@@ -196,15 +233,12 @@ class QLearningPolicy(RouteController):
                 self._recent_edges[vid] = deque(maxlen=self.loop_window)
             self._visit_count.setdefault(vid, {})
             self._best_dist.setdefault(vid, float("inf"))
-            self._finalize_commitment(vehicle)
-
-            if vid in self._pending_decisions:
-                # Keep commitment semantics aligned with training:
-                # one decision is open until the vehicle exits the decision edge.
-                continue
-
             step = int(traci.simulation.getTime())
             context = self.decision_engine.build_context(str(vid), start_edge, vehicle.destination, step)
+            if self._advance_pending_lifecycle(vehicle, context, step):
+                # Keep commitment semantics aligned with training:
+                # one decision is open until lifecycle close (commit+realize or abort).
+                continue
 
             # Skip non-meaningful junction points; apply forced action directly.
             if context.forced_action is not None:
@@ -254,33 +288,55 @@ class QLearningPolicy(RouteController):
                     action_idx = best_action
                     selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
 
-            lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action_idx)
-            if lane_change_requested and not lane_change_ok:
-                self._metrics["overrides"] += 1
-
-            fragment, local_target, frag_error = self.decision_engine.build_route_fragment(
-                start_edge, action_idx, vehicle.destination
+            fallback_actions = self._ordered_fallback_actions(
+                context,
+                action_idx,
+                start_edge,
+                vehicle.destination,
+                self._recent_edges[vid],
             )
-            if frag_error or local_target is None:
+            execution = self.decision_engine.attempt_execute_action(
+                context,
+                action_idx,
+                vehicle.destination,
+                fallback_actions=fallback_actions,
+            )
+            if execution.intervention_type != "none":
+                self._metrics["chosen_infeasible_count"] += 1
+                self._metrics["overrides"] += 1
+                if execution.executed_action is None:
+                    self._metrics["fallback_failed_count"] += 1
+                    self._metrics["skipped_due_to_infeasibility"] += 1
+                    continue
+                self._metrics["fallback_applied_count"] += 1
+
+            if not execution.committed_decision:
                 self._metrics["overrides"] += 1
                 continue
 
-            next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
+            next_edge = execution.executed_next_edge
             if next_edge:
                 self._recent_edges[vid].append(next_edge)
                 self._visit_count[vid][next_edge] = self._visit_count[vid].get(next_edge, 0) + 1
                 self._best_dist[vid] = min(self._best_dist[vid], self._dist_to_dest(next_edge, vehicle.destination))
                 self._pending_decisions[vid] = PendingDecision(
                     state=None,
-                    intended_action=action_idx,
+                    chosen_action=action_idx,
+                    executed_action=execution.executed_action,
                     intended_next_edge=next_edge,
                     decision_edge=start_edge,
                     decision_step=step,
                     destination=vehicle.destination,
                     context=context,
-                    lane_change_requested=lane_change_requested,
+                    lane_change_requested=execution.lane_change_requested,
+                    lane_change_ok=execution.lane_change_ok,
+                    intervention_type=execution.intervention_type,
+                    committed=False,
+                    commit_step=None,
+                    route_fragment=list(execution.route_fragment),
                 )
-            local_targets[vehicle.vehicle_id] = local_target
+                self._metrics["provisional_decisions"] += 1
+            local_targets[vehicle.vehicle_id] = execution.local_target
 
         if self._metrics["decisions"] > 0:
             snapshot = (
