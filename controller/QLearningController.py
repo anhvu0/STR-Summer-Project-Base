@@ -10,7 +10,7 @@ from collections import deque
 from xml.dom.minidom import parse
 import os
 from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision
-from core.route_loop_safety import transition_signal, would_worsen_distance
+from core.route_loop_safety import score_transition_risk
 
 def parse_sumocfg(sumocfg_path):
     dom = parse(sumocfg_path)
@@ -20,7 +20,16 @@ net_path = parse_sumocfg("./configurations/myconfig.sumocfg")
 
 
 class QLearningPolicy(RouteController):
-    def __init__(self, vehicles, connection_info, model_file, net_xml_file = net_path):
+    def __init__(
+        self,
+        vehicles,
+        connection_info,
+        model_file,
+        net_xml_file=net_path,
+        enable_safety_action_filter=True,
+        enable_safety_q_penalty=True,
+        enable_lane_change_recheck_before_fallback=True,
+    ):
         super().__init__(connection_info)
         self.model = load_model(model_file)
         self.model_state_size = int(self.model.input_shape[-1])
@@ -51,6 +60,10 @@ class QLearningPolicy(RouteController):
         self.loop_window = 10
         self.loop_repeat_threshold = 2
         self.score_slack = 30.0
+        self.enable_safety_action_filter = bool(enable_safety_action_filter)
+        self.enable_safety_q_penalty = bool(enable_safety_q_penalty)
+        self.safety_q_penalty_scale = 1.5
+        self.enable_lane_change_recheck_before_fallback = bool(enable_lane_change_recheck_before_fallback)
         self.deadline_deficit_override_slack = 2.0
         self.distance_tiebreak_scale = 0.05
         self.edge_embedding_dim = 8
@@ -146,29 +159,55 @@ class QLearningPolicy(RouteController):
         return len(outgoing)
 
     def _action_safety_score(self, current_edge, next_edge, destination, recent_history):
-        edge_out_degree = {edge: self._edge_out_degree(edge) for edge in set(recent_history) | {next_edge}}
-        signals = transition_signal(recent_history, next_edge, edge_out_degree=edge_out_degree)
+        edge_out_degree = {edge: self._edge_out_degree(edge) for edge in set(recent_history) | {next_edge, current_edge}}
         current_dist = self._dist_to_dest(current_edge, destination)
         next_dist = self._dist_to_dest(next_edge, destination)
-        dist_worsen = would_worsen_distance(current_dist, next_dist, slack=self.score_slack)
-        trap_like = (
-            next_edge != destination
-            and self._edge_out_degree(next_edge) <= 1
-            and len(recent_history) > 0
-            and recent_history[-1] == current_edge
+        score_card = score_transition_risk(
+            history=recent_history,
+            current_edge=current_edge,
+            next_edge=next_edge,
+            destination=destination,
+            current_distance=current_dist,
+            next_distance=next_dist,
+            edge_out_degree=edge_out_degree,
+            distance_slack=self.score_slack,
         )
-        score = 0
-        if signals["short_cycle"]:
-            score += 5
-        if signals["aba_bounce"]:
-            score += 5
-        if signals["dead_end_reentry"]:
-            score += 3
-        if dist_worsen:
-            score += 2
-        if trap_like:
-            score += 4
-        return score, signals, dist_worsen, trap_like
+        return (
+            score_card["score"],
+            {
+                "short_cycle": score_card["short_cycle"],
+                "aba_bounce": score_card["aba_bounce"],
+                "dead_end_reentry": score_card["dead_end_reentry"],
+            },
+            score_card["distance_worsen"],
+            score_card["trap_like"],
+        )
+
+    def _safety_rank_actions(self, current_edge, destination, available_actions, recent_history):
+        scored = []
+        for action in available_actions:
+            next_edge = self.decision_engine.get_next_edge(current_edge, action)
+            if next_edge is None:
+                continue
+            score, signals, dist_worsen, trap_like = self._action_safety_score(
+                current_edge, next_edge, destination, recent_history
+            )
+            scored.append((action, float(score), signals, dist_worsen, trap_like))
+        if not scored:
+            return list(available_actions), {}, False, False, False
+
+        scores = {action: score for action, score, *_ in scored}
+        min_score = min(scores.values())
+        safest = [action for action, score in scores.items() if score <= min_score + 1e-6]
+        risky_only = len(safest) == len(scores) and min_score > 0.0
+        filtered = False
+        downranked = False
+        if self.enable_safety_action_filter and len(safest) > 0 and len(safest) < len(scores):
+            filtered = True
+            return safest, scores, filtered, downranked, risky_only
+        if self.enable_safety_q_penalty and any(score > min_score for score in scores.values()):
+            downranked = True
+        return list(available_actions), scores, filtered, downranked, risky_only
 
     def _finalize_commitment(self, vehicle):
         vid = vehicle.vehicle_id
@@ -223,7 +262,13 @@ class QLearningPolicy(RouteController):
                 continue
             else:
                 state = self.getState(vid, start_edge, vehicle.destination, context=context)
-                action_idx = self.act(state, available_actions=context.available_actions)
+                candidate_actions, safety_scores, _, apply_q_penalty, _ = self._safety_rank_actions(
+                    start_edge,
+                    vehicle.destination,
+                    context.available_actions,
+                    self._recent_edges[vid],
+                )
+                action_idx = self.act(state, available_actions=candidate_actions, safety_scores=safety_scores if apply_q_penalty else None)
                 self._metrics["decisions"] += 1
 
             if action_idx not in context.available_actions:
@@ -241,15 +286,26 @@ class QLearningPolicy(RouteController):
                     self._lane_change_deferrals[vid] = self._lane_change_deferrals.get(vid, 0) + 1
                     if self._lane_change_deferrals[vid] < self.decision_engine.lane_change_defer_limit:
                         continue
-                    fallback_actions = self.decision_engine.lane_feasible_fallback_actions(context, blocked_action=action_idx)
-                    if not fallback_actions:
+                    fallback_actions = None
+                    if self.enable_lane_change_recheck_before_fallback:
+                        retry_context = self.decision_engine.build_context(str(vid), start_edge, vehicle.destination, step)
+                        if action_idx in retry_context.available_actions:
+                            context = retry_context
+                        else:
+                            fallback_actions = self.decision_engine.lane_feasible_fallback_actions(context, blocked_action=action_idx)
+                    else:
+                        fallback_actions = self.decision_engine.lane_feasible_fallback_actions(context, blocked_action=action_idx)
+                    if fallback_actions is None:
+                        pass
+                    elif not fallback_actions:
                         continue
-                    state = self.getState(vid, start_edge, vehicle.destination, context=context)
-                    action_idx = self.act(state, available_actions=fallback_actions)
-                    selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
-                    if selected_next_edge is None:
-                        continue
-                    self._metrics["fallback_to_lane_feasible_now"] += 1
+                    else:
+                        state = self.getState(vid, start_edge, vehicle.destination, context=context)
+                        action_idx = self.act(state, available_actions=fallback_actions)
+                        selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
+                        if selected_next_edge is None:
+                            continue
+                        self._metrics["fallback_to_lane_feasible_now"] += 1
                 else:
                     fallback_actions = self.decision_engine.lane_feasible_fallback_actions(context, blocked_action=action_idx)
                     if not fallback_actions:
@@ -326,7 +382,7 @@ class QLearningPolicy(RouteController):
 
 
     # this function reacheds the Neural Network trained before and let it make a decision for the situation now
-    def act(self, state, available_actions=None):
+    def act(self, state, available_actions=None, safety_scores=None):
         act_values = self.model.predict(state, verbose=0)[0]
         if available_actions is None:
             mask_start = self.direction_mask_start + 18 if self.use_compact_state else self.direction_mask_start
@@ -337,6 +393,9 @@ class QLearningPolicy(RouteController):
             return int(np.argmax(act_values))
         masked = np.full_like(act_values, -1e9)
         masked[available] = act_values[available]
+        if safety_scores:
+            for action in available:
+                masked[action] -= self.safety_q_penalty_scale * float(safety_scores.get(action, 0.0))
         return int(np.argmax(masked))
 
     # this function gives the current state of the vehicle based on the state size

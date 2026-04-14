@@ -53,3 +53,55 @@ def would_worsen_distance(
     if next_distance == float("inf"):
         return True
     return (next_distance - current_distance) > slack
+
+
+def score_transition_risk(
+    history: Deque[str],
+    current_edge: str,
+    next_edge: str,
+    destination: str,
+    current_distance: float,
+    next_distance: float,
+    edge_out_degree: Dict[str, int],
+    distance_slack: float = 30.0,
+) -> Dict[str, object]:
+    """
+    Shared transition risk scoring for training + inference.
+    Returns a compact score card that can be used for hard filtering or Q down-ranking.
+    """
+    signals = transition_signal(history, next_edge, edge_out_degree=edge_out_degree)
+    distance_worsen = would_worsen_distance(current_distance, next_distance, slack=distance_slack)
+    trap_like = (
+        next_edge != destination
+        and edge_out_degree.get(next_edge, 0) <= 1
+        and len(history) > 0
+        and history[-1] == current_edge
+    )
+
+    score = 0.0
+    reasons = []
+    if signals["short_cycle"]:
+        score += 5.0
+        reasons.append("short_cycle")
+    if signals["aba_bounce"]:
+        score += 5.0
+        reasons.append("aba_bounce")
+    if signals["dead_end_reentry"]:
+        score += 3.0
+        reasons.append("dead_end_reentry")
+    if distance_worsen:
+        score += 2.0
+        reasons.append("distance_worsen")
+    if trap_like:
+        score += 4.0
+        reasons.append("trap_like")
+
+    return {
+        "score": float(score),
+        "reasons": reasons,
+        "short_cycle": bool(signals["short_cycle"]),
+        "aba_bounce": bool(signals["aba_bounce"]),
+        "dead_end_reentry": bool(signals["dead_end_reentry"]),
+        "distance_worsen": bool(distance_worsen),
+        "trap_like": bool(trap_like),
+    }
