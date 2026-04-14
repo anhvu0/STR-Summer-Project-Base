@@ -24,6 +24,7 @@ class DecisionContext:
     forced_action: Optional[int] = None
     branch_with_choice: bool = False
     skip_reason: Optional[str] = None
+    lane_alignment_score: float = 0.0
 
 
 @dataclass
@@ -72,8 +73,10 @@ class JunctionDecisionEngine:
         self.lane_change_margin_m = 24.0
         self.commit_min_distance = 14.0
         self.default_fragment_horizon_m = 180.0
-        self.pending_timeout_steps = 18
-        self.lane_change_defer_limit = 4
+        self.pending_timeout_steps = 10
+        self.pending_nonprogress_min_age = 3
+        self.pending_nonprogress_dist_shrink_threshold_m = 8.0
+        self.lane_change_defer_limit = 1
 
     def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
         if snapshot is not None:
@@ -181,6 +184,13 @@ class JunctionDecisionEngine:
             forced_action=forced_action,
             branch_with_choice=branch_with_choice,
             skip_reason=skip_reason,
+            lane_alignment_score=self._lane_alignment_score(
+                lane_idx=int(lane_idx),
+                lane_count=int(lane_count),
+                action_idx=None,
+                required_shift_map=required_shift,
+                lane_feasible_now=lane_now,
+            ),
         )
 
     def is_decision_open(self, context: DecisionContext) -> bool:
@@ -189,9 +199,110 @@ class JunctionDecisionEngine:
     def pending_age_steps(self, pending: PendingDecision, step: int) -> int:
         return max(int(step) - int(pending.decision_step), 0)
 
-    def should_timeout_pending(self, pending: PendingDecision, step: int, max_age_steps: Optional[int] = None) -> bool:
-        threshold = self.pending_timeout_steps if max_age_steps is None else int(max_age_steps)
+    def effective_pending_timeout_steps(self, context: DecisionContext) -> int:
+        """
+        Dynamic timeout: closer to the edge end (or moving faster near commit window)
+        gets a smaller pending timeout so stale decisions clear earlier.
+        """
+        base = max(int(self.pending_timeout_steps), 1)
+        speed = max(float(context.speed), 0.0)
+        dist = max(float(context.dist_to_end), 0.0)
+        if context.commit_window or dist < max(18.0, speed * 1.2):
+            return max(base - 5, 3)
+        if dist < max(35.0, speed * 2.0):
+            return max(base - 3, 4)
+        if dist < max(55.0, speed * 2.8):
+            return max(base - 1, 5)
+        return base
+
+    def should_timeout_pending(
+        self,
+        pending: PendingDecision,
+        step: int,
+        max_age_steps: Optional[int] = None,
+        context: Optional[DecisionContext] = None,
+    ) -> bool:
+        if max_age_steps is None and context is not None:
+            threshold = self.effective_pending_timeout_steps(context)
+        else:
+            threshold = self.pending_timeout_steps if max_age_steps is None else int(max_age_steps)
         return self.pending_age_steps(pending, step) >= max(threshold, 1)
+
+    def _lane_alignment_score(
+        self,
+        lane_idx: int,
+        lane_count: int,
+        action_idx: Optional[int],
+        required_shift_map: Dict[int, int],
+        lane_feasible_now: List[int],
+    ) -> float:
+        if action_idx is None or action_idx in lane_feasible_now:
+            return 1.0
+        shift = required_shift_map.get(action_idx)
+        if shift is None:
+            return 0.0
+        denom = max(int(lane_count) - 1, 1)
+        return 1.0 - min(float(shift) / float(denom), 1.0)
+
+    def pending_nonprogress_status(
+        self,
+        pending: PendingDecision,
+        context: DecisionContext,
+        step: int,
+    ) -> Tuple[bool, Dict[str, object]]:
+        """
+        Detect pending decisions that are not progressing in execution.
+        Shared by training + inference.
+        """
+        age = self.pending_age_steps(pending, step)
+        same_decision_edge = context.edge_id == pending.decision_edge
+        intended_action = int(pending.intended_action)
+        action_lane_feasible_now = intended_action in context.lane_feasible_now_actions
+
+        previous_alignment = float(pending.metadata.get("last_alignment_score", 0.0))
+        current_alignment = self._lane_alignment_score(
+            lane_idx=context.lane_index,
+            lane_count=context.lane_count,
+            action_idx=intended_action,
+            required_shift_map=context.required_lane_shift,
+            lane_feasible_now=context.lane_feasible_now_actions,
+        )
+        alignment_improving = current_alignment > (previous_alignment + 1e-3)
+
+        previous_dist = float(pending.metadata.get("last_dist_to_end", context.dist_to_end))
+        dist_shrunk = max(previous_dist - float(context.dist_to_end), 0.0)
+        maneuver_window_shrinking = dist_shrunk >= self.pending_nonprogress_dist_shrink_threshold_m
+
+        timed_out = self.should_timeout_pending(pending, step, context=context)
+        nonprogress = (
+            same_decision_edge
+            and age >= max(int(self.pending_nonprogress_min_age), 1)
+            and (not action_lane_feasible_now)
+            and (not alignment_improving)
+            and maneuver_window_shrinking
+        )
+        should_cancel = bool(nonprogress or timed_out)
+        reason = None
+        if nonprogress:
+            reason = "non_progress"
+        elif timed_out:
+            reason = "timeout"
+
+        diagnostics = {
+            "pending_age": age,
+            "same_decision_edge": same_decision_edge,
+            "action_lane_feasible_now": action_lane_feasible_now,
+            "alignment_improving": alignment_improving,
+            "previous_alignment": previous_alignment,
+            "current_alignment": current_alignment,
+            "previous_dist_to_end": previous_dist,
+            "current_dist_to_end": float(context.dist_to_end),
+            "dist_shrunk_m": dist_shrunk,
+            "maneuver_window_shrinking": maneuver_window_shrinking,
+            "effective_timeout_steps": self.effective_pending_timeout_steps(context),
+            "cancel_reason": reason,
+        }
+        return should_cancel, diagnostics
 
     def lane_feasible_fallback_actions(self, context: DecisionContext, blocked_action: Optional[int] = None) -> List[int]:
         candidates = sorted(set(context.lane_feasible_now_actions))
