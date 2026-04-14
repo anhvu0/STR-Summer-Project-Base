@@ -31,6 +31,7 @@ class QLearningPolicy(RouteController):
         self._best_dist = {}
         self._recent_edges = {}
         self._pending_decisions = {}
+        self._lane_change_attempts = {}
         self._lane_change_deferrals = {}
         self._metrics = {
             "decisions": 0,
@@ -43,6 +44,11 @@ class QLearningPolicy(RouteController):
             "pending_decision_timeouts": 0,
             "fallback_to_lane_feasible_now": 0,
             "deferred_lane_change_actions": 0,
+            "lane_change_stall_replans": 0,
+            "pending_no_progress_aborts": 0,
+            "target_lane_reached_before_commit": 0,
+            "commit_window_forced_fallbacks": 0,
+            "same_edge_pending_steps": 0,
         }
         self._last_metrics_snapshot = None
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
@@ -177,6 +183,15 @@ class QLearningPolicy(RouteController):
             return
         step = int(traci.simulation.getTime())
         if vehicle.current_edge == pending.decision_edge:
+            context = self.decision_engine.build_context(str(vid), vehicle.current_edge, pending.destination, step)
+            abort, abort_reason, diag = self.decision_engine.should_abort_pending_decision(pending, context, step)
+            self._metrics["same_edge_pending_steps"] += int(diag.get("same_edge_pending_steps", 0))
+            if abort:
+                self._pending_decisions.pop(vid, None)
+                self._metrics["pending_no_progress_aborts"] += 1
+                if abort_reason == "commit_window_not_lane_feasible":
+                    self._metrics["commit_window_forced_fallbacks"] += 1
+                return
             if self.decision_engine.should_timeout_pending(pending, step):
                 self._pending_decisions.pop(vid, None)
                 self._metrics["pending_decision_timeouts"] += 1
@@ -184,8 +199,22 @@ class QLearningPolicy(RouteController):
             self._metrics["decision_committed_skips"] += 1
             return
         self._pending_decisions.pop(vid, None)
+        self._lane_change_attempts.pop(vid, None)
         self._lane_change_deferrals[vid] = 0
     #----------------------------------------------------------------------
+
+    def _pick_safest_action(self, current_edge, destination, candidate_actions, recent_history):
+        safest_action = None
+        safest_score = float("inf")
+        for action_idx in candidate_actions:
+            next_edge = self.decision_engine.get_next_edge(current_edge, action_idx)
+            if next_edge is None:
+                continue
+            score, _, _, _ = self._action_safety_score(current_edge, next_edge, destination, recent_history)
+            if score < safest_score:
+                safest_score = score
+                safest_action = action_idx
+        return safest_action, safest_score
 
 
     def make_decisions(self, vehicles, connection_info: ConnectionInfo):
@@ -216,8 +245,44 @@ class QLearningPolicy(RouteController):
             step = int(traci.simulation.getTime())
             context = self.decision_engine.build_context(str(vid), start_edge, vehicle.destination, step)
 
+            lane_change_attempt = self._lane_change_attempts.get(vid)
+            if lane_change_attempt and lane_change_attempt.get("decision_edge") == start_edge:
+                action_idx = int(lane_change_attempt["action"])
+                if action_idx in context.lane_feasible_now_actions:
+                    self._metrics["target_lane_reached_before_commit"] += 1
+                    self._lane_change_attempts.pop(vid, None)
+                else:
+                    abort, reason, updated = self.decision_engine.evaluate_lane_change_progress(
+                        lane_change_attempt,
+                        context,
+                        action_idx,
+                    )
+                    lane_change_attempt.update(updated)
+                    self._lane_change_attempts[vid] = lane_change_attempt
+                    if not abort:
+                        self._metrics["decision_committed_skips"] += 1
+                        continue
+                    self._metrics["lane_change_stall_replans"] += 1
+                    if reason == "commit_window_not_lane_feasible":
+                        self._metrics["commit_window_forced_fallbacks"] += 1
+                    self._lane_change_attempts.pop(vid, None)
+                    fallback_actions = self.decision_engine.lane_feasible_fallback_actions(
+                        context,
+                        blocked_action=action_idx,
+                    )
+                    if not fallback_actions:
+                        continue
+                    action_idx = self.act(
+                        self.getState(vid, start_edge, vehicle.destination, context=context),
+                        available_actions=fallback_actions,
+                    )
+            else:
+                action_idx = None
+
             # Skip non-meaningful junction points; apply forced action directly.
-            if context.forced_action is not None:
+            if action_idx is not None:
+                pass
+            elif context.forced_action is not None:
                 action_idx = context.forced_action
             elif not self.decision_engine.is_decision_open(context):
                 continue
@@ -230,6 +295,12 @@ class QLearningPolicy(RouteController):
                 self._metrics["impossible_action_overrides"] += 1
                 continue
 
+            safe_actions = sorted(set(context.available_actions))
+            safe_action, safe_score = self._pick_safest_action(start_edge, vehicle.destination, safe_actions, list(self._recent_edges[vid]))
+            if safe_action is not None and safe_score >= 6 and safe_action != action_idx:
+                action_idx = safe_action
+                self._metrics["fallback_to_lane_feasible_now"] += 1
+
             selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
             if selected_next_edge is None:
                 continue
@@ -238,18 +309,16 @@ class QLearningPolicy(RouteController):
             if lane_change_requested:
                 if lane_change_ok:
                     self._metrics["deferred_lane_change_actions"] += 1
-                    self._lane_change_deferrals[vid] = self._lane_change_deferrals.get(vid, 0) + 1
-                    if self._lane_change_deferrals[vid] < self.decision_engine.lane_change_defer_limit:
-                        continue
-                    fallback_actions = self.decision_engine.lane_feasible_fallback_actions(context, blocked_action=action_idx)
-                    if not fallback_actions:
-                        continue
-                    state = self.getState(vid, start_edge, vehicle.destination, context=context)
-                    action_idx = self.act(state, available_actions=fallback_actions)
-                    selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
-                    if selected_next_edge is None:
-                        continue
-                    self._metrics["fallback_to_lane_feasible_now"] += 1
+                    self._lane_change_attempts[vid] = {
+                        "decision_edge": start_edge,
+                        "action": action_idx,
+                        "started_step": step,
+                        "same_edge_steps": 0,
+                        "last_lane_index": context.lane_index,
+                        "last_required_shift": self.decision_engine.required_lane_shift_for_action(context, action_idx),
+                        "last_dist_to_end": context.dist_to_end,
+                    }
+                    continue
                 else:
                     fallback_actions = self.decision_engine.lane_feasible_fallback_actions(context, blocked_action=action_idx)
                     if not fallback_actions:
@@ -262,6 +331,7 @@ class QLearningPolicy(RouteController):
                     self._metrics["fallback_to_lane_feasible_now"] += 1
             else:
                 self._lane_change_deferrals[vid] = 0
+                self._lane_change_attempts.pop(vid, None)
 
             full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
                 str(vid),
@@ -290,6 +360,12 @@ class QLearningPolicy(RouteController):
                     context=context,
                     lane_change_requested=lane_change_requested,
                     route_fragment=list(full_route[1:]) if full_route else [],
+                    metadata={
+                        "same_edge_pending_steps": 0,
+                        "last_lane_index": context.lane_index,
+                        "last_required_shift": self.decision_engine.required_lane_shift_for_action(context, action_idx),
+                        "last_dist_to_end": context.dist_to_end,
+                    },
                 )
                 self._lane_change_deferrals[vid] = 0
             # Route already committed directly via shared apply_route_decision.
