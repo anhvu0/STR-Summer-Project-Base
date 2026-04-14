@@ -1,7 +1,9 @@
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 import math
 import traci
+from core.route_loop_safety import transition_signal, would_worsen_distance
 
 
 @dataclass
@@ -74,6 +76,13 @@ class JunctionDecisionEngine:
         self.default_fragment_horizon_m = 180.0
         self.pending_timeout_steps = 18
         self.lane_change_defer_limit = 4
+        self.observe_steps_min = 2
+        self.observe_steps_max = 4
+        self.observe_low_speed_mps = 0.8
+        self.observe_stall_steps = 2
+        self.cooldown_steps = 3
+        self.pending_progress_timeout_steps = 10
+        self.loop_distance_slack = 30.0
 
     def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
         if snapshot is not None:
@@ -143,7 +152,12 @@ class JunctionDecisionEngine:
                     available.append(idx)
                     continue
                 shift = required_shift.get(idx, 999)
-                if shift < 999 and lane_change_budget >= shift * self.lane_change_margin_m and dist_to_end >= reaction_distance:
+                dynamic_margin = self.lane_change_margin_m * (1.0 + 0.5 * max(0, shift - 1))
+                low_speed = speed < 1.2
+                aggressive_shift = shift >= 2 and dist_to_end < (dynamic_margin + commit_distance + reaction_distance)
+                if low_speed or aggressive_shift:
+                    continue
+                if shift < 999 and lane_change_budget >= shift * dynamic_margin and dist_to_end >= reaction_distance:
                     available.append(idx)
 
         available = sorted(set(available))
@@ -193,11 +207,174 @@ class JunctionDecisionEngine:
         threshold = self.pending_timeout_steps if max_age_steps is None else int(max_age_steps)
         return self.pending_age_steps(pending, step) >= max(threshold, 1)
 
+    def lane_change_observe_limit(self, context: DecisionContext) -> int:
+        limit = self.observe_steps_min
+        if context.speed >= 8.0 and context.dist_to_end >= 55.0:
+            limit += 1
+        if context.speed >= 14.0 and context.dist_to_end >= 95.0:
+            limit += 1
+        return int(max(self.observe_steps_min, min(limit, self.observe_steps_max)))
+
+    def start_lane_change_observe(
+        self,
+        context: DecisionContext,
+        action_idx: int,
+        step: int,
+        lane_change_sent: bool,
+        lane_change_ok: bool,
+    ) -> Dict[str, object]:
+        return {
+            "phase": "observe_lane_change",
+            "observe_action": int(action_idx),
+            "observe_started_step": int(step),
+            "observe_steps": 0,
+            "observe_limit": self.lane_change_observe_limit(context),
+            "observe_last_lane_index": int(context.lane_index),
+            "observe_last_required_shift": int(context.required_lane_shift.get(action_idx, 99)),
+            "observe_stall_steps": 0,
+            "lane_change_requested_once": bool(lane_change_sent),
+            "lane_change_request_ok": bool(lane_change_ok),
+        }
+
+    def evaluate_lane_change_observation(
+        self,
+        observe_meta: Dict[str, object],
+        context: DecisionContext,
+        action_idx: int,
+    ) -> Tuple[str, Optional[str]]:
+        current_shift = int(context.required_lane_shift.get(action_idx, 99))
+        last_lane = int(observe_meta.get("observe_last_lane_index", context.lane_index))
+        last_shift = int(observe_meta.get("observe_last_required_shift", current_shift))
+        observe_steps = int(observe_meta.get("observe_steps", 0)) + 1
+        observe_limit = int(observe_meta.get("observe_limit", self.observe_steps_min))
+        stall_steps = int(observe_meta.get("observe_stall_steps", 0))
+
+        toward_target = current_shift < last_shift
+        lane_changed = context.lane_index != last_lane
+        feasible_now = action_idx in context.lane_feasible_now_actions
+        good_motion = context.speed >= self.observe_low_speed_mps and (not context.commit_window or context.dist_to_end > self.commit_min_distance)
+        progressing = toward_target or lane_changed or feasible_now or good_motion
+        if progressing:
+            stall_steps = 0
+        else:
+            stall_steps += 1
+
+        observe_meta["observe_steps"] = observe_steps
+        observe_meta["observe_last_lane_index"] = int(context.lane_index)
+        observe_meta["observe_last_required_shift"] = int(current_shift)
+        observe_meta["observe_stall_steps"] = int(stall_steps)
+
+        if feasible_now:
+            return "success", None
+        if context.commit_window and action_idx not in context.lane_feasible_now_actions:
+            return "abort", "commit_window"
+        if context.speed < self.observe_low_speed_mps and observe_steps >= 1:
+            return "abort", "low_speed"
+        if stall_steps >= self.observe_stall_steps:
+            return "abort", "no_progress"
+        if observe_steps >= observe_limit:
+            return "abort", "no_progress"
+        return "continue", None
+
     def lane_feasible_fallback_actions(self, context: DecisionContext, blocked_action: Optional[int] = None) -> List[int]:
         candidates = sorted(set(context.lane_feasible_now_actions))
         if blocked_action is None:
             return candidates
         return [a for a in candidates if a != blocked_action] or candidates
+
+    def safe_connected_fallback_actions(self, context: DecisionContext, blocked_action: Optional[int] = None) -> List[int]:
+        candidates = []
+        for action in context.available_actions:
+            if blocked_action is not None and action == blocked_action:
+                continue
+            next_edge = self.get_next_edge(context.edge_id, action)
+            if next_edge is None:
+                continue
+            if self._edge_allows_passenger(next_edge):
+                candidates.append(action)
+        return sorted(set(candidates))
+
+    def ranked_fallback_actions(
+        self,
+        context: DecisionContext,
+        destination: str,
+        recent_history: List[str],
+        blocked_action: Optional[int] = None,
+        distance_fn: Optional[Callable[[str, str], float]] = None,
+    ) -> List[int]:
+        candidate_pool = self.lane_feasible_fallback_actions(context, blocked_action=blocked_action)
+        if not candidate_pool:
+            candidate_pool = self.safe_connected_fallback_actions(context, blocked_action=blocked_action)
+        if not candidate_pool:
+            return []
+
+        scored = []
+        for action in candidate_pool:
+            safe_ok, details = self.prefilter_action_for_loops(
+                context=context,
+                action_idx=action,
+                destination=destination,
+                recent_history=recent_history,
+                distance_fn=distance_fn,
+            )
+            score = 0.0
+            if not safe_ok:
+                score += 50.0
+            if details.get("dead_end_reentry"):
+                score += 10.0
+            if details.get("short_cycle") or details.get("aba_bounce"):
+                score += 12.0
+            if details.get("trap_like_reversal"):
+                score += 8.0
+            if details.get("distance_worsen"):
+                score += 5.0
+            next_edge = self.get_next_edge(context.edge_id, action)
+            if distance_fn is not None and next_edge is not None:
+                next_dist = distance_fn(next_edge, destination)
+                if math.isfinite(next_dist):
+                    score += min(float(next_dist) / 250.0, 10.0)
+                else:
+                    score += 25.0
+            score += 0.05 * float(context.required_lane_shift.get(action, 0))
+            scored.append((score, action))
+        scored.sort(key=lambda x: x[0])
+        return [action for _, action in scored]
+
+    def prefilter_action_for_loops(
+        self,
+        context: DecisionContext,
+        action_idx: int,
+        destination: str,
+        recent_history: List[str],
+        distance_fn: Optional[Callable[[str, str], float]] = None,
+        distance_slack: Optional[float] = None,
+    ) -> Tuple[bool, Dict[str, bool]]:
+        next_edge = self.get_next_edge(context.edge_id, action_idx)
+        if next_edge is None:
+            return False, {"invalid_action": True}
+        history_deque = recent_history if isinstance(recent_history, deque) else deque(recent_history, maxlen=max(len(recent_history), 1))
+        edge_out_degree = {edge: len(self.connection_info.outgoing_edges_dict.get(edge, {})) for edge in set(history_deque) | {next_edge}}
+        signals = transition_signal(history_deque, next_edge, edge_out_degree=edge_out_degree)
+        trap_like = (
+            next_edge != destination
+            and edge_out_degree.get(next_edge, 0) <= 1
+            and len(history_deque) > 0
+            and history_deque[-1] == context.edge_id
+        )
+        dist_worsen = False
+        if distance_fn is not None:
+            current_distance = distance_fn(context.edge_id, destination)
+            next_distance = distance_fn(next_edge, destination)
+            dist_worsen = would_worsen_distance(
+                current_distance,
+                next_distance,
+                slack=self.loop_distance_slack if distance_slack is None else float(distance_slack),
+            )
+        blocked = bool(signals.get("short_cycle") or signals.get("aba_bounce") or signals.get("dead_end_reentry") or trap_like or dist_worsen)
+        details = dict(signals)
+        details["trap_like_reversal"] = trap_like
+        details["distance_worsen"] = dist_worsen
+        return (not blocked), details
 
     def try_request_lane_change(self, context: DecisionContext, action_idx: int, duration: int = 70) -> Tuple[bool, bool]:
         direction = self.direction_choices[action_idx]
