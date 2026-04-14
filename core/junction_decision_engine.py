@@ -72,8 +72,15 @@ class JunctionDecisionEngine:
         self.lane_change_margin_m = 24.0
         self.commit_min_distance = 14.0
         self.default_fragment_horizon_m = 180.0
-        self.pending_timeout_steps = 18
-        self.lane_change_defer_limit = 4
+        self.change_lane_duration = 20
+        self.pending_timeout_steps = 6
+        self.lane_change_defer_limit = 2
+        self.pending_progress_grace_steps = 1
+        self.pending_low_speed_threshold_mps = 1.5
+        self.pending_no_progress_lane_steps = 2
+        self.commit_guard_extra_distance_m = 28.0
+        self.low_speed_lane_change_limit_mps = 1.2
+        self.low_speed_max_shift = 1
 
     def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
         if snapshot is not None:
@@ -133,6 +140,8 @@ class JunctionDecisionEngine:
         commit_distance = max(self.commit_min_distance, speed * self.commit_time_s)
         commit_window = dist_to_end <= commit_distance
 
+        near_commit_window = dist_to_end <= (commit_distance + self.commit_guard_extra_distance_m)
+        low_speed = speed <= self.low_speed_lane_change_limit_mps
         available = []
         if commit_window:
             available = list(lane_now)
@@ -143,6 +152,10 @@ class JunctionDecisionEngine:
                     available.append(idx)
                     continue
                 shift = required_shift.get(idx, 999)
+                if near_commit_window:
+                    continue
+                if low_speed and shift > self.low_speed_max_shift:
+                    continue
                 if shift < 999 and lane_change_budget >= shift * self.lane_change_margin_m and dist_to_end >= reaction_distance:
                     available.append(idx)
 
@@ -199,7 +212,7 @@ class JunctionDecisionEngine:
             return candidates
         return [a for a in candidates if a != blocked_action] or candidates
 
-    def try_request_lane_change(self, context: DecisionContext, action_idx: int, duration: int = 70) -> Tuple[bool, bool]:
+    def try_request_lane_change(self, context: DecisionContext, action_idx: int, duration: Optional[int] = None) -> Tuple[bool, bool]:
         direction = self.direction_choices[action_idx]
         lane_now_map = self.connection_info.lane_outgoing_edges_dict.get(context.lane_id, {})
         if direction in lane_now_map:
@@ -216,10 +229,50 @@ class JunctionDecisionEngine:
             return False, False
 
         try:
-            traci.vehicle.changeLane(context.vehicle_id, target_lane, duration)
+            traci.vehicle.changeLane(context.vehicle_id, target_lane, int(duration if duration is not None else self.change_lane_duration))
             return True, True
         except traci.TraCIException:
             return True, False
+
+    def _required_shift_now(self, context: DecisionContext, action_idx: int) -> int:
+        if action_idx in context.lane_feasible_now_actions:
+            return 0
+        return int(context.required_lane_shift.get(action_idx, 999))
+
+    def evaluate_lane_change_progress(self, metadata: Dict[str, object], context: DecisionContext, action_idx: int, step: int) -> Dict[str, object]:
+        prev_lane_idx = int(metadata.get("last_lane_index", context.lane_index))
+        prev_shift = int(metadata.get("last_required_lane_shift", self._required_shift_now(context, action_idx)))
+        prev_dist = float(metadata.get("last_dist_to_end", context.dist_to_end))
+        same_edge_steps = int(metadata.get("same_edge_steps", 0)) + 1
+        curr_shift = self._required_shift_now(context, action_idx)
+        target_lane_reached = action_idx in context.lane_feasible_now_actions
+        lane_changed = int(context.lane_index) != prev_lane_idx
+        shift_decreased = curr_shift < prev_shift
+        dist_shrinking = float(context.dist_to_end) < (prev_dist - 0.25)
+        low_speed = float(context.speed) < self.pending_low_speed_threshold_mps
+        grace_elapsed = same_edge_steps > self.pending_progress_grace_steps
+        stalled_same_lane = grace_elapsed and (not lane_changed) and (not shift_decreased)
+        stalled_low_speed = grace_elapsed and low_speed and (not shift_decreased)
+        commit_window_blocked = context.commit_window and (not target_lane_reached)
+        dist_to_junction_stalling = grace_elapsed and dist_shrinking and (not shift_decreased) and (not target_lane_reached)
+        no_progress = commit_window_blocked or stalled_same_lane or stalled_low_speed or dist_to_junction_stalling
+        should_abort = no_progress and (not target_lane_reached)
+        metadata.update({
+            "last_lane_index": int(context.lane_index),
+            "last_required_lane_shift": int(curr_shift),
+            "last_dist_to_end": float(context.dist_to_end),
+            "same_edge_steps": int(same_edge_steps),
+            "last_progress_step": int(step if (lane_changed or shift_decreased or target_lane_reached) else metadata.get("last_progress_step", step)),
+        })
+        return {
+            "target_lane_reached": target_lane_reached,
+            "commit_window_blocked": commit_window_blocked,
+            "no_progress": no_progress,
+            "should_abort": should_abort,
+            "same_edge_steps": same_edge_steps,
+            "stall_low_speed": stalled_low_speed,
+            "stall_same_lane": stalled_same_lane,
+        }
 
     def get_next_edge(self, edge_id: str, action_idx: int) -> Optional[str]:
         outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
