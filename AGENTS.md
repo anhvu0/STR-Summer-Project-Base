@@ -18,3 +18,29 @@
 ## Compatibility note
 
 - Vehicle deadlines are still present in generated vehicle objects for backward compatibility with old scenarios, but training logic should not prioritize on-time-arrival metrics unless explicitly reintroduced.
+
+## Routing stability context (updated April 14, 2026)
+
+- The prior route-mismatch failure was fixed by unified route application through shared `setRoute(...)` helpers (training + inference).
+- The dominant remaining failure mode is now timeout-at-step-cap from overlong pending decisions and repeated lane-change deferrals.
+- Current objective: reduce defer/pending loops while preserving strict SUMO route continuity/alignment.
+- Key telemetry to track in each run:
+  - `pending_decision_timeouts`
+  - `fallback_to_lane_feasible_now`
+  - `mean_pending_age`
+  - `deferred_lane_change_actions`
+  - `decision_pending_at_episode_end`
+  - `fail_timeout`
+
+### Files changed in this pass
+
+- `core/junction_decision_engine.py`
+- `core/rl_training_pipeline.py`
+- `controller/QLearningController.py`
+- `AGENTS.md`
+
+### Next things to inspect
+
+- Correlation between `pending_decision_timeouts` and `completion_rate` over rolling windows (ensure timeout recovery helps finish rate).
+- Whether `lane_change_defer_limit` and `pending_timeout_steps` need per-network tuning for high-speed edges.
+- Distribution of fallback actions to confirm controller is not over-collapsing to a single lane-feasible direction.

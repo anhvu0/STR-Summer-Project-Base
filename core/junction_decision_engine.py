@@ -67,11 +67,13 @@ class JunctionDecisionEngine:
         self.direction_choices = direction_choices
 
         self.base_reaction_distance = 25.0
-        self.reaction_time_s = 1.6
-        self.commit_time_s = 1.0
-        self.lane_change_margin_m = 28.0
+        self.reaction_time_s = 1.3
+        self.commit_time_s = 0.8
+        self.lane_change_margin_m = 24.0
         self.commit_min_distance = 14.0
         self.default_fragment_horizon_m = 180.0
+        self.pending_timeout_steps = 18
+        self.lane_change_defer_limit = 4
 
     def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
         if snapshot is not None:
@@ -183,6 +185,19 @@ class JunctionDecisionEngine:
 
     def is_decision_open(self, context: DecisionContext) -> bool:
         return context.branch_with_choice and len(context.available_actions) > 1
+
+    def pending_age_steps(self, pending: PendingDecision, step: int) -> int:
+        return max(int(step) - int(pending.decision_step), 0)
+
+    def should_timeout_pending(self, pending: PendingDecision, step: int, max_age_steps: Optional[int] = None) -> bool:
+        threshold = self.pending_timeout_steps if max_age_steps is None else int(max_age_steps)
+        return self.pending_age_steps(pending, step) >= max(threshold, 1)
+
+    def lane_feasible_fallback_actions(self, context: DecisionContext, blocked_action: Optional[int] = None) -> List[int]:
+        candidates = sorted(set(context.lane_feasible_now_actions))
+        if blocked_action is None:
+            return candidates
+        return [a for a in candidates if a != blocked_action] or candidates
 
     def try_request_lane_change(self, context: DecisionContext, action_idx: int, duration: int = 70) -> Tuple[bool, bool]:
         direction = self.direction_choices[action_idx]
