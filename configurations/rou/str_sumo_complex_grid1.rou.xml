@@ -1,0 +1,369 @@
+<?xml version="1.0" ?>
+<!-- generated on 2026-04-13T18:01:15.797519-06:00 by Eclipse SUMO duarouter 1.26.0
+<duarouterConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/duarouterConfiguration.xsd">
+
+    <input>
+        <net-file value="./configurations/./maps/complex_grid1.net.xml"/>
+        <route-files value="trips.trips.xml"/>
+    </input>
+
+    <output>
+        <output-file value="./configurations/./rou/str_sumo_complex_grid1.rou.xml"/>
+    </output>
+
+    <time>
+        <begin value="0"/>
+        <end value="80.0"/>
+    </time>
+
+    <report>
+        <no-warnings value="true"/>
+        <ignore-errors value="true"/>
+        <no-step-log value="true"/>
+    </report>
+
+</duarouterConfiguration>
+-->
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+    
+	
+
+	<vehicle id="0" depart="0.00">
+		
+        
+		<route edges="-gneE20 -gneE16"/>
+		
+    
+	</vehicle>
+	<vehicle depart="0" id="31">
+		<route edges="-gneE15"/>
+	</vehicle>
+	<vehicle id="1" depart="2.66">
+		
+        
+		<route edges="gneE16 gneE17 -gneE9 -gneE12"/>
+		
+    
+	</vehicle>
+	<vehicle depart="4.0" id="32">
+		<route edges="-gneE12"/>
+	</vehicle>
+	<vehicle id="2" depart="5.32">
+		
+        
+		<route edges="gneE10 -gneE21 -gneE20 -gneE19 -gneE18 -gneE24"/>
+		
+    
+	</vehicle>
+	<vehicle id="3" depart="7.98">
+		
+        
+		<route edges="-gneE11 -gneE21 -gneE20 -gneE19 -gneE18 gneE1"/>
+		
+    
+	</vehicle>
+	<vehicle depart="8.0" id="33">
+		<route edges="gneE5"/>
+	</vehicle>
+	<vehicle id="4" depart="10.64">
+		
+        
+		<route edges="-gneE10 -gneE9 -gneE5 -gneE4"/>
+		
+    
+	</vehicle>
+	<vehicle depart="12.0" id="34">
+		<route edges="gneE2"/>
+	</vehicle>
+	<vehicle id="5" depart="13.30">
+		
+        
+		<route edges="-gneE11 -gneE10 -gneE14"/>
+		
+    
+	</vehicle>
+	<vehicle id="6" depart="15.96">
+		
+        
+		<route edges="-gneE4 gneE12 gneE9 -gneE17 gneE20"/>
+		
+    
+	</vehicle>
+	<vehicle depart="16.0" id="35">
+		<route edges="gneE2"/>
+	</vehicle>
+	<vehicle id="7" depart="18.62">
+		
+        
+		<route edges="-gneE14 gneE16 -gneE19"/>
+		
+    
+	</vehicle>
+	<vehicle depart="20.0" id="36">
+		<route edges="-gneE15"/>
+	</vehicle>
+	<vehicle id="8" depart="21.28">
+		
+        
+		<route edges="gneE15 gneE14 -gneE9 -gneE12 gneE4 gneE5"/>
+		
+    
+	</vehicle>
+	<vehicle id="9" depart="23.94">
+		
+        
+		<route edges="gneE12 -gneE5 -gneE4 -gneE3"/>
+		
+    
+	</vehicle>
+	<vehicle depart="24.0" id="37">
+		<route edges="-gneE12"/>
+	</vehicle>
+	<vehicle id="10" depart="26.60">
+		
+        
+		<route edges="gneE9 -gneE17 gneE20 gneE21 -gneE10"/>
+		
+    
+	</vehicle>
+	<vehicle depart="28.0" id="38">
+		<route edges="-gneE12"/>
+	</vehicle>
+	<vehicle id="11" depart="29.26">
+		
+        
+		<route edges="gneE22 gneE14 gneE10 -gneE21 -gneE20"/>
+		
+    
+	</vehicle>
+	<vehicle id="12" depart="31.92">
+		
+        
+		<route edges="-gneE15"/>
+		
+    
+	</vehicle>
+	<vehicle depart="32.0" id="39">
+		<route edges="-gneE19"/>
+	</vehicle>
+	<vehicle id="13" depart="34.58">
+		
+        
+		<route edges="-gneE20 -gneE19 gneE22 gneE16 gneE20"/>
+		
+    
+	</vehicle>
+	<vehicle depart="36.0" id="40">
+		<route edges="gneE9"/>
+	</vehicle>
+	<vehicle id="14" depart="37.24">
+		
+        
+		<route edges="-gneE16 gneE14 gneE10 gneE11"/>
+		
+    
+	</vehicle>
+	<vehicle id="15" depart="39.90">
+		
+        
+		<route edges="gneE16 -gneE19 -gneE18 -gneE24"/>
+		
+    
+	</vehicle>
+	<vehicle depart="40.0" id="41">
+		<route edges="-gneE16"/>
+	</vehicle>
+	<vehicle id="16" depart="42.56">
+		
+        
+		<route edges="gneE10 -gneE21 -gneE20 gneE17 -gneE9 -gneE12"/>
+		
+    
+	</vehicle>
+	<vehicle depart="44.0" id="42">
+		<route edges="-gneE12"/>
+	</vehicle>
+	<vehicle id="17" depart="45.22">
+		
+        
+		<route edges="-gneE11 -gneE21 -gneE20 -gneE19 -gneE18"/>
+		
+    
+	</vehicle>
+	<vehicle id="18" depart="47.88">
+		
+        
+		<route edges="gneE17 -gneE9 -gneE5 -gneE4"/>
+		
+    
+	</vehicle>
+	<vehicle depart="48.0" id="43">
+		<route edges="-gneE12"/>
+	</vehicle>
+	<vehicle id="19" depart="50.54">
+		
+        
+		<route edges="-gneE20 -gneE16 -gneE15 gneE2 gneE3 gneE12"/>
+		
+    
+	</vehicle>
+	<vehicle depart="52.0" id="44">
+		<route edges="gneE16"/>
+	</vehicle>
+	<vehicle id="20" depart="53.20">
+		
+        
+		<route edges="-gneE5 -gneE4 gneE12 gneE9 gneE10 -gneE21 -gneE20"/>
+		
+    
+	</vehicle>
+	<vehicle id="21" depart="55.86">
+		
+        
+		<route edges="gneE20 gneE21 -gneE10 -gneE14 gneE16 gneE17"/>
+		
+    
+	</vehicle>
+	<vehicle depart="56.0" id="45">
+		<route edges="-gneE15"/>
+	</vehicle>
+	<vehicle id="22" depart="58.52">
+		
+        
+		<route edges="-gneE18 gneE1 gneE15 gneE14 gneE10 gneE11"/>
+		
+    
+	</vehicle>
+	<vehicle depart="60.0" id="46">
+		<route edges="-gneE14"/>
+	</vehicle>
+	<vehicle id="23" depart="61.18">
+		
+        
+		<route edges="gneE1 gneE15 gneE16 -gneE19 gneE22"/>
+		
+    
+	</vehicle>
+	<vehicle id="24" depart="63.84">
+		
+        
+		<route edges="gneE19 gneE17 gneE10 -gneE21 -gneE20"/>
+		
+    
+	</vehicle>
+	<vehicle depart="64.0" id="47">
+		<route edges="-gneE15"/>
+	</vehicle>
+	<vehicle id="25" depart="66.50">
+		
+        
+		<route edges="gneE9 -gneE14 -gneE15"/>
+		
+    
+	</vehicle>
+	<vehicle depart="68.0" id="48">
+		<route edges="gneE2"/>
+	</vehicle>
+	<vehicle id="26" depart="69.16">
+		
+        
+		<route edges="-gneE4 -gneE3 -gneE2 -gneE1 gneE18 gneE19"/>
+		
+    
+	</vehicle>
+	<vehicle id="27" depart="71.82">
+		
+        
+		<route edges="-gneE15 -gneE1 gneE18 gneE19 gneE17 -gneE9"/>
+		
+    
+	</vehicle>
+	<vehicle depart="72.0" id="49">
+		<route edges="-gneE12"/>
+	</vehicle>
+	<vehicle id="28" depart="74.48">
+		
+        
+		<route edges="-gneE10 -gneE14 gneE16"/>
+		
+    
+	</vehicle>
+	<vehicle depart="76.0" id="50">
+		<route edges="-gneE11"/>
+	</vehicle>
+	<vehicle id="29" depart="77.14">
+		
+        
+		<route edges="gneE2 gneE3 gneE12 gneE9 gneE10 gneE11"/>
+		
+    
+	</vehicle>
+	<vehicle id="30" depart="79.80">
+		
+        
+		<route edges="gneE24 gneE1 gneE15 gneE14 gneE10 -gneE21"/>
+		
+    
+	</vehicle>
+</routes>
