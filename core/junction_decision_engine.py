@@ -72,8 +72,10 @@ class JunctionDecisionEngine:
         self.lane_change_margin_m = 24.0
         self.commit_min_distance = 14.0
         self.default_fragment_horizon_m = 180.0
-        self.pending_timeout_steps = 18
-        self.lane_change_defer_limit = 4
+        self.pending_timeout_steps = 6
+        self.lane_change_defer_limit = 1
+        self.pending_stagnation_steps = 3
+        self.pending_min_progress_m = 6.0
 
     def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
         if snapshot is not None:
@@ -198,6 +200,50 @@ class JunctionDecisionEngine:
         if blocked_action is None:
             return candidates
         return [a for a in candidates if a != blocked_action] or candidates
+
+    def should_prioritize_lane_feasible_now(
+        self,
+        context: DecisionContext,
+        pending_age: int = 0,
+        alignment_improving: bool = True,
+        heavy_traffic: bool = False,
+    ) -> bool:
+        if not context.lane_feasible_now_actions:
+            return False
+        near_commit = bool(context.commit_window) or (context.dist_to_end <= (self.commit_min_distance + self.lane_change_margin_m))
+        aged_pending = int(pending_age) >= int(max(self.lane_change_defer_limit, 1))
+        return bool(near_commit or heavy_traffic or (not alignment_improving) or aged_pending)
+
+    def should_cancel_pending_early(
+        self,
+        pending: PendingDecision,
+        context: DecisionContext,
+        step: int,
+    ) -> bool:
+        if context.edge_id != pending.decision_edge:
+            return False
+        if not context.lane_feasible_now_actions:
+            return False
+        pending_age = self.pending_age_steps(pending, step)
+        if pending_age < self.pending_stagnation_steps:
+            return False
+        prev_lane_idx = pending.metadata.get("last_lane_index")
+        prev_shift = pending.metadata.get("last_required_shift")
+        prev_dist = pending.metadata.get("last_dist_to_end")
+        curr_shift = context.required_lane_shift.get(pending.intended_action, 999)
+        if curr_shift <= 0:
+            return False
+        lane_progress = False
+        if prev_lane_idx is not None and prev_shift is not None and int(prev_shift) < 999:
+            lane_progress = abs(curr_shift) < abs(int(prev_shift))
+            if int(context.lane_index) != int(prev_lane_idx):
+                lane_progress = True
+        road_progress = (
+            prev_dist is not None
+            and (float(prev_dist) - float(context.dist_to_end)) >= max(0.5, 0.25 * float(context.speed))
+        )
+        running_out_of_road = bool(context.commit_window) or (context.dist_to_end <= (self.commit_min_distance + self.lane_change_margin_m))
+        return (not lane_progress) and (not road_progress) and running_out_of_road
 
     def try_request_lane_change(self, context: DecisionContext, action_idx: int, duration: int = 70) -> Tuple[bool, bool]:
         direction = self.direction_choices[action_idx]
