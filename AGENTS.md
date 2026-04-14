@@ -44,3 +44,31 @@
 - Correlation between `pending_decision_timeouts` and `completion_rate` over rolling windows (ensure timeout recovery helps finish rate).
 - Whether `lane_change_defer_limit` and `pending_timeout_steps` need per-network tuning for high-speed edges.
 - Distribution of fallback actions to confirm controller is not over-collapsing to a single lane-feasible direction.
+
+## Execution-aware pending/fallback policy (updated April 14, 2026)
+
+- Strategic choice opening remains broad in `build_context()`:
+  - `available_actions`, `forced_action`, `branch_with_choice`, and `is_decision_open()` keep branch points visible to policy selection.
+- Conservatism is applied **after** action selection:
+  - Policy still selects over `context.available_actions`.
+  - Execution-aware fallback/cancel only triggers when a chosen action is lane-change constrained or pending execution stalls.
+- Pending cancellation is based on **non-progress signals**, not age alone:
+  - same `decision_edge`,
+  - minimum pending age,
+  - action still not lane-feasible-now,
+  - no lane-alignment improvement,
+  - shrinking remaining distance reduces maneuver executability.
+- Lower defer/timeout behavior:
+  - `lane_change_defer_limit` default lowered to `1`.
+  - `pending_timeout_steps` lowered and made distance/speed aware through effective timeout logic.
+- Reward/learning rationale:
+  - Keep replay based on actual execution outcomes.
+  - Add explicit penalties for non-lane-feasible selections, fallback after defer/failure, and non-progress pending cancellation.
+- Post-run telemetry to monitor:
+  - `pending_decision_timeouts`
+  - `fallback_to_lane_feasible_now`
+  - `mean_pending_age`
+  - `deferred_lane_change_actions`
+  - `decision_pending_at_episode_end`
+  - `fail_timeout`
+  - fallback distribution by original action vs fallback action.
