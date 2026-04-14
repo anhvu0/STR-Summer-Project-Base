@@ -9,7 +9,7 @@ from collections import deque
 
 from xml.dom.minidom import parse
 import os
-from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision
+from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision, VehicleSnapshot
 from core.route_loop_safety import transition_signal, would_worsen_distance
 
 def parse_sumocfg(sumocfg_path):
@@ -32,6 +32,7 @@ class QLearningPolicy(RouteController):
         self._recent_edges = {}
         self._pending_decisions = {}
         self._lane_change_deferrals = {}
+        self._lane_change_cooldown = {}
         self._metrics = {
             "decisions": 0,
             "overrides": 0,
@@ -43,6 +44,14 @@ class QLearningPolicy(RouteController):
             "pending_decision_timeouts": 0,
             "fallback_to_lane_feasible_now": 0,
             "deferred_lane_change_actions": 0,
+            "lane_change_observe_started": 0,
+            "lane_change_observe_success": 0,
+            "lane_change_observe_abort_no_progress": 0,
+            "lane_change_observe_abort_commit_window": 0,
+            "same_edge_pending_released_no_progress": 0,
+            "cooldown_replans_blocked": 0,
+            "loop_override_count": 0,
+            "dead_end_reentry_override_count": 0,
         }
         self._last_metrics_snapshot = None
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
@@ -176,15 +185,43 @@ class QLearningPolicy(RouteController):
         if not pending:
             return
         step = int(traci.simulation.getTime())
+        snapshot = self._snapshot_vehicle(vid, vehicle.current_edge, step)
         if vehicle.current_edge == pending.decision_edge:
-            if self.decision_engine.should_timeout_pending(pending, step):
+            if snapshot is None:
+                return
+            context = self.decision_engine.build_context(str(vid), vehicle.current_edge, vehicle.destination, step, snapshot=snapshot)
+            if self.decision_engine.should_timeout_pending(pending, step, max_age_steps=self.decision_engine.pending_progress_timeout_steps):
                 self._pending_decisions.pop(vid, None)
                 self._metrics["pending_decision_timeouts"] += 1
+                self._metrics["same_edge_pending_released_no_progress"] += 1
+                self._lane_change_cooldown[(vid, vehicle.current_edge)] = step + self.decision_engine.cooldown_steps
+                return
+            if context.commit_window and pending.intended_action not in context.lane_feasible_now_actions:
+                self._pending_decisions.pop(vid, None)
+                self._metrics["same_edge_pending_released_no_progress"] += 1
+                self._lane_change_cooldown[(vid, vehicle.current_edge)] = step + self.decision_engine.cooldown_steps
                 return
             self._metrics["decision_committed_skips"] += 1
             return
         self._pending_decisions.pop(vid, None)
         self._lane_change_deferrals[vid] = 0
+
+    def _snapshot_vehicle(self, vid, edge_id, step):
+        try:
+            lane_id = traci.vehicle.getLaneID(vid)
+            lane_index = int(traci.vehicle.getLaneIndex(vid))
+            lane_position = float(traci.vehicle.getLanePosition(vid))
+            lane_length = float(traci.lane.getLength(lane_id))
+            lane_count = max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1)
+            speed = max(float(traci.vehicle.getSpeed(vid)), 0.0)
+            dist_to_end = max(lane_length - lane_position, 0.0)
+            return VehicleSnapshot(
+                vehicle_id=str(vid), step=int(step), edge_id=edge_id, lane_id=lane_id,
+                lane_index=lane_index, lane_count=lane_count, lane_position=lane_position,
+                lane_length=lane_length, dist_to_end=dist_to_end, speed=speed,
+            )
+        except traci.TraCIException:
+            return None
     #----------------------------------------------------------------------
 
 
@@ -209,12 +246,93 @@ class QLearningPolicy(RouteController):
             self._finalize_commitment(vehicle)
 
             if vid in self._pending_decisions:
-                # Keep commitment semantics aligned with training:
-                # one decision is open until the vehicle exits the decision edge.
+                pending = self._pending_decisions[vid]
+                phase = pending.metadata.get("phase", "route_pending")
+                if phase == "observe_lane_change":
+                    obs_snapshot = self._snapshot_vehicle(vid, start_edge, step)
+                    if obs_snapshot is None:
+                        continue
+                    obs_context = self.decision_engine.build_context(str(vid), start_edge, vehicle.destination, step, snapshot=obs_snapshot)
+                    status, reason = self.decision_engine.evaluate_lane_change_observation(
+                        pending.metadata, obs_context, pending.intended_action
+                    )
+                    if status == "continue":
+                        continue
+                    self._pending_decisions.pop(vid, None)
+                    if status == "success":
+                        self._metrics["lane_change_observe_success"] += 1
+                        context = obs_context
+                        action_idx = pending.intended_action
+                        selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
+                        if selected_next_edge is None:
+                            continue
+                        full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
+                            str(vid), start_edge, action_idx, vehicle.destination
+                        )
+                        if apply_error:
+                            self._metrics["overrides"] += 1
+                            continue
+                        self._pending_decisions[vid] = PendingDecision(
+                            state=None,
+                            intended_action=action_idx,
+                            intended_next_edge=committed_next_edge,
+                            decision_edge=start_edge,
+                            decision_step=step,
+                            last_credit_edge=start_edge,
+                            last_credit_step=step,
+                            destination=vehicle.destination,
+                            context=context,
+                            lane_change_requested=True,
+                            route_fragment=list(full_route[1:]) if full_route else [],
+                            metadata={"phase": "route_pending"},
+                        )
+                        continue
+                    if reason == "commit_window":
+                        self._metrics["lane_change_observe_abort_commit_window"] += 1
+                    else:
+                        self._metrics["lane_change_observe_abort_no_progress"] += 1
+                    self._lane_change_cooldown[(vid, start_edge)] = step + self.decision_engine.cooldown_steps
+                    fallback_actions = self.decision_engine.ranked_fallback_actions(
+                        context=obs_context,
+                        destination=vehicle.destination,
+                        recent_history=list(self._recent_edges.get(vid, deque(maxlen=self.loop_window))),
+                        blocked_action=pending.intended_action,
+                        distance_fn=self._dist_to_dest,
+                    )
+                    if not fallback_actions:
+                        continue
+                    action_idx = fallback_actions[0]
+                    selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
+                    if selected_next_edge is None:
+                        continue
+                    self._metrics["fallback_to_lane_feasible_now"] += 1
+                    full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
+                        str(vid), start_edge, action_idx, vehicle.destination
+                    )
+                    if apply_error:
+                        continue
+                    self._pending_decisions[vid] = PendingDecision(
+                        state=None,
+                        intended_action=action_idx,
+                        intended_next_edge=committed_next_edge,
+                        decision_edge=start_edge,
+                        decision_step=step,
+                        last_credit_edge=start_edge,
+                        last_credit_step=step,
+                        destination=vehicle.destination,
+                        context=obs_context,
+                        lane_change_requested=False,
+                        route_fragment=list(full_route[1:]) if full_route else [],
+                        metadata={"phase": "route_pending"},
+                    )
+                    continue
                 continue
 
             step = int(traci.simulation.getTime())
-            context = self.decision_engine.build_context(str(vid), start_edge, vehicle.destination, step)
+            snapshot = self._snapshot_vehicle(vid, start_edge, step)
+            if snapshot is None:
+                continue
+            context = self.decision_engine.build_context(str(vid), start_edge, vehicle.destination, step, snapshot=snapshot)
 
             # Skip non-meaningful junction points; apply forced action directly.
             if context.forced_action is not None:
@@ -229,39 +347,69 @@ class QLearningPolicy(RouteController):
             if action_idx not in context.available_actions:
                 self._metrics["impossible_action_overrides"] += 1
                 continue
+            recent = list(self._recent_edges.get(vid, deque(maxlen=self.loop_window)))
+            safe_ok, signal = self.decision_engine.prefilter_action_for_loops(
+                context=context,
+                action_idx=action_idx,
+                destination=vehicle.destination,
+                recent_history=recent,
+                distance_fn=self._dist_to_dest,
+                distance_slack=self.score_slack,
+            )
+            if not safe_ok:
+                self._metrics["loop_override_count"] += 1
+                if signal.get("dead_end_reentry"):
+                    self._metrics["dead_end_reentry_override_count"] += 1
+                fallback_actions = self.decision_engine.ranked_fallback_actions(
+                    context=context,
+                    destination=vehicle.destination,
+                    recent_history=recent,
+                    blocked_action=action_idx,
+                    distance_fn=self._dist_to_dest,
+                )
+                if not fallback_actions:
+                    continue
+                action_idx = self.act(state, available_actions=fallback_actions) if context.forced_action is None else fallback_actions[0]
 
             selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
             if selected_next_edge is None:
                 continue
 
-            lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action_idx)
-            if lane_change_requested:
-                if lane_change_ok:
-                    self._metrics["deferred_lane_change_actions"] += 1
-                    self._lane_change_deferrals[vid] = self._lane_change_deferrals.get(vid, 0) + 1
-                    if self._lane_change_deferrals[vid] < self.decision_engine.lane_change_defer_limit:
-                        continue
-                    fallback_actions = self.decision_engine.lane_feasible_fallback_actions(context, blocked_action=action_idx)
+            lane_change_requested = False
+            if action_idx not in context.lane_feasible_now_actions:
+                cooldown_until = self._lane_change_cooldown.get((vid, start_edge), -1)
+                if step < cooldown_until:
+                    self._metrics["cooldown_replans_blocked"] += 1
+                    fallback_actions = self.decision_engine.ranked_fallback_actions(
+                        context=context,
+                        destination=vehicle.destination,
+                        recent_history=recent,
+                        blocked_action=action_idx,
+                        distance_fn=self._dist_to_dest,
+                    )
                     if not fallback_actions:
                         continue
-                    state = self.getState(vid, start_edge, vehicle.destination, context=context)
-                    action_idx = self.act(state, available_actions=fallback_actions)
-                    selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
-                    if selected_next_edge is None:
-                        continue
-                    self._metrics["fallback_to_lane_feasible_now"] += 1
+                    action_idx = fallback_actions[0]
                 else:
-                    fallback_actions = self.decision_engine.lane_feasible_fallback_actions(context, blocked_action=action_idx)
-                    if not fallback_actions:
-                        continue
-                    state = self.getState(vid, start_edge, vehicle.destination, context=context)
-                    action_idx = self.act(state, available_actions=fallback_actions)
-                    selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
-                    if selected_next_edge is None:
-                        continue
-                    self._metrics["fallback_to_lane_feasible_now"] += 1
-            else:
-                self._lane_change_deferrals[vid] = 0
+                    lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action_idx)
+                    observe_meta = self.decision_engine.start_lane_change_observe(context, action_idx, step, lane_change_requested, lane_change_ok)
+                    self._pending_decisions[vid] = PendingDecision(
+                        state=None,
+                        intended_action=action_idx,
+                        intended_next_edge=selected_next_edge,
+                        decision_edge=start_edge,
+                        decision_step=step,
+                        last_credit_edge=start_edge,
+                        last_credit_step=step,
+                        destination=vehicle.destination,
+                        context=context,
+                        lane_change_requested=lane_change_requested,
+                        route_fragment=[],
+                        metadata=observe_meta,
+                    )
+                    self._metrics["lane_change_observe_started"] += 1
+                    self._metrics["deferred_lane_change_actions"] += 1
+                    continue
 
             full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
                 str(vid),
@@ -290,6 +438,7 @@ class QLearningPolicy(RouteController):
                     context=context,
                     lane_change_requested=lane_change_requested,
                     route_fragment=list(full_route[1:]) if full_route else [],
+                    metadata={"phase": "route_pending"},
                 )
                 self._lane_change_deferrals[vid] = 0
             # Route already committed directly via shared apply_route_decision.
