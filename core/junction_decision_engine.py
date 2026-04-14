@@ -72,8 +72,11 @@ class JunctionDecisionEngine:
         self.lane_change_margin_m = 24.0
         self.commit_min_distance = 14.0
         self.default_fragment_horizon_m = 180.0
-        self.pending_timeout_steps = 18
-        self.lane_change_defer_limit = 4
+        self.pending_timeout_steps = 6
+        self.lane_change_defer_limit = 2
+        self.change_lane_duration_steps = 20
+        self.low_speed_lane_change_threshold = 1.25
+        self.commit_window_hold_buffer_m = 6.0
 
     def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
         if snapshot is not None:
@@ -134,6 +137,8 @@ class JunctionDecisionEngine:
         commit_window = dist_to_end <= commit_distance
 
         available = []
+        commit_near = dist_to_end <= (commit_distance + self.commit_window_hold_buffer_m)
+        reaction_consumed = dist_to_end < reaction_distance
         if commit_window:
             available = list(lane_now)
         else:
@@ -143,7 +148,15 @@ class JunctionDecisionEngine:
                     available.append(idx)
                     continue
                 shift = required_shift.get(idx, 999)
-                if shift < 999 and lane_change_budget >= shift * self.lane_change_margin_m and dist_to_end >= reaction_distance:
+                if shift >= 999:
+                    continue
+                if speed <= self.low_speed_lane_change_threshold and shift > 1:
+                    continue
+                if commit_near and shift > 0:
+                    continue
+                if reaction_consumed and shift > 1:
+                    continue
+                if lane_change_budget >= shift * self.lane_change_margin_m and dist_to_end >= reaction_distance:
                     available.append(idx)
 
         available = sorted(set(available))
@@ -199,7 +212,8 @@ class JunctionDecisionEngine:
             return candidates
         return [a for a in candidates if a != blocked_action] or candidates
 
-    def try_request_lane_change(self, context: DecisionContext, action_idx: int, duration: int = 70) -> Tuple[bool, bool]:
+    def try_request_lane_change(self, context: DecisionContext, action_idx: int, duration: Optional[int] = None) -> Tuple[bool, bool]:
+        duration = self.change_lane_duration_steps if duration is None else int(duration)
         direction = self.direction_choices[action_idx]
         lane_now_map = self.connection_info.lane_outgoing_edges_dict.get(context.lane_id, {})
         if direction in lane_now_map:
@@ -220,6 +234,72 @@ class JunctionDecisionEngine:
             return True, True
         except traci.TraCIException:
             return True, False
+
+    def lane_change_attempt_state(self, context: DecisionContext, action_idx: int, step: int) -> Dict[str, object]:
+        required_shift = int(context.required_lane_shift.get(action_idx, 0 if action_idx in context.lane_feasible_now_actions else 999))
+        return {
+            "action_idx": int(action_idx),
+            "decision_edge": context.edge_id,
+            "start_step": int(step),
+            "last_lane_index": int(context.lane_index),
+            "same_lane_steps": 0,
+            "last_required_shift": required_shift,
+            "required_shift_non_decrease_steps": 0,
+            "last_dist_to_end": float(context.dist_to_end),
+            "dist_shrinking_steps": 0,
+            "low_speed_steps": 1 if float(context.speed) < self.low_speed_lane_change_threshold else 0,
+        }
+
+    def update_lane_change_attempt(self, attempt: Dict[str, object], context: DecisionContext) -> Dict[str, object]:
+        lane_index = int(context.lane_index)
+        prev_lane_index = int(attempt.get("last_lane_index", lane_index))
+        if lane_index == prev_lane_index:
+            attempt["same_lane_steps"] = int(attempt.get("same_lane_steps", 0)) + 1
+        else:
+            attempt["same_lane_steps"] = 0
+        attempt["last_lane_index"] = lane_index
+
+        action_idx = int(attempt.get("action_idx", -1))
+        required_shift = int(context.required_lane_shift.get(action_idx, 0 if action_idx in context.lane_feasible_now_actions else 999))
+        prev_shift = int(attempt.get("last_required_shift", required_shift))
+        if required_shift >= prev_shift:
+            attempt["required_shift_non_decrease_steps"] = int(attempt.get("required_shift_non_decrease_steps", 0)) + 1
+        else:
+            attempt["required_shift_non_decrease_steps"] = 0
+        attempt["last_required_shift"] = required_shift
+
+        dist_to_end = float(context.dist_to_end)
+        prev_dist = float(attempt.get("last_dist_to_end", dist_to_end))
+        if dist_to_end < prev_dist:
+            attempt["dist_shrinking_steps"] = int(attempt.get("dist_shrinking_steps", 0)) + 1
+        else:
+            attempt["dist_shrinking_steps"] = 0
+        attempt["last_dist_to_end"] = dist_to_end
+
+        if float(context.speed) < self.low_speed_lane_change_threshold:
+            attempt["low_speed_steps"] = int(attempt.get("low_speed_steps", 0)) + 1
+        else:
+            attempt["low_speed_steps"] = 0
+        return attempt
+
+    def evaluate_lane_change_attempt(self, attempt: Dict[str, object], context: DecisionContext, step: int) -> Tuple[bool, Optional[str]]:
+        action_idx = int(attempt.get("action_idx", -1))
+        age = max(int(step) - int(attempt.get("start_step", step)), 0)
+        if action_idx in context.lane_feasible_now_actions:
+            return True, "target_lane_reached_before_commit"
+        if context.commit_window:
+            return True, "commit_window_forced_fallback"
+        if age >= max(self.lane_change_defer_limit, 1):
+            return True, "lane_change_short_wait_expired"
+        if int(attempt.get("same_lane_steps", 0)) >= 2:
+            return True, "lane_index_stalled"
+        if int(attempt.get("required_shift_non_decrease_steps", 0)) >= 2:
+            return True, "required_lane_shift_not_decreasing"
+        if int(attempt.get("low_speed_steps", 0)) >= 2 and int(attempt.get("required_shift_non_decrease_steps", 0)) >= 1:
+            return True, "low_speed_stall"
+        if int(attempt.get("dist_shrinking_steps", 0)) >= 2 and int(attempt.get("last_required_shift", 0)) > 0:
+            return True, "dist_to_end_shrinking_without_lane_progress"
+        return False, None
 
     def get_next_edge(self, edge_id: str, action_idx: int) -> Optional[str]:
         outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
