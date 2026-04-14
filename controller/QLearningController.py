@@ -1,393 +1,166 @@
-from controller.RouteController import RouteController
-from core.Util import ConnectionInfo, Vehicle
-from keras.models import load_model
-import numpy as np
-import traci
-import sumolib
-import math
-from collections import deque
+"""Inference policy aligned with RL training semantics."""
+
+from __future__ import annotations
+
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from typing import Deque, Dict, List, Optional
 
 from xml.dom.minidom import parse
 import os
-from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision
-from core.route_loop_safety import transition_signal, would_worsen_distance
 
-def parse_sumocfg(sumocfg_path):
+import numpy as np
+import sumolib
+import traci
+from keras.models import load_model
+
+from controller.RouteController import RouteController
+from core.junction_decision_engine import DecisionContext, JunctionDecisionEngine, PendingDecision
+
+
+def parse_sumocfg(sumocfg_path: str) -> str:
     dom = parse(sumocfg_path)
-    net_file = dom.getElementsByTagName('net-file')[0].attributes['value'].nodeValue
+    net_file = dom.getElementsByTagName("net-file")[0].attributes["value"].nodeValue
     return os.path.join(os.path.dirname(sumocfg_path), net_file)
-net_path = parse_sumocfg("./configurations/myconfig.sumocfg")
+
+
+DEFAULT_NET_PATH = parse_sumocfg("./configurations/myconfig.sumocfg")
+
+
+@dataclass
+class VehicleDecisionState:
+    recent_edges: Deque[str]
+    interventions: int = 0
 
 
 class QLearningPolicy(RouteController):
-    def __init__(self, vehicles, connection_info, model_file, net_xml_file = net_path):
+    """Run-time routing policy using the shared junction ranking engine."""
+
+    def __init__(self, vehicles, connection_info, model_file, net_xml_file=DEFAULT_NET_PATH):
         super().__init__(connection_info)
-        self.model = load_model(model_file)
-        self.model_state_size = int(self.model.input_shape[-1])
         self.vehicles = vehicles
+        self.model = load_model(model_file)
+        self.state_size = int(self.model.input_shape[-1])
         self.net = sumolib.net.readNet(net_xml_file)
-        self.decision_engine = JunctionDecisionEngine(connection_info, self.net, self.direction_choices)
-        self._visit_count = {}
-        self._best_dist = {}
-        self._recent_edges = {}
-        self._pending_decisions = {}
-        self._lane_change_deferrals = {}
-        self._metrics = {
-            "decisions": 0,
-            "overrides": 0,
-            "loop_overrides": 0,
-            "distance_overrides": 0,
-            "impossible_action_overrides": 0,
-            "deadend_overrides": 0,
-            "decision_committed_skips": 0,
-            "pending_decision_timeouts": 0,
-            "fallback_to_lane_feasible_now": 0,
-            "deferred_lane_change_actions": 0,
-        }
-        self._last_metrics_snapshot = None
-        # Cache for shortest-path distances (edge_id, dest_id) -> cost
-        # How many actions to plan ahead each time
-        self.decision_horizon = 1
-        self.loop_window = 10
-        self.loop_repeat_threshold = 2
-        self.score_slack = 30.0
-        self.deadline_deficit_override_slack = 2.0
-        self.distance_tiebreak_scale = 0.05
-        self.edge_embedding_dim = 8
-        self.local_congestion_k = 6
-        self.compact_state_size = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 3 + self.local_congestion_k
-        self.legacy_state_size = 2 + 6 + 3 + 3 + len(self.connection_info.edge_list)
-        self.use_compact_state = (self.model_state_size == self.compact_state_size)
-        self.direction_mask_start = (2 * self.edge_embedding_dim) if self.use_compact_state else 2
-        self._init_edge_embeddings(seed=1337)
+        self.engine = JunctionDecisionEngine(connection_info, self.net, self.direction_choices)
+        self.pending: Dict[str, PendingDecision] = {}
+        self.vstate: Dict[str, VehicleDecisionState] = {}
+        self.distance_cache: Dict[tuple[str, str], float] = {}
+        self.metrics = defaultdict(int)
 
-    def _init_edge_embeddings(self, seed=1337):
-        rng = np.random.default_rng(seed)
-        self._edge_embeddings = {}
-        for edge_id in self.connection_info.edge_list:
-            emb = rng.normal(loc=0.0, scale=0.1, size=self.edge_embedding_dim).astype(np.float32)
-            self._edge_embeddings[edge_id] = emb
+    def _ensure_vstate(self, vehicle_id: str) -> VehicleDecisionState:
+        if vehicle_id not in self.vstate:
+            self.vstate[vehicle_id] = VehicleDecisionState(recent_edges=deque(maxlen=12))
+        return self.vstate[vehicle_id]
 
-    def _get_edge_embedding(self, edge_id):
-        return self._edge_embeddings.get(
-            edge_id,
-            np.zeros(self.edge_embedding_dim, dtype=np.float32),
+    def _state_vector(self, context: DecisionContext, remaining_eta_norm: float) -> np.ndarray:
+        edge_mask, lane_mask, reachable_mask = self.engine.direction_masks(context)
+        lane_idx_norm = context.lane_index / max(context.lane_count - 1, 1)
+        lane_count_norm = min(context.lane_count, 6) / 6.0
+        dist_to_end_norm = min(context.dist_to_end, 150.0) / 150.0
+
+        current_density = traci.edge.getLastStepVehicleNumber(context.edge_id) / max(
+            self.connection_info.edge_length_dict.get(context.edge_id, 10.0), 10.0
         )
-
-    def _local_congestion_features(self, edge_id):
-        lengths = self.connection_info.edge_length_dict
-        current_density = traci.edge.getLastStepVehicleNumber(edge_id) / max(lengths.get(edge_id, 5.0), 5.0)
-        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
-        outgoing_densities = [
-            traci.edge.getLastStepVehicleNumber(next_edge) / max(lengths.get(next_edge, 5.0), 5.0)
-            for next_edge in outgoing.values()
+        outgoing = self.connection_info.outgoing_edges_dict.get(context.edge_id, {})
+        outgoing_density = [
+            traci.edge.getLastStepVehicleNumber(e) / max(self.connection_info.edge_length_dict.get(e, 10.0), 10.0)
+            for e in outgoing.values()
         ]
+        mean_out = float(np.mean(outgoing_density)) if outgoing_density else current_density
+        max_out = float(np.max(outgoing_density)) if outgoing_density else current_density
 
-        all_densities = [
-            traci.edge.getLastStepVehicleNumber(edge) / max(lengths.get(edge, 5.0), 5.0)
-            for edge in self.connection_info.edge_list
+        # Compact edge id embeddings compatible with old models that used indices.
+        edge_idx = self.connection_info.edge_index_dict.get(context.edge_id, 0)
+        dest_idx = self.connection_info.edge_index_dict.get(context.destination, 0)
+        max_idx = max(len(self.connection_info.edge_index_dict), 1)
+
+        vec = [
+            edge_idx / max_idx,
+            dest_idx / max_idx,
+            *edge_mask,
+            *lane_mask,
+            *reachable_mask,
+            lane_idx_norm,
+            lane_count_norm,
+            dist_to_end_norm,
+            float(np.clip(remaining_eta_norm, 0.0, 1.5)),
+            float(current_density),
+            float(mean_out),
+            float(max_out),
         ]
-        mean_global = float(np.mean(all_densities)) if len(all_densities) > 0 else 0.0
-        std_global = float(np.std(all_densities)) if len(all_densities) > 0 else 0.0
-        mean_out = float(np.mean(outgoing_densities)) if outgoing_densities else current_density
-        max_out = float(np.max(outgoing_densities)) if outgoing_densities else current_density
-        min_out = float(np.min(outgoing_densities)) if outgoing_densities else current_density
+        vec = np.asarray(vec, dtype=np.float32)
+        if vec.shape[0] < self.state_size:
+            vec = np.pad(vec, (0, self.state_size - vec.shape[0]))
+        elif vec.shape[0] > self.state_size:
+            vec = vec[: self.state_size]
+        return vec.reshape(1, -1)
 
-        return [
-            current_density,
-            mean_out,
-            max_out,
-            min_out,
-            current_density - mean_global,
-            std_global,
-        ]
-
-
-    
-
-
-    def _compute_deadline_features(self, vehicle_id):
-        vehicle_obj = self.vehicles.get(str(vehicle_id))
-        if vehicle_obj is None:
-            return [0.0, 0.0, 0.0]
-
-        now = traci.simulation.getTime()
-        deadline_window = max(float(vehicle_obj.deadline) - float(vehicle_obj.start_time), 1.0)
-        time_left = max(float(vehicle_obj.deadline) - float(now), 0.0)
-        elapsed = max(float(now) - float(vehicle_obj.start_time), 0.0)
-        urgency = 1.0 - min(time_left / deadline_window, 1.0)
-
-        return [
-            min(time_left / deadline_window, 1.0),
-            min(elapsed / deadline_window, 1.0),
-            urgency,
-        ]
-
-    #-----------------------DEBUGGING-------------------------------------
-    def _dist_to_dest(self, edge_id, dest_id):
-        try:
-            from_edge = self.net.getEdge(edge_id)
-            to_edge = self.net.getEdge(dest_id)
-            path_edges, path_cost = self.net.getShortestPath(from_edge, to_edge, vClass="passenger")
-            if path_edges is None:
-                return float("inf")
-            return path_cost
-        except Exception:
-            return float("inf")
-
-    def _estimate_eta(self, edge_id, dest_id):
-        dist = self._dist_to_dest(edge_id, dest_id)
-        if not np.isfinite(dist):
-            return float("inf")
-        return float(dist) / 8.0
-
-    def _edge_out_degree(self, edge_id):
-        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
-        return len(outgoing)
-
-    def _action_safety_score(self, current_edge, next_edge, destination, recent_history):
-        edge_out_degree = {edge: self._edge_out_degree(edge) for edge in set(recent_history) | {next_edge}}
-        signals = transition_signal(recent_history, next_edge, edge_out_degree=edge_out_degree)
-        current_dist = self._dist_to_dest(current_edge, destination)
-        next_dist = self._dist_to_dest(next_edge, destination)
-        dist_worsen = would_worsen_distance(current_dist, next_dist, slack=self.score_slack)
-        trap_like = (
-            next_edge != destination
-            and self._edge_out_degree(next_edge) <= 1
-            and len(recent_history) > 0
-            and recent_history[-1] == current_edge
-        )
-        score = 0
-        if signals["short_cycle"]:
-            score += 5
-        if signals["aba_bounce"]:
-            score += 5
-        if signals["dead_end_reentry"]:
-            score += 3
-        if dist_worsen:
-            score += 2
-        if trap_like:
-            score += 4
-        return score, signals, dist_worsen, trap_like
-
-    def _finalize_commitment(self, vehicle):
-        vid = vehicle.vehicle_id
-        pending = self._pending_decisions.get(vid)
-        if not pending:
-            return
-        step = int(traci.simulation.getTime())
-        if vehicle.current_edge == pending.decision_edge:
-            if self.decision_engine.should_timeout_pending(pending, step):
-                self._pending_decisions.pop(vid, None)
-                self._metrics["pending_decision_timeouts"] += 1
-                return
-            self._metrics["decision_committed_skips"] += 1
-            return
-        self._pending_decisions.pop(vid, None)
-        self._lane_change_deferrals[vid] = 0
-    #----------------------------------------------------------------------
-
-
-    def make_decisions(self, vehicles, connection_info: ConnectionInfo):
-        local_targets = {}
-
-        if not hasattr(self, "_debug_net_checked"):
-            self._debug_net_checked = True
-            # print("[DEBUG] has self.net:", hasattr(self, "net"))
-            # print("[DEBUG] self.net type:", type(self.net))
-
-        for vehicle in vehicles:
-            start_edge = vehicle.current_edge
-            if vehicle.destination == start_edge:
-                continue
-
-            vid = vehicle.vehicle_id
-            if vid not in self._recent_edges:
-                self._recent_edges[vid] = deque(maxlen=self.loop_window)
-            self._visit_count.setdefault(vid, {})
-            self._best_dist.setdefault(vid, float("inf"))
-            self._finalize_commitment(vehicle)
-
-            if vid in self._pending_decisions:
-                # Keep commitment semantics aligned with training:
-                # one decision is open until the vehicle exits the decision edge.
-                continue
-
-            step = int(traci.simulation.getTime())
-            context = self.decision_engine.build_context(str(vid), start_edge, vehicle.destination, step)
-
-            # Skip non-meaningful junction points; apply forced action directly.
-            if context.forced_action is not None:
-                action_idx = context.forced_action
-            elif not self.decision_engine.is_decision_open(context):
-                continue
-            else:
-                state = self.getState(vid, start_edge, vehicle.destination, context=context)
-                action_idx = self.act(state, available_actions=context.available_actions)
-                self._metrics["decisions"] += 1
-
-            if action_idx not in context.available_actions:
-                self._metrics["impossible_action_overrides"] += 1
-                continue
-
-            selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
-            if selected_next_edge is None:
-                continue
-
-            lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action_idx)
-            if lane_change_requested:
-                if lane_change_ok:
-                    self._metrics["deferred_lane_change_actions"] += 1
-                    self._lane_change_deferrals[vid] = self._lane_change_deferrals.get(vid, 0) + 1
-                    if self._lane_change_deferrals[vid] < self.decision_engine.lane_change_defer_limit:
-                        continue
-                    fallback_actions = self.decision_engine.lane_feasible_fallback_actions(context, blocked_action=action_idx)
-                    if not fallback_actions:
-                        continue
-                    state = self.getState(vid, start_edge, vehicle.destination, context=context)
-                    action_idx = self.act(state, available_actions=fallback_actions)
-                    selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
-                    if selected_next_edge is None:
-                        continue
-                    self._metrics["fallback_to_lane_feasible_now"] += 1
-                else:
-                    fallback_actions = self.decision_engine.lane_feasible_fallback_actions(context, blocked_action=action_idx)
-                    if not fallback_actions:
-                        continue
-                    state = self.getState(vid, start_edge, vehicle.destination, context=context)
-                    action_idx = self.act(state, available_actions=fallback_actions)
-                    selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
-                    if selected_next_edge is None:
-                        continue
-                    self._metrics["fallback_to_lane_feasible_now"] += 1
-            else:
-                self._lane_change_deferrals[vid] = 0
-
-            full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
-                str(vid),
-                start_edge,
-                action_idx,
-                vehicle.destination,
-            )
-            if apply_error:
-                self._metrics["overrides"] += 1
-                continue
-
-            next_edge = committed_next_edge
-            if next_edge:
-                self._recent_edges[vid].append(next_edge)
-                self._visit_count[vid][next_edge] = self._visit_count[vid].get(next_edge, 0) + 1
-                self._best_dist[vid] = min(self._best_dist[vid], self._dist_to_dest(next_edge, vehicle.destination))
-                self._pending_decisions[vid] = PendingDecision(
-                    state=None,
-                    intended_action=action_idx,
-                    intended_next_edge=next_edge,
-                    decision_edge=start_edge,
-                    decision_step=step,
-                    last_credit_edge=start_edge,
-                    last_credit_step=step,
-                    destination=vehicle.destination,
-                    context=context,
-                    lane_change_requested=lane_change_requested,
-                    route_fragment=list(full_route[1:]) if full_route else [],
-                )
-                self._lane_change_deferrals[vid] = 0
-            # Route already committed directly via shared apply_route_decision.
-
-        if self._metrics["decisions"] > 0:
-            snapshot = (
-                self._metrics["decisions"],
-                self._metrics["overrides"],
-                self._metrics["loop_overrides"],
-                self._metrics["distance_overrides"],
-                self._metrics["impossible_action_overrides"],
-                self._metrics["deadend_overrides"],
-            )
-            if snapshot == self._last_metrics_snapshot:
-                return local_targets
-
-            self._last_metrics_snapshot = snapshot
-            ratio = self._metrics["overrides"] / float(self._metrics["decisions"])
-            # print(
-            #     "[Q-METRICS] decisions={} overrides={} override_ratio={:.2%} "
-            #     "loop_overrides={} distance_overrides={} impossible_action_overrides={}".format(
-            #         self._metrics["decisions"],
-            #         self._metrics["overrides"],
-            #         ratio,
-            #         self._metrics["loop_overrides"],
-            #         self._metrics["distance_overrides"],
-            #         self._metrics["impossible_action_overrides"],
-            #     )
-            # )
-
-        return local_targets
-
-
-
-
-    # this function reacheds the Neural Network trained before and let it make a decision for the situation now
-    def act(self, state, available_actions=None):
-        act_values = self.model.predict(state, verbose=0)[0]
-        if available_actions is None:
-            mask_start = self.direction_mask_start + 18 if self.use_compact_state else self.direction_mask_start
-            available = [i for i, v in enumerate(state[0][mask_start:mask_start + 6]) if v > 0.5]
-        else:
-            available = list(available_actions)
-        if not available:
-            return int(np.argmax(act_values))
-        masked = np.full_like(act_values, -1e9)
-        masked[available] = act_values[available]
+    def _pick_policy_action(self, state: np.ndarray, candidate_actions: List[int]) -> Optional[int]:
+        if not candidate_actions:
+            return None
+        q_values = self.model.predict(state, verbose=0)[0]
+        masked = np.full_like(q_values, -1e9)
+        masked[candidate_actions] = q_values[candidate_actions]
         return int(np.argmax(masked))
 
-    # this function gives the current state of the vehicle based on the state size
-    def getState(self, vehicle_id, edge_now, destination_edge, context=None):
-        en = edge_now
-        state = []
-        if self.use_compact_state:
-            state.extend(self._get_edge_embedding(en).tolist())
-            state.extend(self._get_edge_embedding(destination_edge).tolist())
-        else:
-            state.append(self.connection_info.edge_index_dict[en])
-            state.append(self.connection_info.edge_index_dict[destination_edge])
-        if context is None:
-            context = self.decision_engine.build_context(str(vehicle_id), en, destination_edge, int(traci.simulation.getTime()))
-        edge_mask, lane_mask, reach_mask, avail_mask = self.decision_engine.direction_masks(context)
-        if self.use_compact_state:
-            state.extend(edge_mask)
-            state.extend(lane_mask)
-            state.extend(reach_mask)
-            state.extend(avail_mask)
-            state.append(1.0 if context.commit_window else 0.0)
-        else:
-            for c in self.direction_choices:
-                state.append(1 if c in self.connection_info.outgoing_edges_dict[en].keys() else 0)
-        # put the congestion ratio of all edges into the state.
+    def make_decisions(self, vehicles, connection_info):
+        del connection_info
+        for vehicle in vehicles:
+            vid = str(vehicle.vehicle_id)
+            if vehicle.current_edge == vehicle.destination:
+                continue
 
-        lane_idx_norm = 0.0
-        lane_count_norm = 0.0
-        dist_to_end_norm = 0.0
-        try:
-            lane_idx = context.lane_index
-            lane_count = max(context.lane_count, 1)
-            dist_to_end = max(context.dist_to_end, 0.0)
+            vstate = self._ensure_vstate(vid)
+            vstate.recent_edges.append(vehicle.current_edge)
 
-            lane_idx_norm = lane_idx / max(lane_count - 1, 1)
-            lane_count_norm = min(lane_count, 6) / 6.0
-            dist_to_end_norm = min(dist_to_end, 200.0) / 200.0
-        except traci.TraCIException:
-            # Vehicle may have arrived/teleported between steps. Keep neutral defaults.
-            pass
+            pending = self.pending.get(vid)
+            if pending and vehicle.current_edge == pending.decision_edge:
+                continue
+            if pending:
+                self.pending.pop(vid, None)
 
-        state.extend([lane_idx_norm, lane_count_norm, dist_to_end_norm])
-        state.extend(self._compute_deadline_features(vehicle_id))
+            step = int(traci.simulation.getTime())
+            context = self.engine.build_context(vid, vehicle.current_edge, vehicle.destination, step)
+            ranked = self.engine.rank_actions(context, vstate.recent_edges, self.distance_cache)
+            if not ranked:
+                self.metrics["unreachable"] += 1
+                continue
 
-        if self.use_compact_state:
-            state.extend(self._local_congestion_features(en))
-        else:
-            for edge_now in self.connection_info.edge_list:
-                car_num = traci.edge.getLastStepVehicleNumber(edge_now)
-                density = car_num / self.connection_info.edge_length_dict[edge_now]
-                state.append(density)
+            safe_candidates = [c.action_idx for c in ranked if c.loop_risk <= 6.0 and c.trap_risk <= 3.0]
+            remaining_eta_norm = self.engine._estimate_eta(vehicle.current_edge, vehicle.destination) / 400.0
+            state = self._state_vector(context, remaining_eta_norm)
 
-        state = np.reshape(state, [1, len(state)])
-        return state
+            chosen = self._pick_policy_action(state, safe_candidates)
+            ranked_map = {r.action_idx: r for r in ranked}
+            selected = ranked_map.get(chosen) if chosen is not None else None
+            if selected is None or selected.total_score < -5.0:
+                selected = self.engine.fallback_action(ranked, context)
+                self.metrics["fallback_used"] += 1
+                if selected is None:
+                    self.metrics["trapped_loop"] += 1
+                    continue
+
+            _, next_edge, err = self.engine.apply_route_decision(vid, vehicle.current_edge, selected.action_idx, vehicle.destination)
+            if err:
+                fallback = self.engine.fallback_action(ranked, context)
+                if fallback is None:
+                    self.metrics["route_apply_failure"] += 1
+                    continue
+                _, next_edge, err = self.engine.apply_route_decision(vid, vehicle.current_edge, fallback.action_idx, vehicle.destination)
+                self.metrics["fallback_apply"] += 1
+                if err:
+                    self.metrics["route_apply_failure"] += 1
+                    continue
+
+            self.pending[vid] = PendingDecision(
+                state=state,
+                action=selected.action_idx,
+                decision_edge=vehicle.current_edge,
+                intended_next_edge=next_edge,
+                decision_step=step,
+                destination=vehicle.destination,
+            )
+            self.metrics["decisions"] += 1
+
+        return {}
