@@ -672,6 +672,60 @@ class RLTrainingPipeline:
     def valid_actions_for_vehicle(self, vehicle_id, edge_id, destination_edge, step):
         context = self.decision_engine.build_context(vehicle_id, edge_id, destination_edge, step)
         return context.available_actions
+
+    def _policy_action_candidates(self, context, recent_history, cooldown_active, destination):
+        """
+        Build a stricter action subset for policy selection only.
+        NOTE:
+        - context.available_actions remains the full safety/feasibility action set.
+        - fallback machinery still relies on available_actions and ranked fallback behavior.
+        """
+        available_actions = list(context.available_actions)
+        if not available_actions:
+            return []
+
+        policy_actions = []
+        lane_now = set(context.lane_feasible_now_actions)
+        recent_history = list(recent_history or [])
+
+        commit_distance = max(
+            float(self.decision_engine.commit_min_distance),
+            float(context.speed) * float(self.decision_engine.commit_time_s),
+        )
+        extra_buffer = max(10.0, 0.5 * float(self.decision_engine.lane_change_margin_m))
+        comfortable_dist_threshold = commit_distance + extra_buffer
+
+        for action in available_actions:
+            if action in lane_now:
+                policy_actions.append(action)
+                continue
+
+            if cooldown_active:
+                continue
+            if context.commit_window:
+                continue
+            if float(context.speed) < 1.2:
+                continue
+            if int(context.required_lane_shift.get(action, 99)) > 1:
+                continue
+            if float(context.dist_to_end) <= comfortable_dist_threshold:
+                continue
+
+            safe_ok, _ = self.decision_engine.prefilter_action_for_loops(
+                context=context,
+                action_idx=action,
+                destination=destination,
+                recent_history=recent_history,
+                distance_fn=self.get_distance_to_destination,
+            )
+            if not safe_ok:
+                continue
+            policy_actions.append(action)
+
+        policy_actions = sorted(set(policy_actions))
+        if not policy_actions:
+            return available_actions
+        return policy_actions
     
     def dist_to_end(self, vehicle_id, snapshot=None):
         """
@@ -1251,6 +1305,7 @@ class RLTrainingPipeline:
             "loop_override_count", "dead_end_reentry_override_count",
             "batched_policy_calls", "snapshot_cache_hits", "shortest_path_cache_hits",
             "exploration_actions", "policy_actions", "override_ratio",
+            "policy_masked_actions_removed", "override_learning_transitions",
             "timeout_unfinished_controlled", "exited_without_destination", "arrived_non_global_target",
             "alive_at_step_cap", "decision_pending_at_episode_end", "mean_pending_age", "mean_decision_latency_steps",
             "mean_reward_per_finalized_decision", "mean_route_difficulty_eta", "p50_route_difficulty_eta",
@@ -1485,6 +1540,29 @@ class RLTrainingPipeline:
                                     )
                                     if apply_error:
                                         decision_metrics["route_apply_fail"] += 1
+                                        override_penalty = self._clip_reward(-6.0)
+                                        obs_policy_actions = self._policy_action_candidates(
+                                            context=obs_context,
+                                            recent_history=list(recent_edge_history[vehicle_id]),
+                                            cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
+                                            destination=vehicle.destination,
+                                        )
+                                        self.trainer.remember(
+                                            pending.state,
+                                            pending.intended_action,
+                                            override_penalty,
+                                            pending.state,
+                                            False,
+                                            next_valid_actions=obs_policy_actions,
+                                            metadata={
+                                                "override_learning": True,
+                                                "override_cause": "route_apply_failure",
+                                                "route_apply_failed": True,
+                                                "observe_phase": True,
+                                            },
+                                        )
+                                        decision_metrics["override_learning_transitions"] += 1
+                                        episode_return += override_penalty
                                         prev_edge_by_vehicle[vehicle_id] = current_edge
                                         continue
                                     pending.metadata["phase"] = "route_pending"
@@ -1517,7 +1595,11 @@ class RLTrainingPipeline:
                                     ),
                                     False,
                                     next_valid_actions=obs_context.available_actions,
-                                    metadata={"observe_abort": reason or "no_progress"},
+                                    metadata={
+                                        "observe_abort": reason or "no_progress",
+                                        "override_cause": "lane_change_observe_abort",
+                                        "abort_reason": reason or "no_progress",
+                                    },
                                 )
                                 episode_return += pending_pen
                                 decision_metrics["same_edge_pending_released_no_progress"] += 1
@@ -1680,6 +1762,7 @@ class RLTrainingPipeline:
                             step=step,
                             snapshot=snapshot,
                         )
+                        cooldown_until = lane_change_cooldown_until.get((vehicle_id, current_edge), -1)
                         action_source = "forced" if context.forced_action is not None else ""
                         if context.forced_action is not None:
                             action = context.forced_action
@@ -1692,8 +1775,17 @@ class RLTrainingPipeline:
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
                         else:
+                            cooldown_active = step < cooldown_until
+                            policy_actions = self._policy_action_candidates(
+                                context=context,
+                                recent_history=list(recent_edge_history[vehicle_id]),
+                                cooldown_active=cooldown_active,
+                                destination=vehicle.destination,
+                            )
+                            removed_actions = max(len(context.available_actions) - len(policy_actions), 0)
+                            decision_metrics["policy_masked_actions_removed"] += removed_actions
                             action, action_source = self.trainer.select_action(
-                                state, context.available_actions, return_source=True
+                                state, policy_actions, return_source=True
                             )
                             if action is None:
                                 decision_metrics["decisions_skipped"] += 1
@@ -1719,6 +1811,7 @@ class RLTrainingPipeline:
                             distance_fn=self.get_distance_to_destination,
                         )
                         if not safe_ok:
+                            original_action = action
                             decision_metrics["loop_override_count"] += 1
                             if safety_details.get("dead_end_reentry"):
                                 decision_metrics["dead_end_reentry_override_count"] += 1
@@ -1734,7 +1827,28 @@ class RLTrainingPipeline:
                             decision_metrics["fallback_overrides"] += 1
                             decision_metrics["safety_overrides"] += 1
                             action_source = "loop_prefilter_fallback"
-                            episode_return += self._clip_reward(self.loop_trap_override_penalty)
+                            override_penalty = self._clip_reward(self.loop_trap_override_penalty)
+                            policy_actions_after_override = self._policy_action_candidates(
+                                context=context,
+                                recent_history=list(recent_edge_history[vehicle_id]),
+                                cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
+                                destination=vehicle.destination,
+                            )
+                            self.trainer.remember(
+                                state,
+                                original_action,
+                                override_penalty,
+                                state,
+                                False,
+                                next_valid_actions=policy_actions_after_override,
+                                metadata={
+                                    "override_learning": True,
+                                    "override_cause": "loop_prefilter_fallback",
+                                    "fallback_action": action,
+                                },
+                            )
+                            decision_metrics["override_learning_transitions"] += 1
+                            episode_return += override_penalty
                             next_edge = self.decision_engine.get_next_edge(current_edge, action)
                             if next_edge is None:
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -1742,8 +1856,8 @@ class RLTrainingPipeline:
 
                         lane_change_requested = False
                         if action not in context.lane_feasible_now_actions:
-                            cooldown_until = lane_change_cooldown_until.get((vehicle_id, current_edge), -1)
                             if step < cooldown_until:
+                                original_action = action
                                 decision_metrics["cooldown_replans_blocked"] += 1
                                 fallback_action = self._select_fallback_action(
                                     context,
@@ -1758,7 +1872,28 @@ class RLTrainingPipeline:
                                 action_source = "cooldown_fallback"
                                 decision_metrics["fallback_overrides"] += 1
                                 decision_metrics["fallback_to_lane_feasible_now"] += 1
-                                episode_return += self._clip_reward(self.same_edge_repeat_chase_penalty)
+                                override_penalty = self._clip_reward(self.same_edge_repeat_chase_penalty)
+                                policy_actions_after_override = self._policy_action_candidates(
+                                    context=context,
+                                    recent_history=list(recent_edge_history[vehicle_id]),
+                                    cooldown_active=True,
+                                    destination=vehicle.destination,
+                                )
+                                self.trainer.remember(
+                                    state,
+                                    original_action,
+                                    override_penalty,
+                                    state,
+                                    False,
+                                    next_valid_actions=policy_actions_after_override,
+                                    metadata={
+                                        "override_learning": True,
+                                        "override_cause": "cooldown_fallback",
+                                        "fallback_action": action,
+                                    },
+                                )
+                                decision_metrics["override_learning_transitions"] += 1
+                                episode_return += override_penalty
                             else:
                                 lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action)
                                 decision_metrics["lane_change_attempts"] += 1
@@ -1798,6 +1933,28 @@ class RLTrainingPipeline:
                         if apply_error:
                             decision_metrics["route_apply_fail"] += 1
                             decision_metrics["fragment_build_failures"] += 1
+                            override_penalty = self._clip_reward(-6.0)
+                            policy_actions_after_override = self._policy_action_candidates(
+                                context=context,
+                                recent_history=list(recent_edge_history[vehicle_id]),
+                                cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
+                                destination=vehicle.destination,
+                            )
+                            self.trainer.remember(
+                                state,
+                                action,
+                                override_penalty,
+                                state,
+                                False,
+                                next_valid_actions=policy_actions_after_override,
+                                metadata={
+                                    "override_learning": True,
+                                    "override_cause": "route_apply_failure",
+                                    "route_apply_failed": True,
+                                },
+                            )
+                            decision_metrics["override_learning_transitions"] += 1
+                            episode_return += override_penalty
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
                         last_planned_terminal_edge_by_vehicle[vehicle_id] = full_route[-1] if full_route else vehicle.destination
@@ -2172,6 +2329,8 @@ class RLTrainingPipeline:
                             + decision_metrics["fallback_overrides"]
                             + decision_metrics["route_apply_fail"]
                         ) / max(decision_metrics["decisions_opened"], 1.0),
+                        "policy_masked_actions_removed": decision_metrics["policy_masked_actions_removed"],
+                        "override_learning_transitions": decision_metrics["override_learning_transitions"],
                         "timeout_unfinished_controlled": alive_at_step_cap_count,
                         "exited_without_destination": exited_without_destination,
                         "arrived_non_global_target": arrived_non_global_target,
