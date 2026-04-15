@@ -343,6 +343,8 @@ class RLTrainingPipeline:
         self.pending_timeout_penalty = -8.0
         self.pending_latency_penalty_per_step = 0.015
         self.pending_replan_penalty = -1.0
+        self.stale_disappeared_penalty = -14.0
+        self.non_global_arrival_penalty = -8.0
         self.observe_no_progress_penalty = -1.2
         self.observe_low_speed_penalty = -1.0
         self.observe_commit_window_miss_penalty = -1.6
@@ -399,6 +401,7 @@ class RLTrainingPipeline:
             "finalize_delay_steps", "reward", "done", "route_mismatch", "teleported",
             "reached_global_destination", "prev_eta", "curr_eta", "prev_distance", "curr_distance",
             "edge_density", "mean_density", "externality_penalty", "marginal_pressure",
+            "terminal_outcome", "last_confirmed_edge", "destination", "in_arrived_ids", "in_teleport_ids",
         ]
 
     def _ensure_decision_debug_csv_header(self):
@@ -444,6 +447,11 @@ class RLTrainingPipeline:
         mean_density="",
         externality_penalty="",
         marginal_pressure="",
+        terminal_outcome="",
+        last_confirmed_edge="",
+        destination="",
+        in_arrived_ids="",
+        in_teleport_ids="",
     ):
         context = pending.context
         return {
@@ -476,6 +484,11 @@ class RLTrainingPipeline:
             "mean_density": mean_density,
             "externality_penalty": externality_penalty,
             "marginal_pressure": marginal_pressure,
+            "terminal_outcome": terminal_outcome,
+            "last_confirmed_edge": last_confirmed_edge,
+            "destination": destination,
+            "in_arrived_ids": in_arrived_ids,
+            "in_teleport_ids": in_teleport_ids,
         }
 
     def _get_route_difficulty_scale(self, vehicle, reference_edge):
@@ -804,6 +817,237 @@ class RLTrainingPipeline:
             )
         return np.zeros((1, self.state_size), dtype=np.float32)
 
+    def _classify_terminal_outcome(self, vehicle_id, destination, arrived_ids, teleport_ids, last_confirmed_edge):
+        if vehicle_id in teleport_ids:
+            return "teleport"
+        if vehicle_id in arrived_ids:
+            return "global_arrival" if last_confirmed_edge == destination else "non_global_arrival"
+        return "stale_disappeared"
+
+    def _finalize_terminal_transition(
+        self,
+        vehicle_id,
+        vehicle,
+        outcome,
+        step,
+        pending_decisions,
+        terminal_recorded_ids,
+        last_snapshot_by_vehicle,
+        last_seen_edge_by_vehicle,
+        decision_metrics,
+        decision_latency_steps,
+        finalized_decision_rewards,
+        decision_debug_rows,
+        episode,
+        in_arrived_ids=False,
+        in_teleport_ids=False,
+    ):
+        if vehicle_id in terminal_recorded_ids:
+            return 0.0
+        pending = pending_decisions.get(vehicle_id)
+        if pending is None:
+            last_confirmed_edge = last_seen_edge_by_vehicle.get(vehicle_id, vehicle.destination)
+            snapshot = last_snapshot_by_vehicle.get(vehicle_id)
+            base_state = self.make_terminal_next_state_from_snapshot(
+                snapshot,
+                vehicle.destination,
+                vehicle=vehicle,
+                step=step,
+            )
+            if outcome == "global_arrival":
+                reward, done = self.compute_reward(
+                    vehicle,
+                    vehicle.destination,
+                    vehicle.destination,
+                    step,
+                    arrived=True,
+                    reached_global_destination=True,
+                    terminal_outcome=outcome,
+                )
+                next_state = self.make_terminal_next_state_from_edge(
+                    vehicle.destination,
+                    vehicle.destination,
+                    vehicle=vehicle,
+                    step=step,
+                )
+            elif outcome == "non_global_arrival":
+                reward = self._clip_reward(self.non_global_arrival_penalty)
+                done = True
+                next_state = base_state
+            elif outcome == "teleport":
+                reward = self._clip_reward(self.teleport_penalty)
+                done = True
+                next_state = base_state
+                decision_metrics["fail_teleport"] += 1
+            elif outcome == "timeout":
+                reward = self._clip_reward(self.pending_timeout_penalty)
+                done = True
+                next_state = base_state
+                decision_metrics["fail_timeout"] += 1
+            else:
+                reward = self._clip_reward(self.stale_disappeared_penalty)
+                done = True
+                next_state = base_state
+                decision_metrics["fail_removed_non_destination"] += 1
+            self.trainer.remember(
+                base_state,
+                0,
+                reward,
+                next_state,
+                done,
+                next_valid_actions=[],
+                metadata={"terminal_outcome": outcome, "synthetic_terminal_no_pending": True},
+            )
+            decision_metrics["decisions_finalized"] += 1
+            finalized_decision_rewards.append(float(reward))
+            decision_debug_rows.append({
+                "episode": episode,
+                "step": step,
+                "vehicle_id": vehicle_id,
+                "decision_edge": last_confirmed_edge,
+                "action": 0,
+                "action_source": "synthetic_terminal",
+                "available_actions": "[]",
+                "forced_action": "",
+                "lane_feasible_now_actions": "[]",
+                "reachable_with_lane_change_actions": "[]",
+                "commit_window": "",
+                "dist_to_end": "",
+                "intended_next_edge": "",
+                "actual_next_edge": vehicle.destination if outcome == "global_arrival" else last_confirmed_edge,
+                "finalized": 1,
+                "finalize_delay_steps": 0,
+                "reward": reward,
+                "done": 1,
+                "route_mismatch": "",
+                "teleported": 1 if outcome == "teleport" else 0,
+                "reached_global_destination": 1 if outcome == "global_arrival" else 0,
+                "prev_eta": "",
+                "curr_eta": "",
+                "prev_distance": "",
+                "curr_distance": "",
+                "edge_density": "",
+                "mean_density": "",
+                "externality_penalty": "",
+                "marginal_pressure": "",
+                "terminal_outcome": outcome,
+                "last_confirmed_edge": last_confirmed_edge,
+                "destination": vehicle.destination,
+                "in_arrived_ids": int(bool(in_arrived_ids)),
+                "in_teleport_ids": int(bool(in_teleport_ids)),
+            })
+            terminal_recorded_ids.add(vehicle_id)
+            return float(reward)
+
+        last_confirmed_edge = last_seen_edge_by_vehicle.get(vehicle_id, pending.last_credit_edge)
+        snapshot = last_snapshot_by_vehicle.get(vehicle_id)
+        if outcome == "global_arrival":
+            reward, done = self.compute_reward(
+                vehicle,
+                pending.last_credit_edge,
+                vehicle.destination,
+                step,
+                arrived=True,
+                delta_t=max(step - pending.last_credit_step, 1),
+                reached_global_destination=True,
+                terminal_outcome=outcome,
+            )
+            next_state = self.make_terminal_next_state_from_edge(
+                vehicle.destination,
+                vehicle.destination,
+                vehicle=vehicle,
+                step=step,
+            )
+            decision_metrics["arrived_global_destination"] += 1
+        elif outcome == "non_global_arrival":
+            reward, done = self.compute_reward(
+                vehicle,
+                pending.last_credit_edge,
+                last_confirmed_edge,
+                step,
+                arrived=True,
+                delta_t=max(step - pending.last_credit_step, 1),
+                reached_global_destination=False,
+                terminal_outcome=outcome,
+            )
+            next_state = self.make_terminal_next_state_from_snapshot(
+                snapshot,
+                vehicle.destination,
+                vehicle=vehicle,
+                step=step,
+            )
+            decision_metrics["arrived_non_global_target"] += 1
+        elif outcome == "teleport":
+            reward = self._clip_reward(self.teleport_penalty)
+            done = True
+            next_state = self.make_terminal_next_state_from_snapshot(
+                snapshot,
+                vehicle.destination,
+                vehicle=vehicle,
+                step=step,
+            )
+            decision_metrics["fail_teleport"] += 1
+        elif outcome == "timeout":
+            timeout_elapsed = max(step - pending.last_credit_step, 0)
+            reward = self.compute_pending_step_reward(
+                vehicle,
+                last_confirmed_edge,
+                elapsed=timeout_elapsed,
+                pending_age=max(step - pending.decision_step, 0),
+                lane_change_deferrals=pending.metadata.get("lane_change_deferrals", 0),
+            ) + self.pending_timeout_penalty
+            reward = self._clip_reward(reward)
+            done = True
+            next_state = self.make_terminal_next_state_from_snapshot(
+                snapshot,
+                vehicle.destination,
+                vehicle=vehicle,
+                step=step,
+            )
+            decision_metrics["fail_timeout"] += 1
+        else:
+            reward = self._clip_reward(self.stale_disappeared_penalty)
+            done = True
+            next_state = self.make_terminal_next_state_from_snapshot(
+                snapshot,
+                vehicle.destination,
+                vehicle=vehicle,
+                step=step,
+            )
+            decision_metrics["fail_removed_non_destination"] += 1
+
+        self.trainer.remember(
+            pending.state,
+            pending.intended_action,
+            reward,
+            next_state,
+            done,
+            next_valid_actions=[],
+            metadata={"terminal_outcome": outcome},
+        )
+        decision_metrics["decisions_finalized"] += 1
+        decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
+        finalized_decision_rewards.append(float(reward))
+        terminal_recorded_ids.add(vehicle_id)
+        decision_debug_rows.append(self._build_decision_debug_row(
+            episode=episode,
+            step=step,
+            pending=pending,
+            actual_next_edge=vehicle.destination if outcome == "global_arrival" else last_confirmed_edge,
+            finalized=1,
+            finalize_delay_steps=max(step - pending.decision_step, 0),
+            reward=reward,
+            done=1,
+            teleported=1 if outcome == "teleport" else 0,
+            reached_global_destination=1 if outcome == "global_arrival" else 0,
+            terminal_outcome=outcome,
+            last_confirmed_edge=last_confirmed_edge,
+            destination=vehicle.destination,
+            in_arrived_ids=int(bool(in_arrived_ids)),
+            in_teleport_ids=int(bool(in_teleport_ids)),
+        ))
+        return float(reward)
+
     def _edge_out_degree_map(self, edges):
         return {
             edge: len(self.connection_info.outgoing_edges_dict.get(edge, {}))
@@ -868,7 +1112,9 @@ class RLTrainingPipeline:
         invalid_late_turn=False,
         route_apply_failed=False,
         uturn_repeat=False,
+        long_horizon_loop=False,
         externality_penalty=0.0,
+        terminal_outcome=None,
     ):
         """
         Compute a bounded reward with clear objective priority:
@@ -913,6 +1159,8 @@ class RLTrainingPipeline:
             reward -= self.loop_repeat_penalty * min(repeated_recent_edges, 3)
         if uturn_repeat:
             reward -= 3.0
+        if long_horizon_loop:
+            reward -= 4.0
         if route_mismatch:
             reward -= 4.0
         if invalid_late_turn:
@@ -930,6 +1178,8 @@ class RLTrainingPipeline:
                 reward += self.destination_reward
                 speed_bonus = max(0.0, 1.0 - (float(step) / float(MAX_SIMULATION_STEPS)))
                 reward += 3.0 * speed_bonus
+            elif terminal_outcome == "non_global_arrival":
+                reward += self.non_global_arrival_penalty
             else:
                 reward -= 8.0
             done = True
@@ -1005,6 +1255,7 @@ class RLTrainingPipeline:
             "forced_actions", "decisions_opened", "decisions_finalized", "decisions_skipped",
             "decisions_superseded", "route_mismatch", "loop_events", "uturn_events",
             "short_cycle_events", "aba_bounce_events", "dead_end_reentry_events",
+            "long_horizon_loop_events", "revisit_without_progress_events",
             "safety_overrides", "loop_avoidance_overrides", "distance_worsening_overrides",
             "fragment_build_failures", "fallback_overrides", "fallback_to_lane_feasible_now",
             "pending_decision_timeouts", "deferred_lane_change_actions",
@@ -1113,7 +1364,6 @@ class RLTrainingPipeline:
                         # Do not cleanup pre-step destination reaches yet; terminal transition
                         # must be written exactly once before any state is removed.
                         if current_edge == vehicle.destination:
-                            arrived_ids.add(vehicle_id)
                             continue
 
                         prev_edge = prev_edge_by_vehicle.get(vehicle_id)
@@ -1123,10 +1373,17 @@ class RLTrainingPipeline:
                             mismatch = not self.decision_engine.route_matches_expected(pending, current_edge)
                             if mismatch:
                                 decision_metrics["route_mismatch"] += 1
+                            signal_edges = set(recent_edge_history[vehicle_id]) | {current_edge}
+                            edge_distance_lookup = {
+                                edge: self.get_distance_to_destination(edge, vehicle.destination)
+                                for edge in signal_edges
+                            }
                             loop_signals = transition_signal(
                                 recent_edge_history[vehicle_id],
                                 current_edge,
                                 edge_out_degree=self._edge_out_degree_map(list(recent_edge_history[vehicle_id]) + [current_edge]),
+                                edge_distance_lookup=edge_distance_lookup,
+                                progress_slack=self.decision_engine.loop_distance_slack,
                             )
                             if loop_signals["aba_bounce"]:
                                 decision_metrics["aba_bounce_events"] += 1
@@ -1135,6 +1392,10 @@ class RLTrainingPipeline:
                                 decision_metrics["short_cycle_events"] += 1
                             if loop_signals["dead_end_reentry"]:
                                 decision_metrics["dead_end_reentry_events"] += 1
+                            if loop_signals.get("long_horizon_loop"):
+                                decision_metrics["long_horizon_loop_events"] += 1
+                            if loop_signals.get("revisit_without_progress"):
+                                decision_metrics["revisit_without_progress_events"] += 1
                             ext_pen = max(self.connection_info.edge_vehicle_count.get(current_edge, 0) / max(self.connection_info.edge_length_dict.get(current_edge, 10.0), 10.0), 0.0)
                             prev_distance = self.get_distance_to_destination(pending.decision_edge, vehicle.destination)
                             curr_distance = self.get_distance_to_destination(current_edge, vehicle.destination)
@@ -1146,6 +1407,7 @@ class RLTrainingPipeline:
                                 delta_t=max(step - pending.last_credit_step, 1),
                                 route_mismatch=mismatch,
                                 uturn_repeat=loop_signals["aba_bounce"] or loop_signals["short_cycle"],
+                                long_horizon_loop=loop_signals.get("long_horizon_loop") or loop_signals.get("revisit_without_progress"),
                                 externality_penalty=ext_pen,
                             )
                             next_ctx = self.decision_engine.build_context(
@@ -1577,197 +1839,67 @@ class RLTrainingPipeline:
 
                     simulation_step()
 
-                    # Vehicles removed by SUMO because they reached their current route target.
-                    # This is where we can tell whether they ended at the global destination
-                    # or were terminated at an intermediate/local target.
                     arrived_this_step = set(simulation_get_arrived_ids())
-                    live_after_step = set(vehicle_get_ids())
-                    destination_live_ids = {
-                        vid for vid in controlled_live_ids
-                        if vid in live_after_step and vid in vehicles
-                        and last_seen_edge_by_vehicle.get(vid) == vehicles[vid].destination
-                    }
-                    for arrived_vehicle_id in (arrived_this_step | destination_live_ids):
-                        if arrived_vehicle_id not in vehicles:
-                            continue
-
-                        vehicle = vehicles[arrived_vehicle_id]
-                        already_terminal = arrived_vehicle_id in terminal_recorded_ids
-
-                        last_seen_edge = last_seen_edge_by_vehicle.get(arrived_vehicle_id, "<unknown>")
-                        reached_global_destination = (last_seen_edge == vehicle.destination)
-                        observed_destination_edge = (last_seen_edge == vehicle.destination)
-                        if not observed_destination_edge:
-                            decision_metrics["arrived_with_stale_pre_step_edge"] += 1
-
-                        if reached_global_destination:
-                            arrived_ids.add(arrived_vehicle_id)
-                            arrived_global_destination_ids.add(arrived_vehicle_id)
-
-                        debug_record = {
-                            "vehicle_id": arrived_vehicle_id,
-                            "global_destination": vehicle.destination,
-                            "last_seen_edge": last_seen_edge,
-                            "observed_destination_edge": observed_destination_edge,
-                            "last_local_target": last_target_by_vehicle.get(arrived_vehicle_id, "<unset>"),
-                            "reached_global_destination": reached_global_destination,
-                        }
-                        arrived_debug_records.append(debug_record)
-                        if reached_global_destination and arrived_vehicle_id not in completed_travel_time_ids:
-                            completed_travel_time_ids.add(arrived_vehicle_id)
-                            completed_travel_times.append(max(float(step) - float(vehicle.start_time), 0.0))
-
-                        if (not already_terminal) and (arrived_vehicle_id in pending_decisions):
-                            pending = pending_decisions[arrived_vehicle_id]
-                            repeated_recent_edges = sum(
-                                1 for edge in recent_edge_history[arrived_vehicle_id]
-                                if edge == last_seen_edge
-                            )
-                            prev_distance = self.get_distance_to_destination(pending.decision_edge, vehicle.destination)
-                            curr_distance = self.get_distance_to_destination(vehicle.destination, vehicle.destination)
-                            prev_eta = self._estimate_remaining_eta(pending.decision_edge, vehicle.destination)
-                            curr_eta = self._estimate_remaining_eta(vehicle.destination, vehicle.destination)
-                            reward, done = self.compute_reward(
-                                vehicle,
-                                pending.last_credit_edge,
-                                vehicle.destination,
-                                step,
-                                arrived=True,
-                                repeated_recent_edges=repeated_recent_edges,
-                                delta_t=max(step - pending.last_credit_step, 1),
-                                reached_global_destination=reached_global_destination,
-                            )
-                            next_state = self.make_terminal_next_state_from_edge(
-                                vehicle.destination,
-                                vehicle.destination,
-                                vehicle=vehicle,
-                                step=step,
-                            )
-                            self.trainer.remember(
-                                pending.state,
-                                pending.intended_action,
-                                reward,
-                                next_state,
-                                done,
-                                next_valid_actions=[],
-                            )
-                            episode_return += reward
-                            decision_metrics["decisions_finalized"] += 1
-                            decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
-                            finalized_decision_rewards.append(float(reward))
-                            terminal_recorded_ids.add(arrived_vehicle_id)
-                            decision_debug_rows.append(self._build_decision_debug_row(
-                                episode=episode,
-                                step=step,
-                                pending=pending,
-                                actual_next_edge=vehicle.destination,
-                                finalized=1,
-                                finalize_delay_steps=max(step - pending.decision_step, 0),
-                                reward=reward,
-                                done=int(bool(done)),
-                                route_mismatch=0,
-                                teleported=0,
-                                reached_global_destination=int(bool(reached_global_destination)),
-                                prev_eta=prev_eta if math.isfinite(prev_eta) else "",
-                                curr_eta=curr_eta if math.isfinite(curr_eta) else "",
-                                prev_distance=prev_distance if math.isfinite(prev_distance) else "",
-                                curr_distance=curr_distance if math.isfinite(curr_distance) else "",
-                                externality_penalty=0.0,
-                            ))
-                            pending_debug_logged_ids.add(arrived_vehicle_id)
-
-                        # Only cleanup when SUMO removed vehicle or it has no pending transition.
-                        if (arrived_vehicle_id not in live_after_step) or (arrived_vehicle_id not in pending_decisions):
-                            self.cleanup_vehicle_state(
-                                arrived_vehicle_id,
-                                pending_decisions,
-                                prev_edge_by_vehicle,
-                                last_seen_edge_by_vehicle,
-                                last_target_by_vehicle,
-                                recent_edge_history,
-                                last_snapshot_by_vehicle,
-                            )
-
-                    # =========================
-                    # Teleport detection + terminal penalty
-                    # =========================
                     teleported_ids = self.get_teleport_ids()
+                    live_after_step = set(vehicle_get_ids())
+                    removed_controlled_ids = {
+                        vid for vid in controlled_live_ids
+                        if vid not in live_after_step and vid in vehicles
+                    }
+
                     if teleported_ids:
                         episode_teleport_events += len(teleported_ids)
                         decision_metrics["teleports"] += len(teleported_ids)
                         teleported_controlled_ids.update(tid for tid in teleported_ids if tid in vehicles)
-                        for tid in list(teleported_ids):
-                            if tid not in vehicles:
-                                continue
 
-                            # If we have an open transition for this vehicle, close it as terminal
-                            if tid in pending_decisions:
-                                pending = pending_decisions[tid]
-                                v = vehicles[tid]
+                    for removed_id in sorted(removed_controlled_ids):
+                        vehicle = vehicles[removed_id]
+                        last_seen_edge = last_seen_edge_by_vehicle.get(removed_id, "<unknown>")
+                        outcome = self._classify_terminal_outcome(
+                            removed_id,
+                            vehicle.destination,
+                            arrived_this_step,
+                            teleported_ids,
+                            last_seen_edge,
+                        )
+                        reached_global_destination = (outcome == "global_arrival")
+                        if reached_global_destination:
+                            arrived_ids.add(removed_id)
+                            arrived_global_destination_ids.add(removed_id)
+                            if removed_id not in completed_travel_time_ids:
+                                completed_travel_time_ids.add(removed_id)
+                                completed_travel_times.append(max(float(step) - float(vehicle.start_time), 0.0))
+                        elif outcome == "non_global_arrival":
+                            decision_metrics["arrived_with_stale_pre_step_edge"] += 1
 
-                                # Big penalty so agent learns to avoid situations leading to teleports
-                                terminal_snapshot = last_snapshot_by_vehicle.get(tid)
-                                next_state = self.make_terminal_next_state_from_snapshot(
-                                    terminal_snapshot,
-                                    v.destination,
-                                    vehicle=v,
-                                    step=step,
-                                )
-
-                                self.trainer.remember(
-                                    pending.state,
-                                    pending.intended_action,
-                                    self.teleport_penalty,
-                                    next_state,
-                                    True,
-                                    next_valid_actions=[],
-                                )
-                                episode_return += self.teleport_penalty
-                                terminal_recorded_ids.add(tid)
-                                decision_metrics["decisions_finalized"] += 1
-                                decision_metrics["fail_teleport"] += 1
-                                decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
-                                finalized_decision_rewards.append(float(self.teleport_penalty))
-                                decision_debug_rows.append(self._build_decision_debug_row(
-                                    episode=episode,
-                                    step=step,
-                                    pending=pending,
-                                    actual_next_edge="",
-                                    finalized=1,
-                                    finalize_delay_steps=max(step - pending.decision_step, 0),
-                                    reward=self.teleport_penalty,
-                                    done=1,
-                                    route_mismatch="",
-                                    teleported=1,
-                                    reached_global_destination=0,
-                                ))
-
-                            self.cleanup_vehicle_state(
-                                tid,
-                                pending_decisions,
-                                prev_edge_by_vehicle,
-                                last_seen_edge_by_vehicle,
-                                last_target_by_vehicle,
-                                recent_edge_history,
-                                last_snapshot_by_vehicle,
-                            )
-
-                    tracked_ids = (
-                        set(pending_decisions.keys())
-                        | set(prev_edge_by_vehicle.keys())
-                        | set(last_seen_edge_by_vehicle.keys())
-                        | set(last_target_by_vehicle.keys())
-                        | set(last_snapshot_by_vehicle.keys())
-                        | set(recent_edge_history.keys())
-                    )
-                    stale_disappeared = [
-                        vid for vid in tracked_ids
-                        if vid not in live_after_step and vid not in arrived_ids and vid not in teleported_controlled_ids
-                    ]
-                    for stale_id in stale_disappeared:
-                        decision_metrics["fail_removed_non_destination"] += 1
+                        arrived_debug_records.append({
+                            "vehicle_id": removed_id,
+                            "global_destination": vehicle.destination,
+                            "last_seen_edge": last_seen_edge,
+                            "observed_destination_edge": reached_global_destination,
+                            "last_local_target": last_target_by_vehicle.get(removed_id, "<unset>"),
+                            "reached_global_destination": reached_global_destination,
+                            "terminal_outcome": outcome,
+                        })
+                        episode_return += self._finalize_terminal_transition(
+                            vehicle_id=removed_id,
+                            vehicle=vehicle,
+                            outcome=outcome,
+                            step=step,
+                            pending_decisions=pending_decisions,
+                            terminal_recorded_ids=terminal_recorded_ids,
+                            last_snapshot_by_vehicle=last_snapshot_by_vehicle,
+                            last_seen_edge_by_vehicle=last_seen_edge_by_vehicle,
+                            decision_metrics=decision_metrics,
+                            decision_latency_steps=decision_latency_steps,
+                            finalized_decision_rewards=finalized_decision_rewards,
+                            decision_debug_rows=decision_debug_rows,
+                            episode=episode,
+                            in_arrived_ids=(removed_id in arrived_this_step),
+                            in_teleport_ids=(removed_id in teleported_ids),
+                        )
                         self.cleanup_vehicle_state(
-                            stale_id,
+                            removed_id,
                             pending_decisions,
                             prev_edge_by_vehicle,
                             last_seen_edge_by_vehicle,
@@ -1801,51 +1933,25 @@ class RLTrainingPipeline:
             finally:
                 if last_step_executed >= (MAX_SIMULATION_STEPS - 1):
                     alive_at_step_cap_ids = {vid for vid in vehicle_get_ids() if vid in vehicles}
-                    decision_metrics["fail_timeout"] += len(alive_at_step_cap_ids)
                     for vid in alive_at_step_cap_ids:
-                        if vid in pending_decisions:
-                            pending = pending_decisions[vid]
-                            timeout_vehicle = vehicles[vid]
-                            timeout_snapshot = last_snapshot_by_vehicle.get(vid)
-                            timeout_next_state = self.make_terminal_next_state_from_snapshot(
-                                timeout_snapshot,
-                                timeout_vehicle.destination,
-                                vehicle=timeout_vehicle,
-                                step=last_step_executed,
-                            )
-                            timeout_edge = last_seen_edge_by_vehicle.get(vid, pending.last_credit_edge)
-                            timeout_elapsed = max(last_step_executed - pending.last_credit_step, 0)
-                            timeout_reward = self.compute_pending_step_reward(
-                                timeout_vehicle,
-                                timeout_edge,
-                                elapsed=timeout_elapsed,
-                                pending_age=max(last_step_executed - pending.decision_step, 0),
-                                lane_change_deferrals=pending.metadata.get("lane_change_deferrals", 0),
-                            ) + self.pending_timeout_penalty
-                            timeout_reward = self._clip_reward(timeout_reward)
-                            self.trainer.remember(
-                                pending.state,
-                                pending.intended_action,
-                                timeout_reward,
-                                timeout_next_state,
-                                True,
-                                next_valid_actions=[],
-                                metadata={"timeout": True},
-                            )
-                            episode_return += timeout_reward
-                            decision_metrics["decisions_finalized"] += 1
-                            finalized_decision_rewards.append(float(timeout_reward))
-                            decision_latency_steps.append(float(max(last_step_executed - pending.decision_step, 0)))
-                            decision_debug_rows.append(self._build_decision_debug_row(
-                                episode=episode,
-                                step=last_step_executed,
-                                pending=pending,
-                                actual_next_edge=timeout_edge,
-                                finalized=1,
-                                finalize_delay_steps=max(last_step_executed - pending.decision_step, 0),
-                                reward=timeout_reward,
-                                done=1,
-                            ))
+                        timeout_vehicle = vehicles[vid]
+                        episode_return += self._finalize_terminal_transition(
+                            vehicle_id=vid,
+                            vehicle=timeout_vehicle,
+                            outcome="timeout",
+                            step=last_step_executed,
+                            pending_decisions=pending_decisions,
+                            terminal_recorded_ids=terminal_recorded_ids,
+                            last_snapshot_by_vehicle=last_snapshot_by_vehicle,
+                            last_seen_edge_by_vehicle=last_seen_edge_by_vehicle,
+                            decision_metrics=decision_metrics,
+                            decision_latency_steps=decision_latency_steps,
+                            finalized_decision_rewards=finalized_decision_rewards,
+                            decision_debug_rows=decision_debug_rows,
+                            episode=episode,
+                            in_arrived_ids=False,
+                            in_teleport_ids=False,
+                        )
                 completion_rate = (
                     len(arrived_ids) / float(total_controlled)
                     if total_controlled > 0 else 0.0
@@ -2035,6 +2141,8 @@ class RLTrainingPipeline:
                         "short_cycle_events": decision_metrics["short_cycle_events"],
                         "aba_bounce_events": decision_metrics["aba_bounce_events"],
                         "dead_end_reentry_events": decision_metrics["dead_end_reentry_events"],
+                        "long_horizon_loop_events": decision_metrics["long_horizon_loop_events"],
+                        "revisit_without_progress_events": decision_metrics["revisit_without_progress_events"],
                         "safety_overrides": decision_metrics["safety_overrides"],
                         "loop_avoidance_overrides": decision_metrics["loop_avoidance_overrides"],
                         "distance_worsening_overrides": decision_metrics["distance_worsening_overrides"],

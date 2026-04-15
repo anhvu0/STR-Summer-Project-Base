@@ -354,7 +354,18 @@ class JunctionDecisionEngine:
             return False, {"invalid_action": True}
         history_deque = recent_history if isinstance(recent_history, deque) else deque(recent_history, maxlen=max(len(recent_history), 1))
         edge_out_degree = {edge: len(self.connection_info.outgoing_edges_dict.get(edge, {})) for edge in set(history_deque) | {next_edge}}
-        signals = transition_signal(history_deque, next_edge, edge_out_degree=edge_out_degree)
+        edge_distance_lookup = None
+        if distance_fn is not None:
+            edge_distance_lookup = {}
+            for edge in set(history_deque) | {next_edge, context.edge_id}:
+                edge_distance_lookup[edge] = distance_fn(edge, destination)
+        signals = transition_signal(
+            history_deque,
+            next_edge,
+            edge_out_degree=edge_out_degree,
+            edge_distance_lookup=edge_distance_lookup,
+            progress_slack=self.loop_distance_slack,
+        )
         trap_like = (
             next_edge != destination
             and edge_out_degree.get(next_edge, 0) <= 1
@@ -370,7 +381,15 @@ class JunctionDecisionEngine:
                 next_distance,
                 slack=self.loop_distance_slack if distance_slack is None else float(distance_slack),
             )
-        blocked = bool(signals.get("short_cycle") or signals.get("aba_bounce") or signals.get("dead_end_reentry") or trap_like or dist_worsen)
+        blocked = bool(
+            signals.get("short_cycle")
+            or signals.get("aba_bounce")
+            or signals.get("dead_end_reentry")
+            or signals.get("long_horizon_loop")
+            or signals.get("revisit_without_progress")
+            or trap_like
+            or dist_worsen
+        )
         details = dict(signals)
         details["trap_like_reversal"] = trap_like
         details["distance_worsen"] = dist_worsen
