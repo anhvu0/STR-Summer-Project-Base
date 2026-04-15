@@ -155,14 +155,22 @@ class QLearningPolicy(RouteController):
         return len(outgoing)
 
     def _action_safety_score(self, current_edge, next_edge, destination, recent_history):
-        edge_out_degree = {edge: self._edge_out_degree(edge) for edge in set(recent_history) | {next_edge}}
-        signals = transition_signal(recent_history, next_edge, edge_out_degree=edge_out_degree)
+        relevant_edges = set(recent_history) | {current_edge, next_edge}
+        edge_out_degree = {edge: self._edge_out_degree(edge) for edge in relevant_edges}
+        edge_distance_lookup = {edge: self._dist_to_dest(edge, destination) for edge in relevant_edges}
+        signals = transition_signal(
+            recent_history,
+            next_edge,
+            edge_out_degree=edge_out_degree,
+            edge_distance_lookup=edge_distance_lookup,
+            progress_slack=self.score_slack,
+        )
         current_dist = self._dist_to_dest(current_edge, destination)
         next_dist = self._dist_to_dest(next_edge, destination)
         dist_worsen = would_worsen_distance(current_dist, next_dist, slack=self.score_slack)
         trap_like = (
             next_edge != destination
-            and self._edge_out_degree(next_edge) <= 1
+            and self._edge_out_degree(next_edge) == 0
             and len(recent_history) > 0
             and recent_history[-1] == current_edge
         )
@@ -173,6 +181,10 @@ class QLearningPolicy(RouteController):
             score += 5
         if signals["dead_end_reentry"]:
             score += 3
+        if signals.get("long_horizon_loop"):
+            score += 6
+        if signals.get("revisit_without_progress"):
+            score += 6
         if dist_worsen:
             score += 2
         if trap_like:
