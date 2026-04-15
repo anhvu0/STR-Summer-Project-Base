@@ -63,7 +63,18 @@ class JunctionDecisionEngine:
     Shared decision feasibility and route-fragment planner for training + inference.
     """
 
-    def __init__(self, connection_info, net, direction_choices):
+    def __init__(
+        self,
+        connection_info,
+        net,
+        direction_choices,
+        pending_timeout_steps: int = 18,
+        pending_progress_timeout_steps: int = 10,
+        observe_steps_min: int = 2,
+        observe_steps_max: int = 4,
+        observe_low_speed_mps: float = 0.8,
+        observe_stall_steps: int = 2,
+    ):
         self.connection_info = connection_info
         self.net = net
         self.direction_choices = direction_choices
@@ -74,14 +85,14 @@ class JunctionDecisionEngine:
         self.lane_change_margin_m = 24.0
         self.commit_min_distance = 14.0
         self.default_fragment_horizon_m = 180.0
-        self.pending_timeout_steps = 18
+        self.pending_timeout_steps = max(int(pending_timeout_steps), 1)
         self.lane_change_defer_limit = 4
-        self.observe_steps_min = 2
-        self.observe_steps_max = 4
-        self.observe_low_speed_mps = 0.8
-        self.observe_stall_steps = 2
+        self.observe_steps_min = max(int(observe_steps_min), 1)
+        self.observe_steps_max = max(int(observe_steps_max), self.observe_steps_min)
+        self.observe_low_speed_mps = max(float(observe_low_speed_mps), 0.0)
+        self.observe_stall_steps = max(int(observe_stall_steps), 1)
         self.cooldown_steps = 3
-        self.pending_progress_timeout_steps = 10
+        self.pending_progress_timeout_steps = max(int(pending_progress_timeout_steps), 1)
         self.loop_distance_slack = 30.0
 
     def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
