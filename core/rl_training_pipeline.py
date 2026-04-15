@@ -283,6 +283,17 @@ class RLTrainingPipeline:
         route_difficulty_scale_max=1.0,
         decision_debug_csv_path=None,
         fast_training_profile=False,
+        training_pending_timeout_steps=32,
+        training_pending_progress_timeout_steps=22,
+        training_observe_steps_max=7,
+        training_observe_low_speed_mps=0.45,
+        training_observe_stall_steps=4,
+        no_progress_same_edge_steps=150,
+        no_progress_low_speed_steps=120,
+        no_progress_distance_stall_steps=120,
+        no_progress_low_speed_mps=0.35,
+        no_progress_distance_epsilon=3.0,
+        stuck_penalty=-3.0,
     ):
         """
         Args:
@@ -320,6 +331,17 @@ class RLTrainingPipeline:
         self.route_difficulty_scale_min = float(np.clip(route_difficulty_scale_min, 0.05, 1.0))
         self.route_difficulty_scale_max = float(np.clip(route_difficulty_scale_max, self.route_difficulty_scale_min, 1.0))
         self.fast_training_profile = bool(fast_training_profile)
+        self.training_pending_timeout_steps = max(int(training_pending_timeout_steps), 1)
+        self.training_pending_progress_timeout_steps = max(int(training_pending_progress_timeout_steps), 1)
+        self.training_observe_steps_max = max(int(training_observe_steps_max), 2)
+        self.training_observe_low_speed_mps = max(float(training_observe_low_speed_mps), 0.0)
+        self.training_observe_stall_steps = max(int(training_observe_stall_steps), 1)
+        self.no_progress_same_edge_steps = max(int(no_progress_same_edge_steps), 1)
+        self.no_progress_low_speed_steps = max(int(no_progress_low_speed_steps), 1)
+        self.no_progress_distance_stall_steps = max(int(no_progress_distance_stall_steps), 1)
+        self.no_progress_low_speed_mps = max(float(no_progress_low_speed_mps), 0.0)
+        self.no_progress_distance_epsilon = max(float(no_progress_distance_epsilon), 0.1)
+        self.stuck_penalty = float(stuck_penalty)
         self.decision_debug_csv_path = decision_debug_csv_path
         if self.fast_training_profile and self.decision_debug_csv_path:
             self.decision_debug_csv_path = None
@@ -363,6 +385,11 @@ class RLTrainingPipeline:
             self.connection_info,
             self.net,
             self.route_helper.direction_choices,
+            pending_timeout_steps=self.training_pending_timeout_steps,
+            pending_progress_timeout_steps=self.training_pending_progress_timeout_steps,
+            observe_steps_max=self.training_observe_steps_max,
+            observe_low_speed_mps=self.training_observe_low_speed_mps,
+            observe_stall_steps=self.training_observe_stall_steps,
         )
 
         # state = [edge_embedding, destination_embedding]
@@ -818,6 +845,7 @@ class RLTrainingPipeline:
         last_planned_terminal_edge_by_vehicle,
         recent_edge_history,
         last_snapshot_by_vehicle,
+        no_progress_tracker=None,
     ):
         pending_decisions.pop(vehicle_id, None)
         prev_edge_by_vehicle.pop(vehicle_id, None)
@@ -825,6 +853,8 @@ class RLTrainingPipeline:
         last_planned_terminal_edge_by_vehicle.pop(vehicle_id, None)
         last_snapshot_by_vehicle.pop(vehicle_id, None)
         recent_edge_history.pop(vehicle_id, None)
+        if no_progress_tracker is not None:
+            no_progress_tracker.pop(vehicle_id, None)
 
     def make_terminal_next_state_from_snapshot(self, snapshot, destination_edge, vehicle=None, step=None):
         if snapshot is None:
@@ -945,6 +975,10 @@ class RLTrainingPipeline:
                 done = True
                 next_state = base_state
                 decision_metrics["fail_timeout"] += 1
+            elif outcome == "stuck_no_progress":
+                reward = self._clip_reward(self.stuck_penalty)
+                done = True
+                next_state = base_state
             elif outcome == "removed_nonarrival":
                 reward = self._clip_reward(self.stale_disappeared_penalty)
                 done = True
@@ -1050,6 +1084,15 @@ class RLTrainingPipeline:
                 step=step,
             )
             decision_metrics["fail_timeout"] += 1
+        elif outcome == "stuck_no_progress":
+            reward = self._clip_reward(self.stuck_penalty)
+            done = True
+            next_state = self.make_terminal_next_state_from_snapshot(
+                snapshot,
+                vehicle.destination,
+                vehicle=vehicle,
+                step=step,
+            )
         elif outcome == "removed_nonarrival":
             reward = self._clip_reward(self.stale_disappeared_penalty)
             done = True
@@ -1319,7 +1362,9 @@ class RLTrainingPipeline:
             "timeout_unfinished_controlled", "exited_without_destination", "arrived_non_global_target",
             "alive_at_step_cap", "decision_pending_at_episode_end", "mean_pending_age", "mean_decision_latency_steps",
             "mean_reward_per_finalized_decision", "mean_route_difficulty_eta", "p50_route_difficulty_eta",
-            "p90_route_difficulty_eta", "fail_teleport", "fail_timeout", "fail_removed_non_destination",
+            "p90_route_difficulty_eta", "true_teleports", "episode_truncated_survivors",
+            "per_vehicle_stuck_terminations", "no_progress_events", "avg_queue_wait_before_stuck",
+            "fail_teleport", "fail_timeout", "fail_removed_non_destination",
             "fail_unreachable_transition", "fail_dead_end_no_outgoing",
         ]
         # Rewrite metrics each new training session to avoid schema drift/appending old runs.
@@ -1376,6 +1421,9 @@ class RLTrainingPipeline:
             route_difficulty_etas = []
             last_step_executed = -1
             alive_at_step_cap_ids = set()
+            stuck_terminated_ids = set()
+            no_progress_tracker = {}
+            queue_wait_samples_before_stuck = []
             pending_debug_logged_ids = set()
             decision_debug_rows = []
             arrived_with_prestep_edge_not_destination = 0
@@ -1410,6 +1458,62 @@ class RLTrainingPipeline:
                         last_seen_edge_by_vehicle[vehicle_id] = current_edge
                         last_snapshot_by_vehicle[vehicle_id] = snapshot
                         recent_edge_history[vehicle_id].append(current_edge)
+
+                        tracker = no_progress_tracker.get(vehicle_id)
+                        if tracker is None:
+                            tracker = {
+                                "last_edge": current_edge,
+                                "same_edge_steps": 0,
+                                "low_speed_steps": 0,
+                                "distance_stall_steps": 0,
+                                "best_distance": math.inf,
+                                "queue_wait_steps": 0,
+                            }
+                            no_progress_tracker[vehicle_id] = tracker
+
+                        current_distance = self.get_distance_to_destination(current_edge, vehicle.destination)
+                        improved_distance = (
+                            math.isfinite(current_distance)
+                            and (
+                                (not math.isfinite(tracker["best_distance"]))
+                                or (current_distance <= (tracker["best_distance"] - self.no_progress_distance_epsilon))
+                            )
+                        )
+                        if improved_distance:
+                            tracker["best_distance"] = current_distance
+                            tracker["distance_stall_steps"] = 0
+                        else:
+                            tracker["distance_stall_steps"] += 1
+
+                        if tracker["last_edge"] == current_edge:
+                            tracker["same_edge_steps"] += 1
+                        else:
+                            tracker["last_edge"] = current_edge
+                            tracker["same_edge_steps"] = 0
+                            tracker["queue_wait_steps"] = 0
+
+                        if snapshot.speed <= self.no_progress_low_speed_mps:
+                            tracker["low_speed_steps"] += 1
+                            tracker["queue_wait_steps"] += 1
+                        else:
+                            tracker["low_speed_steps"] = 0
+
+                        if (
+                            tracker["same_edge_steps"] >= self.no_progress_same_edge_steps
+                            and tracker["low_speed_steps"] >= self.no_progress_low_speed_steps
+                            and tracker["distance_stall_steps"] >= self.no_progress_distance_stall_steps
+                        ):
+                            decision_metrics["no_progress_events"] += 1
+                            queue_wait_samples_before_stuck.append(float(tracker["queue_wait_steps"]))
+                            stuck_terminated_ids.add(vehicle_id)
+                            try:
+                                traci.vehicle.remove(vehicle_id)
+                                prev_edge_by_vehicle[vehicle_id] = current_edge
+                                continue
+                            except Exception:
+                                # If removal fails this step, continue normal handling;
+                                # detector telemetry is still preserved for debugging.
+                                stuck_terminated_ids.discard(vehicle_id)
 
                         # Do not cleanup pre-step destination reaches yet; terminal transition
                         # must be written exactly once before any state is removed.
@@ -2102,6 +2206,8 @@ class RLTrainingPipeline:
                             teleported_ids,
                             is_live=(removed_id in live_after_step),
                         )
+                        if removed_id in stuck_terminated_ids:
+                            outcome = "stuck_no_progress"
                         final_outcome_by_vehicle[removed_id] = outcome
                         reached_global_destination = (outcome == "global_arrival")
                         if reached_global_destination:
@@ -2146,6 +2252,7 @@ class RLTrainingPipeline:
                             last_planned_terminal_edge_by_vehicle,
                             recent_edge_history,
                             last_snapshot_by_vehicle,
+                            no_progress_tracker=no_progress_tracker,
                         )
 
                     if step % self.train_every == 0:
@@ -2175,29 +2282,16 @@ class RLTrainingPipeline:
                     alive_at_step_cap_ids = {vid for vid in vehicle_get_ids() if vid in vehicles}
                     for vid in alive_at_step_cap_ids:
                         if vid not in final_outcome_by_vehicle:
-                            final_outcome_by_vehicle[vid] = "alive_at_step_cap"
-                        timeout_vehicle = vehicles[vid]
-                        episode_return += self._finalize_terminal_transition(
-                            vehicle_id=vid,
-                            vehicle=timeout_vehicle,
-                            outcome="timeout",
-                            step=last_step_executed,
-                            pending_decisions=pending_decisions,
-                            terminal_recorded_ids=terminal_recorded_ids,
-                            last_snapshot_by_vehicle=last_snapshot_by_vehicle,
-                            last_seen_edge_by_vehicle=last_seen_edge_by_vehicle,
-                            decision_metrics=decision_metrics,
-                            decision_latency_steps=decision_latency_steps,
-                            finalized_decision_rewards=finalized_decision_rewards,
-                            decision_debug_rows=decision_debug_rows,
-                            episode=episode,
-                            in_arrived_ids=False,
-                            in_teleport_ids=False,
-                        )
+                            # Episode step-cap truncation is a dataset boundary, not a teleport/failure event.
+                            # Keep the outcome separate so dense waiting costs are not double-counted by mass
+                            # terminal negatives at the global step limit.
+                            final_outcome_by_vehicle[vid] = "episode_truncated"
+                            decision_metrics["episode_truncated_survivors"] += 1
                 global_arrival_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "global_arrival")
                 terminal_teleport_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "teleport")
                 removed_nonarrival_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "removed_nonarrival")
-                alive_at_step_cap_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "alive_at_step_cap")
+                episode_truncated_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "episode_truncated")
+                stuck_no_progress_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "stuck_no_progress")
                 completion_rate = (
                     global_arrival_count / float(total_controlled)
                     if total_controlled > 0 else 0.0
@@ -2223,6 +2317,9 @@ class RLTrainingPipeline:
                 )
                 p90_route_difficulty_eta = (
                     float(np.percentile(route_difficulty_etas, 90)) if route_difficulty_etas else 0.0
+                )
+                avg_queue_wait_before_stuck = (
+                    float(np.mean(queue_wait_samples_before_stuck)) if queue_wait_samples_before_stuck else 0.0
                 )
 
                 rolling_teleport_events.append(float(episode_teleport_events))
@@ -2294,6 +2391,16 @@ class RLTrainingPipeline:
                         decision_metrics["fallback_overrides"],
                     )
                 )
+                print(
+                    "  congestion terminals: true_teleports={} episode_truncated={} "
+                    "stuck_no_progress={} no_progress_events={} avg_queue_wait_before_stuck={:.1f}".format(
+                        terminal_teleport_count,
+                        episode_truncated_count,
+                        stuck_no_progress_count,
+                        decision_metrics["no_progress_events"],
+                        avg_queue_wait_before_stuck,
+                    )
+                )
 
                 exited_without_destination = removed_nonarrival_count
                 arrived_non_global_target = 0
@@ -2302,14 +2409,16 @@ class RLTrainingPipeline:
                     f"arrived={global_arrival_count}/{total_controlled}, "
                     f"teleported_terminal={terminal_teleport_count}/{total_controlled}, "
                     f"removed_nonarrival={removed_nonarrival_count}/{total_controlled}, "
-                    f"alive_at_step_cap={alive_at_step_cap_count}/{total_controlled}"
+                    f"episode_truncated={episode_truncated_count}/{total_controlled}, "
+                    f"stuck_no_progress={stuck_no_progress_count}/{total_controlled}"
                 )
                 print(
                     "  terminal_outcomes: "
                     f"global_arrival={global_arrival_count} "
                     f"teleport={terminal_teleport_count} "
                     f"removed_nonarrival={removed_nonarrival_count} "
-                    f"alive_at_step_cap={alive_at_step_cap_count} "
+                    f"episode_truncated={episode_truncated_count} "
+                    f"stuck_no_progress={stuck_no_progress_count} "
                     f"arrived_with_prestep_edge_not_destination={arrived_with_prestep_edge_not_destination}"
                 )
 
@@ -2359,6 +2468,44 @@ class RLTrainingPipeline:
                             "  EXITED_WITHOUT_DEST ... "
                             f"{len(removed_nonarrival_ids) - self.debug_exit_diagnostics_limit} more vehicles"
                         )
+                for vid in sorted(alive_at_step_cap_ids):
+                    snapshot = last_snapshot_by_vehicle.get(vid)
+                    decision_debug_rows.append({
+                        "episode": episode,
+                        "step": last_step_executed,
+                        "vehicle_id": vid,
+                        "decision_edge": snapshot.edge_id if snapshot is not None else last_seen_edge_by_vehicle.get(vid, ""),
+                        "action": "",
+                        "action_source": "episode_truncated",
+                        "available_actions": "[]",
+                        "forced_action": "",
+                        "lane_feasible_now_actions": "[]",
+                        "reachable_with_lane_change_actions": "[]",
+                        "commit_window": "",
+                        "dist_to_end": snapshot.dist_to_end if snapshot is not None else "",
+                        "intended_next_edge": "",
+                        "actual_next_edge": "",
+                        "finalized": 0,
+                        "finalize_delay_steps": "",
+                        "reward": "",
+                        "done": 0,
+                        "route_mismatch": "",
+                        "teleported": 0,
+                        "reached_global_destination": 0,
+                        "prev_eta": "",
+                        "curr_eta": "",
+                        "prev_distance": "",
+                        "curr_distance": "",
+                        "edge_density": "",
+                        "mean_density": "",
+                        "externality_penalty": "",
+                        "marginal_pressure": "",
+                        "terminal_outcome": "episode_truncated",
+                        "last_confirmed_edge": last_seen_edge_by_vehicle.get(vid, ""),
+                        "destination": vehicles[vid].destination,
+                        "in_arrived_ids": 0,
+                        "in_teleport_ids": 0,
+                    })
                 for vid, pending in pending_decisions.items():
                     if vid in pending_debug_logged_ids:
                         continue
@@ -2434,10 +2581,10 @@ class RLTrainingPipeline:
                         "route_apply_fail_overrides": decision_metrics["route_apply_fail_overrides"],
                         "override_learning_negative": decision_metrics["override_learning_negative"],
                         "override_learning_imitation": decision_metrics["override_learning_imitation"],
-                        "timeout_unfinished_controlled": alive_at_step_cap_count,
+                        "timeout_unfinished_controlled": episode_truncated_count,
                         "exited_without_destination": exited_without_destination,
                         "arrived_non_global_target": arrived_non_global_target,
-                        "alive_at_step_cap": alive_at_step_cap_count,
+                        "alive_at_step_cap": episode_truncated_count,
                         "decision_pending_at_episode_end": len(pending_decisions),
                         "mean_pending_age": mean_pending_age,
                         "mean_decision_latency_steps": mean_decision_latency_steps,
@@ -2445,6 +2592,11 @@ class RLTrainingPipeline:
                         "mean_route_difficulty_eta": mean_route_difficulty_eta,
                         "p50_route_difficulty_eta": p50_route_difficulty_eta,
                         "p90_route_difficulty_eta": p90_route_difficulty_eta,
+                        "true_teleports": terminal_teleport_count,
+                        "episode_truncated_survivors": episode_truncated_count,
+                        "per_vehicle_stuck_terminations": stuck_no_progress_count,
+                        "no_progress_events": decision_metrics["no_progress_events"],
+                        "avg_queue_wait_before_stuck": avg_queue_wait_before_stuck,
                         "fail_teleport": terminal_teleport_count,
                         "fail_timeout": decision_metrics["fail_timeout"],
                         "fail_removed_non_destination": decision_metrics["fail_removed_non_destination"],
