@@ -400,6 +400,19 @@ class RLTrainingPipeline:
             "reached_global_destination", "prev_eta", "curr_eta", "prev_distance", "curr_distance",
             "edge_density", "mean_density", "externality_penalty", "marginal_pressure",
         ]
+        self.terminal_debug_csv_path = os.path.join(self.sumocfg_dir, "rl_terminal_events.csv")
+        self._terminal_debug_fields = [
+            "episode",
+            "vehicle_id",
+            "terminal_type",
+            "step",
+            "last_seen_edge",
+            "last_local_target",
+            "global_destination",
+            "recent_reward_sum",
+        ]
+        self.train_on_executed_action_when_overridden = True
+        self.progress_stagnation_window = 5
 
     def _ensure_decision_debug_csv_header(self):
         if not self.decision_debug_csv_path:
@@ -421,6 +434,20 @@ class RLTrainingPipeline:
             return
         with open(self.decision_debug_csv_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=self._decision_debug_fields)
+            writer.writerows(rows)
+
+    def _ensure_terminal_debug_csv_header(self):
+        if not self.terminal_debug_csv_path:
+            return
+        if not os.path.exists(self.terminal_debug_csv_path):
+            with open(self.terminal_debug_csv_path, "w", newline="") as f:
+                csv.DictWriter(f, fieldnames=self._terminal_debug_fields).writeheader()
+
+    def _append_terminal_debug_rows(self, rows):
+        if not self.terminal_debug_csv_path or not rows:
+            return
+        with open(self.terminal_debug_csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self._terminal_debug_fields)
             writer.writerows(rows)
 
     def _build_decision_debug_row(
@@ -744,6 +771,9 @@ class RLTrainingPipeline:
         last_target_by_vehicle,
         recent_edge_history,
         last_snapshot_by_vehicle,
+        recent_distance_history=None,
+        recent_eta_history=None,
+        recent_reward_sum_by_vehicle=None,
     ):
         pending_decisions.pop(vehicle_id, None)
         prev_edge_by_vehicle.pop(vehicle_id, None)
@@ -751,6 +781,12 @@ class RLTrainingPipeline:
         last_target_by_vehicle.pop(vehicle_id, None)
         last_snapshot_by_vehicle.pop(vehicle_id, None)
         recent_edge_history.pop(vehicle_id, None)
+        if recent_distance_history is not None:
+            recent_distance_history.pop(vehicle_id, None)
+        if recent_eta_history is not None:
+            recent_eta_history.pop(vehicle_id, None)
+        if recent_reward_sum_by_vehicle is not None:
+            recent_reward_sum_by_vehicle.pop(vehicle_id, None)
 
     def make_terminal_next_state_from_snapshot(self, snapshot, destination_edge, vehicle=None, step=None):
         if snapshot is None:
@@ -810,17 +846,34 @@ class RLTrainingPipeline:
             for edge in set(edges)
         }
 
-    def _select_fallback_action(self, context, blocked_action, destination, recent_history):
+    def _select_fallback_action(self, context, blocked_action, destination, recent_history, progress_stagnating=False):
         ranked = self.decision_engine.ranked_fallback_actions(
             context=context,
             destination=destination,
             recent_history=recent_history,
             blocked_action=blocked_action,
             distance_fn=self.get_distance_to_destination,
+            progress_stagnating=progress_stagnating,
         )
         if ranked:
             return ranked[0]
         return None
+
+    def _is_progress_stagnating(self, distance_hist, eta_hist):
+        window = self.progress_stagnation_window
+        if len(distance_hist) < window and len(eta_hist) < window:
+            return False
+        distance_stalled = True
+        if len(distance_hist) >= window:
+            dseq = list(distance_hist)[-window:]
+            best_prev = min(dseq[:-1]) if len(dseq) > 1 else dseq[0]
+            distance_stalled = (not math.isfinite(dseq[-1])) or (math.isfinite(best_prev) and dseq[-1] >= best_prev)
+        eta_stalled = True
+        if len(eta_hist) >= window:
+            eseq = list(eta_hist)[-window:]
+            best_prev_eta = min(eseq[:-1]) if len(eseq) > 1 else eseq[0]
+            eta_stalled = (not math.isfinite(eseq[-1])) or (math.isfinite(best_prev_eta) and eseq[-1] >= best_prev_eta)
+        return bool(distance_stalled and eta_stalled)
 
     def _estimate_remaining_eta(self, edge_id, destination_edge):
         """
@@ -1024,6 +1077,7 @@ class RLTrainingPipeline:
         with open(self.metrics_csv_path, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=csv_fields).writeheader()
         self._ensure_decision_debug_csv_header()
+        self._ensure_terminal_debug_csv_header()
 
         # MAX_CACHE_SIZE = 5000
 
@@ -1052,6 +1106,9 @@ class RLTrainingPipeline:
             lane_change_deferrals = defaultdict(int)
             lane_change_cooldown_until = {}
             recent_edge_history = defaultdict(lambda: deque(maxlen=self.loop_window))
+            recent_distance_history = defaultdict(lambda: deque(maxlen=self.loop_window))
+            recent_eta_history = defaultdict(lambda: deque(maxlen=self.loop_window))
+            recent_reward_sum_by_vehicle = defaultdict(float)
             prev_edge_by_vehicle = {}
             decision_metrics = defaultdict(float)
 
@@ -1078,6 +1135,7 @@ class RLTrainingPipeline:
             alive_at_step_cap_ids = set()
             pending_debug_logged_ids = set()
             decision_debug_rows = []
+            terminal_debug_rows = []
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
@@ -1109,6 +1167,12 @@ class RLTrainingPipeline:
                         last_seen_edge_by_vehicle[vehicle_id] = current_edge
                         last_snapshot_by_vehicle[vehicle_id] = snapshot
                         recent_edge_history[vehicle_id].append(current_edge)
+                        recent_distance_history[vehicle_id].append(
+                            self.get_distance_to_destination(current_edge, vehicle.destination)
+                        )
+                        recent_eta_history[vehicle_id].append(
+                            self._estimate_remaining_eta(current_edge, vehicle.destination)
+                        )
 
                         # Do not cleanup pre-step destination reaches yet; terminal transition
                         # must be written exactly once before any state is removed.
@@ -1166,17 +1230,25 @@ class RLTrainingPipeline:
                             )
                             self.trainer.remember(
                                 pending.state,
-                                pending.intended_action,
+                                pending.metadata.get("executed_action", pending.intended_action),
                                 reward,
                                 next_state,
                                 done,
                                 next_valid_actions=next_ctx.available_actions,
-                                metadata={"forced": pending.context.forced_action is not None, "mismatch": mismatch},
+                                metadata={
+                                    "forced": pending.context.forced_action is not None,
+                                    "mismatch": mismatch,
+                                    "selected_action": pending.metadata.get("selected_action", pending.intended_action),
+                                    "executed_action": pending.metadata.get("executed_action", pending.intended_action),
+                                    "action_overridden": bool(pending.metadata.get("action_overridden", False)),
+                                    "override_type": pending.metadata.get("override_type", ""),
+                                },
                             )
                             decision_metrics["decisions_finalized"] += 1
                             decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
                             finalized_decision_rewards.append(float(reward))
                             episode_return += reward
+                            recent_reward_sum_by_vehicle[vehicle_id] += float(reward)
                             if repeated_recent_edges > 1:
                                 decision_metrics["loop_events"] += 1
                             if math.isfinite(prev_distance) and (not math.isfinite(curr_distance)):
@@ -1263,16 +1335,21 @@ class RLTrainingPipeline:
                                 pending_pen = self._clip_reward(pending_pen + self.same_edge_repeat_chase_penalty)
                                 self.trainer.remember(
                                     pending.state,
-                                    pending.intended_action,
+                                    pending.metadata.get("executed_action", pending.intended_action),
                                     pending_pen,
                                     self.encode_state(
                                         vehicle_id, current_edge, vehicle.destination, context=obs_context, vehicle=vehicle, step=step, snapshot=snapshot
                                     ),
                                     False,
                                     next_valid_actions=obs_context.available_actions,
-                                    metadata={"observe_abort": reason or "no_progress"},
+                                    metadata={
+                                        "observe_abort": reason or "no_progress",
+                                        "action_overridden": bool(pending.metadata.get("action_overridden", False)),
+                                        "override_type": pending.metadata.get("override_type", ""),
+                                    },
                                 )
                                 episode_return += pending_pen
+                                recent_reward_sum_by_vehicle[vehicle_id] += float(pending_pen)
                                 decision_metrics["same_edge_pending_released_no_progress"] += 1
                                 cooldown_key = (vehicle_id, current_edge)
                                 lane_change_cooldown_until[cooldown_key] = step + self.decision_engine.cooldown_steps
@@ -1281,6 +1358,10 @@ class RLTrainingPipeline:
                                     blocked_action=pending.intended_action,
                                     destination=vehicle.destination,
                                     recent_history=list(recent_edge_history[vehicle_id]),
+                                    progress_stagnating=self._is_progress_stagnating(
+                                        recent_distance_history[vehicle_id],
+                                        recent_eta_history[vehicle_id],
+                                    ),
                                 )
                                 if fallback_action is None:
                                     prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -1306,7 +1387,14 @@ class RLTrainingPipeline:
                                     context=obs_context,
                                     lane_change_requested=False,
                                     route_fragment=list(full_route[1:]) if full_route else [],
-                                    metadata={"phase": "route_pending", "action_source": "observe_fallback"},
+                                    metadata={
+                                        "phase": "route_pending",
+                                        "action_source": "observe_fallback",
+                                        "selected_action": pending.intended_action,
+                                        "executed_action": fallback_action,
+                                        "action_overridden": bool(fallback_action != pending.intended_action),
+                                        "override_type": "hard_feasibility_observe_abort",
+                                    },
                                 )
                                 decision_metrics["fallback_overrides"] += 1
                                 decision_metrics["fallback_to_lane_feasible_now"] += 1
@@ -1347,14 +1435,19 @@ class RLTrainingPipeline:
                                 )
                                 self.trainer.remember(
                                     pending.state,
-                                    pending.intended_action,
+                                    pending.metadata.get("executed_action", pending.intended_action),
                                     pending_reward,
                                     next_state,
                                     False,
                                     next_valid_actions=next_ctx.available_actions,
-                                    metadata={"interim_pending_credit": True},
+                                    metadata={
+                                        "interim_pending_credit": True,
+                                        "action_overridden": bool(pending.metadata.get("action_overridden", False)),
+                                        "override_type": pending.metadata.get("override_type", ""),
+                                    },
                                 )
                                 episode_return += pending_reward
+                                recent_reward_sum_by_vehicle[vehicle_id] += float(pending_reward)
                                 pending.state = next_state
                                 pending.last_credit_edge = current_edge
                                 pending.last_credit_step = step
@@ -1378,14 +1471,19 @@ class RLTrainingPipeline:
                                 timeout_penalty = self._clip_reward(self.pending_replan_penalty)
                                 self.trainer.remember(
                                     pending.state,
-                                    pending.intended_action,
+                                    pending.metadata.get("executed_action", pending.intended_action),
                                     timeout_penalty,
                                     timeout_state,
                                     False,
                                     next_valid_actions=timeout_ctx.available_actions,
-                                    metadata={"pending_timeout_replan": True},
+                                    metadata={
+                                        "pending_timeout_replan": True,
+                                        "action_overridden": bool(pending.metadata.get("action_overridden", False)),
+                                        "override_type": pending.metadata.get("override_type", ""),
+                                    },
                                 )
                                 episode_return += timeout_penalty
+                                recent_reward_sum_by_vehicle[vehicle_id] += float(timeout_penalty)
                                 decision_metrics["pending_decision_timeouts"] += 1
                                 decision_metrics["same_edge_pending_released_no_progress"] += 1
                                 pending_decisions.pop(vehicle_id, None)
@@ -1456,6 +1554,8 @@ class RLTrainingPipeline:
                                 decision_metrics["exploration_actions"] += 1
                             elif action_source == "policy":
                                 decision_metrics["policy_actions"] += 1
+                        selected_action = action
+                        override_type = ""
 
                         next_edge = self.decision_engine.get_next_edge(current_edge, action)
                         if next_edge is None:
@@ -1470,6 +1570,10 @@ class RLTrainingPipeline:
                             destination=vehicle.destination,
                             recent_history=list(recent_edge_history[vehicle_id]),
                             distance_fn=self.get_distance_to_destination,
+                            progress_stagnating=self._is_progress_stagnating(
+                                recent_distance_history[vehicle_id],
+                                recent_eta_history[vehicle_id],
+                            ),
                         )
                         if not safe_ok:
                             decision_metrics["loop_override_count"] += 1
@@ -1480,6 +1584,10 @@ class RLTrainingPipeline:
                                 blocked_action=action,
                                 destination=vehicle.destination,
                                 recent_history=list(recent_edge_history[vehicle_id]),
+                                progress_stagnating=self._is_progress_stagnating(
+                                    recent_distance_history[vehicle_id],
+                                    recent_eta_history[vehicle_id],
+                                ),
                             )
                             if action is None:
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -1487,7 +1595,10 @@ class RLTrainingPipeline:
                             decision_metrics["fallback_overrides"] += 1
                             decision_metrics["safety_overrides"] += 1
                             action_source = "loop_prefilter_fallback"
-                            episode_return += self._clip_reward(self.loop_trap_override_penalty)
+                            override_type = "policy_correction_loop"
+                            loop_override_penalty = self._clip_reward(self.loop_trap_override_penalty)
+                            episode_return += loop_override_penalty
+                            recent_reward_sum_by_vehicle[vehicle_id] += float(loop_override_penalty)
                             next_edge = self.decision_engine.get_next_edge(current_edge, action)
                             if next_edge is None:
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -1503,6 +1614,10 @@ class RLTrainingPipeline:
                                     blocked_action=action,
                                     destination=vehicle.destination,
                                     recent_history=list(recent_edge_history[vehicle_id]),
+                                    progress_stagnating=self._is_progress_stagnating(
+                                        recent_distance_history[vehicle_id],
+                                        recent_eta_history[vehicle_id],
+                                    ),
                                 )
                                 if fallback_action is None:
                                     prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -1511,7 +1626,10 @@ class RLTrainingPipeline:
                                 action_source = "cooldown_fallback"
                                 decision_metrics["fallback_overrides"] += 1
                                 decision_metrics["fallback_to_lane_feasible_now"] += 1
-                                episode_return += self._clip_reward(self.same_edge_repeat_chase_penalty)
+                                override_type = "hard_feasibility_cooldown"
+                                cooldown_penalty = self._clip_reward(self.same_edge_repeat_chase_penalty)
+                                episode_return += cooldown_penalty
+                                recent_reward_sum_by_vehicle[vehicle_id] += float(cooldown_penalty)
                             else:
                                 lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action)
                                 decision_metrics["lane_change_attempts"] += 1
@@ -1536,7 +1654,14 @@ class RLTrainingPipeline:
                                     context=context,
                                     lane_change_requested=lane_change_requested,
                                     route_fragment=[],
-                                    metadata={"action_source": action_source, **observe_metadata},
+                                    metadata={
+                                        "action_source": action_source,
+                                        "selected_action": selected_action,
+                                        "executed_action": action,
+                                        "action_overridden": bool(action != selected_action),
+                                        "override_type": override_type,
+                                        **observe_metadata,
+                                    },
                                 )
                                 decision_metrics["decisions_opened"] += 1
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -1569,7 +1694,14 @@ class RLTrainingPipeline:
                             context=context,
                             lane_change_requested=lane_change_requested,
                             route_fragment=list(full_route[1:]) if full_route else [],
-                            metadata={"action_source": action_source, "lane_change_deferrals": lane_change_deferrals.get(vehicle_id, 0)},
+                            metadata={
+                                "action_source": action_source,
+                                "lane_change_deferrals": lane_change_deferrals.get(vehicle_id, 0),
+                                "selected_action": selected_action,
+                                "executed_action": action,
+                                "action_overridden": bool(action != selected_action),
+                                "override_type": override_type,
+                            },
                         )
                         lane_change_deferrals[vehicle_id] = 0
                         decision_metrics["decisions_opened"] += 1
@@ -1577,203 +1709,114 @@ class RLTrainingPipeline:
 
                     simulation_step()
 
-                    # Vehicles removed by SUMO because they reached their current route target.
-                    # This is where we can tell whether they ended at the global destination
-                    # or were terminated at an intermediate/local target.
                     arrived_this_step = set(simulation_get_arrived_ids())
                     live_after_step = set(vehicle_get_ids())
-                    destination_live_ids = {
-                        vid for vid in controlled_live_ids
-                        if vid in live_after_step and vid in vehicles
-                        and last_seen_edge_by_vehicle.get(vid) == vehicles[vid].destination
-                    }
-                    for arrived_vehicle_id in (arrived_this_step | destination_live_ids):
-                        if arrived_vehicle_id not in vehicles:
-                            continue
-
-                        vehicle = vehicles[arrived_vehicle_id]
-                        already_terminal = arrived_vehicle_id in terminal_recorded_ids
-
-                        last_seen_edge = last_seen_edge_by_vehicle.get(arrived_vehicle_id, "<unknown>")
-                        reached_global_destination = (last_seen_edge == vehicle.destination)
-                        observed_destination_edge = (last_seen_edge == vehicle.destination)
-                        if not observed_destination_edge:
-                            decision_metrics["arrived_with_stale_pre_step_edge"] += 1
-
-                        if reached_global_destination:
-                            arrived_ids.add(arrived_vehicle_id)
-                            arrived_global_destination_ids.add(arrived_vehicle_id)
-
-                        debug_record = {
-                            "vehicle_id": arrived_vehicle_id,
-                            "global_destination": vehicle.destination,
-                            "last_seen_edge": last_seen_edge,
-                            "observed_destination_edge": observed_destination_edge,
-                            "last_local_target": last_target_by_vehicle.get(arrived_vehicle_id, "<unset>"),
-                            "reached_global_destination": reached_global_destination,
-                        }
-                        arrived_debug_records.append(debug_record)
-                        if reached_global_destination and arrived_vehicle_id not in completed_travel_time_ids:
-                            completed_travel_time_ids.add(arrived_vehicle_id)
-                            completed_travel_times.append(max(float(step) - float(vehicle.start_time), 0.0))
-
-                        if (not already_terminal) and (arrived_vehicle_id in pending_decisions):
-                            pending = pending_decisions[arrived_vehicle_id]
-                            repeated_recent_edges = sum(
-                                1 for edge in recent_edge_history[arrived_vehicle_id]
-                                if edge == last_seen_edge
-                            )
-                            prev_distance = self.get_distance_to_destination(pending.decision_edge, vehicle.destination)
-                            curr_distance = self.get_distance_to_destination(vehicle.destination, vehicle.destination)
-                            prev_eta = self._estimate_remaining_eta(pending.decision_edge, vehicle.destination)
-                            curr_eta = self._estimate_remaining_eta(vehicle.destination, vehicle.destination)
-                            reward, done = self.compute_reward(
-                                vehicle,
-                                pending.last_credit_edge,
-                                vehicle.destination,
-                                step,
-                                arrived=True,
-                                repeated_recent_edges=repeated_recent_edges,
-                                delta_t=max(step - pending.last_credit_step, 1),
-                                reached_global_destination=reached_global_destination,
-                            )
-                            next_state = self.make_terminal_next_state_from_edge(
-                                vehicle.destination,
-                                vehicle.destination,
-                                vehicle=vehicle,
-                                step=step,
-                            )
-                            self.trainer.remember(
-                                pending.state,
-                                pending.intended_action,
-                                reward,
-                                next_state,
-                                done,
-                                next_valid_actions=[],
-                            )
-                            episode_return += reward
-                            decision_metrics["decisions_finalized"] += 1
-                            decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
-                            finalized_decision_rewards.append(float(reward))
-                            terminal_recorded_ids.add(arrived_vehicle_id)
-                            decision_debug_rows.append(self._build_decision_debug_row(
-                                episode=episode,
-                                step=step,
-                                pending=pending,
-                                actual_next_edge=vehicle.destination,
-                                finalized=1,
-                                finalize_delay_steps=max(step - pending.decision_step, 0),
-                                reward=reward,
-                                done=int(bool(done)),
-                                route_mismatch=0,
-                                teleported=0,
-                                reached_global_destination=int(bool(reached_global_destination)),
-                                prev_eta=prev_eta if math.isfinite(prev_eta) else "",
-                                curr_eta=curr_eta if math.isfinite(curr_eta) else "",
-                                prev_distance=prev_distance if math.isfinite(prev_distance) else "",
-                                curr_distance=curr_distance if math.isfinite(curr_distance) else "",
-                                externality_penalty=0.0,
-                            ))
-                            pending_debug_logged_ids.add(arrived_vehicle_id)
-
-                        # Only cleanup when SUMO removed vehicle or it has no pending transition.
-                        if (arrived_vehicle_id not in live_after_step) or (arrived_vehicle_id not in pending_decisions):
-                            self.cleanup_vehicle_state(
-                                arrived_vehicle_id,
-                                pending_decisions,
-                                prev_edge_by_vehicle,
-                                last_seen_edge_by_vehicle,
-                                last_target_by_vehicle,
-                                recent_edge_history,
-                                last_snapshot_by_vehicle,
-                            )
-
-                    # =========================
-                    # Teleport detection + terminal penalty
-                    # =========================
                     teleported_ids = self.get_teleport_ids()
                     if teleported_ids:
                         episode_teleport_events += len(teleported_ids)
                         decision_metrics["teleports"] += len(teleported_ids)
-                        teleported_controlled_ids.update(tid for tid in teleported_ids if tid in vehicles)
-                        for tid in list(teleported_ids):
-                            if tid not in vehicles:
-                                continue
-
-                            # If we have an open transition for this vehicle, close it as terminal
-                            if tid in pending_decisions:
-                                pending = pending_decisions[tid]
-                                v = vehicles[tid]
-
-                                # Big penalty so agent learns to avoid situations leading to teleports
-                                terminal_snapshot = last_snapshot_by_vehicle.get(tid)
-                                next_state = self.make_terminal_next_state_from_snapshot(
-                                    terminal_snapshot,
-                                    v.destination,
-                                    vehicle=v,
-                                    step=step,
-                                )
-
-                                self.trainer.remember(
-                                    pending.state,
-                                    pending.intended_action,
-                                    self.teleport_penalty,
-                                    next_state,
-                                    True,
-                                    next_valid_actions=[],
-                                )
-                                episode_return += self.teleport_penalty
-                                terminal_recorded_ids.add(tid)
-                                decision_metrics["decisions_finalized"] += 1
-                                decision_metrics["fail_teleport"] += 1
-                                decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
-                                finalized_decision_rewards.append(float(self.teleport_penalty))
-                                decision_debug_rows.append(self._build_decision_debug_row(
-                                    episode=episode,
-                                    step=step,
-                                    pending=pending,
-                                    actual_next_edge="",
-                                    finalized=1,
-                                    finalize_delay_steps=max(step - pending.decision_step, 0),
-                                    reward=self.teleport_penalty,
-                                    done=1,
-                                    route_mismatch="",
-                                    teleported=1,
-                                    reached_global_destination=0,
-                                ))
-
-                            self.cleanup_vehicle_state(
-                                tid,
-                                pending_decisions,
-                                prev_edge_by_vehicle,
-                                last_seen_edge_by_vehicle,
-                                last_target_by_vehicle,
-                                recent_edge_history,
-                                last_snapshot_by_vehicle,
-                            )
-
                     tracked_ids = (
                         set(pending_decisions.keys())
                         | set(prev_edge_by_vehicle.keys())
                         | set(last_seen_edge_by_vehicle.keys())
                         | set(last_target_by_vehicle.keys())
                         | set(last_snapshot_by_vehicle.keys())
+                        | set(recent_distance_history.keys())
+                        | set(recent_eta_history.keys())
+                        | set(recent_reward_sum_by_vehicle.keys())
                         | set(recent_edge_history.keys())
                     )
-                    stale_disappeared = [
-                        vid for vid in tracked_ids
-                        if vid not in live_after_step and vid not in arrived_ids and vid not in teleported_controlled_ids
-                    ]
-                    for stale_id in stale_disappeared:
-                        decision_metrics["fail_removed_non_destination"] += 1
+                    terminal_types = {}
+                    for vid in controlled_ids:
+                        if vid in live_after_step:
+                            continue
+                        last_edge = last_seen_edge_by_vehicle.get(vid, "")
+                        destination = vehicles[vid].destination if vid in vehicles else ""
+                        if vid in teleported_ids:
+                            terminal_types[vid] = "teleported"
+                        elif vid in arrived_this_step and last_edge == destination:
+                            terminal_types[vid] = "arrived_global"
+                        else:
+                            terminal_types[vid] = "removed_non_destination"
+
+                    for vid in list(terminal_types.keys()):
+                        if vid not in vehicles:
+                            continue
+                        terminal_type = terminal_types[vid]
+                        if terminal_type == "teleported":
+                            teleported_controlled_ids.add(vid)
+                        if terminal_type == "arrived_global":
+                            arrived_ids.add(vid)
+                            arrived_global_destination_ids.add(vid)
+                            arrived_debug_records.append({
+                                "vehicle_id": vid,
+                                "global_destination": vehicles[vid].destination,
+                                "last_seen_edge": last_seen_edge_by_vehicle.get(vid, "<unknown>"),
+                                "observed_destination_edge": True,
+                                "last_local_target": last_target_by_vehicle.get(vid, "<unset>"),
+                                "reached_global_destination": True,
+                            })
+                            if vid not in completed_travel_time_ids:
+                                completed_travel_time_ids.add(vid)
+                                completed_travel_times.append(max(float(step) - float(vehicles[vid].start_time), 0.0))
+                        elif terminal_type == "removed_non_destination":
+                            decision_metrics["fail_removed_non_destination"] += 1
+                            exited_without_destination_ids.add(vid)
+                        if terminal_type == "teleported":
+                            decision_metrics["fail_teleport"] += 1
+
+                        terminal_debug_rows.append({
+                            "episode": episode,
+                            "vehicle_id": vid,
+                            "terminal_type": terminal_type,
+                            "step": step,
+                            "last_seen_edge": last_seen_edge_by_vehicle.get(vid, "<unknown>"),
+                            "last_local_target": last_target_by_vehicle.get(vid, "<unset>"),
+                            "global_destination": vehicles[vid].destination,
+                            "recent_reward_sum": float(recent_reward_sum_by_vehicle.get(vid, 0.0)),
+                        })
+
+                        if vid in pending_decisions and vid not in terminal_recorded_ids:
+                            pending = pending_decisions[vid]
+                            v = vehicles[vid]
+                            reward = self.teleport_penalty if terminal_type == "teleported" else self.pending_timeout_penalty
+                            reward = self._clip_reward(reward)
+                            next_state = self.make_terminal_next_state_from_snapshot(
+                                last_snapshot_by_vehicle.get(vid),
+                                v.destination,
+                                vehicle=v,
+                                step=step,
+                            )
+                            self.trainer.remember(
+                                pending.state,
+                                pending.metadata.get("executed_action", pending.intended_action),
+                                reward,
+                                next_state,
+                                True,
+                                next_valid_actions=[],
+                                metadata={
+                                    "terminal_type": terminal_type,
+                                    "action_overridden": bool(pending.metadata.get("action_overridden", False)),
+                                    "override_type": pending.metadata.get("override_type", ""),
+                                },
+                            )
+                            episode_return += reward
+                            recent_reward_sum_by_vehicle[vid] += float(reward)
+                            decision_metrics["decisions_finalized"] += 1
+                            decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
+                            finalized_decision_rewards.append(float(reward))
+                            terminal_recorded_ids.add(vid)
                         self.cleanup_vehicle_state(
-                            stale_id,
+                            vid,
                             pending_decisions,
                             prev_edge_by_vehicle,
                             last_seen_edge_by_vehicle,
                             last_target_by_vehicle,
                             recent_edge_history,
                             last_snapshot_by_vehicle,
+                            recent_distance_history=recent_distance_history,
+                            recent_eta_history=recent_eta_history,
+                            recent_reward_sum_by_vehicle=recent_reward_sum_by_vehicle,
                         )
 
                     if step % self.train_every == 0:
@@ -1803,6 +1846,16 @@ class RLTrainingPipeline:
                     alive_at_step_cap_ids = {vid for vid in vehicle_get_ids() if vid in vehicles}
                     decision_metrics["fail_timeout"] += len(alive_at_step_cap_ids)
                     for vid in alive_at_step_cap_ids:
+                        terminal_debug_rows.append({
+                            "episode": episode,
+                            "vehicle_id": vid,
+                            "terminal_type": "timeout_alive",
+                            "step": last_step_executed,
+                            "last_seen_edge": last_seen_edge_by_vehicle.get(vid, "<unknown>"),
+                            "last_local_target": last_target_by_vehicle.get(vid, "<unset>"),
+                            "global_destination": vehicles[vid].destination,
+                            "recent_reward_sum": float(recent_reward_sum_by_vehicle.get(vid, 0.0)),
+                        })
                         if vid in pending_decisions:
                             pending = pending_decisions[vid]
                             timeout_vehicle = vehicles[vid]
@@ -1825,14 +1878,19 @@ class RLTrainingPipeline:
                             timeout_reward = self._clip_reward(timeout_reward)
                             self.trainer.remember(
                                 pending.state,
-                                pending.intended_action,
+                                pending.metadata.get("executed_action", pending.intended_action),
                                 timeout_reward,
                                 timeout_next_state,
                                 True,
                                 next_valid_actions=[],
-                                metadata={"timeout": True},
+                                metadata={
+                                    "timeout": True,
+                                    "action_overridden": bool(pending.metadata.get("action_overridden", False)),
+                                    "override_type": pending.metadata.get("override_type", ""),
+                                },
                             )
                             episode_return += timeout_reward
+                            recent_reward_sum_by_vehicle[vid] += float(timeout_reward)
                             decision_metrics["decisions_finalized"] += 1
                             finalized_decision_rewards.append(float(timeout_reward))
                             decision_latency_steps.append(float(max(last_step_executed - pending.decision_step, 0)))
@@ -2008,6 +2066,7 @@ class RLTrainingPipeline:
                         finalize_delay_steps=max(last_step_executed - pending.decision_step, 0),
                     ))
                 self._append_decision_debug_rows(decision_debug_rows)
+                self._append_terminal_debug_rows(terminal_debug_rows)
                 traci.close()
                 with open(self.metrics_csv_path, "a", newline="") as f:
                     writer = csv.DictWriter(f, fieldnames=csv_fields)

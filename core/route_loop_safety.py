@@ -16,6 +16,28 @@ def has_short_cycle_repeat(history: Iterable[str], max_cycle_len: int = 4) -> bo
     return False
 
 
+def has_repeated_subsequence(
+    history: Iterable[str],
+    min_len: int = 3,
+    max_len: int = 6,
+) -> bool:
+    """
+    Detect longer repeated subsequences in recent history (e.g., U-turn + 3-4 edges + repeat).
+    This is intentionally a soft signal for ranking/deprioritization, not always a hard ban.
+    """
+    seq = list(history)
+    n = len(seq)
+    if n < (min_len * 2):
+        return False
+    upper = min(max_len, n // 2)
+    for length in range(min_len, upper + 1):
+        tail = tuple(seq[-length:])
+        for start in range(0, n - (2 * length) + 1):
+            if tuple(seq[start:start + length]) == tail:
+                return True
+    return False
+
+
 def dead_end_reentry_count(
     history: Iterable[str],
     edge_out_degree: Dict[str, int],
@@ -39,6 +61,7 @@ def transition_signal(
     return {
         "aba_bounce": is_aba_bounce(probe),
         "short_cycle": has_short_cycle_repeat(probe),
+        "long_cycle_repeat": has_repeated_subsequence(probe),
         "dead_end_reentry": dead_end_reentry_count(probe, edge_out_degree) > 0,
     }
 

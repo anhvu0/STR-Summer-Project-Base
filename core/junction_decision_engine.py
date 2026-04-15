@@ -301,6 +301,7 @@ class JunctionDecisionEngine:
         recent_history: List[str],
         blocked_action: Optional[int] = None,
         distance_fn: Optional[Callable[[str, str], float]] = None,
+        progress_stagnating: bool = False,
     ) -> List[int]:
         candidate_pool = self.lane_feasible_fallback_actions(context, blocked_action=blocked_action)
         if not candidate_pool:
@@ -316,6 +317,7 @@ class JunctionDecisionEngine:
                 destination=destination,
                 recent_history=recent_history,
                 distance_fn=distance_fn,
+                progress_stagnating=progress_stagnating,
             )
             score = 0.0
             if not safe_ok:
@@ -324,6 +326,8 @@ class JunctionDecisionEngine:
                 score += 10.0
             if details.get("short_cycle") or details.get("aba_bounce"):
                 score += 12.0
+            if details.get("long_cycle_repeat"):
+                score += 9.0
             if details.get("trap_like_reversal"):
                 score += 8.0
             if details.get("distance_worsen"):
@@ -348,6 +352,7 @@ class JunctionDecisionEngine:
         recent_history: List[str],
         distance_fn: Optional[Callable[[str, str], float]] = None,
         distance_slack: Optional[float] = None,
+        progress_stagnating: bool = False,
     ) -> Tuple[bool, Dict[str, bool]]:
         next_edge = self.get_next_edge(context.edge_id, action_idx)
         if next_edge is None:
@@ -370,10 +375,19 @@ class JunctionDecisionEngine:
                 next_distance,
                 slack=self.loop_distance_slack if distance_slack is None else float(distance_slack),
             )
-        blocked = bool(signals.get("short_cycle") or signals.get("aba_bounce") or signals.get("dead_end_reentry") or trap_like or dist_worsen)
+        soft_loop_signal = bool(
+            signals.get("short_cycle")
+            or signals.get("aba_bounce")
+            or signals.get("long_cycle_repeat")
+            or signals.get("dead_end_reentry")
+        )
+        # Loop signals are only a hard block when progress has stalled.
+        # Otherwise they are still emitted for fallback ranking/telemetry.
+        blocked = bool(trap_like or dist_worsen or (soft_loop_signal and progress_stagnating))
         details = dict(signals)
         details["trap_like_reversal"] = trap_like
         details["distance_worsen"] = dist_worsen
+        details["progress_stagnating"] = bool(progress_stagnating)
         return (not blocked), details
 
     def try_request_lane_change(self, context: DecisionContext, action_idx: int, duration: int = 70) -> Tuple[bool, bool]:
