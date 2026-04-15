@@ -74,6 +74,8 @@ class JunctionDecisionEngine:
         self.lane_change_margin_m = 24.0
         self.commit_min_distance = 14.0
         self.default_fragment_horizon_m = 180.0
+        self.min_fragment_buffer_m = 140.0
+        self.min_fragment_buffer_edges = 3
         self.pending_timeout_steps = 18
         self.lane_change_defer_limit = 4
         self.observe_steps_min = 2
@@ -448,18 +450,30 @@ class JunctionDecisionEngine:
         path_ids = [edge.getID() for edge in path_edges]
         fragment = []
         cumulative = 0.0
+        buffered_fallback = None
         for edge in path_ids:
             if not self._edge_allows_passenger(edge):
                 return [], None, "non_passenger_edge"
             fragment.append(edge)
             cumulative += float(self.connection_info.edge_length_dict.get(edge, 40.0))
+            idx = len(fragment)
+            if cumulative >= self.min_fragment_buffer_m and idx >= self.min_fragment_buffer_edges:
+                buffered_fallback = edge
+                out_degree = len(self.connection_info.outgoing_edges_dict.get(edge, {}))
+                if edge == destination or out_degree != 1:
+                    break
             if cumulative >= horizon:
                 break
 
         if fragment[-1] != destination and destination not in path_ids:
             return [], None, "fragment_disconnected"
 
-        local_target = fragment[-1]
+        if destination in fragment:
+            local_target = destination
+        elif buffered_fallback is not None:
+            local_target = buffered_fallback
+        else:
+            local_target = fragment[-1]
         return fragment, local_target, None
 
     def build_full_route(self, edge_id: str, action_idx: int, destination: str):

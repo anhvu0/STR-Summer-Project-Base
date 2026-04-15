@@ -50,9 +50,11 @@ class RouteController(ABC):
             if current_target_edge == vehicle.destination:
                 return vehicle.destination
 
-            # deterministic, no random fallbacks in runtime-critical routing
-            path_length = 0.0
-            horizon = max(float(vehicle.current_speed), 140.0)
+            # Deterministic, no random fallbacks in runtime-critical routing.
+            # Keep a minimum route buffer to reduce route-end removals.
+            min_buffer_m = max(140.0, 2.5 * float(vehicle.current_speed))
+            min_buffer_edges = 3
+            cumulative_length = 0.0
             traversed_edges = [current_target_edge]
 
             for choice in decision_list:
@@ -61,11 +63,11 @@ class RouteController(ABC):
                     break
                 current_target_edge = outgoing[choice]
                 traversed_edges.append(current_target_edge)
-                path_length += float(self.connection_info.edge_length_dict.get(current_target_edge, 30.0))
-                if current_target_edge == vehicle.destination or path_length >= horizon:
+                if current_target_edge == vehicle.destination:
                     return current_target_edge
 
-            # Extend deterministically via shortest path to keep fragment stable and connected.
+            # Extend deterministically via shortest path to keep a connected fragment,
+            # and avoid ending local targets on corridor-only edges when possible.
             try:
                 net = sumolib.net.readNet(self.connection_info.net_filename)
                 from_edge = net.getEdge(current_target_edge)
@@ -77,15 +79,36 @@ class RouteController(ABC):
                         if not edge_obj.allows("passenger"):
                             break
                         traversed_edges.append(edge_id)
-                        path_length += float(self.connection_info.edge_length_dict.get(edge_id, 30.0))
                         current_target_edge = edge_id
-                        if current_target_edge == vehicle.destination or path_length >= horizon:
+                        if current_target_edge == vehicle.destination:
                             break
             except Exception:
                 # Keep deterministic safe behavior; stay on last connected edge.
                 pass
 
-            return current_target_edge if traversed_edges else vehicle.current_edge
+            # If destination is already in the committed reachable fragment,
+            # target destination directly.
+            if vehicle.destination in traversed_edges:
+                return vehicle.destination
+
+            # Select the earliest non-corridor edge after satisfying minimum buffer.
+            buffered_fallback = None
+            for idx, edge_id in enumerate(traversed_edges[1:], start=1):
+                cumulative_length += float(self.connection_info.edge_length_dict.get(edge_id, 30.0))
+                if cumulative_length < min_buffer_m or idx < min_buffer_edges:
+                    continue
+                buffered_fallback = edge_id
+                out_degree = len(self.connection_info.outgoing_edges_dict.get(edge_id, {}))
+                # Prefer true decision-like edges (not corridor-only), but allow
+                # any buffered edge as fallback when the corridor continues.
+                if out_degree != 1:
+                    return edge_id
+
+            if buffered_fallback is not None:
+                return buffered_fallback
+
+            # No near decision point: extend as far as we can on the valid fragment.
+            return traversed_edges[-1] if traversed_edges else vehicle.current_edge
 
         except Exception as e:
             print("compute_local_target exception:", e)
