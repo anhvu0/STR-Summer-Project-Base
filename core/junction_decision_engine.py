@@ -301,6 +301,8 @@ class JunctionDecisionEngine:
         recent_history: List[str],
         blocked_action: Optional[int] = None,
         distance_fn: Optional[Callable[[str, str], float]] = None,
+        congestion_score_fn: Optional[Callable[[str, Optional[str]], float]] = None,
+        branch_pressure_fn: Optional[Callable[[Optional[str]], float]] = None,
     ) -> List[int]:
         candidate_pool = self.lane_feasible_fallback_actions(context, blocked_action=blocked_action)
         if not candidate_pool:
@@ -335,6 +337,10 @@ class JunctionDecisionEngine:
                     score += min(float(next_dist) / 250.0, 10.0)
                 else:
                     score += 25.0
+            if congestion_score_fn is not None:
+                score += max(float(congestion_score_fn(context.edge_id, next_edge)), 0.0)
+            if branch_pressure_fn is not None:
+                score += max(float(branch_pressure_fn(next_edge)), 0.0)
             score += 0.05 * float(context.required_lane_shift.get(action, 0))
             scored.append((score, action))
         scored.sort(key=lambda x: x[0])

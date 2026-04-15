@@ -34,6 +34,8 @@ class QLearningPolicy(RouteController):
         self._pending_decisions = {}
         self._lane_change_deferrals = {}
         self._lane_change_cooldown = {}
+        self._edge_commitments = deque(maxlen=200)
+        self._pending_progress = {}
         self._metrics = {
             "decisions": 0,
             "overrides": 0,
@@ -53,6 +55,8 @@ class QLearningPolicy(RouteController):
             "cooldown_replans_blocked": 0,
             "loop_override_count": 0,
             "dead_end_reentry_override_count": 0,
+            "pending_preemptions": 0,
+            "trapped_replan_skips": 0,
         }
         self._last_metrics_snapshot = None
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
@@ -70,6 +74,78 @@ class QLearningPolicy(RouteController):
         self.use_compact_state = (self.model_state_size == self.compact_state_size)
         self.direction_mask_start = (2 * self.edge_embedding_dim) if self.use_compact_state else 2
         self._init_edge_embeddings(seed=1337)
+
+    def _edge_density(self, edge_id):
+        return traci.edge.getLastStepVehicleNumber(edge_id) / max(
+            self.connection_info.edge_length_dict.get(edge_id, 5.0),
+            5.0,
+        )
+
+    def _congestion_score(self, current_edge, next_edge):
+        current_density = self._edge_density(current_edge)
+        next_density = self._edge_density(next_edge) if next_edge else current_density
+        return (2.0 * current_density) + (2.5 * next_density)
+
+    def _branch_pressure_penalty(self, next_edge):
+        if not next_edge:
+            return 0.0
+        count = sum(1 for edge in self._edge_commitments if edge == next_edge)
+        return min(float(count) * 0.45, 6.0)
+
+    def _record_commitment(self, next_edge):
+        if next_edge:
+            self._edge_commitments.append(next_edge)
+
+    def _physically_recoverable_actions(self, context):
+        lane_now = set(context.lane_feasible_now_actions)
+        reachable = set(context.reachable_with_lane_change_actions)
+        recoverable = []
+        for action in context.available_actions:
+            if action in lane_now:
+                recoverable.append(action)
+                continue
+            if context.commit_window:
+                continue
+            if action not in reachable:
+                continue
+            required_shift = int(context.required_lane_shift.get(action, 99))
+            if required_shift >= 99:
+                continue
+            lane_change_budget = max(float(context.dist_to_end) - float(self.decision_engine.commit_min_distance), 0.0)
+            required_budget = required_shift * float(self.decision_engine.lane_change_margin_m)
+            if lane_change_budget >= required_budget and float(context.speed) >= 1.0:
+                recoverable.append(action)
+        return sorted(set(recoverable))
+
+    def _should_preempt_pending_for_congestion(self, pending, context, step):
+        pending_age = self.decision_engine.pending_age_steps(pending, step)
+        progress = self._pending_progress.setdefault(
+            pending.context.vehicle_id,
+            {"edge": context.edge_id, "edge_steps": 0, "best_dist_to_end": float(context.dist_to_end)},
+        )
+        if progress["edge"] != context.edge_id:
+            progress["edge"] = context.edge_id
+            progress["edge_steps"] = 0
+            progress["best_dist_to_end"] = float(context.dist_to_end)
+        progress["edge_steps"] += 1
+        progress["best_dist_to_end"] = min(progress["best_dist_to_end"], float(context.dist_to_end))
+        dist_gain = max(progress["best_dist_to_end"] - float(context.dist_to_end), 0.0)
+
+        recoverable = self._physically_recoverable_actions(context)
+        feasible_escape = [a for a in recoverable if a != pending.intended_action]
+        if not feasible_escape:
+            return False, True
+        if context.commit_window and pending.intended_action not in context.lane_feasible_now_actions:
+            return True, False
+
+        blocked = (
+            progress["edge_steps"] >= 4
+            and float(context.speed) <= 0.6
+            and self._edge_density(context.edge_id) >= 0.18
+            and dist_gain <= 2.0
+        )
+        stale = pending_age >= max(4, self.decision_engine.pending_progress_timeout_steps // 2) and dist_gain <= 1.0
+        return (blocked or stale), False
 
     def _init_edge_embeddings(self, seed=1337):
         rng = np.random.default_rng(seed)
@@ -252,6 +328,7 @@ class QLearningPolicy(RouteController):
         vid = vehicle.vehicle_id
         pending = self._pending_decisions.get(vid)
         if not pending:
+            self._pending_progress.pop(vid, None)
             return
         step = int(traci.simulation.getTime())
         snapshot = self._snapshot_vehicle(vid, vehicle.current_edge, step)
@@ -264,16 +341,19 @@ class QLearningPolicy(RouteController):
                 self._metrics["pending_decision_timeouts"] += 1
                 self._metrics["same_edge_pending_released_no_progress"] += 1
                 self._lane_change_cooldown[(vid, vehicle.current_edge)] = step + self.decision_engine.cooldown_steps
+                self._pending_progress.pop(vid, None)
                 return
             if context.commit_window and pending.intended_action not in context.lane_feasible_now_actions:
                 self._pending_decisions.pop(vid, None)
                 self._metrics["same_edge_pending_released_no_progress"] += 1
                 self._lane_change_cooldown[(vid, vehicle.current_edge)] = step + self.decision_engine.cooldown_steps
+                self._pending_progress.pop(vid, None)
                 return
             self._metrics["decision_committed_skips"] += 1
             return
         self._pending_decisions.pop(vid, None)
         self._lane_change_deferrals[vid] = 0
+        self._pending_progress.pop(vid, None)
 
     def _snapshot_vehicle(self, vid, edge_id, step):
         try:
@@ -371,7 +451,11 @@ class QLearningPolicy(RouteController):
                         recent_history=list(self._recent_edges.get(vid, deque(maxlen=self.loop_window))),
                         blocked_action=pending.intended_action,
                         distance_fn=self._dist_to_dest,
+                        congestion_score_fn=self._congestion_score,
+                        branch_pressure_fn=self._branch_pressure_penalty,
                     )
+                    recoverable = set(self._physically_recoverable_actions(obs_context))
+                    fallback_actions = [a for a in fallback_actions if a in recoverable]
                     if not fallback_actions:
                         continue
                     action_idx = fallback_actions[0]
@@ -399,7 +483,52 @@ class QLearningPolicy(RouteController):
                         metadata={"phase": "route_pending"},
                     )
                     continue
-                continue
+                if phase == "route_pending":
+                    obs_snapshot = self._snapshot_vehicle(vid, start_edge, step)
+                    if obs_snapshot is None:
+                        continue
+                    obs_context = self.decision_engine.build_context(str(vid), start_edge, vehicle.destination, step, snapshot=obs_snapshot)
+                    should_preempt, trapped = self._should_preempt_pending_for_congestion(pending, obs_context, step)
+                    if trapped:
+                        self._metrics["trapped_replan_skips"] += 1
+                        continue
+                    if should_preempt:
+                        fallback_actions = self.decision_engine.ranked_fallback_actions(
+                            context=obs_context,
+                            destination=vehicle.destination,
+                            recent_history=list(self._recent_edges.get(vid, deque(maxlen=self.loop_window))),
+                            blocked_action=pending.intended_action,
+                            distance_fn=self._dist_to_dest,
+                            congestion_score_fn=self._congestion_score,
+                            branch_pressure_fn=self._branch_pressure_penalty,
+                        )
+                        recoverable = set(self._physically_recoverable_actions(obs_context))
+                        fallback_actions = [a for a in fallback_actions if a in recoverable]
+                        if fallback_actions:
+                            action_idx = fallback_actions[0]
+                            full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
+                                str(vid), start_edge, action_idx, vehicle.destination
+                            )
+                            if not apply_error:
+                                self._pending_decisions[vid] = PendingDecision(
+                                    state=None,
+                                    intended_action=action_idx,
+                                    intended_next_edge=committed_next_edge,
+                                    decision_edge=start_edge,
+                                    decision_step=step,
+                                    last_credit_edge=start_edge,
+                                    last_credit_step=step,
+                                    destination=vehicle.destination,
+                                    context=obs_context,
+                                    lane_change_requested=False,
+                                    route_fragment=list(full_route[1:]) if full_route else [],
+                                    metadata={"phase": "route_pending", "action_source": "congestion_preempt"},
+                                )
+                                self._metrics["pending_preemptions"] += 1
+                                self._metrics["fallback_to_lane_feasible_now"] += 1
+                                self._record_commitment(committed_next_edge)
+                        continue
+                    continue
 
             snapshot = self._snapshot_vehicle(vid, start_edge, step)
             if snapshot is None:
@@ -447,7 +576,11 @@ class QLearningPolicy(RouteController):
                     recent_history=recent,
                     blocked_action=action_idx,
                     distance_fn=self._dist_to_dest,
+                    congestion_score_fn=self._congestion_score,
+                    branch_pressure_fn=self._branch_pressure_penalty,
                 )
+                recoverable = set(self._physically_recoverable_actions(context))
+                fallback_actions = [a for a in fallback_actions if a in recoverable]
                 if not fallback_actions:
                     continue
                 action_idx = self.act(state, available_actions=fallback_actions) if context.forced_action is None else fallback_actions[0]
@@ -467,10 +600,17 @@ class QLearningPolicy(RouteController):
                         recent_history=recent,
                         blocked_action=action_idx,
                         distance_fn=self._dist_to_dest,
+                        congestion_score_fn=self._congestion_score,
+                        branch_pressure_fn=self._branch_pressure_penalty,
                     )
+                    recoverable = set(self._physically_recoverable_actions(context))
+                    fallback_actions = [a for a in fallback_actions if a in recoverable]
                     if not fallback_actions:
                         continue
                     action_idx = fallback_actions[0]
+                    selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
+                    if selected_next_edge is None:
+                        continue
                 else:
                     lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action_idx)
                     observe_meta = self.decision_engine.start_lane_change_observe(context, action_idx, step, lane_change_requested, lane_change_ok)
@@ -519,6 +659,7 @@ class QLearningPolicy(RouteController):
                     metadata={"phase": "route_pending"},
                 )
                 self._lane_change_deferrals[vid] = 0
+                self._record_commitment(next_edge)
             # Route already committed directly via shared apply_route_decision.
 
         if self._metrics["decisions"] > 0:
