@@ -17,6 +17,7 @@ def parse_sumocfg(sumocfg_path):
     net_file = dom.getElementsByTagName('net-file')[0].attributes['value'].nodeValue
     return os.path.join(os.path.dirname(sumocfg_path), net_file)
 net_path = parse_sumocfg("./configurations/myconfig.sumocfg")
+MAX_SIMULATION_STEPS = 2000
 
 
 class QLearningPolicy(RouteController):
@@ -115,22 +116,78 @@ class QLearningPolicy(RouteController):
     
 
 
-    def _compute_deadline_features(self, vehicle_id):
+    def _compute_objective_features(self, vehicle_id, edge_id, destination_edge, step=None):
         vehicle_obj = self.vehicles.get(str(vehicle_id))
-        if vehicle_obj is None:
+        if vehicle_obj is None or edge_id is None:
             return [0.0, 0.0, 0.0]
 
-        now = traci.simulation.getTime()
-        deadline_window = max(float(vehicle_obj.deadline) - float(vehicle_obj.start_time), 1.0)
-        time_left = max(float(vehicle_obj.deadline) - float(now), 0.0)
-        elapsed = max(float(now) - float(vehicle_obj.start_time), 0.0)
-        urgency = 1.0 - min(time_left / deadline_window, 1.0)
+        now = float(traci.simulation.getTime()) if step is None else float(step)
+        elapsed = max(now - float(vehicle_obj.start_time), 0.0)
+        remaining_eta = self._estimate_eta(edge_id, destination_edge)
+        density = traci.edge.getLastStepVehicleNumber(edge_id) / max(
+            self.connection_info.edge_length_dict.get(edge_id, 5.0),
+            5.0,
+        )
 
         return [
-            min(time_left / deadline_window, 1.0),
-            min(elapsed / deadline_window, 1.0),
-            urgency,
+            min(elapsed / float(MAX_SIMULATION_STEPS), 1.0),
+            min(float(remaining_eta) / float(MAX_SIMULATION_STEPS), 1.0) if math.isfinite(remaining_eta) else 1.0,
+            min(float(density), 1.0),
         ]
+
+    def _policy_action_candidates(self, context, recent_history, cooldown_active, destination):
+        available_actions = list(context.available_actions)
+        if not available_actions:
+            return []
+
+        lane_now = set(context.lane_feasible_now_actions)
+        recent_history = list(recent_history or [])
+
+        commit_distance = max(
+            float(self.decision_engine.commit_min_distance),
+            float(context.speed) * float(self.decision_engine.commit_time_s),
+        )
+        extra_buffer = max(10.0, 0.5 * float(self.decision_engine.lane_change_margin_m))
+        comfortable_dist_threshold = commit_distance + extra_buffer
+
+        safe_lane_now_actions = []
+        strict_non_lane_actions = []
+        filtered_available_actions = []
+
+        for action in available_actions:
+            safe_ok, _ = self.decision_engine.prefilter_action_for_loops(
+                context=context,
+                action_idx=action,
+                destination=destination,
+                recent_history=recent_history,
+                distance_fn=self._dist_to_dest,
+            )
+            if not safe_ok:
+                continue
+            filtered_available_actions.append(action)
+            if action in lane_now:
+                safe_lane_now_actions.append(action)
+                continue
+
+            if cooldown_active:
+                continue
+            if context.commit_window:
+                continue
+            if float(context.speed) < 1.2:
+                continue
+            if int(context.required_lane_shift.get(action, 99)) != 1:
+                continue
+            if float(context.dist_to_end) <= comfortable_dist_threshold:
+                continue
+            strict_non_lane_actions.append(action)
+
+        if safe_lane_now_actions:
+            return sorted(set(safe_lane_now_actions))
+        if strict_non_lane_actions:
+            return sorted(set(strict_non_lane_actions))
+        if filtered_available_actions:
+            return sorted(set(filtered_available_actions))
+        return available_actions
 
     #-----------------------DEBUGGING-------------------------------------
     def _dist_to_dest(self, edge_id, dest_id):
@@ -251,10 +308,14 @@ class QLearningPolicy(RouteController):
                 continue
 
             vid = vehicle.vehicle_id
+            step = int(traci.simulation.getTime())
             if vid not in self._recent_edges:
                 self._recent_edges[vid] = deque(maxlen=self.loop_window)
+            self._recent_edges[vid].append(start_edge)
             self._visit_count.setdefault(vid, {})
             self._best_dist.setdefault(vid, float("inf"))
+            self._visit_count[vid][start_edge] = self._visit_count[vid].get(start_edge, 0) + 1
+            self._best_dist[vid] = min(self._best_dist[vid], self._dist_to_dest(start_edge, vehicle.destination))
             self._finalize_commitment(vehicle)
 
             if vid in self._pending_decisions:
@@ -340,7 +401,6 @@ class QLearningPolicy(RouteController):
                     continue
                 continue
 
-            step = int(traci.simulation.getTime())
             snapshot = self._snapshot_vehicle(vid, start_edge, step)
             if snapshot is None:
                 continue
@@ -353,7 +413,16 @@ class QLearningPolicy(RouteController):
                 continue
             else:
                 state = self.getState(vid, start_edge, vehicle.destination, context=context)
-                action_idx = self.act(state, available_actions=context.available_actions)
+                cooldown_until = self._lane_change_cooldown.get((vid, start_edge), -1)
+                cooldown_active = step < cooldown_until
+                recent = list(self._recent_edges.get(vid, deque(maxlen=self.loop_window)))
+                policy_actions = self._policy_action_candidates(
+                    context=context,
+                    recent_history=recent,
+                    cooldown_active=cooldown_active,
+                    destination=vehicle.destination,
+                )
+                action_idx = self.act(state, available_actions=policy_actions)
                 self._metrics["decisions"] += 1
 
             if action_idx not in context.available_actions:
@@ -435,9 +504,6 @@ class QLearningPolicy(RouteController):
 
             next_edge = committed_next_edge
             if next_edge:
-                self._recent_edges[vid].append(next_edge)
-                self._visit_count[vid][next_edge] = self._visit_count[vid].get(next_edge, 0) + 1
-                self._best_dist[vid] = min(self._best_dist[vid], self._dist_to_dest(next_edge, vehicle.destination))
                 self._pending_decisions[vid] = PendingDecision(
                     state=None,
                     intended_action=action_idx,
@@ -540,7 +606,7 @@ class QLearningPolicy(RouteController):
             pass
 
         state.extend([lane_idx_norm, lane_count_norm, dist_to_end_norm])
-        state.extend(self._compute_deadline_features(vehicle_id))
+        state.extend(self._compute_objective_features(vehicle_id, en, destination_edge))
 
         if self.use_compact_state:
             state.extend(self._local_congestion_features(en))
