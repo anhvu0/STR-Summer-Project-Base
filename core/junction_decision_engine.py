@@ -74,14 +74,16 @@ class JunctionDecisionEngine:
         self.lane_change_margin_m = 24.0
         self.commit_min_distance = 14.0
         self.default_fragment_horizon_m = 180.0
-        self.pending_timeout_steps = 18
+        self.pending_timeout_steps = 28
         self.lane_change_defer_limit = 4
-        self.observe_steps_min = 2
-        self.observe_steps_max = 4
-        self.observe_low_speed_mps = 0.8
-        self.observe_stall_steps = 2
+        self.observe_steps_min = 3
+        self.observe_steps_max = 7
+        self.observe_low_speed_mps = 0.35
+        self.observe_stall_steps = 5
+        self.observe_jam_speed_mps = 1.5
+        self.observe_jam_grace_steps = 4
         self.cooldown_steps = 3
-        self.pending_progress_timeout_steps = 10
+        self.pending_progress_timeout_steps = 16
         self.loop_distance_slack = 30.0
 
     def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
@@ -232,6 +234,8 @@ class JunctionDecisionEngine:
             "observe_last_lane_index": int(context.lane_index),
             "observe_last_required_shift": int(context.required_lane_shift.get(action_idx, 99)),
             "observe_stall_steps": 0,
+            "observe_last_dist_to_end": float(context.dist_to_end),
+            "observe_jam_steps": 0,
             "lane_change_requested_once": bool(lane_change_sent),
             "lane_change_request_ok": bool(lane_change_ok),
         }
@@ -248,31 +252,46 @@ class JunctionDecisionEngine:
         observe_steps = int(observe_meta.get("observe_steps", 0)) + 1
         observe_limit = int(observe_meta.get("observe_limit", self.observe_steps_min))
         stall_steps = int(observe_meta.get("observe_stall_steps", 0))
+        jam_steps = int(observe_meta.get("observe_jam_steps", 0))
+        last_dist_to_end = float(observe_meta.get("observe_last_dist_to_end", context.dist_to_end))
+        dist_progress = max(last_dist_to_end - float(context.dist_to_end), 0.0)
 
         toward_target = current_shift < last_shift
         lane_changed = context.lane_index != last_lane
         feasible_now = action_idx in context.lane_feasible_now_actions
-        good_motion = context.speed >= self.observe_low_speed_mps and (not context.commit_window or context.dist_to_end > self.commit_min_distance)
-        progressing = toward_target or lane_changed or feasible_now or good_motion
+        in_jam = context.speed <= self.observe_jam_speed_mps
+        good_motion = context.speed >= self.observe_low_speed_mps and (
+            not context.commit_window or context.dist_to_end > self.commit_min_distance
+        )
+        creeping_progress = dist_progress >= 0.5
+        progressing = toward_target or lane_changed or feasible_now or good_motion or creeping_progress
         if progressing:
             stall_steps = 0
+            jam_steps = 0
         else:
             stall_steps += 1
+            jam_steps = (jam_steps + 1) if in_jam else 0
 
         observe_meta["observe_steps"] = observe_steps
         observe_meta["observe_last_lane_index"] = int(context.lane_index)
         observe_meta["observe_last_required_shift"] = int(current_shift)
         observe_meta["observe_stall_steps"] = int(stall_steps)
+        observe_meta["observe_last_dist_to_end"] = float(context.dist_to_end)
+        observe_meta["observe_jam_steps"] = int(jam_steps)
 
         if feasible_now:
             return "success", None
-        if context.commit_window and action_idx not in context.lane_feasible_now_actions:
+        if context.commit_window and action_idx not in context.lane_feasible_now_actions and observe_steps >= 2:
             return "abort", "commit_window"
-        if context.speed < self.observe_low_speed_mps and observe_steps >= 1:
+        if (
+            context.speed < self.observe_low_speed_mps
+            and observe_steps >= max(observe_limit - 1, 2)
+            and jam_steps < self.observe_jam_grace_steps
+        ):
             return "abort", "low_speed"
-        if stall_steps >= self.observe_stall_steps:
+        if stall_steps >= self.observe_stall_steps and jam_steps < self.observe_jam_grace_steps:
             return "abort", "no_progress"
-        if observe_steps >= observe_limit:
+        if observe_steps >= observe_limit and jam_steps < self.observe_jam_grace_steps:
             return "abort", "no_progress"
         return "continue", None
 

@@ -283,6 +283,9 @@ class RLTrainingPipeline:
         route_difficulty_scale_max=1.0,
         decision_debug_csv_path=None,
         fast_training_profile=False,
+        num_target_vehicles=20,
+        num_random_vehicles=30,
+        sumo_time_to_teleport=300,
     ):
         """
         Args:
@@ -320,6 +323,9 @@ class RLTrainingPipeline:
         self.route_difficulty_scale_min = float(np.clip(route_difficulty_scale_min, 0.05, 1.0))
         self.route_difficulty_scale_max = float(np.clip(route_difficulty_scale_max, self.route_difficulty_scale_min, 1.0))
         self.fast_training_profile = bool(fast_training_profile)
+        self.num_target_vehicles = max(int(num_target_vehicles), 1)
+        self.num_random_vehicles = max(int(num_random_vehicles), 0)
+        self.sumo_time_to_teleport = None if sumo_time_to_teleport is None else float(sumo_time_to_teleport)
         self.decision_debug_csv_path = decision_debug_csv_path
         if self.fast_training_profile and self.decision_debug_csv_path:
             self.decision_debug_csv_path = None
@@ -774,6 +780,15 @@ class RLTrainingPipeline:
             pass
 
         return teleported
+
+    def _is_congestion_likely(self, edge_id, snapshot=None):
+        speed = float(snapshot.speed) if snapshot is not None else math.inf
+        density = self.connection_info.edge_vehicle_count.get(edge_id, 0) / max(
+            self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0
+        )
+        mean_density = float(self._density_mean)
+        dense_edge = density >= max(0.12, mean_density * 1.25)
+        return dense_edge and speed <= 1.5
 
     def _lane_length(self, lane_id):
         if lane_id in self._lane_length_cache:
@@ -1273,8 +1288,8 @@ class RLTrainingPipeline:
         generator = target_vehicles_generator(os.path.join(self.sumocfg_dir, self.net_file))
         route_path = os.path.join(self.sumocfg_dir, self.route_file)
         vehicle_list = generator.generate_vehicles(
-            num_target_vehicles=20,
-            num_random_vehicles=30,
+            num_target_vehicles=self.num_target_vehicles,
+            num_random_vehicles=self.num_random_vehicles,
             pattern=self.target_pattern,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
@@ -1321,6 +1336,8 @@ class RLTrainingPipeline:
             "mean_reward_per_finalized_decision", "mean_route_difficulty_eta", "p50_route_difficulty_eta",
             "p90_route_difficulty_eta", "fail_teleport", "fail_timeout", "fail_removed_non_destination",
             "fail_unreachable_transition", "fail_dead_end_no_outgoing",
+            "teleports_with_pending_decision", "teleports_during_lane_change_observe",
+            "teleports_in_congestion", "teleports_pending_and_congestion",
         ]
         # Rewrite metrics each new training session to avoid schema drift/appending old runs.
         with open(self.metrics_csv_path, "w", newline="") as f:
@@ -1340,12 +1357,15 @@ class RLTrainingPipeline:
 
             vehicles = self.generate_episode_vehicles(episode_seed=episode_seed)
 
-            traci.start([
+            sumo_start_cmd = [
                 sumo_binary,
                 "-c", self.sumocfg_path,
                 "--tripinfo-output", os.path.join(self.sumocfg_dir, "trips.trips.xml"),
                 "--quit-on-end",
-            ])
+            ]
+            if self.sumo_time_to_teleport is not None:
+                sumo_start_cmd.extend(["--time-to-teleport", str(self.sumo_time_to_teleport)])
+            traci.start(sumo_start_cmd)
             simulation_get_min_expected = traci.simulation.getMinExpectedNumber
             simulation_step = traci.simulationStep
             simulation_get_arrived_ids = traci.simulation.getArrivedIDList
@@ -1733,6 +1753,18 @@ class RLTrainingPipeline:
                                 pending.last_credit_edge = current_edge
                                 pending.last_credit_step = step
                             if self.decision_engine.should_timeout_pending(pending, step):
+                                congestion_hold = self._is_congestion_likely(current_edge, snapshot=snapshot)
+                                timeout_threshold = self.decision_engine.pending_timeout_steps
+                                if congestion_hold:
+                                    timeout_threshold = int(timeout_threshold * 2)
+                                    decision_metrics["pending_timeout_extended_for_congestion"] += 1
+                                if not self.decision_engine.should_timeout_pending(
+                                    pending,
+                                    step,
+                                    max_age_steps=timeout_threshold,
+                                ):
+                                    prev_edge_by_vehicle[vehicle_id] = current_edge
+                                    continue
                                 timeout_ctx = self.decision_engine.build_context(
                                     vehicle_id,
                                     current_edge,
@@ -1778,7 +1810,10 @@ class RLTrainingPipeline:
                                 and pending.intended_action not in pending_ctx.lane_feasible_now_actions
                             )
                             no_progress_same_edge = (
-                                pending_age >= self.decision_engine.pending_progress_timeout_steps
+                                pending_age >= (
+                                    self.decision_engine.pending_progress_timeout_steps
+                                    + (8 if self._is_congestion_likely(current_edge, snapshot=snapshot) else 0)
+                                )
                                 and current_edge == pending.decision_edge
                             )
                             if wrong_lane_commit or no_progress_same_edge:
@@ -2090,6 +2125,24 @@ class RLTrainingPipeline:
                         episode_teleport_events += len(teleported_ids)
                         decision_metrics["teleports"] += len(teleported_ids)
                         teleported_controlled_ids.update(tid for tid in teleported_ids if tid in vehicles)
+                        for tid in teleported_ids:
+                            if tid not in vehicles:
+                                continue
+                            pending = pending_decisions.get(tid)
+                            if pending is not None:
+                                decision_metrics["teleports_with_pending_decision"] += 1
+                                if pending.metadata.get("phase") == "observe_lane_change":
+                                    decision_metrics["teleports_during_lane_change_observe"] += 1
+                            snapshot = last_snapshot_by_vehicle.get(tid)
+                            edge_id = last_seen_edge_by_vehicle.get(
+                                tid,
+                                snapshot.edge_id if snapshot is not None else None,
+                            )
+                            congested = edge_id is not None and self._is_congestion_likely(edge_id, snapshot=snapshot)
+                            if congested:
+                                decision_metrics["teleports_in_congestion"] += 1
+                            if congested and pending is not None:
+                                decision_metrics["teleports_pending_and_congestion"] += 1
 
                     for removed_id in sorted(removed_controlled_ids):
                         if removed_id in final_outcome_by_vehicle:
@@ -2294,6 +2347,16 @@ class RLTrainingPipeline:
                         decision_metrics["fallback_overrides"],
                     )
                 )
+                print(
+                    "  teleport attribution: pending={:.0f} lane_change_observe={:.0f} congestion={:.0f} "
+                    "pending_and_congestion={:.0f} pending_timeout_ext={:.0f}".format(
+                        decision_metrics["teleports_with_pending_decision"],
+                        decision_metrics["teleports_during_lane_change_observe"],
+                        decision_metrics["teleports_in_congestion"],
+                        decision_metrics["teleports_pending_and_congestion"],
+                        decision_metrics["pending_timeout_extended_for_congestion"],
+                    )
+                )
 
                 exited_without_destination = removed_nonarrival_count
                 arrived_non_global_target = 0
@@ -2450,6 +2513,10 @@ class RLTrainingPipeline:
                         "fail_removed_non_destination": decision_metrics["fail_removed_non_destination"],
                         "fail_unreachable_transition": decision_metrics["fail_unreachable_transition"],
                         "fail_dead_end_no_outgoing": decision_metrics["fail_dead_end_no_outgoing"],
+                        "teleports_with_pending_decision": decision_metrics["teleports_with_pending_decision"],
+                        "teleports_during_lane_change_observe": decision_metrics["teleports_during_lane_change_observe"],
+                        "teleports_in_congestion": decision_metrics["teleports_in_congestion"],
+                        "teleports_pending_and_congestion": decision_metrics["teleports_pending_and_congestion"],
                     }
                     if set(row.keys()) != set(csv_fields):
                         raise ValueError("rl_episode_metrics.csv row schema does not match header")
