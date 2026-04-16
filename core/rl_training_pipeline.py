@@ -12,7 +12,7 @@ from keras.losses import Huber
 from keras.optimizers import Adam
 from collections import defaultdict, deque
 import random
-from controller.RouteController import RouteController
+from controller.RouteController import STRAIGHT, TURN_AROUND, SLIGHT_RIGHT, RIGHT, SLIGHT_LEFT, LEFT
 from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision, VehicleSnapshot
 from core.Util import ConnectionInfo
 from core.target_vehicles_generation_protocols import target_vehicles_generator
@@ -56,17 +56,6 @@ class ReplayBuffer:
     
     def __len__(self):
         return len(self.buffer)
-
-class TrainingRouteHelper(RouteController):
-    """
-    Helper class to reuse compute_local_target during RL training and use connection_info
-    """
-
-    def __init__(self, connection_info):
-        super().__init__(connection_info)
-
-    def make_decisions(self, vehicles, connection_info):
-        return {}
 
 class DQNTrainer:
     """
@@ -380,11 +369,13 @@ class RLTrainingPipeline:
         self.net = sumolib.net.readNet(os.path.join(self.sumocfg_dir, self.net_file))
 
         self.connection_info = ConnectionInfo(os.path.join(self.sumocfg_dir, self.net_file))
-        self.route_helper = TrainingRouteHelper(self.connection_info)
+        # RL training/inference use shared JunctionDecisionEngine + setRoute(...),
+        # not RouteController.compute_local_target legacy local-target fragments.
+        self.direction_choices = [STRAIGHT, TURN_AROUND, SLIGHT_RIGHT, RIGHT, SLIGHT_LEFT, LEFT]
         self.decision_engine = JunctionDecisionEngine(
             self.connection_info,
             self.net,
-            self.route_helper.direction_choices,
+            self.direction_choices,
             pending_timeout_steps=self.training_pending_timeout_steps,
             pending_progress_timeout_steps=self.training_pending_progress_timeout_steps,
             observe_steps_max=self.training_observe_steps_max,
