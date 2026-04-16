@@ -10,7 +10,7 @@ from collections import deque
 from xml.dom.minidom import parse
 import os
 from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision, VehicleSnapshot
-from core.route_loop_safety import transition_signal, would_worsen_distance
+# from core.route_loop_safety import transition_signal, would_worsen_distance  # Legacy safety-scoring helpers (unused in current inference flow)
 
 def parse_sumocfg(sumocfg_path):
     dom = parse(sumocfg_path)
@@ -28,8 +28,9 @@ class QLearningPolicy(RouteController):
         self.vehicles = vehicles
         self.net = sumolib.net.readNet(net_xml_file)
         self.decision_engine = JunctionDecisionEngine(connection_info, self.net, self.direction_choices)
-        self._visit_count = {}
-        self._best_dist = {}
+        # Legacy per-vehicle visit/distance tracking (previous heuristic override approach).
+        # self._visit_count = {}
+        # self._best_dist = {}
         self._recent_edges = {}
         self._pending_decisions = {}
         self._lane_change_deferrals = {}
@@ -37,10 +38,10 @@ class QLearningPolicy(RouteController):
         self._metrics = {
             "decisions": 0,
             "overrides": 0,
-            "loop_overrides": 0,
-            "distance_overrides": 0,
+            # "loop_overrides": 0,      # Legacy metric (no longer produced by current decision path)
+            # "distance_overrides": 0,  # Legacy metric (no longer produced by current decision path)
             "impossible_action_overrides": 0,
-            "deadend_overrides": 0,
+            # "deadend_overrides": 0,   # Legacy metric (no longer produced by current decision path)
             "decision_committed_skips": 0,
             "pending_decision_timeouts": 0,
             "fallback_to_lane_feasible_now": 0,
@@ -56,17 +57,20 @@ class QLearningPolicy(RouteController):
         }
         self._last_metrics_snapshot = None
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
-        # How many actions to plan ahead each time
-        self.decision_horizon = 1
+        # Legacy: fixed horizon lookahead from old heuristic planner (unused now).
+        # self.decision_horizon = 1
         self.loop_window = 10
-        self.loop_repeat_threshold = 2
+        # Legacy: loop repeat threshold from old heuristic planner (unused now).
+        # self.loop_repeat_threshold = 2
         self.score_slack = 30.0
-        self.deadline_deficit_override_slack = 2.0
+        # Legacy: deadline-feasibility slack from old objective (unused now).
+        # self.deadline_deficit_override_slack = 2.0
         self.distance_tiebreak_scale = 0.05
         self.edge_embedding_dim = 8
         self.local_congestion_k = 6
         self.compact_state_size = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 3 + self.local_congestion_k
-        self.legacy_state_size = 2 + 6 + 3 + 3 + len(self.connection_info.edge_list)
+        # Legacy dense-state size (edge-density vector mode) kept for reference only.
+        # self.legacy_state_size = 2 + 6 + 3 + 3 + len(self.connection_info.edge_list)
         self.use_compact_state = (self.model_state_size == self.compact_state_size)
         self.direction_mask_start = (2 * self.edge_embedding_dim) if self.use_compact_state else 2
         self._init_edge_embeddings(seed=1337)
@@ -207,46 +211,47 @@ class QLearningPolicy(RouteController):
             return float("inf")
         return float(dist) / 8.0
 
-    def _edge_out_degree(self, edge_id):
-        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
-        return len(outgoing)
-
-    def _action_safety_score(self, current_edge, next_edge, destination, recent_history):
-        relevant_edges = set(recent_history) | {current_edge, next_edge}
-        edge_out_degree = {edge: self._edge_out_degree(edge) for edge in relevant_edges}
-        edge_distance_lookup = {edge: self._dist_to_dest(edge, destination) for edge in relevant_edges}
-        signals = transition_signal(
-            recent_history,
-            next_edge,
-            edge_out_degree=edge_out_degree,
-            edge_distance_lookup=edge_distance_lookup,
-            progress_slack=self.score_slack,
-        )
-        current_dist = self._dist_to_dest(current_edge, destination)
-        next_dist = self._dist_to_dest(next_edge, destination)
-        dist_worsen = would_worsen_distance(current_dist, next_dist, slack=self.score_slack)
-        trap_like = (
-            next_edge != destination
-            and self._edge_out_degree(next_edge) == 0
-            and len(recent_history) > 0
-            and recent_history[-1] == current_edge
-        )
-        score = 0
-        if signals["short_cycle"]:
-            score += 5
-        if signals["aba_bounce"]:
-            score += 5
-        if signals["dead_end_reentry"]:
-            score += 3
-        if signals.get("long_horizon_loop"):
-            score += 6
-        if signals.get("revisit_without_progress"):
-            score += 6
-        if dist_worsen:
-            score += 2
-        if trap_like:
-            score += 4
-        return score, signals, dist_worsen, trap_like
+    # Legacy unused safety scoring helpers retained as comments for reference.
+    # def _edge_out_degree(self, edge_id):
+    #     outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
+    #     return len(outgoing)
+    #
+    # def _action_safety_score(self, current_edge, next_edge, destination, recent_history):
+    #     relevant_edges = set(recent_history) | {current_edge, next_edge}
+    #     edge_out_degree = {edge: self._edge_out_degree(edge) for edge in relevant_edges}
+    #     edge_distance_lookup = {edge: self._dist_to_dest(edge, destination) for edge in relevant_edges}
+    #     signals = transition_signal(
+    #         recent_history,
+    #         next_edge,
+    #         edge_out_degree=edge_out_degree,
+    #         edge_distance_lookup=edge_distance_lookup,
+    #         progress_slack=self.score_slack,
+    #     )
+    #     current_dist = self._dist_to_dest(current_edge, destination)
+    #     next_dist = self._dist_to_dest(next_edge, destination)
+    #     dist_worsen = would_worsen_distance(current_dist, next_dist, slack=self.score_slack)
+    #     trap_like = (
+    #         next_edge != destination
+    #         and self._edge_out_degree(next_edge) == 0
+    #         and len(recent_history) > 0
+    #         and recent_history[-1] == current_edge
+    #     )
+    #     score = 0
+    #     if signals["short_cycle"]:
+    #         score += 5
+    #     if signals["aba_bounce"]:
+    #         score += 5
+    #     if signals["dead_end_reentry"]:
+    #         score += 3
+    #     if signals.get("long_horizon_loop"):
+    #         score += 6
+    #     if signals.get("revisit_without_progress"):
+    #         score += 6
+    #     if dist_worsen:
+    #         score += 2
+    #     if trap_like:
+    #         score += 4
+    #     return score, signals, dist_worsen, trap_like
 
     def _finalize_commitment(self, vehicle):
         vid = vehicle.vehicle_id
@@ -312,10 +317,11 @@ class QLearningPolicy(RouteController):
             if vid not in self._recent_edges:
                 self._recent_edges[vid] = deque(maxlen=self.loop_window)
             self._recent_edges[vid].append(start_edge)
-            self._visit_count.setdefault(vid, {})
-            self._best_dist.setdefault(vid, float("inf"))
-            self._visit_count[vid][start_edge] = self._visit_count[vid].get(start_edge, 0) + 1
-            self._best_dist[vid] = min(self._best_dist[vid], self._dist_to_dest(start_edge, vehicle.destination))
+            # Legacy heuristic tracking removed from active inference path.
+            # self._visit_count.setdefault(vid, {})
+            # self._best_dist.setdefault(vid, float("inf"))
+            # self._visit_count[vid][start_edge] = self._visit_count[vid].get(start_edge, 0) + 1
+            # self._best_dist[vid] = min(self._best_dist[vid], self._dist_to_dest(start_edge, vehicle.destination))
             self._finalize_commitment(vehicle)
 
             if vid in self._pending_decisions:
@@ -525,10 +531,7 @@ class QLearningPolicy(RouteController):
             snapshot = (
                 self._metrics["decisions"],
                 self._metrics["overrides"],
-                self._metrics["loop_overrides"],
-                self._metrics["distance_overrides"],
                 self._metrics["impossible_action_overrides"],
-                self._metrics["deadend_overrides"],
             )
             if snapshot == self._last_metrics_snapshot:
                 return local_targets

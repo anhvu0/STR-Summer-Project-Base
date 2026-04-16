@@ -45,6 +45,8 @@ class RouteController(ABC):
         self.direction_choices = [STRAIGHT, TURN_AROUND,  SLIGHT_RIGHT, RIGHT, SLIGHT_LEFT, LEFT]
 
     def compute_local_target(self, decision_list, vehicle):
+        # Legacy helper for non-RL local-target controllers (e.g., Random/Dijkstra).
+        # RL training/inference now apply contiguous routes directly via setRoute(...).
         current_target_edge = vehicle.current_edge
         try:
             if current_target_edge == vehicle.destination:

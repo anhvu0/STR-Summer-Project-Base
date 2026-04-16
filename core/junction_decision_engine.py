@@ -433,45 +433,48 @@ class JunctionDecisionEngine:
         direction = self.direction_choices[action_idx]
         return outgoing.get(direction)
 
-    def build_route_fragment(self, edge_id: str, action_idx: int, destination: str, horizon_m: Optional[float] = None):
-        horizon = self.default_fragment_horizon_m if horizon_m is None else float(horizon_m)
-        immediate = self.get_next_edge(edge_id, action_idx)
-        if immediate is None:
-            return [], None, "invalid_action"
-        if not self._edge_allows_passenger(immediate):
-            return [], None, "non_passenger_edge"
-        immediate_outgoing = self.connection_info.outgoing_edges_dict.get(immediate, {})
-        if immediate != destination and len(immediate_outgoing) == 1 and edge_id in immediate_outgoing.values():
-            return [], None, "trap_like_reversal"
-
-        try:
-            from_edge = self.net.getEdge(immediate)
-            to_edge = self.net.getEdge(destination)
-            path_edges, _ = self.net.getShortestPath(from_edge, to_edge, vClass="passenger")
-        except Exception:
-            path_edges = None
-
-        if not path_edges:
-            if immediate == destination:
-                return [immediate], immediate, None
-            return [], None, "unreachable_destination"
-
-        path_ids = [edge.getID() for edge in path_edges]
-        fragment = []
-        cumulative = 0.0
-        for edge in path_ids:
-            if not self._edge_allows_passenger(edge):
-                return [], None, "non_passenger_edge"
-            fragment.append(edge)
-            cumulative += float(self.connection_info.edge_length_dict.get(edge, 40.0))
-            if cumulative >= horizon:
-                break
-
-        if fragment[-1] != destination and destination not in path_ids:
-            return [], None, "fragment_disconnected"
-
-        local_target = fragment[-1]
-        return fragment, local_target, None
+    # Legacy route-fragment builder from split-routing approach.
+    # Kept commented for reference; training + inference now use build_full_route()
+    # and apply_route_decision() for strict contiguous SUMO route application.
+    # def build_route_fragment(self, edge_id: str, action_idx: int, destination: str, horizon_m: Optional[float] = None):
+    #     horizon = self.default_fragment_horizon_m if horizon_m is None else float(horizon_m)
+    #     immediate = self.get_next_edge(edge_id, action_idx)
+    #     if immediate is None:
+    #         return [], None, "invalid_action"
+    #     if not self._edge_allows_passenger(immediate):
+    #         return [], None, "non_passenger_edge"
+    #     immediate_outgoing = self.connection_info.outgoing_edges_dict.get(immediate, {})
+    #     if immediate != destination and len(immediate_outgoing) == 1 and edge_id in immediate_outgoing.values():
+    #         return [], None, "trap_like_reversal"
+    #
+    #     try:
+    #         from_edge = self.net.getEdge(immediate)
+    #         to_edge = self.net.getEdge(destination)
+    #         path_edges, _ = self.net.getShortestPath(from_edge, to_edge, vClass="passenger")
+    #     except Exception:
+    #         path_edges = None
+    #
+    #     if not path_edges:
+    #         if immediate == destination:
+    #             return [immediate], immediate, None
+    #         return [], None, "unreachable_destination"
+    #
+    #     path_ids = [edge.getID() for edge in path_edges]
+    #     fragment = []
+    #     cumulative = 0.0
+    #     for edge in path_ids:
+    #         if not self._edge_allows_passenger(edge):
+    #             return [], None, "non_passenger_edge"
+    #         fragment.append(edge)
+    #         cumulative += float(self.connection_info.edge_length_dict.get(edge, 40.0))
+    #         if cumulative >= horizon:
+    #             break
+    #
+    #     if fragment[-1] != destination and destination not in path_ids:
+    #         return [], None, "fragment_disconnected"
+    #
+    #     local_target = fragment[-1]
+    #     return fragment, local_target, None
 
     def build_full_route(self, edge_id: str, action_idx: int, destination: str):
         """
