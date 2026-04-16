@@ -283,6 +283,7 @@ class RLTrainingPipeline:
         no_progress_low_speed_mps=0.35,
         no_progress_distance_epsilon=3.0,
         stuck_penalty=-3.0,
+        behavior_clone_warmstart_steps=0,
     ):
         """
         Args:
@@ -331,6 +332,8 @@ class RLTrainingPipeline:
         self.no_progress_low_speed_mps = max(float(no_progress_low_speed_mps), 0.0)
         self.no_progress_distance_epsilon = max(float(no_progress_distance_epsilon), 0.1)
         self.stuck_penalty = float(stuck_penalty)
+        self.behavior_clone_warmstart_steps = max(int(behavior_clone_warmstart_steps), 0)
+        self._bc_warmstart_remaining = self.behavior_clone_warmstart_steps
         self.decision_debug_csv_path = decision_debug_csv_path
         if self.fast_training_profile and self.decision_debug_csv_path:
             self.decision_debug_csv_path = None
@@ -339,7 +342,7 @@ class RLTrainingPipeline:
         self._distance_cache = {}
         self._cache_metrics = defaultdict(float)
         self.progress_reward_scale = 1.00
-        self.system_congestion_scale = 0.015
+        self.system_congestion_scale = 0.02
         self.loop_window = 12
         self.loop_repeat_penalty = 1.5
         # Objective priority:
@@ -347,12 +350,12 @@ class RLTrainingPipeline:
         # 2) congestion externality (secondary)
         # 3) shortest-path distance as tie-breaker
         self.travel_time_penalty = 0.05
-        self.eta_progress_scale = 0.65
-        self.distance_tiebreak_scale = 0.06
-        self.reward_clip_low = -20.0
-        self.reward_clip_high = 20.0
-        self.pending_timeout_penalty = -8.0
-        self.pending_latency_penalty_per_step = 0.015
+        self.eta_progress_scale = 0.30
+        self.distance_tiebreak_scale = 0.02
+        self.reward_clip_low = -40.0
+        self.reward_clip_high = 40.0
+        self.pending_timeout_penalty = -12.0
+        self.pending_latency_penalty_per_step = 0.03
         self.pending_replan_penalty = -1.0
         self.stale_disappeared_penalty = -14.0
         self.non_global_arrival_penalty = -8.0
@@ -362,6 +365,8 @@ class RLTrainingPipeline:
         self.same_edge_repeat_chase_penalty = -1.2
         self.fallback_missed_lane_penalty = -1.0
         self.loop_trap_override_penalty = -1.4
+        self.ema_alpha = 0.20
+        self._edge_travel_time_ema = {}
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
@@ -420,6 +425,9 @@ class RLTrainingPipeline:
             "reached_global_destination", "prev_eta", "curr_eta", "prev_distance", "curr_distance",
             "edge_density", "mean_density", "externality_penalty", "marginal_pressure",
             "terminal_outcome", "last_confirmed_edge", "destination", "in_arrived_ids", "in_teleport_ids",
+            "original_policy_action", "shield_rejected", "shield_reason", "fallback_action",
+            "pending_age", "abort_reason", "lane_feasible_now", "reachable_with_lane_change",
+            "queue_wait_before_terminal",
         ]
 
     def _ensure_decision_debug_csv_header(self):
@@ -470,8 +478,18 @@ class RLTrainingPipeline:
         destination="",
         in_arrived_ids="",
         in_teleport_ids="",
+        original_policy_action="",
+        shield_rejected=0,
+        shield_reason="",
+        fallback_action="",
+        pending_age="",
+        abort_reason="",
+        lane_feasible_now="",
+        reachable_with_lane_change="",
+        queue_wait_before_terminal="",
     ):
         context = pending.context
+        meta = pending.metadata or {}
         return {
             "episode": episode,
             "step": step,
@@ -507,6 +525,15 @@ class RLTrainingPipeline:
             "destination": destination,
             "in_arrived_ids": in_arrived_ids,
             "in_teleport_ids": in_teleport_ids,
+            "original_policy_action": original_policy_action if original_policy_action != "" else meta.get("original_policy_action", ""),
+            "shield_rejected": shield_rejected if shield_rejected != 0 else int(bool(meta.get("shield_rejected", False))),
+            "shield_reason": shield_reason if shield_reason else meta.get("shield_reason", ""),
+            "fallback_action": fallback_action if fallback_action != "" else meta.get("fallback_action", ""),
+            "pending_age": pending_age if pending_age != "" else meta.get("pending_age", ""),
+            "abort_reason": abort_reason if abort_reason else meta.get("abort_reason", ""),
+            "lane_feasible_now": lane_feasible_now if lane_feasible_now != "" else int(bool(meta.get("lane_feasible_now", False))),
+            "reachable_with_lane_change": reachable_with_lane_change if reachable_with_lane_change != "" else int(bool(meta.get("reachable_with_lane_change", False))),
+            "queue_wait_before_terminal": queue_wait_before_terminal if queue_wait_before_terminal != "" else meta.get("queue_wait_before_terminal", ""),
         }
 
     def _get_route_difficulty_scale(self, vehicle, reference_edge):
@@ -717,14 +744,14 @@ class RLTrainingPipeline:
         filtered_available_actions = []
 
         for action in available_actions:
-            safe_ok, _ = self.decision_engine.prefilter_action_for_loops(
+            safe_ok, details = self.decision_engine.prefilter_action_for_loops(
                 context=context,
                 action_idx=action,
                 destination=destination,
                 recent_history=recent_history,
                 distance_fn=self.get_distance_to_destination,
             )
-            if not safe_ok:
+            if (not safe_ok) and bool(details.get("shield_hard_block")):
                 continue
             filtered_available_actions.append(action)
             if action in lane_now:
@@ -1148,14 +1175,48 @@ class RLTrainingPipeline:
         return None
 
     def _estimate_remaining_eta(self, edge_id, destination_edge):
-        """
-        Estimate travel time from edge_id to destination using shortest-path
-        distance and a conservative minimum speed floor.
-        """
-        distance = self.get_distance_to_destination(edge_id, destination_edge)
-        if not math.isfinite(distance):
+        route_edges = self._shortest_path_edges(edge_id, destination_edge)
+        if route_edges is None:
             return math.inf
-        return float(distance) / 8.0
+        eta = 0.0
+        for edge in route_edges:
+            eta += self._edge_travel_time_estimate(edge)
+        return float(eta)
+
+    def _shortest_path_edges(self, edge_id, destination_edge):
+        try:
+            from_edge = self.net.getEdge(edge_id)
+            to_edge = self.net.getEdge(destination_edge)
+            path_edges, _ = self.net.getShortestPath(from_edge, to_edge, vClass="passenger")
+            if not path_edges:
+                return None
+            return [e.getID() for e in path_edges]
+        except Exception:
+            return None
+
+    def _edge_travel_time_estimate(self, edge_id):
+        edge_len = max(float(self.connection_info.edge_length_dict.get(edge_id, 20.0)), 5.0)
+        freeflow = edge_len / 8.0
+        try:
+            sampled_tt = float(traci.edge.getTraveltime(edge_id))
+        except Exception:
+            sampled_tt = freeflow
+        if (not math.isfinite(sampled_tt)) or sampled_tt <= 0.0:
+            try:
+                speed = max(float(traci.edge.getLastStepMeanSpeed(edge_id)), 0.4)
+                sampled_tt = edge_len / speed
+            except Exception:
+                sampled_tt = freeflow
+        prev = self._edge_travel_time_ema.get(edge_id, sampled_tt)
+        ema = (1.0 - self.ema_alpha) * float(prev) + self.ema_alpha * float(sampled_tt)
+        self._edge_travel_time_ema[edge_id] = float(max(ema, freeflow * 0.4))
+        queue_delay = 0.0
+        try:
+            halted = float(traci.edge.getLastStepHaltingNumber(edge_id))
+            queue_delay = min(halted * 0.25, 8.0)
+        except Exception:
+            queue_delay = 0.0
+        return float(self._edge_travel_time_ema[edge_id] + queue_delay)
 
     def get_distance_to_destination(self, edge_id, destination_edge):
         """
@@ -1219,7 +1280,7 @@ class RLTrainingPipeline:
         congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
         edge_len = max(self.connection_info.edge_length_dict.get(current_edge, 5.0), 5.0)
         edge_density = congestion / edge_len
-        reward -= 0.015 * edge_density * elapsed
+        reward -= 0.02 * edge_density * elapsed
         reward -= float(np.clip(externality_penalty, 0.0, 1.5))
 
         mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
@@ -1228,7 +1289,7 @@ class RLTrainingPipeline:
 
         # Progress shaping using ETA and distance improvement.
         if math.isfinite(prev_eta) and math.isfinite(curr_eta):
-            reward += self.eta_progress_scale * np.clip(prev_eta - curr_eta, -3.0, 3.0)
+            reward += self.eta_progress_scale * np.clip(prev_eta - curr_eta, -2.0, 2.0)
 
         # Tertiary tie-breaker: shortest-path distance progress.
         if math.isfinite(prev_distance) and math.isfinite(curr_distance):
@@ -1237,21 +1298,21 @@ class RLTrainingPipeline:
 
         # Safety and control quality penalties.
         if repeated_recent_edges > 0:
-            reward -= self.loop_repeat_penalty * min(repeated_recent_edges, 3)
+            reward -= self.loop_repeat_penalty * min(repeated_recent_edges, 4)
         if uturn_repeat:
             reward -= 3.0
         if long_horizon_loop:
-            reward -= 4.0
+            reward -= 6.0
         if route_mismatch:
-            reward -= 4.0
+            reward -= 5.0
         if invalid_late_turn:
             reward -= 2.0
         if route_apply_failed:
-            reward -= 6.0
+            reward -= 10.0
 
         # Unreachable transition after a decision is strongly terminal-negative.
         if math.isfinite(prev_distance) and not math.isfinite(curr_distance):
-            reward -= 12.0
+            reward -= 16.0
             done = True
 
         if arrived:
@@ -1268,7 +1329,7 @@ class RLTrainingPipeline:
 
         outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
         if (not outgoing or len(outgoing) == 0) and current_edge != vehicle.destination:
-            reward -= 12.0
+            reward -= 14.0
             done = True
 
         return self._clip_reward(reward), done
@@ -1290,14 +1351,14 @@ class RLTrainingPipeline:
         congestion = self.connection_info.edge_vehicle_count.get(edge_id, 0)
         edge_len = max(self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0)
         edge_density = congestion / edge_len
-        reward -= 0.015 * edge_density * elapsed
+        reward -= 0.02 * edge_density * elapsed
         reward -= float(np.clip(externality_penalty, 0.0, 1.5))
 
         mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
         marginal_pressure = max(edge_density - mean_density, 0.0)
         reward -= self.system_congestion_scale * marginal_pressure * elapsed
         reward -= self.pending_latency_penalty_per_step * float(max(pending_age, 0))
-        reward -= 0.02 * float(max(lane_change_deferrals, 0))
+        reward -= 0.04 * float(max(lane_change_deferrals, 0))
         return self._clip_reward(reward)
 
     def generate_episode_vehicles(self, episode_seed=None):
@@ -1320,6 +1381,28 @@ class RLTrainingPipeline:
                 "Failed to generate vehicles. Check randomTrips.py output for errors."
             )
         return {str(vehicle.vehicle_id): vehicle for vehicle in vehicle_list}
+
+    def _dijkstra_oracle_action(self, context, destination):
+        best = None
+        best_dist = math.inf
+        for action in context.available_actions:
+            safe_ok, details = self.decision_engine.prefilter_action_for_loops(
+                context=context,
+                action_idx=action,
+                destination=destination,
+                recent_history=[],
+                distance_fn=self.get_distance_to_destination,
+            )
+            if (not safe_ok) and details.get("shield_hard_block"):
+                continue
+            next_edge = self.decision_engine.get_next_edge(context.edge_id, action)
+            if next_edge is None:
+                continue
+            dist = self.get_distance_to_destination(next_edge, destination)
+            if dist < best_dist:
+                best_dist = dist
+                best = action
+        return best
 
     def run(self):
         """Run RL training with shared junction-aware feasibility + pending-decision finalization."""
@@ -1349,6 +1432,8 @@ class RLTrainingPipeline:
             "policy_masked_actions_removed", "override_learning_transitions",
             "loop_prefilter_overrides", "cooldown_fallback_overrides",
             "observe_abort_fallback_overrides", "route_apply_fail_overrides",
+            "shield_soft_distance_worsen", "shield_soft_long_horizon_loop",
+            "shield_soft_revisit_without_progress", "shield_soft_dead_end_reentry",
             "override_learning_negative", "override_learning_imitation",
             "timeout_unfinished_controlled", "exited_without_destination", "arrived_non_global_target",
             "alive_at_step_cap", "decision_pending_at_episode_end", "mean_pending_age", "mean_decision_latency_steps",
@@ -1695,6 +1780,7 @@ class RLTrainingPipeline:
                                 else:
                                     decision_metrics["lane_change_observe_abort_no_progress"] += 1
                                     pending_pen = self.observe_no_progress_penalty
+                                pending.metadata["abort_reason"] = reason or "unknown"
                                 pending_pen = self._clip_reward(pending_pen + self.same_edge_repeat_chase_penalty)
                                 self.trainer.remember(
                                     pending.state,
@@ -1930,6 +2016,19 @@ class RLTrainingPipeline:
                             action, action_source = self.trainer.select_action(
                                 state, policy_actions, return_source=True
                             )
+                            if self._bc_warmstart_remaining > 0:
+                                oracle_action = self._dijkstra_oracle_action(context, vehicle.destination)
+                                if oracle_action is not None:
+                                    self.trainer.remember(
+                                        state,
+                                        oracle_action,
+                                        0.6,
+                                        state,
+                                        False,
+                                        next_valid_actions=policy_actions,
+                                        metadata={"behavior_cloning": True, "source": "dijkstra_oracle_open_state"},
+                                    )
+                                    self._bc_warmstart_remaining -= 1
                             if action is None:
                                 decision_metrics["decisions_skipped"] += 1
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -1953,12 +2052,20 @@ class RLTrainingPipeline:
                             recent_history=list(recent_edge_history[vehicle_id]),
                             distance_fn=self.get_distance_to_destination,
                         )
-                        if not safe_ok:
+                        hard_blocked = (not safe_ok) and bool(safety_details.get("shield_hard_block"))
+                        if hard_blocked:
                             original_action = action
                             decision_metrics["loop_override_count"] += 1
                             decision_metrics["loop_prefilter_overrides"] += 1
                             if safety_details.get("dead_end_reentry"):
                                 decision_metrics["dead_end_reentry_override_count"] += 1
+                            rejection_reason = "shield_hard_block"
+                            if safety_details.get("destination_unreachable"):
+                                rejection_reason = "unreachable_destination"
+                            elif safety_details.get("short_cycle") or safety_details.get("aba_bounce"):
+                                rejection_reason = "two_cycle"
+                            elif safety_details.get("trap_like_reversal"):
+                                rejection_reason = "trap_like_reversal"
                             action = self._select_fallback_action(
                                 context,
                                 blocked_action=action,
@@ -1991,6 +2098,8 @@ class RLTrainingPipeline:
                                     "original_action": original_action,
                                     "fallback_action": action,
                                     "override_cause": "loop_prefilter_fallback",
+                                    "shield_rejected": True,
+                                    "shield_reason": rejection_reason,
                                 },
                             )
                             decision_metrics["override_learning_transitions"] += 1
@@ -2009,6 +2118,8 @@ class RLTrainingPipeline:
                                     "original_action": original_action,
                                     "fallback_action": action,
                                     "imitation_credit": True,
+                                    "shield_rejected": True,
+                                    "shield_reason": rejection_reason,
                                 },
                             )
                             decision_metrics["override_learning_transitions"] += 1
@@ -2018,6 +2129,15 @@ class RLTrainingPipeline:
                             if next_edge is None:
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
                                 continue
+                        else:
+                            if safety_details.get("distance_worsen"):
+                                decision_metrics["shield_soft_distance_worsen"] += 1
+                            if safety_details.get("long_horizon_loop"):
+                                decision_metrics["shield_soft_long_horizon_loop"] += 1
+                            if safety_details.get("revisit_without_progress"):
+                                decision_metrics["shield_soft_revisit_without_progress"] += 1
+                            if safety_details.get("dead_end_reentry"):
+                                decision_metrics["shield_soft_dead_end_reentry"] += 1
 
                         lane_change_requested = False
                         if action not in context.lane_feasible_now_actions:
@@ -2105,7 +2225,13 @@ class RLTrainingPipeline:
                                     context=context,
                                     lane_change_requested=lane_change_requested,
                                     route_fragment=[],
-                                    metadata={"action_source": action_source, **observe_metadata},
+                                    metadata={
+                                        "action_source": action_source,
+                                        "original_policy_action": action,
+                                        "lane_feasible_now": int(action in context.lane_feasible_now_actions),
+                                        "reachable_with_lane_change": int(action in context.reachable_with_lane_change_actions),
+                                        **observe_metadata,
+                                    },
                                 )
                                 decision_metrics["decisions_opened"] += 1
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -2165,7 +2291,13 @@ class RLTrainingPipeline:
                             context=context,
                             lane_change_requested=lane_change_requested,
                             route_fragment=list(full_route[1:]) if full_route else [],
-                            metadata={"action_source": action_source, "lane_change_deferrals": lane_change_deferrals.get(vehicle_id, 0)},
+                            metadata={
+                                "action_source": action_source,
+                                "original_policy_action": action,
+                                "lane_feasible_now": int(action in context.lane_feasible_now_actions),
+                                "reachable_with_lane_change": int(action in context.reachable_with_lane_change_actions),
+                                "lane_change_deferrals": lane_change_deferrals.get(vehicle_id, 0),
+                            },
                         )
                         lane_change_deferrals[vehicle_id] = 0
                         decision_metrics["decisions_opened"] += 1
