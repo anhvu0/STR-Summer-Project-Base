@@ -32,6 +32,7 @@ class QLearningPolicy(RouteController):
         # self._visit_count = {}
         # self._best_dist = {}
         self._recent_edges = {}
+        self._last_history_edge = {}
         self._pending_decisions = {}
         self._lane_change_deferrals = {}
         self._lane_change_cooldown = {}
@@ -316,7 +317,9 @@ class QLearningPolicy(RouteController):
             step = int(traci.simulation.getTime())
             if vid not in self._recent_edges:
                 self._recent_edges[vid] = deque(maxlen=self.loop_window)
-            self._recent_edges[vid].append(start_edge)
+            if self._last_history_edge.get(vid) != start_edge:
+                self._recent_edges[vid].append(start_edge)
+                self._last_history_edge[vid] = start_edge
             # Legacy heuristic tracking removed from active inference path.
             # self._visit_count.setdefault(vid, {})
             # self._best_dist.setdefault(vid, float("inf"))
