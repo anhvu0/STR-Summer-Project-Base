@@ -216,6 +216,17 @@ class JunctionDecisionEngine:
 
     def should_timeout_pending(self, pending: PendingDecision, step: int, max_age_steps: Optional[int] = None) -> bool:
         threshold = self.pending_timeout_steps if max_age_steps is None else int(max_age_steps)
+        context = pending.context
+        edge_density = 0.0
+        try:
+            edge_count = float(traci.edge.getLastStepVehicleNumber(context.edge_id))
+            edge_len = max(float(self.connection_info.edge_length_dict.get(context.edge_id, 20.0)), 5.0)
+            edge_density = edge_count / edge_len
+        except Exception:
+            edge_density = 0.0
+        # Congested/queued edges need a longer grace window before abandoning a commitment.
+        adaptive_bonus = int(min(max(edge_density * 60.0, 0.0), 14.0))
+        threshold += adaptive_bonus
         return self.pending_age_steps(pending, step) >= max(threshold, 1)
 
     def lane_change_observe_limit(self, context: DecisionContext) -> int:
@@ -224,6 +235,9 @@ class JunctionDecisionEngine:
             limit += 1
         if context.speed >= 14.0 and context.dist_to_end >= 95.0:
             limit += 1
+        # Near-zero speeds with adequate distance are usually congestion/queue effects.
+        if context.speed <= max(self.observe_low_speed_mps, 0.8) and context.dist_to_end >= 22.0:
+            limit += 2
         return int(max(self.observe_steps_min, min(limit, self.observe_steps_max)))
 
     def start_lane_change_observe(
@@ -279,7 +293,9 @@ class JunctionDecisionEngine:
             return "success", None
         if context.commit_window and action_idx not in context.lane_feasible_now_actions:
             return "abort", "commit_window"
-        if context.speed < self.observe_low_speed_mps and observe_steps >= 1:
+        # Abort for low-speed only after the observe budget is mostly exhausted.
+        low_speed_abort_floor = max(2, observe_limit - 1)
+        if context.speed < self.observe_low_speed_mps and observe_steps >= low_speed_abort_floor:
             return "abort", "low_speed"
         if stall_steps >= self.observe_stall_steps:
             return "abort", "no_progress"
@@ -363,6 +379,8 @@ class JunctionDecisionEngine:
         next_edge = self.get_next_edge(context.edge_id, action_idx)
         if next_edge is None:
             return False, {"invalid_action": True}
+        if not self._edge_allows_passenger(next_edge):
+            return False, {"non_passenger_edge": True}
         history_deque = recent_history if isinstance(recent_history, deque) else deque(recent_history, maxlen=max(len(recent_history), 1))
         edge_out_degree = {edge: len(self.connection_info.outgoing_edges_dict.get(edge, {})) for edge in set(history_deque) | {next_edge}}
         edge_distance_lookup = None
@@ -384,6 +402,7 @@ class JunctionDecisionEngine:
             and history_deque[-1] == context.edge_id
         )
         dist_worsen = False
+        destination_unreachable = False
         if distance_fn is not None:
             current_distance = distance_fn(context.edge_id, destination)
             next_distance = distance_fn(next_edge, destination)
@@ -392,18 +411,18 @@ class JunctionDecisionEngine:
                 next_distance,
                 slack=self.loop_distance_slack if distance_slack is None else float(distance_slack),
             )
+            destination_unreachable = not math.isfinite(next_distance)
         blocked = bool(
             signals.get("short_cycle")
             or signals.get("aba_bounce")
-            or signals.get("dead_end_reentry")
-            or signals.get("long_horizon_loop")
-            or signals.get("revisit_without_progress")
             or trap_like
-            or dist_worsen
+            or destination_unreachable
         )
         details = dict(signals)
         details["trap_like_reversal"] = trap_like
         details["distance_worsen"] = dist_worsen
+        details["destination_unreachable"] = destination_unreachable
+        details["shield_hard_block"] = blocked
         return (not blocked), details
 
     def try_request_lane_change(self, context: DecisionContext, action_idx: int, duration: int = 70) -> Tuple[bool, bool]:

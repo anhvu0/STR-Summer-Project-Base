@@ -66,6 +66,14 @@ class QLearningPolicy(RouteController):
         # Legacy: deadline-feasibility slack from old objective (unused now).
         # self.deadline_deficit_override_slack = 2.0
         self.distance_tiebreak_scale = 0.05
+        self.eta_ema_alpha = 0.20
+        self._edge_travel_time_ema = {}
+        self.eta_route_cache_ttl_steps = 20
+        self.eta_feature_refresh_steps = 3
+        self._eta_path_cache = {}
+        self._edge_traffic_snapshot = {}
+        self._edge_traffic_snapshot_step = -1
+        self._eta_feature_cache = {}
         self.edge_embedding_dim = 8
         self.local_congestion_k = 6
         self.compact_state_size = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 3 + self.local_congestion_k
@@ -127,7 +135,22 @@ class QLearningPolicy(RouteController):
 
         now = float(traci.simulation.getTime()) if step is None else float(step)
         elapsed = max(now - float(vehicle_obj.start_time), 0.0)
-        remaining_eta = self._estimate_eta(edge_id, destination_edge)
+        cache_key = str(vehicle_id)
+        cached = self._eta_feature_cache.get(cache_key)
+        if cached is not None:
+            cached_step, cached_edge, cached_dest, cached_eta = cached
+            if (
+                cached_edge == edge_id
+                and cached_dest == destination_edge
+                and (int(now) - int(cached_step)) < self.eta_feature_refresh_steps
+            ):
+                remaining_eta = float(cached_eta)
+            else:
+                remaining_eta = self._estimate_eta(edge_id, destination_edge, step=int(now))
+                self._eta_feature_cache[cache_key] = (int(now), edge_id, destination_edge, float(remaining_eta))
+        else:
+            remaining_eta = self._estimate_eta(edge_id, destination_edge, step=int(now))
+            self._eta_feature_cache[cache_key] = (int(now), edge_id, destination_edge, float(remaining_eta))
         density = traci.edge.getLastStepVehicleNumber(edge_id) / max(
             self.connection_info.edge_length_dict.get(edge_id, 5.0),
             5.0,
@@ -159,14 +182,14 @@ class QLearningPolicy(RouteController):
         filtered_available_actions = []
 
         for action in available_actions:
-            safe_ok, _ = self.decision_engine.prefilter_action_for_loops(
+            safe_ok, details = self.decision_engine.prefilter_action_for_loops(
                 context=context,
                 action_idx=action,
                 destination=destination,
                 recent_history=recent_history,
                 distance_fn=self._dist_to_dest,
             )
-            if not safe_ok:
+            if (not safe_ok) and bool(details.get("shield_hard_block")):
                 continue
             filtered_available_actions.append(action)
             if action in lane_now:
@@ -205,11 +228,68 @@ class QLearningPolicy(RouteController):
         except Exception:
             return float("inf")
 
-    def _estimate_eta(self, edge_id, dest_id):
-        dist = self._dist_to_dest(edge_id, dest_id)
-        if not np.isfinite(dist):
+    def _refresh_edge_traffic_snapshot(self, step):
+        step = int(step)
+        if self._edge_traffic_snapshot_step == step:
+            return
+        snapshot = {}
+        for edge_id in self.connection_info.edge_list:
+            try:
+                sampled_tt = float(traci.edge.getTraveltime(edge_id))
+            except Exception:
+                sampled_tt = float("nan")
+            try:
+                mean_speed = float(traci.edge.getLastStepMeanSpeed(edge_id))
+            except Exception:
+                mean_speed = float("nan")
+            try:
+                halted = float(traci.edge.getLastStepHaltingNumber(edge_id))
+            except Exception:
+                halted = 0.0
+            snapshot[edge_id] = (sampled_tt, mean_speed, halted)
+        self._edge_traffic_snapshot = snapshot
+        self._edge_traffic_snapshot_step = step
+
+    def _shortest_path_edges_cached(self, edge_id, dest_id, step):
+        key = (edge_id, dest_id)
+        cached = self._eta_path_cache.get(key)
+        if cached is not None:
+            cached_step, cached_path = cached
+            if (int(step) - int(cached_step)) <= self.eta_route_cache_ttl_steps:
+                return cached_path
+        try:
+            from_edge = self.net.getEdge(edge_id)
+            to_edge = self.net.getEdge(dest_id)
+            path_edges, _ = self.net.getShortestPath(from_edge, to_edge, vClass="passenger")
+            if not path_edges:
+                return None
+            path = [edge.getID() for edge in path_edges]
+            self._eta_path_cache[key] = (int(step), path)
+            return path
+        except Exception:
+            return None
+
+    def _estimate_eta(self, edge_id, dest_id, step=None):
+        step = int(traci.simulation.getTime()) if step is None else int(step)
+        path = self._shortest_path_edges_cached(edge_id, dest_id, step)
+        if not path:
             return float("inf")
-        return float(dist) / 8.0
+        self._refresh_edge_traffic_snapshot(step)
+        eta = 0.0
+        for edge_id_i in path:
+            edge_len = max(float(self.connection_info.edge_length_dict.get(edge_id_i, 20.0)), 5.0)
+            freeflow = edge_len / 8.0
+            sampled_tt, mean_speed, halted = self._edge_traffic_snapshot.get(
+                edge_id_i, (float("nan"), float("nan"), 0.0)
+            )
+            if (not np.isfinite(sampled_tt)) or sampled_tt <= 0.0:
+                speed = max(float(mean_speed), 0.4) if np.isfinite(mean_speed) else 0.4
+                sampled_tt = edge_len / speed
+            prev = self._edge_travel_time_ema.get(edge_id_i, sampled_tt)
+            ema_tt = (1.0 - self.eta_ema_alpha) * float(prev) + self.eta_ema_alpha * float(sampled_tt)
+            self._edge_travel_time_ema[edge_id_i] = max(ema_tt, freeflow * 0.4)
+            eta += self._edge_travel_time_ema[edge_id_i] + min(0.25 * halted, 8.0)
+        return float(eta)
 
     # Legacy unused safety scoring helpers retained as comments for reference.
     # def _edge_out_degree(self, edge_id):
@@ -443,7 +523,7 @@ class QLearningPolicy(RouteController):
                 distance_fn=self._dist_to_dest,
                 distance_slack=self.score_slack,
             )
-            if not safe_ok:
+            if (not safe_ok) and bool(signal.get("shield_hard_block")):
                 self._metrics["loop_override_count"] += 1
                 if signal.get("dead_end_reentry"):
                     self._metrics["dead_end_reentry_override_count"] += 1
