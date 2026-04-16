@@ -283,8 +283,8 @@ class RLTrainingPipeline:
         no_progress_low_speed_mps=0.35,
         no_progress_distance_epsilon=3.0,
         stuck_penalty=-3.0,
-        hard_block_long_horizon_loop=False,
-        hard_block_revisit_without_progress=False,
+        hard_block_long_horizon_loop=True,
+        hard_block_revisit_without_progress=True,
         hard_distance_worsen_multiplier=3.0,
     ):
         """
@@ -347,7 +347,9 @@ class RLTrainingPipeline:
         self.progress_reward_scale = 1.00
         self.system_congestion_scale = 0.015
         self.loop_window = 12
-        self.loop_repeat_penalty = 1.5
+        self.loop_repeat_penalty = 1.8
+        self.long_horizon_loop_penalty = 6.0
+        self.revisit_without_progress_penalty = 7.0
         # Objective priority:
         # 1) minimize travel time (dominant)
         # 2) congestion externality (secondary)
@@ -368,6 +370,16 @@ class RLTrainingPipeline:
         self.same_edge_repeat_chase_penalty = -1.2
         self.fallback_missed_lane_penalty = -1.0
         self.loop_trap_override_penalty = -1.4
+        self._override_penalty_by_cause = {
+            "short_cycle_or_aba": -1.5,
+            "dead_end_reentry": -1.8,
+            "long_horizon_loop": -2.2,
+            "revisit_without_progress": -2.5,
+            "trap_like_reversal": -1.9,
+            "distance_worsen_severe": -1.7,
+            "distance_worsen": -1.2,
+            "loop_prefilter": self.loop_trap_override_penalty,
+        }
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
@@ -429,6 +441,14 @@ class RLTrainingPipeline:
             "reached_global_destination", "prev_eta", "curr_eta", "prev_distance", "curr_distance",
             "edge_density", "mean_density", "externality_penalty", "marginal_pressure",
             "terminal_outcome", "last_confirmed_edge", "destination", "in_arrived_ids", "in_teleport_ids",
+            "selected_action", "executed_action", "override_type", "override_cause", "fallback_action",
+            "lane_change_requested", "pending_age", "repeated_recent_edges",
+            "prefilter_short_cycle", "prefilter_aba_bounce", "prefilter_dead_end_reentry",
+            "prefilter_long_horizon_loop", "prefilter_revisit_without_progress",
+            "prefilter_trap_like_reversal", "prefilter_distance_worsen", "prefilter_distance_worsen_severe",
+            "reward_travel_time_component", "reward_density_component", "reward_externality_component",
+            "reward_eta_progress_component", "reward_distance_progress_component", "reward_loop_component",
+            "reward_terminal_component",
         ]
 
     def _ensure_decision_debug_csv_header(self):
@@ -479,8 +499,20 @@ class RLTrainingPipeline:
         destination="",
         in_arrived_ids="",
         in_teleport_ids="",
+        selected_action="",
+        executed_action="",
+        override_type="",
+        override_cause="",
+        fallback_action="",
+        repeated_recent_edges="",
+        reward_components=None,
     ):
         context = pending.context
+        meta = pending.metadata or {}
+        safety = meta.get("safety_details", {}) or {}
+        reward_components = reward_components or {}
+        selected_action = selected_action if selected_action != "" else meta.get("selected_action", pending.intended_action)
+        executed_action = executed_action if executed_action != "" else pending.intended_action
         return {
             "episode": episode,
             "step": step,
@@ -516,6 +548,29 @@ class RLTrainingPipeline:
             "destination": destination,
             "in_arrived_ids": in_arrived_ids,
             "in_teleport_ids": in_teleport_ids,
+            "selected_action": selected_action,
+            "executed_action": executed_action,
+            "override_type": override_type or meta.get("override_type", ""),
+            "override_cause": override_cause or meta.get("override_cause", ""),
+            "fallback_action": fallback_action if fallback_action != "" else meta.get("fallback_action", ""),
+            "lane_change_requested": int(bool(pending.lane_change_requested)),
+            "pending_age": meta.get("pending_age", ""),
+            "repeated_recent_edges": repeated_recent_edges,
+            "prefilter_short_cycle": int(bool(safety.get("short_cycle"))),
+            "prefilter_aba_bounce": int(bool(safety.get("aba_bounce"))),
+            "prefilter_dead_end_reentry": int(bool(safety.get("dead_end_reentry"))),
+            "prefilter_long_horizon_loop": int(bool(safety.get("long_horizon_loop"))),
+            "prefilter_revisit_without_progress": int(bool(safety.get("revisit_without_progress"))),
+            "prefilter_trap_like_reversal": int(bool(safety.get("trap_like_reversal"))),
+            "prefilter_distance_worsen": int(bool(safety.get("distance_worsen"))),
+            "prefilter_distance_worsen_severe": int(bool(safety.get("distance_worsen_severe"))),
+            "reward_travel_time_component": reward_components.get("travel_time", ""),
+            "reward_density_component": reward_components.get("density", ""),
+            "reward_externality_component": reward_components.get("externality", ""),
+            "reward_eta_progress_component": reward_components.get("eta_progress", ""),
+            "reward_distance_progress_component": reward_components.get("distance_progress", ""),
+            "reward_loop_component": reward_components.get("loop_penalty", ""),
+            "reward_terminal_component": reward_components.get("terminal", ""),
         }
 
     def _get_route_difficulty_scale(self, vehicle, reference_edge):
@@ -950,7 +1005,7 @@ class RLTrainingPipeline:
                 step=step,
             )
             if outcome == "global_arrival":
-                reward, done = self.compute_reward(
+                reward, done, reward_components = self.compute_reward(
                     vehicle,
                     vehicle.destination,
                     vehicle.destination,
@@ -958,6 +1013,7 @@ class RLTrainingPipeline:
                     arrived=True,
                     reached_global_destination=True,
                     terminal_outcome=outcome,
+                    return_components=True,
                 )
                 next_state = self.make_terminal_next_state_from_edge(
                     vehicle.destination,
@@ -1032,6 +1088,29 @@ class RLTrainingPipeline:
                 "destination": vehicle.destination,
                 "in_arrived_ids": int(bool(in_arrived_ids)),
                 "in_teleport_ids": int(bool(in_teleport_ids)),
+                "selected_action": "",
+                "executed_action": 0,
+                "override_type": "",
+                "override_cause": "",
+                "fallback_action": "",
+                "lane_change_requested": 0,
+                "pending_age": "",
+                "repeated_recent_edges": "",
+                "prefilter_short_cycle": 0,
+                "prefilter_aba_bounce": 0,
+                "prefilter_dead_end_reentry": 0,
+                "prefilter_long_horizon_loop": 0,
+                "prefilter_revisit_without_progress": 0,
+                "prefilter_trap_like_reversal": 0,
+                "prefilter_distance_worsen": 0,
+                "prefilter_distance_worsen_severe": 0,
+                "reward_travel_time_component": reward_components["travel_time"] if outcome == "global_arrival" else "",
+                "reward_density_component": reward_components["density"] if outcome == "global_arrival" else "",
+                "reward_externality_component": reward_components["externality"] if outcome == "global_arrival" else "",
+                "reward_eta_progress_component": reward_components["eta_progress"] if outcome == "global_arrival" else "",
+                "reward_distance_progress_component": reward_components["distance_progress"] if outcome == "global_arrival" else "",
+                "reward_loop_component": reward_components["loop_penalty"] if outcome == "global_arrival" else "",
+                "reward_terminal_component": reward_components["terminal"] if outcome == "global_arrival" else reward,
             })
             terminal_recorded_ids.add(vehicle_id)
             return float(reward)
@@ -1039,7 +1118,7 @@ class RLTrainingPipeline:
         last_confirmed_edge = last_seen_edge_by_vehicle.get(vehicle_id, pending.last_credit_edge)
         snapshot = last_snapshot_by_vehicle.get(vehicle_id)
         if outcome == "global_arrival":
-            reward, done = self.compute_reward(
+            reward, done, reward_components = self.compute_reward(
                 vehicle,
                 pending.last_credit_edge,
                 vehicle.destination,
@@ -1048,6 +1127,7 @@ class RLTrainingPipeline:
                 delta_t=max(step - pending.last_credit_step, 1),
                 reached_global_destination=True,
                 terminal_outcome=outcome,
+                return_components=True,
             )
             next_state = self.make_terminal_next_state_from_edge(
                 vehicle.destination,
@@ -1135,6 +1215,12 @@ class RLTrainingPipeline:
             destination=vehicle.destination,
             in_arrived_ids=int(bool(in_arrived_ids)),
             in_teleport_ids=int(bool(in_teleport_ids)),
+            selected_action=pending.metadata.get("selected_action", pending.intended_action),
+            executed_action=pending.intended_action,
+            override_type=pending.metadata.get("override_type", ""),
+            override_cause=pending.metadata.get("override_cause", ""),
+            fallback_action=pending.metadata.get("fallback_action", ""),
+            reward_components=reward_components if outcome == "global_arrival" else {"terminal": reward},
         ))
         return float(reward)
 
@@ -1155,6 +1241,10 @@ class RLTrainingPipeline:
         if ranked:
             return ranked[0]
         return None
+
+    def _override_penalty_for_safety(self, safety_details):
+        cause = self.decision_engine.dominant_override_cause(safety_details or {})
+        return self._clip_reward(self._override_penalty_by_cause.get(cause, self.loop_trap_override_penalty)), cause
 
     def _estimate_remaining_eta(self, edge_id, destination_edge):
         """
@@ -1203,8 +1293,10 @@ class RLTrainingPipeline:
         route_apply_failed=False,
         uturn_repeat=False,
         long_horizon_loop=False,
+        revisit_without_progress=False,
         externality_penalty=0.0,
         terminal_outcome=None,
+        return_components=False,
     ):
         """
         Compute a bounded reward with clear objective priority:
@@ -1221,36 +1313,61 @@ class RLTrainingPipeline:
 
         reward = 0.0
         done = False
+        components = {
+            "travel_time": 0.0,
+            "density": 0.0,
+            "externality": 0.0,
+            "eta_progress": 0.0,
+            "distance_progress": 0.0,
+            "loop_penalty": 0.0,
+            "terminal": 0.0,
+        }
 
         # Dense shaping: small living/time and congestion costs.
         time_cost_scale = self._get_route_difficulty_scale(vehicle, prev_edge)
-        reward -= self.travel_time_penalty * time_cost_scale * elapsed
+        travel_time_component = -self.travel_time_penalty * time_cost_scale * elapsed
+        reward += travel_time_component
+        components["travel_time"] += travel_time_component
         congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
         edge_len = max(self.connection_info.edge_length_dict.get(current_edge, 5.0), 5.0)
         edge_density = congestion / edge_len
-        reward -= 0.015 * edge_density * elapsed
-        reward -= float(np.clip(externality_penalty, 0.0, 1.5))
+        density_component = -0.015 * edge_density * elapsed
+        reward += density_component
+        components["density"] += density_component
+        externality_component = -float(np.clip(externality_penalty, 0.0, 1.5))
+        reward += externality_component
+        components["externality"] += externality_component
 
         mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
         marginal_pressure = max(edge_density - mean_density, 0.0)
-        reward -= self.system_congestion_scale * marginal_pressure * elapsed
+        pressure_component = -self.system_congestion_scale * marginal_pressure * elapsed
+        reward += pressure_component
+        components["externality"] += pressure_component
 
         # Progress shaping using ETA and distance improvement.
         if math.isfinite(prev_eta) and math.isfinite(curr_eta):
-            reward += self.eta_progress_scale * np.clip(prev_eta - curr_eta, -3.0, 3.0)
+            eta_component = self.eta_progress_scale * np.clip(prev_eta - curr_eta, -3.0, 3.0)
+            reward += eta_component
+            components["eta_progress"] += float(eta_component)
 
         # Tertiary tie-breaker: shortest-path distance progress.
         if math.isfinite(prev_distance) and math.isfinite(curr_distance):
             progress = (prev_distance - curr_distance) * (self.distance_tiebreak_scale * self.progress_reward_scale)
-            reward += float(np.clip(progress, -1.0, 1.0))
+            distance_component = float(np.clip(progress, -1.0, 1.0))
+            reward += distance_component
+            components["distance_progress"] += distance_component
 
-        # Safety and control quality penalties.
+        # Safety/control penalties intentionally separate long-horizon loop signals:
+        # repeated edge churn < long-horizon loops <= revisit-without-progress.
         if repeated_recent_edges > 0:
-            reward -= self.loop_repeat_penalty * min(repeated_recent_edges, 3)
+            components["loop_penalty"] -= self.loop_repeat_penalty * min(repeated_recent_edges, 3)
         if uturn_repeat:
-            reward -= 3.0
+            components["loop_penalty"] -= 3.0
         if long_horizon_loop:
-            reward -= 4.0
+            components["loop_penalty"] -= self.long_horizon_loop_penalty
+        if revisit_without_progress:
+            components["loop_penalty"] -= self.revisit_without_progress_penalty
+        reward += components["loop_penalty"]
         if route_mismatch:
             reward -= 4.0
         if invalid_late_turn:
@@ -1265,22 +1382,29 @@ class RLTrainingPipeline:
 
         if arrived:
             if reached_global_destination:
-                reward += self.destination_reward
+                components["terminal"] += self.destination_reward
                 speed_bonus = max(0.0, 1.0 - (float(step) / float(MAX_SIMULATION_STEPS)))
-                reward += 3.0 * speed_bonus
+                components["terminal"] += 3.0 * speed_bonus
             elif terminal_outcome == "non_global_arrival":
-                reward += self.non_global_arrival_penalty
+                components["terminal"] += self.non_global_arrival_penalty
             else:
-                reward -= 8.0
+                components["terminal"] -= 8.0
+            reward += components["terminal"]
             done = True
-            return self._clip_reward(reward), done
+            clipped = self._clip_reward(reward)
+            if return_components:
+                return clipped, done, components
+            return clipped, done
 
         outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
         if (not outgoing or len(outgoing) == 0) and current_edge != vehicle.destination:
             reward -= 12.0
             done = True
 
-        return self._clip_reward(reward), done
+        clipped = self._clip_reward(reward)
+        if return_components:
+            return clipped, done, components
+        return clipped, done
 
     def _clip_reward(self, reward_value):
         return float(np.clip(reward_value, self.reward_clip_low, self.reward_clip_high))
@@ -1563,14 +1687,16 @@ class RLTrainingPipeline:
                             curr_distance = self.get_distance_to_destination(current_edge, vehicle.destination)
                             prev_eta = self._estimate_remaining_eta(pending.decision_edge, vehicle.destination)
                             curr_eta = self._estimate_remaining_eta(current_edge, vehicle.destination)
-                            reward, done = self.compute_reward(
+                            reward, done, reward_components = self.compute_reward(
                                 vehicle, pending.last_credit_edge, current_edge, step, arrived=False,
                                 repeated_recent_edges=repeated_recent_edges,
                                 delta_t=max(step - pending.last_credit_step, 1),
                                 route_mismatch=mismatch,
                                 uturn_repeat=loop_signals["aba_bounce"] or loop_signals["short_cycle"],
-                                long_horizon_loop=loop_signals.get("long_horizon_loop") or loop_signals.get("revisit_without_progress"),
+                                long_horizon_loop=loop_signals.get("long_horizon_loop"),
+                                revisit_without_progress=loop_signals.get("revisit_without_progress"),
                                 externality_penalty=ext_pen,
+                                return_components=True,
                             )
                             next_ctx = self.decision_engine.build_context(
                                 vehicle_id,
@@ -1633,6 +1759,13 @@ class RLTrainingPipeline:
                                 mean_density=mean_density,
                                 externality_penalty=ext_pen,
                                 marginal_pressure=marginal_pressure,
+                                selected_action=pending.metadata.get("selected_action", pending.intended_action),
+                                executed_action=pending.intended_action,
+                                override_type=pending.metadata.get("override_type", ""),
+                                override_cause=pending.metadata.get("override_cause", ""),
+                                fallback_action=pending.metadata.get("fallback_action", ""),
+                                repeated_recent_edges=repeated_recent_edges,
+                                reward_components=reward_components,
                             ))
                         elif vehicle_id in pending_decisions:
                             pending = pending_decisions[vehicle_id]
@@ -1767,7 +1900,15 @@ class RLTrainingPipeline:
                                     context=obs_context,
                                     lane_change_requested=False,
                                     route_fragment=list(full_route[1:]) if full_route else [],
-                                    metadata={"phase": "route_pending", "action_source": "observe_fallback"},
+                                    metadata={
+                                        "phase": "route_pending",
+                                        "action_source": "observe_fallback",
+                                        "selected_action": pending.intended_action,
+                                        "executed_action": fallback_action,
+                                        "override_type": "observe_abort_fallback",
+                                        "override_cause": "lane_change_observe_abort",
+                                        "fallback_action": fallback_action,
+                                    },
                                 )
                                 decision_metrics["fallback_overrides"] += 1
                                 decision_metrics["fallback_to_lane_feasible_now"] += 1
@@ -1799,6 +1940,7 @@ class RLTrainingPipeline:
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
                                 continue
                             pending_age = self.decision_engine.pending_age_steps(pending, step)
+                            pending.metadata["pending_age"] = int(pending_age)
                             pending_age_samples.append(float(pending_age))
                             elapsed_pending = max(step - pending.last_credit_step, 0)
                             if elapsed_pending > 0:
@@ -1955,6 +2097,12 @@ class RLTrainingPipeline:
                                 decision_metrics["exploration_actions"] += 1
                             elif action_source == "policy":
                                 decision_metrics["policy_actions"] += 1
+                        selected_action = action
+                        executed_action = action
+                        fallback_action = ""
+                        override_type = ""
+                        override_cause = ""
+                        safety_details = {}
 
                         next_edge = self.decision_engine.get_next_edge(current_edge, action)
                         if next_edge is None:
@@ -1972,6 +2120,7 @@ class RLTrainingPipeline:
                         )
                         if not safe_ok:
                             original_action = action
+                            override_type = "loop_prefilter_fallback"
                             decision_metrics["loop_override_count"] += 1
                             decision_metrics["loop_prefilter_overrides"] += 1
                             if safety_details.get("short_cycle"):
@@ -1990,6 +2139,7 @@ class RLTrainingPipeline:
                                 decision_metrics["prefilter_signal_revisit_without_progress"] += 1
                             if safety_details.get("dead_end_reentry"):
                                 decision_metrics["dead_end_reentry_override_count"] += 1
+                            override_penalty, override_cause = self._override_penalty_for_safety(safety_details)
                             action = self._select_fallback_action(
                                 context,
                                 blocked_action=action,
@@ -2003,7 +2153,8 @@ class RLTrainingPipeline:
                             decision_metrics["safety_overrides"] += 1
                             decision_metrics["selected_executed_mismatch"] += 1
                             action_source = "loop_prefilter_fallback"
-                            override_penalty = self._clip_reward(self.loop_trap_override_penalty)
+                            fallback_action = action
+                            executed_action = action
                             policy_actions_after_override = self._policy_action_candidates(
                                 context=context,
                                 recent_history=list(recent_edge_history[vehicle_id]),
@@ -2022,7 +2173,8 @@ class RLTrainingPipeline:
                                     "override_type": "loop_prefilter_fallback",
                                     "original_action": original_action,
                                     "fallback_action": action,
-                                    "override_cause": "loop_prefilter_fallback",
+                                    "override_cause": override_cause,
+                                    "safety_details": dict(safety_details),
                                 },
                             )
                             decision_metrics["override_learning_transitions"] += 1
@@ -2040,6 +2192,8 @@ class RLTrainingPipeline:
                                     "override_type": "loop_prefilter_fallback",
                                     "original_action": original_action,
                                     "fallback_action": action,
+                                    "override_cause": override_cause,
+                                    "safety_details": dict(safety_details),
                                     "imitation_credit": True,
                                 },
                             )
@@ -2050,11 +2204,14 @@ class RLTrainingPipeline:
                             if next_edge is None:
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
                                 continue
+                        else:
+                            override_cause = ""
 
                         lane_change_requested = False
                         if action not in context.lane_feasible_now_actions:
                             if step < cooldown_until:
                                 original_action = action
+                                override_type = "cooldown_fallback"
                                 decision_metrics["cooldown_replans_blocked"] += 1
                                 decision_metrics["cooldown_fallback_overrides"] += 1
                                 fallback_action = self._select_fallback_action(
@@ -2068,6 +2225,8 @@ class RLTrainingPipeline:
                                     continue
                                 action = fallback_action
                                 action_source = "cooldown_fallback"
+                                override_cause = "cooldown_fallback"
+                                executed_action = action
                                 decision_metrics["fallback_overrides"] += 1
                                 decision_metrics["fallback_to_lane_feasible_now"] += 1
                                 decision_metrics["selected_executed_mismatch"] += 1
@@ -2138,7 +2297,16 @@ class RLTrainingPipeline:
                                     context=context,
                                     lane_change_requested=lane_change_requested,
                                     route_fragment=[],
-                                    metadata={"action_source": action_source, **observe_metadata},
+                                    metadata={
+                                        "action_source": action_source,
+                                        "selected_action": selected_action,
+                                        "executed_action": executed_action,
+                                        "override_type": override_type,
+                                        "override_cause": override_cause,
+                                        "fallback_action": fallback_action,
+                                        "safety_details": dict(safety_details),
+                                        **observe_metadata,
+                                    },
                                 )
                                 decision_metrics["decisions_opened"] += 1
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -2198,7 +2366,16 @@ class RLTrainingPipeline:
                             context=context,
                             lane_change_requested=lane_change_requested,
                             route_fragment=list(full_route[1:]) if full_route else [],
-                            metadata={"action_source": action_source, "lane_change_deferrals": lane_change_deferrals.get(vehicle_id, 0)},
+                            metadata={
+                                "action_source": action_source,
+                                "lane_change_deferrals": lane_change_deferrals.get(vehicle_id, 0),
+                                "selected_action": selected_action,
+                                "executed_action": executed_action,
+                                "override_type": override_type,
+                                "override_cause": override_cause,
+                                "fallback_action": fallback_action,
+                                "safety_details": dict(safety_details),
+                            },
                         )
                         lane_change_deferrals[vehicle_id] = 0
                         decision_metrics["decisions_opened"] += 1
@@ -2529,6 +2706,29 @@ class RLTrainingPipeline:
                         "destination": vehicles[vid].destination,
                         "in_arrived_ids": 0,
                         "in_teleport_ids": 0,
+                        "selected_action": "",
+                        "executed_action": "",
+                        "override_type": "",
+                        "override_cause": "",
+                        "fallback_action": "",
+                        "lane_change_requested": 0,
+                        "pending_age": "",
+                        "repeated_recent_edges": "",
+                        "prefilter_short_cycle": 0,
+                        "prefilter_aba_bounce": 0,
+                        "prefilter_dead_end_reentry": 0,
+                        "prefilter_long_horizon_loop": 0,
+                        "prefilter_revisit_without_progress": 0,
+                        "prefilter_trap_like_reversal": 0,
+                        "prefilter_distance_worsen": 0,
+                        "prefilter_distance_worsen_severe": 0,
+                        "reward_travel_time_component": "",
+                        "reward_density_component": "",
+                        "reward_externality_component": "",
+                        "reward_eta_progress_component": "",
+                        "reward_distance_progress_component": "",
+                        "reward_loop_component": "",
+                        "reward_terminal_component": "",
                     })
                 for vid, pending in pending_decisions.items():
                     if vid in pending_debug_logged_ids:

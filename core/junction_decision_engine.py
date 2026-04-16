@@ -325,6 +325,11 @@ class JunctionDecisionEngine:
         if not candidate_pool:
             return []
 
+        # Ranking priority:
+        # 1) avoid loop traps / no-progress revisits
+        # 2) stay connected and feasible
+        # 3) prefer lower distance-to-destination
+        # 4) prefer smaller required lane shift
         scored = []
         for action in candidate_pool:
             safe_ok, details = self.prefilter_action_for_loops(
@@ -337,6 +342,10 @@ class JunctionDecisionEngine:
             score = 0.0
             if not safe_ok:
                 score += 50.0
+            if details.get("long_horizon_loop"):
+                score += 40.0
+            if details.get("revisit_without_progress"):
+                score += 45.0
             if details.get("dead_end_reentry"):
                 score += 10.0
             if details.get("short_cycle") or details.get("aba_bounce"):
@@ -345,6 +354,8 @@ class JunctionDecisionEngine:
                 score += 8.0
             if details.get("distance_worsen"):
                 score += 5.0
+            if details.get("distance_worsen_severe"):
+                score += 18.0
             next_edge = self.get_next_edge(context.edge_id, action)
             if distance_fn is not None and next_edge is not None:
                 next_dist = distance_fn(next_edge, destination)
@@ -353,9 +364,35 @@ class JunctionDecisionEngine:
                 else:
                     score += 25.0
             score += 0.05 * float(context.required_lane_shift.get(action, 0))
-            scored.append((score, action))
+            scored.append((score, action, details))
         scored.sort(key=lambda x: x[0])
-        return [action for _, action in scored]
+        # If at least one candidate avoids long-horizon/no-progress loop hazards,
+        # prefer that "clean" subset before considering risky fallbacks.
+        clean = []
+        risky = []
+        for _, action, details in scored:
+            if details.get("long_horizon_loop") or details.get("revisit_without_progress"):
+                risky.append(action)
+            else:
+                clean.append(action)
+        return clean + risky
+
+    def dominant_override_cause(self, details: Dict[str, bool]) -> str:
+        if details.get("revisit_without_progress"):
+            return "revisit_without_progress"
+        if details.get("long_horizon_loop"):
+            return "long_horizon_loop"
+        if details.get("dead_end_reentry"):
+            return "dead_end_reentry"
+        if details.get("short_cycle") or details.get("aba_bounce"):
+            return "short_cycle_or_aba"
+        if details.get("trap_like_reversal"):
+            return "trap_like_reversal"
+        if details.get("distance_worsen_severe"):
+            return "distance_worsen_severe"
+        if details.get("distance_worsen"):
+            return "distance_worsen"
+        return "loop_prefilter"
 
     def prefilter_action_for_loops(
         self,

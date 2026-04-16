@@ -21,13 +21,29 @@ MAX_SIMULATION_STEPS = 2000
 
 
 class QLearningPolicy(RouteController):
-    def __init__(self, vehicles, connection_info, model_file, net_xml_file = net_path):
+    def __init__(
+        self,
+        vehicles,
+        connection_info,
+        model_file,
+        net_xml_file=net_path,
+        hard_block_long_horizon_loop=True,
+        hard_block_revisit_without_progress=True,
+        hard_distance_worsen_multiplier=3.0,
+    ):
         super().__init__(connection_info)
         self.model = load_model(model_file)
         self.model_state_size = int(self.model.input_shape[-1])
         self.vehicles = vehicles
         self.net = sumolib.net.readNet(net_xml_file)
-        self.decision_engine = JunctionDecisionEngine(connection_info, self.net, self.direction_choices)
+        self.decision_engine = JunctionDecisionEngine(
+            connection_info,
+            self.net,
+            self.direction_choices,
+            hard_block_long_horizon_loop=hard_block_long_horizon_loop,
+            hard_block_revisit_without_progress=hard_block_revisit_without_progress,
+            hard_distance_worsen_multiplier=hard_distance_worsen_multiplier,
+        )
         # Legacy per-vehicle visit/distance tracking (previous heuristic override approach).
         # self._visit_count = {}
         # self._best_dist = {}
