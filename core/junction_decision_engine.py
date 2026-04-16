@@ -80,10 +80,12 @@ class JunctionDecisionEngine:
         self.direction_choices = direction_choices
 
         self.base_reaction_distance = 25.0
-        self.reaction_time_s = 1.3
-        self.commit_time_s = 0.8
+        self.reaction_time_s = 1.5
+        self.commit_time_s = 1.2
         self.lane_change_margin_m = 24.0
-        self.commit_min_distance = 14.0
+        self.commit_min_distance = 18.0
+        self.proactive_lane_prep_buffer_m = 12.0
+        self.detour_open_distance_m = 60.0
         self.default_fragment_horizon_m = 180.0
         self.pending_timeout_steps = max(int(pending_timeout_steps), 1)
         self.lane_change_defer_limit = 4
@@ -208,6 +210,119 @@ class JunctionDecisionEngine:
             skip_reason=skip_reason,
         )
 
+
+    def _edge_density(self, edge_id: Optional[str]) -> float:
+        if not edge_id:
+            return 0.0
+        try:
+            veh = float(traci.edge.getLastStepVehicleNumber(edge_id))
+        except Exception:
+            veh = 0.0
+        length = max(float(self.connection_info.edge_length_dict.get(edge_id, 5.0)), 5.0)
+        return veh / length
+
+    def _edge_speed_ratio_penalty(self, edge_id: Optional[str]) -> float:
+        if not edge_id:
+            return 0.0
+        try:
+            mean_speed = max(float(traci.edge.getLastStepMeanSpeed(edge_id)), 0.0)
+        except Exception:
+            mean_speed = 0.0
+        try:
+            max_speed = max(float(self.net.getEdge(edge_id).getSpeed()), 0.1)
+        except Exception:
+            max_speed = 13.9
+        ratio = mean_speed / max(max_speed, 0.1)
+        return max(0.0, 1.0 - ratio)
+
+    def _merge_yield_connector_penalty(self, edge_id: str, next_edge: Optional[str]) -> float:
+        if not next_edge:
+            return 0.0
+        penalty = 0.0
+        try:
+            incoming_count = len(self.net.getEdge(next_edge).getIncoming())
+            if incoming_count >= 3:
+                penalty += 1.0
+            elif incoming_count == 2:
+                penalty += 0.5
+        except Exception:
+            pass
+        if len(self.connection_info.outgoing_edges_dict.get(edge_id, {})) >= 3:
+            penalty += 0.3
+        return penalty
+
+    def _queue_near_lane_end_penalty(self, context: DecisionContext) -> float:
+        if context.dist_to_end > 45.0:
+            return 0.0
+        try:
+            lane_halts = float(traci.lane.getLastStepHaltingNumber(context.lane_id))
+        except Exception:
+            lane_halts = 0.0
+        near_end_scale = max(0.0, (45.0 - float(context.dist_to_end)) / 45.0)
+        return near_end_scale * min(lane_halts, 6.0) / 2.0
+
+    def _connector_occupancy_penalty(self, next_edge: Optional[str]) -> float:
+        if not next_edge:
+            return 0.0
+        try:
+            halted = float(traci.edge.getLastStepHaltingNumber(next_edge))
+            lanes = max(int(traci.edge.getLaneNumber(next_edge)), 1)
+        except Exception:
+            return 0.0
+        return min((halted / lanes) / 4.0, 2.0)
+
+    def min_distance_for_lane_shift(self, context: DecisionContext, action_idx: int) -> float:
+        shift = max(int(context.required_lane_shift.get(action_idx, 0)), 0)
+        commit_distance = max(self.commit_min_distance, float(context.speed) * self.commit_time_s)
+        dynamic_margin = self.lane_change_margin_m * (1.0 + 0.5 * max(0, shift - 1))
+        return commit_distance + (shift * dynamic_margin) + self.proactive_lane_prep_buffer_m
+
+    def traffic_feasibility_score(
+        self,
+        context: DecisionContext,
+        action_idx: int,
+        destination: Optional[str] = None,
+        distance_fn: Optional[Callable[[str, str], float]] = None,
+        baseline_distance: Optional[float] = None,
+    ) -> float:
+        next_edge = self.get_next_edge(context.edge_id, action_idx)
+        if next_edge is None:
+            return 1e6
+
+        downstream_density = self._edge_density(next_edge)
+        connector_occupancy = self._connector_occupancy_penalty(next_edge)
+        merge_yield = self._merge_yield_connector_penalty(context.edge_id, next_edge)
+        low_speed_pen = self._edge_speed_ratio_penalty(next_edge)
+        queue_near_end = self._queue_near_lane_end_penalty(context)
+
+        shift = max(int(context.required_lane_shift.get(action_idx, 0)), 0)
+        distance_need = self.min_distance_for_lane_shift(context, action_idx)
+        shift_pressure = 0.0
+        if shift > 0:
+            shortfall = max(distance_need - float(context.dist_to_end), 0.0)
+            shift_pressure = shortfall / max(distance_need, 1.0)
+
+        score = (
+            2.2 * downstream_density
+            + 1.5 * connector_occupancy
+            + 1.3 * merge_yield
+            + 2.0 * low_speed_pen
+            + 1.0 * queue_near_end
+            + 3.0 * shift_pressure
+        )
+
+        if distance_fn is not None and destination is not None and next_edge is not None:
+            next_dist = distance_fn(next_edge, destination)
+            if not math.isfinite(next_dist):
+                score += 20.0
+            elif baseline_distance is not None and math.isfinite(baseline_distance):
+                detour_extra = max(float(next_dist) - float(baseline_distance), 0.0)
+                score += min(detour_extra / 180.0, 6.0)
+
+        if action_idx not in context.lane_feasible_now_actions:
+            score += 0.6
+        return float(score)
+
     def is_decision_open(self, context: DecisionContext) -> bool:
         return context.branch_with_choice and len(context.available_actions) > 1
 
@@ -319,6 +434,19 @@ class JunctionDecisionEngine:
         if not candidate_pool:
             return []
 
+        baseline_distance = None
+        if distance_fn is not None:
+            lane_now_distances = []
+            for lane_action in context.lane_feasible_now_actions:
+                lane_edge = self.get_next_edge(context.edge_id, lane_action)
+                if lane_edge is None:
+                    continue
+                d = distance_fn(lane_edge, destination)
+                if math.isfinite(d):
+                    lane_now_distances.append(d)
+            if lane_now_distances:
+                baseline_distance = min(lane_now_distances)
+
         scored = []
         for action in candidate_pool:
             safe_ok, details = self.prefilter_action_for_loops(
@@ -347,6 +475,13 @@ class JunctionDecisionEngine:
                 else:
                     score += 25.0
             score += 0.05 * float(context.required_lane_shift.get(action, 0))
+            score += self.traffic_feasibility_score(
+                context=context,
+                action_idx=action,
+                destination=destination,
+                distance_fn=distance_fn,
+                baseline_distance=baseline_distance,
+            )
             scored.append((score, action))
         scored.sort(key=lambda x: x[0])
         return [action for _, action in scored]
