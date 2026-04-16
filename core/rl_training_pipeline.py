@@ -362,6 +362,10 @@ class RLTrainingPipeline:
         self.same_edge_repeat_chase_penalty = -1.2
         self.fallback_missed_lane_penalty = -1.0
         self.loop_trap_override_penalty = -1.4
+        self.yield_jam_trap_penalty_scale = 1.8
+        self.emergency_stop_lane_end_penalty = 1.4
+        self.repeated_brake_penalty_scale = 0.8
+        self._brake_streak_by_vehicle = defaultdict(int)
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
@@ -716,6 +720,19 @@ class RLTrainingPipeline:
         strict_non_lane_actions = []
         filtered_available_actions = []
 
+        lane_now_distance_baseline = math.inf
+        if lane_now:
+            lane_distances = []
+            for lane_action in lane_now:
+                lane_edge = self.decision_engine.get_next_edge(context.edge_id, lane_action)
+                if lane_edge is None:
+                    continue
+                lane_dist = self.get_distance_to_destination(lane_edge, destination)
+                if math.isfinite(lane_dist):
+                    lane_distances.append(lane_dist)
+            if lane_distances:
+                lane_now_distance_baseline = min(lane_distances)
+
         for action in available_actions:
             safe_ok, _ = self.decision_engine.prefilter_action_for_loops(
                 context=context,
@@ -732,22 +749,78 @@ class RLTrainingPipeline:
                 continue
 
             # Non-lane-feasible actions are exposed only in exceptional cases.
-            if cooldown_active:
+            if cooldown_active or context.commit_window or float(context.speed) < 1.2:
                 continue
-            if context.commit_window:
+            if int(context.required_lane_shift.get(action, 99)) > 1:
                 continue
-            if float(context.speed) < 1.2:
+            if float(context.dist_to_end) <= max(comfortable_dist_threshold, self.decision_engine.min_distance_for_lane_shift(context, action)):
                 continue
-            if int(context.required_lane_shift.get(action, 99)) != 1:
-                continue
-            if float(context.dist_to_end) <= comfortable_dist_threshold:
+
+            traffic_score = self.decision_engine.traffic_feasibility_score(
+                context=context,
+                action_idx=action,
+                destination=destination,
+                distance_fn=self.get_distance_to_destination,
+                baseline_distance=lane_now_distance_baseline if math.isfinite(lane_now_distance_baseline) else None,
+            )
+            if traffic_score > 8.5:
                 continue
             strict_non_lane_actions.append(action)
 
-        # Dominant learning space: lane-feasible-now actions if any safe options exist.
-        policy_actions = sorted(set(safe_lane_now_actions)) if safe_lane_now_actions else sorted(set(strict_non_lane_actions))
-        if not policy_actions:
-            policy_actions = sorted(set(filtered_available_actions))
+        if safe_lane_now_actions:
+            safe_lane_now_actions = sorted(
+                set(safe_lane_now_actions),
+                key=lambda a: self.decision_engine.traffic_feasibility_score(
+                    context=context,
+                    action_idx=a,
+                    destination=destination,
+                    distance_fn=self.get_distance_to_destination,
+                    baseline_distance=lane_now_distance_baseline if math.isfinite(lane_now_distance_baseline) else None,
+                ),
+            )
+            if strict_non_lane_actions and float(context.dist_to_end) >= self.decision_engine.detour_open_distance_m:
+                strict_non_lane_actions = sorted(
+                    set(strict_non_lane_actions),
+                    key=lambda a: self.decision_engine.traffic_feasibility_score(
+                        context=context,
+                        action_idx=a,
+                        destination=destination,
+                        distance_fn=self.get_distance_to_destination,
+                        baseline_distance=lane_now_distance_baseline if math.isfinite(lane_now_distance_baseline) else None,
+                    ),
+                )
+                if strict_non_lane_actions:
+                    best_lane_score = self.decision_engine.traffic_feasibility_score(
+                        context=context,
+                        action_idx=safe_lane_now_actions[0],
+                        destination=destination,
+                        distance_fn=self.get_distance_to_destination,
+                        baseline_distance=lane_now_distance_baseline if math.isfinite(lane_now_distance_baseline) else None,
+                    )
+                    best_detour_score = self.decision_engine.traffic_feasibility_score(
+                        context=context,
+                        action_idx=strict_non_lane_actions[0],
+                        destination=destination,
+                        distance_fn=self.get_distance_to_destination,
+                        baseline_distance=lane_now_distance_baseline if math.isfinite(lane_now_distance_baseline) else None,
+                    )
+                    if best_detour_score + 0.8 < best_lane_score:
+                        return strict_non_lane_actions
+            return safe_lane_now_actions
+
+        if strict_non_lane_actions:
+            return sorted(
+                set(strict_non_lane_actions),
+                key=lambda a: self.decision_engine.traffic_feasibility_score(
+                    context=context,
+                    action_idx=a,
+                    destination=destination,
+                    distance_fn=self.get_distance_to_destination,
+                    baseline_distance=lane_now_distance_baseline if math.isfinite(lane_now_distance_baseline) else None,
+                ),
+            )
+
+        policy_actions = sorted(set(filtered_available_actions))
         if not policy_actions:
             return available_actions
         return policy_actions
@@ -1179,6 +1252,71 @@ class RLTrainingPipeline:
         self._distance_cache[key] = distance
         return distance
     
+    def _yield_jam_trap_penalty(self, vehicle_id, edge_id, elapsed=1.0):
+        """
+        Penalize entering/remaining in yield-jam traps:
+        - long low-speed on connector-like congested edges,
+        - emergency braking near lane end,
+        - repeated braking on the same corridor.
+        """
+        elapsed = max(float(elapsed), 0.0)
+        if elapsed <= 0.0:
+            return 0.0
+
+        # Vehicle may have arrived/teleported/been removed earlier in the step.
+        # Guard against TraCI lookups on unknown vehicle IDs to avoid noisy
+        # "Vehicle is not known" command errors from SUMO.
+        try:
+            if not traci.vehicle.exists(vehicle_id):
+                self._brake_streak_by_vehicle.pop(vehicle_id, None)
+                return 0.0
+        except Exception:
+            self._brake_streak_by_vehicle.pop(vehicle_id, None)
+            return 0.0
+
+        try:
+            speed = max(float(traci.vehicle.getSpeed(vehicle_id)), 0.0)
+        except Exception:
+            speed = 0.0
+        try:
+            accel = float(traci.vehicle.getAcceleration(vehicle_id))
+        except Exception:
+            accel = 0.0
+        try:
+            lane_id = traci.vehicle.getLaneID(vehicle_id)
+            lane_len = float(traci.lane.getLength(lane_id))
+            lane_pos = float(traci.vehicle.getLanePosition(vehicle_id))
+            dist_to_end = max(lane_len - lane_pos, 0.0)
+        except Exception:
+            dist_to_end = 999.0
+
+        edge_len = max(self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0)
+        edge_density = self.connection_info.edge_vehicle_count.get(edge_id, 0) / edge_len
+        halting = 0.0
+        mean_speed = 0.0
+        try:
+            halting = float(traci.edge.getLastStepHaltingNumber(edge_id))
+            mean_speed = max(float(traci.edge.getLastStepMeanSpeed(edge_id)), 0.0)
+        except Exception:
+            pass
+
+        low_speed_jam = (speed < 1.2 and mean_speed < 2.0 and edge_density > 0.06)
+        jam_penalty = self.yield_jam_trap_penalty_scale * elapsed if low_speed_jam else 0.0
+
+        emergency_stop = accel < -3.5 and dist_to_end < 25.0
+        emergency_penalty = self.emergency_stop_lane_end_penalty if emergency_stop else 0.0
+
+        brake_streak = self._brake_streak_by_vehicle.get(vehicle_id, 0)
+        if accel < -1.8 and speed < 4.0:
+            brake_streak += 1
+        else:
+            brake_streak = max(brake_streak - 1, 0)
+        self._brake_streak_by_vehicle[vehicle_id] = brake_streak
+        repeated_brake_penalty = self.repeated_brake_penalty_scale * min(brake_streak, 4) / 4.0
+
+        connector_pressure = min(halting / 6.0, 2.0) * 0.35
+        return float(jam_penalty + emergency_penalty + repeated_brake_penalty + connector_pressure)
+
     def compute_reward(
         self,
         vehicle,
@@ -1225,6 +1363,7 @@ class RLTrainingPipeline:
         mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
         marginal_pressure = max(edge_density - mean_density, 0.0)
         reward -= self.system_congestion_scale * marginal_pressure * elapsed
+        reward -= self._yield_jam_trap_penalty(vehicle.vehicle_id, current_edge, elapsed=elapsed)
 
         # Progress shaping using ETA and distance improvement.
         if math.isfinite(prev_eta) and math.isfinite(curr_eta):
@@ -1296,6 +1435,7 @@ class RLTrainingPipeline:
         mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
         marginal_pressure = max(edge_density - mean_density, 0.0)
         reward -= self.system_congestion_scale * marginal_pressure * elapsed
+        reward -= self._yield_jam_trap_penalty(vehicle.vehicle_id, edge_id, elapsed=elapsed)
         reward -= self.pending_latency_penalty_per_step * float(max(pending_age, 0))
         reward -= 0.02 * float(max(lane_change_deferrals, 0))
         return self._clip_reward(reward)
