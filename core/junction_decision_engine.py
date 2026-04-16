@@ -74,6 +74,9 @@ class JunctionDecisionEngine:
         observe_steps_max: int = 4,
         observe_low_speed_mps: float = 0.8,
         observe_stall_steps: int = 2,
+        hard_block_long_horizon_loop: bool = False,
+        hard_block_revisit_without_progress: bool = False,
+        hard_distance_worsen_multiplier: float = 3.0,
     ):
         self.connection_info = connection_info
         self.net = net
@@ -94,6 +97,9 @@ class JunctionDecisionEngine:
         self.cooldown_steps = 3
         self.pending_progress_timeout_steps = max(int(pending_progress_timeout_steps), 1)
         self.loop_distance_slack = 30.0
+        self.hard_block_long_horizon_loop = bool(hard_block_long_horizon_loop)
+        self.hard_block_revisit_without_progress = bool(hard_block_revisit_without_progress)
+        self.hard_distance_worsen_multiplier = max(float(hard_distance_worsen_multiplier), 1.0)
 
     def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
         if snapshot is not None:
@@ -384,6 +390,7 @@ class JunctionDecisionEngine:
             and history_deque[-1] == context.edge_id
         )
         dist_worsen = False
+        severe_dist_worsen = False
         if distance_fn is not None:
             current_distance = distance_fn(context.edge_id, destination)
             next_distance = distance_fn(next_edge, destination)
@@ -392,18 +399,28 @@ class JunctionDecisionEngine:
                 next_distance,
                 slack=self.loop_distance_slack if distance_slack is None else float(distance_slack),
             )
+            hard_slack = (
+                (self.loop_distance_slack if distance_slack is None else float(distance_slack))
+                * self.hard_distance_worsen_multiplier
+            )
+            severe_dist_worsen = would_worsen_distance(
+                current_distance,
+                next_distance,
+                slack=hard_slack,
+            )
         blocked = bool(
             signals.get("short_cycle")
             or signals.get("aba_bounce")
             or signals.get("dead_end_reentry")
-            or signals.get("long_horizon_loop")
-            or signals.get("revisit_without_progress")
+            or (self.hard_block_long_horizon_loop and signals.get("long_horizon_loop"))
+            or (self.hard_block_revisit_without_progress and signals.get("revisit_without_progress"))
             or trap_like
-            or dist_worsen
+            or severe_dist_worsen
         )
         details = dict(signals)
         details["trap_like_reversal"] = trap_like
         details["distance_worsen"] = dist_worsen
+        details["distance_worsen_severe"] = severe_dist_worsen
         return (not blocked), details
 
     def try_request_lane_change(self, context: DecisionContext, action_idx: int, duration: int = 70) -> Tuple[bool, bool]:

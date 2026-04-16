@@ -283,6 +283,9 @@ class RLTrainingPipeline:
         no_progress_low_speed_mps=0.35,
         no_progress_distance_epsilon=3.0,
         stuck_penalty=-3.0,
+        hard_block_long_horizon_loop=False,
+        hard_block_revisit_without_progress=False,
+        hard_distance_worsen_multiplier=3.0,
     ):
         """
         Args:
@@ -331,6 +334,9 @@ class RLTrainingPipeline:
         self.no_progress_low_speed_mps = max(float(no_progress_low_speed_mps), 0.0)
         self.no_progress_distance_epsilon = max(float(no_progress_distance_epsilon), 0.1)
         self.stuck_penalty = float(stuck_penalty)
+        self.hard_block_long_horizon_loop = bool(hard_block_long_horizon_loop)
+        self.hard_block_revisit_without_progress = bool(hard_block_revisit_without_progress)
+        self.hard_distance_worsen_multiplier = max(float(hard_distance_worsen_multiplier), 1.0)
         self.decision_debug_csv_path = decision_debug_csv_path
         if self.fast_training_profile and self.decision_debug_csv_path:
             self.decision_debug_csv_path = None
@@ -381,6 +387,9 @@ class RLTrainingPipeline:
             observe_steps_max=self.training_observe_steps_max,
             observe_low_speed_mps=self.training_observe_low_speed_mps,
             observe_stall_steps=self.training_observe_stall_steps,
+            hard_block_long_horizon_loop=self.hard_block_long_horizon_loop,
+            hard_block_revisit_without_progress=self.hard_block_revisit_without_progress,
+            hard_distance_worsen_multiplier=self.hard_distance_worsen_multiplier,
         )
 
         # state = [edge_embedding, destination_embedding]
@@ -1346,10 +1355,15 @@ class RLTrainingPipeline:
             "loop_override_count", "dead_end_reentry_override_count",
             "batched_policy_calls", "snapshot_cache_hits", "shortest_path_cache_hits",
             "exploration_actions", "policy_actions", "override_ratio",
+            "selected_executed_mismatch",
             "policy_masked_actions_removed", "override_learning_transitions",
             "loop_prefilter_overrides", "cooldown_fallback_overrides",
             "observe_abort_fallback_overrides", "route_apply_fail_overrides",
             "override_learning_negative", "override_learning_imitation",
+            "prefilter_block_short_cycle", "prefilter_block_aba_bounce",
+            "prefilter_block_dead_end_reentry", "prefilter_block_trap_like",
+            "prefilter_block_distance_worsen_severe",
+            "prefilter_signal_long_horizon", "prefilter_signal_revisit_without_progress",
             "timeout_unfinished_controlled", "exited_without_destination", "arrived_non_global_target",
             "alive_at_step_cap", "decision_pending_at_episode_end", "mean_pending_age", "mean_decision_latency_steps",
             "mean_reward_per_finalized_decision", "mean_route_difficulty_eta", "p50_route_difficulty_eta",
@@ -1401,6 +1415,7 @@ class RLTrainingPipeline:
             last_seen_edge_by_vehicle = {}
             last_planned_terminal_edge_by_vehicle = {}
             last_snapshot_by_vehicle = {}
+            last_history_edge_by_vehicle = {}
             completed_travel_times = []
             completed_travel_time_ids = set()
             terminal_recorded_ids = set()
@@ -1448,7 +1463,9 @@ class RLTrainingPipeline:
                             vehicle._route_difficulty_eta_logged = True
                         last_seen_edge_by_vehicle[vehicle_id] = current_edge
                         last_snapshot_by_vehicle[vehicle_id] = snapshot
-                        recent_edge_history[vehicle_id].append(current_edge)
+                        if last_history_edge_by_vehicle.get(vehicle_id) != current_edge:
+                            recent_edge_history[vehicle_id].append(current_edge)
+                            last_history_edge_by_vehicle[vehicle_id] = current_edge
 
                         tracker = no_progress_tracker.get(vehicle_id)
                         if tracker is None:
@@ -1957,6 +1974,20 @@ class RLTrainingPipeline:
                             original_action = action
                             decision_metrics["loop_override_count"] += 1
                             decision_metrics["loop_prefilter_overrides"] += 1
+                            if safety_details.get("short_cycle"):
+                                decision_metrics["prefilter_block_short_cycle"] += 1
+                            if safety_details.get("aba_bounce"):
+                                decision_metrics["prefilter_block_aba_bounce"] += 1
+                            if safety_details.get("dead_end_reentry"):
+                                decision_metrics["prefilter_block_dead_end_reentry"] += 1
+                            if safety_details.get("trap_like_reversal"):
+                                decision_metrics["prefilter_block_trap_like"] += 1
+                            if safety_details.get("distance_worsen_severe"):
+                                decision_metrics["prefilter_block_distance_worsen_severe"] += 1
+                            if safety_details.get("long_horizon_loop"):
+                                decision_metrics["prefilter_signal_long_horizon"] += 1
+                            if safety_details.get("revisit_without_progress"):
+                                decision_metrics["prefilter_signal_revisit_without_progress"] += 1
                             if safety_details.get("dead_end_reentry"):
                                 decision_metrics["dead_end_reentry_override_count"] += 1
                             action = self._select_fallback_action(
@@ -1970,6 +2001,7 @@ class RLTrainingPipeline:
                                 continue
                             decision_metrics["fallback_overrides"] += 1
                             decision_metrics["safety_overrides"] += 1
+                            decision_metrics["selected_executed_mismatch"] += 1
                             action_source = "loop_prefilter_fallback"
                             override_penalty = self._clip_reward(self.loop_trap_override_penalty)
                             policy_actions_after_override = self._policy_action_candidates(
@@ -2038,6 +2070,7 @@ class RLTrainingPipeline:
                                 action_source = "cooldown_fallback"
                                 decision_metrics["fallback_overrides"] += 1
                                 decision_metrics["fallback_to_lane_feasible_now"] += 1
+                                decision_metrics["selected_executed_mismatch"] += 1
                                 override_penalty = self._clip_reward(self.same_edge_repeat_chase_penalty)
                                 policy_actions_after_override = self._policy_action_candidates(
                                     context=context,
@@ -2564,6 +2597,7 @@ class RLTrainingPipeline:
                             + decision_metrics["fallback_overrides"]
                             + decision_metrics["route_apply_fail"]
                         ) / max(decision_metrics["decisions_opened"], 1.0),
+                        "selected_executed_mismatch": decision_metrics["selected_executed_mismatch"],
                         "policy_masked_actions_removed": decision_metrics["policy_masked_actions_removed"],
                         "override_learning_transitions": decision_metrics["override_learning_transitions"],
                         "loop_prefilter_overrides": decision_metrics["loop_prefilter_overrides"],
@@ -2572,6 +2606,13 @@ class RLTrainingPipeline:
                         "route_apply_fail_overrides": decision_metrics["route_apply_fail_overrides"],
                         "override_learning_negative": decision_metrics["override_learning_negative"],
                         "override_learning_imitation": decision_metrics["override_learning_imitation"],
+                        "prefilter_block_short_cycle": decision_metrics["prefilter_block_short_cycle"],
+                        "prefilter_block_aba_bounce": decision_metrics["prefilter_block_aba_bounce"],
+                        "prefilter_block_dead_end_reentry": decision_metrics["prefilter_block_dead_end_reentry"],
+                        "prefilter_block_trap_like": decision_metrics["prefilter_block_trap_like"],
+                        "prefilter_block_distance_worsen_severe": decision_metrics["prefilter_block_distance_worsen_severe"],
+                        "prefilter_signal_long_horizon": decision_metrics["prefilter_signal_long_horizon"],
+                        "prefilter_signal_revisit_without_progress": decision_metrics["prefilter_signal_revisit_without_progress"],
                         "timeout_unfinished_controlled": episode_truncated_count,
                         "exited_without_destination": exited_without_destination,
                         "arrived_non_global_target": arrived_non_global_target,
