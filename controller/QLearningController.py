@@ -158,6 +158,19 @@ class QLearningPolicy(RouteController):
         strict_non_lane_actions = []
         filtered_available_actions = []
 
+        lane_now_distance_baseline = math.inf
+        if lane_now:
+            lane_distances = []
+            for lane_action in lane_now:
+                lane_edge = self.decision_engine.get_next_edge(context.edge_id, lane_action)
+                if lane_edge is None:
+                    continue
+                lane_dist = self._dist_to_dest(lane_edge, destination)
+                if math.isfinite(lane_dist):
+                    lane_distances.append(lane_dist)
+            if lane_distances:
+                lane_now_distance_baseline = min(lane_distances)
+
         for action in available_actions:
             safe_ok, _ = self.decision_engine.prefilter_action_for_loops(
                 context=context,
@@ -173,22 +186,79 @@ class QLearningPolicy(RouteController):
                 safe_lane_now_actions.append(action)
                 continue
 
-            if cooldown_active:
+            if cooldown_active or context.commit_window or float(context.speed) < 1.2:
                 continue
-            if context.commit_window:
+
+            required_shift = int(context.required_lane_shift.get(action, 99))
+            if required_shift > 1:
                 continue
-            if float(context.speed) < 1.2:
+            if float(context.dist_to_end) <= max(comfortable_dist_threshold, self.decision_engine.min_distance_for_lane_shift(context, action)):
                 continue
-            if int(context.required_lane_shift.get(action, 99)) != 1:
-                continue
-            if float(context.dist_to_end) <= comfortable_dist_threshold:
+
+            traffic_score = self.decision_engine.traffic_feasibility_score(
+                context=context,
+                action_idx=action,
+                destination=destination,
+                distance_fn=self._dist_to_dest,
+                baseline_distance=lane_now_distance_baseline if math.isfinite(lane_now_distance_baseline) else None,
+            )
+            if traffic_score > 8.5:
                 continue
             strict_non_lane_actions.append(action)
 
         if safe_lane_now_actions:
-            return sorted(set(safe_lane_now_actions))
+            safe_lane_now_actions = sorted(
+                set(safe_lane_now_actions),
+                key=lambda a: self.decision_engine.traffic_feasibility_score(
+                    context=context,
+                    action_idx=a,
+                    destination=destination,
+                    distance_fn=self._dist_to_dest,
+                    baseline_distance=lane_now_distance_baseline if math.isfinite(lane_now_distance_baseline) else None,
+                ),
+            )
+            if strict_non_lane_actions and float(context.dist_to_end) >= self.decision_engine.detour_open_distance_m:
+                strict_non_lane_actions = sorted(
+                    set(strict_non_lane_actions),
+                    key=lambda a: self.decision_engine.traffic_feasibility_score(
+                        context=context,
+                        action_idx=a,
+                        destination=destination,
+                        distance_fn=self._dist_to_dest,
+                        baseline_distance=lane_now_distance_baseline if math.isfinite(lane_now_distance_baseline) else None,
+                    ),
+                )
+                if strict_non_lane_actions:
+                    best_lane_score = self.decision_engine.traffic_feasibility_score(
+                        context=context,
+                        action_idx=safe_lane_now_actions[0],
+                        destination=destination,
+                        distance_fn=self._dist_to_dest,
+                        baseline_distance=lane_now_distance_baseline if math.isfinite(lane_now_distance_baseline) else None,
+                    )
+                    best_detour_score = self.decision_engine.traffic_feasibility_score(
+                        context=context,
+                        action_idx=strict_non_lane_actions[0],
+                        destination=destination,
+                        distance_fn=self._dist_to_dest,
+                        baseline_distance=lane_now_distance_baseline if math.isfinite(lane_now_distance_baseline) else None,
+                    )
+                    if best_detour_score + 0.8 < best_lane_score:
+                        return strict_non_lane_actions
+            return safe_lane_now_actions
+
         if strict_non_lane_actions:
-            return sorted(set(strict_non_lane_actions))
+            return sorted(
+                set(strict_non_lane_actions),
+                key=lambda a: self.decision_engine.traffic_feasibility_score(
+                    context=context,
+                    action_idx=a,
+                    destination=destination,
+                    distance_fn=self._dist_to_dest,
+                    baseline_distance=lane_now_distance_baseline if math.isfinite(lane_now_distance_baseline) else None,
+                ),
+            )
+
         if filtered_available_actions:
             return sorted(set(filtered_available_actions))
         return available_actions
