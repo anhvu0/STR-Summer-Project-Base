@@ -29,6 +29,15 @@ class DecisionContext:
 
 
 @dataclass
+class PolicyActionDiagnostics:
+    hard_invalid_actions: int = 0
+    lane_infeasible_available_actions: int = 0
+    soft_loop_risk_actions: int = 0
+    policy_mask_removed_actions: int = 0
+    non_lane_available_masked: int = 0
+
+
+@dataclass
 class PendingDecision:
     state: object
     intended_action: int
@@ -359,6 +368,7 @@ class JunctionDecisionEngine:
         recent_history: List[str],
         distance_fn: Optional[Callable[[str, str], float]] = None,
         distance_slack: Optional[float] = None,
+        block_distance_worsen: bool = False,
     ) -> Tuple[bool, Dict[str, bool]]:
         next_edge = self.get_next_edge(context.edge_id, action_idx)
         if next_edge is None:
@@ -399,12 +409,69 @@ class JunctionDecisionEngine:
             or signals.get("long_horizon_loop")
             or signals.get("revisit_without_progress")
             or trap_like
-            or dist_worsen
+            or (bool(block_distance_worsen) and dist_worsen)
         )
         details = dict(signals)
         details["trap_like_reversal"] = trap_like
         details["distance_worsen"] = dist_worsen
         return (not blocked), details
+
+    def build_policy_action_set(
+        self,
+        context: DecisionContext,
+        destination: str,
+        recent_history: List[str],
+        cooldown_active: bool,
+        distance_fn: Optional[Callable[[str, str], float]] = None,
+    ) -> Tuple[List[int], PolicyActionDiagnostics]:
+        available_actions = list(context.available_actions)
+        if not available_actions:
+            return [], PolicyActionDiagnostics(
+                hard_invalid_actions=max(len(context.edge_valid_actions), 0),
+            )
+
+        lane_now = set(context.lane_feasible_now_actions)
+        diagnostics = PolicyActionDiagnostics(
+            hard_invalid_actions=max(len(context.edge_valid_actions) - len(available_actions), 0),
+            lane_infeasible_available_actions=sum(1 for a in available_actions if a not in lane_now),
+        )
+
+        safe_lane_now_actions: List[int] = []
+        safe_non_lane_actions: List[int] = []
+        filtered_available_actions: List[int] = []
+        for action in available_actions:
+            safe_ok, _ = self.prefilter_action_for_loops(
+                context=context,
+                action_idx=action,
+                destination=destination,
+                recent_history=recent_history,
+                distance_fn=distance_fn,
+            )
+            if not safe_ok:
+                diagnostics.soft_loop_risk_actions += 1
+                continue
+            filtered_available_actions.append(action)
+            if action in lane_now:
+                safe_lane_now_actions.append(action)
+            elif (not cooldown_active) and (not context.commit_window):
+                safe_non_lane_actions.append(action)
+
+        if context.commit_window:
+            policy_actions = sorted(set(safe_lane_now_actions or filtered_available_actions))
+        elif cooldown_active and safe_lane_now_actions:
+            policy_actions = sorted(set(safe_lane_now_actions))
+        else:
+            policy_actions = sorted(set(safe_lane_now_actions + safe_non_lane_actions))
+            if not policy_actions:
+                policy_actions = sorted(set(filtered_available_actions))
+        if not policy_actions:
+            policy_actions = sorted(set(available_actions))
+
+        diagnostics.policy_mask_removed_actions = max(len(available_actions) - len(policy_actions), 0)
+        diagnostics.non_lane_available_masked = sum(
+            1 for action in available_actions if action not in lane_now and action not in set(policy_actions)
+        )
+        return policy_actions, diagnostics
 
     def try_request_lane_change(self, context: DecisionContext, action_idx: int, duration: int = 70) -> Tuple[bool, bool]:
         direction = self.direction_choices[action_idx]

@@ -140,58 +140,14 @@ class QLearningPolicy(RouteController):
         ]
 
     def _policy_action_candidates(self, context, recent_history, cooldown_active, destination):
-        available_actions = list(context.available_actions)
-        if not available_actions:
-            return []
-
-        lane_now = set(context.lane_feasible_now_actions)
-        recent_history = list(recent_history or [])
-
-        commit_distance = max(
-            float(self.decision_engine.commit_min_distance),
-            float(context.speed) * float(self.decision_engine.commit_time_s),
+        policy_actions, _ = self.decision_engine.build_policy_action_set(
+            context=context,
+            destination=destination,
+            recent_history=list(recent_history or []),
+            cooldown_active=bool(cooldown_active),
+            distance_fn=self._dist_to_dest,
         )
-        extra_buffer = max(10.0, 0.5 * float(self.decision_engine.lane_change_margin_m))
-        comfortable_dist_threshold = commit_distance + extra_buffer
-
-        safe_lane_now_actions = []
-        strict_non_lane_actions = []
-        filtered_available_actions = []
-
-        for action in available_actions:
-            safe_ok, _ = self.decision_engine.prefilter_action_for_loops(
-                context=context,
-                action_idx=action,
-                destination=destination,
-                recent_history=recent_history,
-                distance_fn=self._dist_to_dest,
-            )
-            if not safe_ok:
-                continue
-            filtered_available_actions.append(action)
-            if action in lane_now:
-                safe_lane_now_actions.append(action)
-                continue
-
-            if cooldown_active:
-                continue
-            if context.commit_window:
-                continue
-            if float(context.speed) < 1.2:
-                continue
-            if int(context.required_lane_shift.get(action, 99)) != 1:
-                continue
-            if float(context.dist_to_end) <= comfortable_dist_threshold:
-                continue
-            strict_non_lane_actions.append(action)
-
-        if safe_lane_now_actions:
-            return sorted(set(safe_lane_now_actions))
-        if strict_non_lane_actions:
-            return sorted(set(strict_non_lane_actions))
-        if filtered_available_actions:
-            return sorted(set(filtered_available_actions))
-        return available_actions
+        return policy_actions
 
     #-----------------------DEBUGGING-------------------------------------
     def _dist_to_dest(self, edge_id, dest_id):

@@ -692,65 +692,14 @@ class RLTrainingPipeline:
         return context.available_actions
 
     def _policy_action_candidates(self, context, recent_history, cooldown_active, destination):
-        """
-        Build a stricter action subset for policy selection only.
-        NOTE:
-        - context.available_actions remains the full safety/feasibility action set.
-        - fallback machinery still relies on available_actions and ranked fallback behavior.
-        """
-        available_actions = list(context.available_actions)
-        if not available_actions:
-            return []
-
-        lane_now = set(context.lane_feasible_now_actions)
-        recent_history = list(recent_history or [])
-
-        commit_distance = max(
-            float(self.decision_engine.commit_min_distance),
-            float(context.speed) * float(self.decision_engine.commit_time_s),
+        policy_actions, diagnostics = self.decision_engine.build_policy_action_set(
+            context=context,
+            destination=destination,
+            recent_history=list(recent_history or []),
+            cooldown_active=bool(cooldown_active),
+            distance_fn=self.get_distance_to_destination,
         )
-        extra_buffer = max(10.0, 0.5 * float(self.decision_engine.lane_change_margin_m))
-        comfortable_dist_threshold = commit_distance + extra_buffer
-
-        safe_lane_now_actions = []
-        strict_non_lane_actions = []
-        filtered_available_actions = []
-
-        for action in available_actions:
-            safe_ok, _ = self.decision_engine.prefilter_action_for_loops(
-                context=context,
-                action_idx=action,
-                destination=destination,
-                recent_history=recent_history,
-                distance_fn=self.get_distance_to_destination,
-            )
-            if not safe_ok:
-                continue
-            filtered_available_actions.append(action)
-            if action in lane_now:
-                safe_lane_now_actions.append(action)
-                continue
-
-            # Non-lane-feasible actions are exposed only in exceptional cases.
-            if cooldown_active:
-                continue
-            if context.commit_window:
-                continue
-            if float(context.speed) < 1.2:
-                continue
-            if int(context.required_lane_shift.get(action, 99)) != 1:
-                continue
-            if float(context.dist_to_end) <= comfortable_dist_threshold:
-                continue
-            strict_non_lane_actions.append(action)
-
-        # Dominant learning space: lane-feasible-now actions if any safe options exist.
-        policy_actions = sorted(set(safe_lane_now_actions)) if safe_lane_now_actions else sorted(set(strict_non_lane_actions))
-        if not policy_actions:
-            policy_actions = sorted(set(filtered_available_actions))
-        if not policy_actions:
-            return available_actions
-        return policy_actions
+        return policy_actions, diagnostics
     
     def dist_to_end(self, vehicle_id, snapshot=None):
         """
@@ -1290,12 +1239,22 @@ class RLTrainingPipeline:
         congestion = self.connection_info.edge_vehicle_count.get(edge_id, 0)
         edge_len = max(self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0)
         edge_density = congestion / edge_len
-        reward -= 0.015 * edge_density * elapsed
+        reward -= 0.02 * edge_density * elapsed
         reward -= float(np.clip(externality_penalty, 0.0, 1.5))
+
+        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
+        downstream_densities = [
+            self.connection_info.edge_vehicle_count.get(next_edge, 0)
+            / max(self.connection_info.edge_length_dict.get(next_edge, 5.0), 5.0)
+            for next_edge in outgoing.values()
+        ]
+        downstream_mean = float(np.mean(downstream_densities)) if downstream_densities else edge_density
+        queue_growth_proxy = max(downstream_mean - edge_density, 0.0)
+        reward -= 0.03 * queue_growth_proxy * elapsed
 
         mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
         marginal_pressure = max(edge_density - mean_density, 0.0)
-        reward -= self.system_congestion_scale * marginal_pressure * elapsed
+        reward -= (self.system_congestion_scale * 1.5) * marginal_pressure * elapsed
         reward -= self.pending_latency_penalty_per_step * float(max(pending_age, 0))
         reward -= 0.02 * float(max(lane_change_deferrals, 0))
         return self._clip_reward(reward)
@@ -1347,6 +1306,10 @@ class RLTrainingPipeline:
             "batched_policy_calls", "snapshot_cache_hits", "shortest_path_cache_hits",
             "exploration_actions", "policy_actions", "override_ratio",
             "policy_masked_actions_removed", "override_learning_transitions",
+            "hard_invalid_actions", "lane_infeasible_available_actions", "soft_loop_risk_actions",
+            "open_decision_available_action_count", "open_decision_policy_action_count",
+            "open_decisions_with_non_lane_available", "open_decisions_non_lane_masked",
+            "non_lane_available_masked_actions", "skip_reason_histogram", "fallback_reason_counts",
             "loop_prefilter_overrides", "cooldown_fallback_overrides",
             "observe_abort_fallback_overrides", "route_apply_fail_overrides",
             "override_learning_negative", "override_learning_imitation",
@@ -1647,7 +1610,7 @@ class RLTrainingPipeline:
                                         decision_metrics["route_apply_fail"] += 1
                                         decision_metrics["route_apply_fail_overrides"] += 1
                                         override_penalty = self._clip_reward(-6.0)
-                                        obs_policy_actions = self._policy_action_candidates(
+                                        obs_policy_actions, _ = self._policy_action_candidates(
                                             context=obs_context,
                                             recent_history=list(recent_edge_history[vehicle_id]),
                                             cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
@@ -1755,7 +1718,8 @@ class RLTrainingPipeline:
                                 decision_metrics["fallback_overrides"] += 1
                                 decision_metrics["fallback_to_lane_feasible_now"] += 1
                                 decision_metrics["observe_abort_fallback_overrides"] += 1
-                                observe_policy_actions = self._policy_action_candidates(
+                                decision_metrics["fallback_reason_observe_abort"] += 1
+                                observe_policy_actions, _ = self._policy_action_candidates(
                                     context=obs_context,
                                     recent_history=list(recent_edge_history[vehicle_id]),
                                     cooldown_active=True,
@@ -1890,6 +1854,7 @@ class RLTrainingPipeline:
                         )
                         if vehicle_id in pending_decisions:
                             decision_metrics["decisions_skipped"] += 1
+                            decision_metrics["skip_reason_pending_decision"] += 1
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
 
@@ -1907,11 +1872,15 @@ class RLTrainingPipeline:
                         if context.forced_action is not None:
                             action = context.forced_action
                             decision_metrics["forced_actions"] += 1
+                            decision_metrics[f"skip_reason_{context.skip_reason or 'forced'}"] += 1
                         elif context.skip_reason:
                             decision_metrics["decisions_skipped"] += 1
+                            decision_metrics[f"skip_reason_{context.skip_reason}"] += 1
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
                         elif not self.decision_engine.is_decision_open(context):
+                            if len(context.available_actions) <= 1:
+                                decision_metrics["skip_reason_not_meaningful_action_set"] += 1
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
                         else:
@@ -1919,17 +1888,29 @@ class RLTrainingPipeline:
                             # policy_actions = stricter learning-time subset to reduce harmful overrides.
                             # Fallback machinery below remains the final safety layer.
                             cooldown_active = step < cooldown_until
-                            policy_actions = self._policy_action_candidates(
+                            policy_actions, policy_diag = self._policy_action_candidates(
                                 context=context,
                                 recent_history=list(recent_edge_history[vehicle_id]),
                                 cooldown_active=cooldown_active,
                                 destination=vehicle.destination,
                             )
-                            removed_actions = max(len(context.available_actions) - len(policy_actions), 0)
+                            removed_actions = policy_diag.policy_mask_removed_actions
                             decision_metrics["policy_masked_actions_removed"] += removed_actions
-                            action, action_source = self.trainer.select_action(
-                                state, policy_actions, return_source=True
-                            )
+                            decision_metrics["hard_invalid_actions"] += policy_diag.hard_invalid_actions
+                            decision_metrics["lane_infeasible_available_actions"] += policy_diag.lane_infeasible_available_actions
+                            decision_metrics["soft_loop_risk_actions"] += policy_diag.soft_loop_risk_actions
+                            decision_metrics["non_lane_available_masked_actions"] += policy_diag.non_lane_available_masked
+                            decision_metrics["open_decision_available_action_count"] += len(context.available_actions)
+                            decision_metrics["open_decision_policy_action_count"] += len(policy_actions)
+                            if policy_diag.lane_infeasible_available_actions > 0:
+                                decision_metrics["open_decisions_with_non_lane_available"] += 1
+                                if policy_diag.non_lane_available_masked > 0:
+                                    decision_metrics["open_decisions_non_lane_masked"] += 1
+                            action, action_source = self.trainer.select_actions_batch(
+                                [state],
+                                [policy_actions],
+                            )[0]
+                            decision_metrics["batched_policy_calls"] += 1
                             if action is None:
                                 decision_metrics["decisions_skipped"] += 1
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -1970,9 +1951,10 @@ class RLTrainingPipeline:
                                 continue
                             decision_metrics["fallback_overrides"] += 1
                             decision_metrics["safety_overrides"] += 1
+                            decision_metrics["fallback_reason_loop_prefilter"] += 1
                             action_source = "loop_prefilter_fallback"
                             override_penalty = self._clip_reward(self.loop_trap_override_penalty)
-                            policy_actions_after_override = self._policy_action_candidates(
+                            policy_actions_after_override, _ = self._policy_action_candidates(
                                 context=context,
                                 recent_history=list(recent_edge_history[vehicle_id]),
                                 cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
@@ -2038,8 +2020,9 @@ class RLTrainingPipeline:
                                 action_source = "cooldown_fallback"
                                 decision_metrics["fallback_overrides"] += 1
                                 decision_metrics["fallback_to_lane_feasible_now"] += 1
+                                decision_metrics["fallback_reason_cooldown"] += 1
                                 override_penalty = self._clip_reward(self.same_edge_repeat_chase_penalty)
-                                policy_actions_after_override = self._policy_action_candidates(
+                                policy_actions_after_override, _ = self._policy_action_candidates(
                                     context=context,
                                     recent_history=list(recent_edge_history[vehicle_id]),
                                     cooldown_active=True,
@@ -2122,7 +2105,7 @@ class RLTrainingPipeline:
                             decision_metrics["route_apply_fail_overrides"] += 1
                             decision_metrics["fragment_build_failures"] += 1
                             override_penalty = self._clip_reward(-6.0)
-                            policy_actions_after_override = self._policy_action_candidates(
+                            policy_actions_after_override, _ = self._policy_action_candidates(
                                 context=context,
                                 recent_history=list(recent_edge_history[vehicle_id]),
                                 cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
@@ -2312,6 +2295,26 @@ class RLTrainingPipeline:
                 avg_queue_wait_before_stuck = (
                     float(np.mean(queue_wait_samples_before_stuck)) if queue_wait_samples_before_stuck else 0.0
                 )
+                avg_available_actions_open = (
+                    float(decision_metrics["open_decision_available_action_count"]) / max(float(decision_metrics["decisions_opened"]), 1.0)
+                )
+                avg_policy_actions_open = (
+                    float(decision_metrics["open_decision_policy_action_count"]) / max(float(decision_metrics["decisions_opened"]), 1.0)
+                )
+                non_lane_masked_pct = (
+                    float(decision_metrics["open_decisions_non_lane_masked"])
+                    / max(float(decision_metrics["open_decisions_with_non_lane_available"]), 1.0)
+                )
+                skip_reason_histogram = {
+                    key.replace("skip_reason_", ""): int(value)
+                    for key, value in decision_metrics.items()
+                    if key.startswith("skip_reason_") and value > 0
+                }
+                fallback_reason_counts = {
+                    key.replace("fallback_reason_", ""): int(value)
+                    for key, value in decision_metrics.items()
+                    if key.startswith("fallback_reason_") and value > 0
+                }
 
                 rolling_teleport_events.append(float(episode_teleport_events))
                 rolling_teleported_controlled.append(float(len(teleported_controlled_ids)))
@@ -2380,6 +2383,14 @@ class RLTrainingPipeline:
                         decision_metrics["policy_actions"],
                         decision_metrics["deferred_lane_change_actions"],
                         decision_metrics["fallback_overrides"],
+                    )
+                )
+                print(
+                    "  action-space: avg_available_open={:.2f} avg_policy_open={:.2f} "
+                    "non_lane_masked_when_available={:.1%}".format(
+                        avg_available_actions_open,
+                        avg_policy_actions_open,
+                        non_lane_masked_pct,
                     )
                 )
                 print(
@@ -2566,6 +2577,16 @@ class RLTrainingPipeline:
                         ) / max(decision_metrics["decisions_opened"], 1.0),
                         "policy_masked_actions_removed": decision_metrics["policy_masked_actions_removed"],
                         "override_learning_transitions": decision_metrics["override_learning_transitions"],
+                        "hard_invalid_actions": decision_metrics["hard_invalid_actions"],
+                        "lane_infeasible_available_actions": decision_metrics["lane_infeasible_available_actions"],
+                        "soft_loop_risk_actions": decision_metrics["soft_loop_risk_actions"],
+                        "open_decision_available_action_count": avg_available_actions_open,
+                        "open_decision_policy_action_count": avg_policy_actions_open,
+                        "open_decisions_with_non_lane_available": decision_metrics["open_decisions_with_non_lane_available"],
+                        "open_decisions_non_lane_masked": non_lane_masked_pct,
+                        "non_lane_available_masked_actions": decision_metrics["non_lane_available_masked_actions"],
+                        "skip_reason_histogram": json.dumps(skip_reason_histogram, sort_keys=True),
+                        "fallback_reason_counts": json.dumps(fallback_reason_counts, sort_keys=True),
                         "loop_prefilter_overrides": decision_metrics["loop_prefilter_overrides"],
                         "cooldown_fallback_overrides": decision_metrics["cooldown_fallback_overrides"],
                         "observe_abort_fallback_overrides": decision_metrics["observe_abort_fallback_overrides"],
