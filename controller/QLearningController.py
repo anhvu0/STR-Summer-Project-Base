@@ -157,6 +157,13 @@ class QLearningPolicy(RouteController):
         safe_lane_now_actions = []
         strict_non_lane_actions = []
         filtered_available_actions = []
+        dijkstra_prior = set(
+            self.decision_engine.dijkstra_prior_actions(
+                context=context,
+                destination=destination,
+                distance_fn=self._dist_to_dest,
+            )
+        )
 
         for action in available_actions:
             safe_ok, _ = self.decision_engine.prefilter_action_for_loops(
@@ -167,6 +174,9 @@ class QLearningPolicy(RouteController):
                 distance_fn=self._dist_to_dest,
             )
             if not safe_ok:
+                continue
+            if dijkstra_prior and action not in dijkstra_prior:
+                # Inference follows Dijkstra prior; RL chooses among congestion-aware near-optimal deviations.
                 continue
             filtered_available_actions.append(action)
             if action in lane_now:

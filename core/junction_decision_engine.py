@@ -94,6 +94,8 @@ class JunctionDecisionEngine:
         self.cooldown_steps = 3
         self.pending_progress_timeout_steps = max(int(pending_progress_timeout_steps), 1)
         self.loop_distance_slack = 30.0
+        self.decision_open_buffer_m = 45.0
+        self.dijkstra_deviation_slack_m = 120.0
 
     def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
         if snapshot is not None:
@@ -154,6 +156,7 @@ class JunctionDecisionEngine:
         commit_window = dist_to_end <= commit_distance
 
         available = []
+        early_open_window = dist_to_end > (commit_distance + self.decision_open_buffer_m)
         if commit_window:
             available = list(lane_now)
         else:
@@ -166,9 +169,10 @@ class JunctionDecisionEngine:
                 dynamic_margin = self.lane_change_margin_m * (1.0 + 0.5 * max(0, shift - 1))
                 low_speed = speed < 1.2
                 aggressive_shift = shift >= 2 and dist_to_end < (dynamic_margin + commit_distance + reaction_distance)
-                if low_speed or aggressive_shift:
+                if (low_speed or aggressive_shift) and not early_open_window:
                     continue
-                if shift < 999 and lane_change_budget >= shift * dynamic_margin and dist_to_end >= reaction_distance:
+                relaxed_margin = dynamic_margin * (0.75 if early_open_window else 1.0)
+                if shift < 999 and lane_change_budget >= shift * relaxed_margin and dist_to_end >= reaction_distance:
                     available.append(idx)
 
         available = sorted(set(available))
@@ -392,19 +396,41 @@ class JunctionDecisionEngine:
                 next_distance,
                 slack=self.loop_distance_slack if distance_slack is None else float(distance_slack),
             )
+        # Hard vetoes only for immediate loop traps.
         blocked = bool(
             signals.get("short_cycle")
             or signals.get("aba_bounce")
             or signals.get("dead_end_reentry")
-            or signals.get("long_horizon_loop")
-            or signals.get("revisit_without_progress")
             or trap_like
-            or dist_worsen
         )
         details = dict(signals)
         details["trap_like_reversal"] = trap_like
         details["distance_worsen"] = dist_worsen
         return (not blocked), details
+
+    def dijkstra_prior_actions(
+        self,
+        context: DecisionContext,
+        destination: str,
+        distance_fn: Optional[Callable[[str, str], float]] = None,
+        slack_m: Optional[float] = None,
+    ) -> List[int]:
+        actions = list(context.available_actions)
+        if not actions:
+            return []
+        distances = []
+        for action in actions:
+            next_edge = self.get_next_edge(context.edge_id, action)
+            if next_edge is None:
+                continue
+            d = distance_fn(next_edge, destination) if distance_fn is not None else math.inf
+            distances.append((action, d))
+        finite = [d for _, d in distances if math.isfinite(d)]
+        if not finite:
+            return sorted(set(actions))
+        best = min(finite)
+        threshold = best + float(self.dijkstra_deviation_slack_m if slack_m is None else slack_m)
+        return sorted([action for action, d in distances if (not math.isfinite(d)) or d <= threshold])
 
     def try_request_lane_change(self, context: DecisionContext, action_idx: int, duration: int = 70) -> Tuple[bool, bool]:
         direction = self.direction_choices[action_idx]
