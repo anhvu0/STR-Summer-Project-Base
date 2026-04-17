@@ -539,6 +539,7 @@ class RLTrainingPipeline:
         total_controlled,
         arrived_ids,
         decision_metrics,
+        congestion_snapshot=None,
     ):
         override_total = (
             decision_metrics["safety_overrides"]
@@ -573,6 +574,56 @@ class RLTrainingPipeline:
                 int(decision_metrics["teleports"]),
             )
         )
+        print(
+            "  override_causes: safety={:.0f} fallback={:.0f} route_apply_fail={:.0f} "
+            "loop_prefilter={:.0f} cooldown_fallback={:.0f} observe_abort_fallback={:.0f}".format(
+                decision_metrics["safety_overrides"],
+                decision_metrics["fallback_overrides"],
+                decision_metrics["route_apply_fail"],
+                decision_metrics["loop_prefilter_overrides"],
+                decision_metrics["cooldown_fallback_overrides"],
+                decision_metrics["observe_abort_fallback_overrides"],
+            )
+        )
+        print(
+            "  skips: pending={:.0f} commit_window={:.0f} no_policy_action={:.0f} total={:.0f} "
+            "pending_timeout={:.0f} pending_released_no_progress={:.0f}".format(
+                decision_metrics["skipped_due_to_pending"],
+                decision_metrics["skipped_due_to_commit_window"],
+                decision_metrics["skipped_due_to_no_policy_action"],
+                decision_metrics["decisions_skipped"],
+                decision_metrics["pending_decision_timeouts"],
+                decision_metrics["same_edge_pending_released_no_progress"],
+            )
+        )
+        print(
+            "  lane_change: attempts/success/fail={:.0f}/{:.0f}/{:.0f} deferred={:.0f} "
+            "observe_start/success/abort={:.0f}/{:.0f}/{:.0f}".format(
+                decision_metrics["lane_change_attempts"],
+                decision_metrics["lane_change_success"],
+                decision_metrics["lane_change_fail"],
+                decision_metrics["deferred_lane_change_actions"],
+                decision_metrics["lane_change_observe_started"],
+                decision_metrics["lane_change_observe_success"],
+                (
+                    decision_metrics["lane_change_observe_abort_no_progress"]
+                    + decision_metrics["lane_change_observe_abort_commit_window"]
+                ),
+            )
+        )
+        if congestion_snapshot:
+            print(
+                "  congestion: net_density(mean/p90)={:.4f}/{:.4f} net_vehicles(mean/peak)={:.1f}/{:.0f} "
+                "controlled_edge_density(mean/p90)={:.4f}/{:.4f} controlled_speed(mean)={:.2f}m/s".format(
+                    congestion_snapshot.get("mean_network_density", 0.0),
+                    congestion_snapshot.get("p90_network_density", 0.0),
+                    congestion_snapshot.get("mean_network_vehicles", 0.0),
+                    congestion_snapshot.get("peak_network_vehicles", 0.0),
+                    congestion_snapshot.get("mean_controlled_edge_density", 0.0),
+                    congestion_snapshot.get("p90_controlled_edge_density", 0.0),
+                    congestion_snapshot.get("mean_controlled_speed", 0.0),
+                )
+            )
 
     def _init_edge_embeddings(self, seed=1337):
         """
@@ -1339,10 +1390,13 @@ class RLTrainingPipeline:
             "long_horizon_loop_events", "revisit_without_progress_events",
             "safety_overrides", "loop_avoidance_overrides", "distance_worsening_overrides",
             "fragment_build_failures", "fallback_overrides", "fallback_to_lane_feasible_now",
+            "route_apply_fail", "overrides_total", "override_ratio_safety", "override_ratio_fallback", "override_ratio_route_apply_fail",
             "pending_decision_timeouts", "deferred_lane_change_actions",
             "lane_change_observe_started", "lane_change_observe_success",
             "lane_change_observe_abort_no_progress", "lane_change_observe_abort_commit_window",
+            "lane_change_attempts", "lane_change_success", "lane_change_fail",
             "same_edge_pending_released_no_progress", "cooldown_replans_blocked",
+            "skipped_due_to_pending", "skipped_due_to_commit_window", "skipped_due_to_no_policy_action",
             "loop_override_count", "dead_end_reentry_override_count",
             "batched_policy_calls", "snapshot_cache_hits", "shortest_path_cache_hits",
             "exploration_actions", "policy_actions", "override_ratio",
@@ -1355,6 +1409,8 @@ class RLTrainingPipeline:
             "mean_reward_per_finalized_decision", "mean_route_difficulty_eta", "p50_route_difficulty_eta",
             "p90_route_difficulty_eta", "true_teleports", "episode_truncated_survivors",
             "per_vehicle_stuck_terminations", "no_progress_events", "avg_queue_wait_before_stuck",
+            "mean_network_density", "p90_network_density", "mean_network_vehicles", "peak_network_vehicles",
+            "mean_controlled_edge_density", "p90_controlled_edge_density", "mean_controlled_speed",
             "fail_teleport", "fail_timeout", "fail_removed_non_destination",
             "fail_unreachable_transition", "fail_dead_end_no_outgoing",
         ]
@@ -1418,6 +1474,11 @@ class RLTrainingPipeline:
             pending_debug_logged_ids = set()
             decision_debug_rows = []
             arrived_with_prestep_edge_not_destination = 0
+            network_density_samples = []
+            network_density_p90_samples = []
+            network_vehicle_samples = []
+            controlled_edge_density_samples = []
+            controlled_speed_samples = []
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
@@ -1430,6 +1491,12 @@ class RLTrainingPipeline:
                     vehicle_ids = list(vehicle_get_ids())
                     controlled_live_ids = [vid for vid in vehicle_ids if vid in vehicles]
                     step_snapshots = self.collect_vehicle_snapshots(controlled_live_ids, step)
+                    if hasattr(self, "_density_vec") and len(self._density_vec) > 0:
+                        network_density_samples.append(float(np.mean(self._density_vec)))
+                        network_density_p90_samples.append(float(np.percentile(self._density_vec, 90)))
+                    edge_vehicle_count = self.connection_info.edge_vehicle_count
+                    if edge_vehicle_count:
+                        network_vehicle_samples.append(float(sum(edge_vehicle_count.values())))
 
                     for vehicle_id in controlled_live_ids:
                         snapshot = step_snapshots.get(vehicle_id)
@@ -1441,6 +1508,10 @@ class RLTrainingPipeline:
                         vehicle = vehicles[vehicle_id]
                         vehicle.current_edge = current_edge
                         vehicle.current_speed = snapshot.speed
+                        controlled_speed_samples.append(float(snapshot.speed))
+                        edge_len = max(self.connection_info.edge_length_dict.get(current_edge, 1.0), 1.0)
+                        edge_count = float(self.connection_info.edge_vehicle_count.get(current_edge, 0))
+                        controlled_edge_density_samples.append(edge_count / edge_len)
                         if getattr(vehicle, "_route_difficulty_eta_logged", False) is False:
                             eta0 = self._estimate_remaining_eta(current_edge, vehicle.destination)
                             if math.isfinite(eta0):
@@ -1890,6 +1961,7 @@ class RLTrainingPipeline:
                         )
                         if vehicle_id in pending_decisions:
                             decision_metrics["decisions_skipped"] += 1
+                            decision_metrics["skipped_due_to_pending"] += 1
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
 
@@ -1909,6 +1981,7 @@ class RLTrainingPipeline:
                             decision_metrics["forced_actions"] += 1
                         elif context.skip_reason:
                             decision_metrics["decisions_skipped"] += 1
+                            decision_metrics["skipped_due_to_commit_window"] += 1
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
                         elif not self.decision_engine.is_decision_open(context):
@@ -1932,6 +2005,7 @@ class RLTrainingPipeline:
                             )
                             if action is None:
                                 decision_metrics["decisions_skipped"] += 1
+                                decision_metrics["skipped_due_to_no_policy_action"] += 1
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
                                 continue
                             if action_source == "explore":
@@ -2251,12 +2325,22 @@ class RLTrainingPipeline:
                             self.trainer.replay()
 
                     if step % self.step_log_every == 0:
+                        congestion_snapshot = {
+                            "mean_network_density": float(np.mean(network_density_samples)) if network_density_samples else 0.0,
+                            "p90_network_density": float(np.percentile(network_density_p90_samples, 90)) if network_density_p90_samples else 0.0,
+                            "mean_network_vehicles": float(np.mean(network_vehicle_samples)) if network_vehicle_samples else 0.0,
+                            "peak_network_vehicles": float(np.max(network_vehicle_samples)) if network_vehicle_samples else 0.0,
+                            "mean_controlled_edge_density": float(np.mean(controlled_edge_density_samples)) if controlled_edge_density_samples else 0.0,
+                            "p90_controlled_edge_density": float(np.percentile(controlled_edge_density_samples, 90)) if controlled_edge_density_samples else 0.0,
+                            "mean_controlled_speed": float(np.mean(controlled_speed_samples)) if controlled_speed_samples else 0.0,
+                        }
                         self._print_step_progress(
                             episode=episode,
                             step=step,
                             total_controlled=total_controlled,
                             arrived_ids=arrived_ids,
                             decision_metrics=decision_metrics,
+                            congestion_snapshot=congestion_snapshot,
                         )
 
                     # process = psutil.Process(os.getpid())
@@ -2311,6 +2395,24 @@ class RLTrainingPipeline:
                 )
                 avg_queue_wait_before_stuck = (
                     float(np.mean(queue_wait_samples_before_stuck)) if queue_wait_samples_before_stuck else 0.0
+                )
+                mean_network_density = float(np.mean(network_density_samples)) if network_density_samples else 0.0
+                p90_network_density = float(np.percentile(network_density_samples, 90)) if network_density_samples else 0.0
+                mean_network_vehicles = float(np.mean(network_vehicle_samples)) if network_vehicle_samples else 0.0
+                peak_network_vehicles = float(np.max(network_vehicle_samples)) if network_vehicle_samples else 0.0
+                mean_controlled_edge_density = (
+                    float(np.mean(controlled_edge_density_samples)) if controlled_edge_density_samples else 0.0
+                )
+                p90_controlled_edge_density = (
+                    float(np.percentile(controlled_edge_density_samples, 90)) if controlled_edge_density_samples else 0.0
+                )
+                mean_controlled_speed = (
+                    float(np.mean(controlled_speed_samples)) if controlled_speed_samples else 0.0
+                )
+                overrides_total = (
+                    decision_metrics["safety_overrides"]
+                    + decision_metrics["fallback_overrides"]
+                    + decision_metrics["route_apply_fail"]
                 )
 
                 rolling_teleport_events.append(float(episode_teleport_events))
@@ -2383,6 +2485,21 @@ class RLTrainingPipeline:
                     )
                 )
                 print(
+                    "  diagnosis: route_apply_fail={:.0f} skips(pending/commit/no_action)={:.0f}/{:.0f}/{:.0f} "
+                    "pending_timeout={:.0f} no_progress_release={:.0f} "
+                    "override_breakdown(safety/fallback/apply_fail)={:.0f}/{:.0f}/{:.0f}".format(
+                        decision_metrics["route_apply_fail"],
+                        decision_metrics["skipped_due_to_pending"],
+                        decision_metrics["skipped_due_to_commit_window"],
+                        decision_metrics["skipped_due_to_no_policy_action"],
+                        decision_metrics["pending_decision_timeouts"],
+                        decision_metrics["same_edge_pending_released_no_progress"],
+                        decision_metrics["safety_overrides"],
+                        decision_metrics["fallback_overrides"],
+                        decision_metrics["route_apply_fail"],
+                    )
+                )
+                print(
                     "  congestion terminals: true_teleports={} episode_truncated={} "
                     "stuck_no_progress={} no_progress_events={} avg_queue_wait_before_stuck={:.1f}".format(
                         terminal_teleport_count,
@@ -2390,6 +2507,18 @@ class RLTrainingPipeline:
                         stuck_no_progress_count,
                         decision_metrics["no_progress_events"],
                         avg_queue_wait_before_stuck,
+                    )
+                )
+                print(
+                    "  congestion profile: net_density(mean/p90)={:.4f}/{:.4f} net_vehicles(mean/peak)={:.1f}/{:.0f} "
+                    "controlled_edge_density(mean/p90)={:.4f}/{:.4f} controlled_speed(mean)={:.2f}m/s".format(
+                        mean_network_density,
+                        p90_network_density,
+                        mean_network_vehicles,
+                        peak_network_vehicles,
+                        mean_controlled_edge_density,
+                        p90_controlled_edge_density,
+                        mean_controlled_speed,
                     )
                 )
 
@@ -2544,14 +2673,25 @@ class RLTrainingPipeline:
                         "fragment_build_failures": decision_metrics["fragment_build_failures"],
                         "fallback_overrides": decision_metrics["fallback_overrides"],
                         "fallback_to_lane_feasible_now": decision_metrics["fallback_to_lane_feasible_now"],
+                        "route_apply_fail": decision_metrics["route_apply_fail"],
+                        "overrides_total": overrides_total,
+                        "override_ratio_safety": decision_metrics["safety_overrides"] / max(decision_metrics["decisions_opened"], 1.0),
+                        "override_ratio_fallback": decision_metrics["fallback_overrides"] / max(decision_metrics["decisions_opened"], 1.0),
+                        "override_ratio_route_apply_fail": decision_metrics["route_apply_fail"] / max(decision_metrics["decisions_opened"], 1.0),
                         "pending_decision_timeouts": decision_metrics["pending_decision_timeouts"],
                         "deferred_lane_change_actions": decision_metrics["deferred_lane_change_actions"],
                         "lane_change_observe_started": decision_metrics["lane_change_observe_started"],
                         "lane_change_observe_success": decision_metrics["lane_change_observe_success"],
                         "lane_change_observe_abort_no_progress": decision_metrics["lane_change_observe_abort_no_progress"],
                         "lane_change_observe_abort_commit_window": decision_metrics["lane_change_observe_abort_commit_window"],
+                        "lane_change_attempts": decision_metrics["lane_change_attempts"],
+                        "lane_change_success": decision_metrics["lane_change_success"],
+                        "lane_change_fail": decision_metrics["lane_change_fail"],
                         "same_edge_pending_released_no_progress": decision_metrics["same_edge_pending_released_no_progress"],
                         "cooldown_replans_blocked": decision_metrics["cooldown_replans_blocked"],
+                        "skipped_due_to_pending": decision_metrics["skipped_due_to_pending"],
+                        "skipped_due_to_commit_window": decision_metrics["skipped_due_to_commit_window"],
+                        "skipped_due_to_no_policy_action": decision_metrics["skipped_due_to_no_policy_action"],
                         "loop_override_count": decision_metrics["loop_override_count"],
                         "dead_end_reentry_override_count": decision_metrics["dead_end_reentry_override_count"],
                         "batched_policy_calls": decision_metrics["batched_policy_calls"],
@@ -2588,6 +2728,13 @@ class RLTrainingPipeline:
                         "per_vehicle_stuck_terminations": stuck_no_progress_count,
                         "no_progress_events": decision_metrics["no_progress_events"],
                         "avg_queue_wait_before_stuck": avg_queue_wait_before_stuck,
+                        "mean_network_density": mean_network_density,
+                        "p90_network_density": p90_network_density,
+                        "mean_network_vehicles": mean_network_vehicles,
+                        "peak_network_vehicles": peak_network_vehicles,
+                        "mean_controlled_edge_density": mean_controlled_edge_density,
+                        "p90_controlled_edge_density": p90_controlled_edge_density,
+                        "mean_controlled_speed": mean_controlled_speed,
                         "fail_teleport": terminal_teleport_count,
                         "fail_timeout": decision_metrics["fail_timeout"],
                         "fail_removed_non_destination": decision_metrics["fail_removed_non_destination"],
