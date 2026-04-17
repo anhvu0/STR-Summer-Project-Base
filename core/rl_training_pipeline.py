@@ -1350,6 +1350,7 @@ class RLTrainingPipeline:
         csv_fields = [
             "episode", "epsilon", "replay", "train_steps", "mean_loss", "episode_return",
             "completion_rate", "avg_travel_time", "p50_travel_time", "p90_travel_time", "teleports", "teleported_controlled",
+            "global_arrival_count", "removed_nonarrival_count", "episode_truncated_count", "stuck_no_progress_count",
             "forced_actions", "decisions_opened", "decisions_finalized", "decisions_skipped",
             "decisions_superseded", "route_mismatch", "loop_events", "uturn_events",
             "short_cycle_events", "aba_bounce_events", "dead_end_reentry_events",
@@ -1369,9 +1370,16 @@ class RLTrainingPipeline:
             "override_learning_negative", "override_learning_imitation",
             "timeout_unfinished_controlled", "exited_without_destination", "arrived_non_global_target",
             "alive_at_step_cap", "decision_pending_at_episode_end", "mean_pending_age", "mean_decision_latency_steps",
+            "p90_pending_age", "max_pending_age", "max_decision_latency_steps",
             "mean_reward_per_finalized_decision", "mean_route_difficulty_eta", "p50_route_difficulty_eta",
             "p90_route_difficulty_eta", "true_teleports", "episode_truncated_survivors",
             "per_vehicle_stuck_terminations", "no_progress_events", "avg_queue_wait_before_stuck",
+            "mean_global_density", "p90_global_density", "mean_peak_edge_density",
+            "mean_controlled_speed", "p10_controlled_speed", "low_speed_controlled_fraction",
+            "mean_pending_vehicles", "p90_pending_vehicles", "max_pending_vehicles",
+            "unique_vehicles_with_loops", "loop_events_per_loop_vehicle",
+            "lane_change_attempts", "lane_change_success", "lane_change_fail", "lane_change_success_rate",
+            "pending_timeout_rate_per_open", "fallback_rate_per_open", "route_apply_fail_rate_per_open",
             "fail_teleport", "fail_timeout", "fail_removed_non_destination",
             "fail_unreachable_transition", "fail_dead_end_no_outgoing",
         ]
@@ -1436,6 +1444,13 @@ class RLTrainingPipeline:
             pending_debug_logged_ids = set()
             decision_debug_rows = []
             arrived_with_prestep_edge_not_destination = 0
+            global_density_samples = []
+            peak_edge_density_samples = []
+            controlled_speed_samples = []
+            low_speed_controlled = 0
+            controlled_observations = 0
+            pending_count_samples = []
+            loop_vehicle_ids = set()
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
@@ -1448,6 +1463,10 @@ class RLTrainingPipeline:
                     vehicle_ids = list(vehicle_get_ids())
                     controlled_live_ids = [vid for vid in vehicle_ids if vid in vehicles]
                     step_snapshots = self.collect_vehicle_snapshots(controlled_live_ids, step)
+                    if len(self._density_vec) > 0:
+                        global_density_samples.append(float(np.mean(self._density_vec)))
+                        peak_edge_density_samples.append(float(np.max(self._density_vec)))
+                    pending_count_samples.append(float(len(pending_decisions)))
 
                     for vehicle_id in controlled_live_ids:
                         snapshot = step_snapshots.get(vehicle_id)
@@ -1459,6 +1478,10 @@ class RLTrainingPipeline:
                         vehicle = vehicles[vehicle_id]
                         vehicle.current_edge = current_edge
                         vehicle.current_speed = snapshot.speed
+                        controlled_speed_samples.append(float(snapshot.speed))
+                        controlled_observations += 1
+                        if snapshot.speed <= self.no_progress_low_speed_mps:
+                            low_speed_controlled += 1
                         if getattr(vehicle, "_route_difficulty_eta_logged", False) is False:
                             eta0 = self._estimate_remaining_eta(current_edge, vehicle.destination)
                             if math.isfinite(eta0):
@@ -1610,6 +1633,7 @@ class RLTrainingPipeline:
                             episode_return += reward
                             if repeated_recent_edges > 1:
                                 decision_metrics["loop_events"] += 1
+                                loop_vehicle_ids.add(vehicle_id)
                             if math.isfinite(prev_distance) and (not math.isfinite(curr_distance)):
                                 decision_metrics["fail_unreachable_transition"] += 1
                             outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
@@ -2324,6 +2348,15 @@ class RLTrainingPipeline:
                 mean_decision_latency_steps = (
                     float(np.mean(decision_latency_steps)) if decision_latency_steps else 0.0
                 )
+                p90_pending_age = (
+                    float(np.percentile(pending_age_samples, 90)) if pending_age_samples else 0.0
+                )
+                max_pending_age = (
+                    float(np.max(pending_age_samples)) if pending_age_samples else 0.0
+                )
+                max_decision_latency_steps = (
+                    float(np.max(decision_latency_steps)) if decision_latency_steps else 0.0
+                )
                 mean_reward_per_finalized_decision = (
                     float(np.mean(finalized_decision_rewards)) if finalized_decision_rewards else 0.0
                 )
@@ -2338,6 +2371,49 @@ class RLTrainingPipeline:
                 )
                 avg_queue_wait_before_stuck = (
                     float(np.mean(queue_wait_samples_before_stuck)) if queue_wait_samples_before_stuck else 0.0
+                )
+                mean_global_density = (
+                    float(np.mean(global_density_samples)) if global_density_samples else 0.0
+                )
+                p90_global_density = (
+                    float(np.percentile(global_density_samples, 90)) if global_density_samples else 0.0
+                )
+                mean_peak_edge_density = (
+                    float(np.mean(peak_edge_density_samples)) if peak_edge_density_samples else 0.0
+                )
+                mean_controlled_speed = (
+                    float(np.mean(controlled_speed_samples)) if controlled_speed_samples else 0.0
+                )
+                p10_controlled_speed = (
+                    float(np.percentile(controlled_speed_samples, 10)) if controlled_speed_samples else 0.0
+                )
+                low_speed_controlled_fraction = (
+                    float(low_speed_controlled) / float(max(controlled_observations, 1))
+                )
+                mean_pending_vehicles = (
+                    float(np.mean(pending_count_samples)) if pending_count_samples else 0.0
+                )
+                p90_pending_vehicles = (
+                    float(np.percentile(pending_count_samples, 90)) if pending_count_samples else 0.0
+                )
+                max_pending_vehicles = (
+                    float(np.max(pending_count_samples)) if pending_count_samples else 0.0
+                )
+                unique_vehicles_with_loops = float(len(loop_vehicle_ids))
+                loop_events_per_loop_vehicle = (
+                    float(decision_metrics["loop_events"]) / float(max(len(loop_vehicle_ids), 1))
+                )
+                lane_change_success_rate = (
+                    float(decision_metrics["lane_change_success"]) / max(float(decision_metrics["lane_change_attempts"]), 1.0)
+                )
+                pending_timeout_rate_per_open = (
+                    float(decision_metrics["pending_decision_timeouts"]) / max(float(decision_metrics["decisions_opened"]), 1.0)
+                )
+                fallback_rate_per_open = (
+                    float(decision_metrics["fallback_overrides"]) / max(float(decision_metrics["decisions_opened"]), 1.0)
+                )
+                route_apply_fail_rate_per_open = (
+                    float(decision_metrics["route_apply_fail"]) / max(float(decision_metrics["decisions_opened"]), 1.0)
                 )
 
                 rolling_teleport_events.append(float(episode_teleport_events))
@@ -2552,6 +2628,10 @@ class RLTrainingPipeline:
                         "p90_travel_time": p90_travel_time,
                         "teleports": episode_teleport_events,
                         "teleported_controlled": len(teleported_controlled_ids),
+                        "global_arrival_count": global_arrival_count,
+                        "removed_nonarrival_count": removed_nonarrival_count,
+                        "episode_truncated_count": episode_truncated_count,
+                        "stuck_no_progress_count": stuck_no_progress_count,
                         "forced_actions": decision_metrics["forced_actions"],
                         "decisions_opened": decision_metrics["decisions_opened"],
                         "decisions_finalized": decision_metrics["decisions_finalized"],
@@ -2606,6 +2686,9 @@ class RLTrainingPipeline:
                         "decision_pending_at_episode_end": len(pending_decisions),
                         "mean_pending_age": mean_pending_age,
                         "mean_decision_latency_steps": mean_decision_latency_steps,
+                        "p90_pending_age": p90_pending_age,
+                        "max_pending_age": max_pending_age,
+                        "max_decision_latency_steps": max_decision_latency_steps,
                         "mean_reward_per_finalized_decision": mean_reward_per_finalized_decision,
                         "mean_route_difficulty_eta": mean_route_difficulty_eta,
                         "p50_route_difficulty_eta": p50_route_difficulty_eta,
@@ -2615,6 +2698,24 @@ class RLTrainingPipeline:
                         "per_vehicle_stuck_terminations": stuck_no_progress_count,
                         "no_progress_events": decision_metrics["no_progress_events"],
                         "avg_queue_wait_before_stuck": avg_queue_wait_before_stuck,
+                        "mean_global_density": mean_global_density,
+                        "p90_global_density": p90_global_density,
+                        "mean_peak_edge_density": mean_peak_edge_density,
+                        "mean_controlled_speed": mean_controlled_speed,
+                        "p10_controlled_speed": p10_controlled_speed,
+                        "low_speed_controlled_fraction": low_speed_controlled_fraction,
+                        "mean_pending_vehicles": mean_pending_vehicles,
+                        "p90_pending_vehicles": p90_pending_vehicles,
+                        "max_pending_vehicles": max_pending_vehicles,
+                        "unique_vehicles_with_loops": unique_vehicles_with_loops,
+                        "loop_events_per_loop_vehicle": loop_events_per_loop_vehicle,
+                        "lane_change_attempts": decision_metrics["lane_change_attempts"],
+                        "lane_change_success": decision_metrics["lane_change_success"],
+                        "lane_change_fail": decision_metrics["lane_change_fail"],
+                        "lane_change_success_rate": lane_change_success_rate,
+                        "pending_timeout_rate_per_open": pending_timeout_rate_per_open,
+                        "fallback_rate_per_open": fallback_rate_per_open,
+                        "route_apply_fail_rate_per_open": route_apply_fail_rate_per_open,
                         "fail_teleport": terminal_teleport_count,
                         "fail_timeout": decision_metrics["fail_timeout"],
                         "fail_removed_non_destination": decision_metrics["fail_removed_non_destination"],
