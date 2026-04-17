@@ -68,6 +68,9 @@ class QLearningPolicy(RouteController):
         self.distance_tiebreak_scale = 0.05
         self.edge_embedding_dim = 8
         self.local_congestion_k = 6
+        self.action_congestion_guard_band = 0.22
+        self.action_congestion_guard_band_dijkstra = 0.38
+        self.fallback_pressure_top_k = 3
         self.compact_state_size = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 3 + self.local_congestion_k
         # Legacy dense-state size (edge-density vector mode) kept for reference only.
         # self.legacy_state_size = 2 + 6 + 3 + 3 + len(self.connection_info.edge_list)
@@ -165,6 +168,7 @@ class QLearningPolicy(RouteController):
             )
         )
 
+        action_pressures = {}
         for action in available_actions:
             safe_ok, _ = self.decision_engine.prefilter_action_for_loops(
                 context=context,
@@ -178,6 +182,7 @@ class QLearningPolicy(RouteController):
             if dijkstra_prior and action not in dijkstra_prior:
                 # Inference follows Dijkstra prior; RL chooses among congestion-aware near-optimal deviations.
                 continue
+            action_pressures[action] = self._action_congestion_pressure(context, action)
             filtered_available_actions.append(action)
             if action in lane_now:
                 safe_lane_now_actions.append(action)
@@ -196,12 +201,83 @@ class QLearningPolicy(RouteController):
             strict_non_lane_actions.append(action)
 
         if safe_lane_now_actions:
-            return sorted(set(safe_lane_now_actions))
+            return self._congestion_filtered_actions(
+                safe_lane_now_actions,
+                pressure_map=action_pressures,
+                dijkstra_prior=dijkstra_prior,
+            )
         if strict_non_lane_actions:
-            return sorted(set(strict_non_lane_actions))
+            return self._congestion_filtered_actions(
+                strict_non_lane_actions,
+                pressure_map=action_pressures,
+                dijkstra_prior=dijkstra_prior,
+            )
         if filtered_available_actions:
-            return sorted(set(filtered_available_actions))
+            return self._congestion_filtered_actions(
+                filtered_available_actions,
+                pressure_map=action_pressures,
+                dijkstra_prior=dijkstra_prior,
+            )
         return available_actions
+
+    def _edge_density(self, edge_id):
+        return traci.edge.getLastStepVehicleNumber(edge_id) / max(
+            self.connection_info.edge_length_dict.get(edge_id, 5.0),
+            5.0,
+        )
+
+    def _action_congestion_pressure(self, context, action_idx):
+        next_edge = self.decision_engine.get_next_edge(context.edge_id, action_idx)
+        if not next_edge:
+            return float("inf")
+        next_density = self._edge_density(next_edge)
+        try:
+            next_speed = max(float(traci.edge.getLastStepMeanSpeed(next_edge)), 0.0)
+        except Exception:
+            next_speed = 0.0
+        speed_penalty = max(0.0, 1.8 - next_speed) / 1.8
+        outgoing = self.connection_info.outgoing_edges_dict.get(next_edge, {})
+        downstream = [self._edge_density(eid) for eid in outgoing.values()]
+        downstream_mean = float(np.mean(downstream)) if downstream else next_density
+        return (0.70 * next_density) + (0.20 * downstream_mean) + (0.10 * speed_penalty)
+
+    def _congestion_filtered_actions(self, actions, pressure_map, dijkstra_prior=None):
+        action_list = sorted(set(actions))
+        if len(action_list) <= 1:
+            return action_list
+        pressures = {action: float(pressure_map.get(action, float("inf"))) for action in action_list}
+        finite = [value for value in pressures.values() if math.isfinite(value)]
+        if not finite:
+            return action_list
+        best_pressure = min(finite)
+        guard = best_pressure + self.action_congestion_guard_band
+        dijkstra_guard = best_pressure + self.action_congestion_guard_band_dijkstra
+        dijkstra_prior = set(dijkstra_prior or [])
+        preferred = []
+        for action in action_list:
+            pressure = pressures[action]
+            if pressure <= guard:
+                preferred.append(action)
+                continue
+            if action in dijkstra_prior and pressure <= dijkstra_guard:
+                preferred.append(action)
+        if preferred:
+            return sorted(set(preferred))
+        best_action = min(action_list, key=lambda action: pressures[action])
+        return [best_action]
+
+    def _select_fallback_action(self, context, destination, recent_history, blocked_action):
+        ranked = self.decision_engine.ranked_fallback_actions(
+            context=context,
+            destination=destination,
+            recent_history=recent_history,
+            blocked_action=blocked_action,
+            distance_fn=self._dist_to_dest,
+        )
+        if not ranked:
+            return None
+        pool = ranked[: max(int(self.fallback_pressure_top_k), 1)]
+        return min(pool, key=lambda action: self._action_congestion_pressure(context, action))
 
     #-----------------------DEBUGGING-------------------------------------
     def _dist_to_dest(self, edge_id, dest_id):
@@ -381,16 +457,15 @@ class QLearningPolicy(RouteController):
                     else:
                         self._metrics["lane_change_observe_abort_no_progress"] += 1
                     self._lane_change_cooldown[(vid, start_edge)] = step + self.decision_engine.cooldown_steps
-                    fallback_actions = self.decision_engine.ranked_fallback_actions(
+                    fallback_action = self._select_fallback_action(
                         context=obs_context,
                         destination=vehicle.destination,
                         recent_history=list(self._recent_edges.get(vid, deque(maxlen=self.loop_window))),
                         blocked_action=pending.intended_action,
-                        distance_fn=self._dist_to_dest,
                     )
-                    if not fallback_actions:
+                    if fallback_action is None:
                         continue
-                    action_idx = fallback_actions[0]
+                    action_idx = fallback_action
                     selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
                     if selected_next_edge is None:
                         continue
@@ -457,16 +532,15 @@ class QLearningPolicy(RouteController):
                 self._metrics["loop_override_count"] += 1
                 if signal.get("dead_end_reentry"):
                     self._metrics["dead_end_reentry_override_count"] += 1
-                fallback_actions = self.decision_engine.ranked_fallback_actions(
+                fallback_action = self._select_fallback_action(
                     context=context,
                     destination=vehicle.destination,
                     recent_history=recent,
                     blocked_action=action_idx,
-                    distance_fn=self._dist_to_dest,
                 )
-                if not fallback_actions:
+                if fallback_action is None:
                     continue
-                action_idx = self.act(state, available_actions=fallback_actions) if context.forced_action is None else fallback_actions[0]
+                action_idx = fallback_action
 
             selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
             if selected_next_edge is None:
@@ -477,16 +551,15 @@ class QLearningPolicy(RouteController):
                 cooldown_until = self._lane_change_cooldown.get((vid, start_edge), -1)
                 if step < cooldown_until:
                     self._metrics["cooldown_replans_blocked"] += 1
-                    fallback_actions = self.decision_engine.ranked_fallback_actions(
+                    fallback_action = self._select_fallback_action(
                         context=context,
                         destination=vehicle.destination,
                         recent_history=recent,
                         blocked_action=action_idx,
-                        distance_fn=self._dist_to_dest,
                     )
-                    if not fallback_actions:
+                    if fallback_action is None:
                         continue
-                    action_idx = fallback_actions[0]
+                    action_idx = fallback_action
                 else:
                     lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action_idx)
                     observe_meta = self.decision_engine.start_lane_change_observe(context, action_idx, step, lane_change_requested, lane_change_ok)

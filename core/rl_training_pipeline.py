@@ -367,6 +367,9 @@ class RLTrainingPipeline:
         self.soft_loop_penalty = -0.6
         self.soft_revisit_penalty = -0.5
         self.soft_distance_worsen_penalty = -0.4
+        self.action_congestion_guard_band = 0.22
+        self.action_congestion_guard_band_dijkstra = 0.38
+        self.fallback_pressure_top_k = 3
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
@@ -730,6 +733,7 @@ class RLTrainingPipeline:
         )
         regret_budget = None if regret_budget is None else float(regret_budget)
 
+        action_pressures = {}
         for action in available_actions:
             safe_ok, _ = self.decision_engine.prefilter_action_for_loops(
                 context=context,
@@ -743,6 +747,7 @@ class RLTrainingPipeline:
             # Regret-budget loop control: when exhausted, stay close to Dijkstra prior.
             if regret_budget is not None and regret_budget <= 0.0 and action not in dijkstra_prior:
                 continue
+            action_pressures[action] = self._action_congestion_pressure(context, action)
             filtered_available_actions.append(action)
             if action in lane_now:
                 safe_lane_now_actions.append(action)
@@ -762,12 +767,73 @@ class RLTrainingPipeline:
             strict_non_lane_actions.append(action)
 
         # Dominant learning space: lane-feasible-now actions if any safe options exist.
-        policy_actions = sorted(set(safe_lane_now_actions)) if safe_lane_now_actions else sorted(set(strict_non_lane_actions))
+        policy_actions = self._congestion_filtered_actions(
+            safe_lane_now_actions,
+            pressure_map=action_pressures,
+            dijkstra_prior=dijkstra_prior,
+        ) if safe_lane_now_actions else self._congestion_filtered_actions(
+            strict_non_lane_actions,
+            pressure_map=action_pressures,
+            dijkstra_prior=dijkstra_prior,
+        )
         if not policy_actions:
-            policy_actions = sorted(set(filtered_available_actions))
+            policy_actions = self._congestion_filtered_actions(
+                filtered_available_actions,
+                pressure_map=action_pressures,
+                dijkstra_prior=dijkstra_prior,
+            )
         if not policy_actions:
             return available_actions
         return policy_actions
+
+    def _edge_density(self, edge_id):
+        return (
+            self.connection_info.edge_vehicle_count.get(edge_id, 0)
+            / max(self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0)
+        )
+
+    def _action_congestion_pressure(self, context, action_idx):
+        next_edge = self.decision_engine.get_next_edge(context.edge_id, action_idx)
+        if not next_edge:
+            return float("inf")
+        next_density = self._edge_density(next_edge)
+        try:
+            next_speed = max(float(traci.edge.getLastStepMeanSpeed(next_edge)), 0.0)
+        except Exception:
+            next_speed = 0.0
+        speed_penalty = max(0.0, 1.8 - next_speed) / 1.8
+        outgoing = self.connection_info.outgoing_edges_dict.get(next_edge, {})
+        downstream = [self._edge_density(eid) for eid in outgoing.values()]
+        downstream_mean = float(np.mean(downstream)) if downstream else next_density
+        return (0.70 * next_density) + (0.20 * downstream_mean) + (0.10 * speed_penalty)
+
+    def _congestion_filtered_actions(self, actions, pressure_map, dijkstra_prior=None):
+        action_list = sorted(set(actions))
+        if len(action_list) <= 1:
+            return action_list
+        pressures = {
+            action: float(pressure_map.get(action, float("inf")))
+            for action in action_list
+        }
+        finite = [value for value in pressures.values() if math.isfinite(value)]
+        if not finite:
+            return action_list
+        best_pressure = min(finite)
+        guard = best_pressure + self.action_congestion_guard_band
+        dijkstra_guard = best_pressure + self.action_congestion_guard_band_dijkstra
+        dijkstra_prior = set(dijkstra_prior or [])
+        preferred = []
+        for action in action_list:
+            pressure = pressures[action]
+            if pressure <= guard:
+                preferred.append(action)
+                continue
+            if action in dijkstra_prior and pressure <= dijkstra_guard:
+                preferred.append(action)
+        if preferred:
+            return sorted(set(preferred))
+        best_action = min(action_list, key=lambda action: pressures[action])
+        return [best_action]
     
     def dist_to_end(self, vehicle_id, snapshot=None):
         """
@@ -1161,7 +1227,8 @@ class RLTrainingPipeline:
             distance_fn=self.get_distance_to_destination,
         )
         if ranked:
-            return ranked[0]
+            pool = ranked[: max(int(self.fallback_pressure_top_k), 1)]
+            return min(pool, key=lambda action: self._action_congestion_pressure(context, action))
         return None
 
     def _estimate_remaining_eta(self, edge_id, destination_edge):
