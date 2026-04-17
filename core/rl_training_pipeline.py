@@ -272,17 +272,17 @@ class RLTrainingPipeline:
         route_difficulty_scale_max=1.0,
         decision_debug_csv_path=None,
         fast_training_profile=False,
-        training_pending_timeout_steps=32,
-        training_pending_progress_timeout_steps=22,
-        training_observe_steps_max=7,
-        training_observe_low_speed_mps=0.45,
-        training_observe_stall_steps=4,
-        no_progress_same_edge_steps=150,
-        no_progress_low_speed_steps=120,
-        no_progress_distance_stall_steps=120,
-        no_progress_low_speed_mps=0.35,
-        no_progress_distance_epsilon=3.0,
-        stuck_penalty=-3.0,
+        training_pending_timeout_steps=24,
+        training_pending_progress_timeout_steps=14,
+        training_observe_steps_max=5,
+        training_observe_low_speed_mps=0.6,
+        training_observe_stall_steps=3,
+        no_progress_same_edge_steps=110,
+        no_progress_low_speed_steps=90,
+        no_progress_distance_stall_steps=90,
+        no_progress_low_speed_mps=0.45,
+        no_progress_distance_epsilon=4.0,
+        stuck_penalty=-4.0,
     ):
         """
         Args:
@@ -351,22 +351,22 @@ class RLTrainingPipeline:
         self.distance_tiebreak_scale = 0.06
         self.reward_clip_low = -20.0
         self.reward_clip_high = 20.0
-        self.pending_timeout_penalty = -8.0
-        self.pending_latency_penalty_per_step = 0.015
+        self.pending_timeout_penalty = -9.0
+        self.pending_latency_penalty_per_step = 0.025
         self.pending_replan_penalty = -1.0
         self.stale_disappeared_penalty = -14.0
         self.non_global_arrival_penalty = -8.0
-        self.observe_no_progress_penalty = -1.2
-        self.observe_low_speed_penalty = -1.0
-        self.observe_commit_window_miss_penalty = -1.6
-        self.same_edge_repeat_chase_penalty = -1.2
-        self.fallback_missed_lane_penalty = -1.0
-        self.loop_trap_override_penalty = -1.4
+        self.observe_no_progress_penalty = -1.4
+        self.observe_low_speed_penalty = -1.2
+        self.observe_commit_window_miss_penalty = -1.8
+        self.same_edge_repeat_chase_penalty = -1.4
+        self.fallback_missed_lane_penalty = -1.1
+        self.loop_trap_override_penalty = -1.5
         self.loop_regret_budget_init = 3.0
         self.loop_regret_recover_per_decision = 0.15
-        self.soft_loop_penalty = -0.6
-        self.soft_revisit_penalty = -0.5
-        self.soft_distance_worsen_penalty = -0.4
+        self.soft_loop_penalty = -0.7
+        self.soft_revisit_penalty = -0.6
+        self.soft_distance_worsen_penalty = -0.5
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
@@ -585,11 +585,14 @@ class RLTrainingPipeline:
         )
         print(
             "  pending/overrides: open_pending={} timeout={} fallback={} apply_fail={} "
-            "lane_change(a/s/f)={:.0f}/{:.0f}/{:.0f}".format(
+            "progress_timeout={} first/forced_pto={}/{} lane_change(a/s/f)={:.0f}/{:.0f}/{:.0f}".format(
                 int(pending_open),
                 int(decision_metrics["pending_decision_timeouts"]),
                 int(decision_metrics["fallback_overrides"]),
                 int(decision_metrics["route_apply_fail"]),
+                int(decision_metrics["pending_progress_timeouts"]),
+                int(decision_metrics["first_progress_timeout_events"]),
+                int(decision_metrics["forced_fallback_after_progress_timeout"]),
                 decision_metrics["lane_change_attempts"],
                 decision_metrics["lane_change_success"],
                 decision_metrics["lane_change_fail"],
@@ -739,8 +742,8 @@ class RLTrainingPipeline:
             float(self.decision_engine.commit_min_distance),
             float(context.speed) * float(self.decision_engine.commit_time_s),
         )
-        extra_buffer = max(10.0, 0.5 * float(self.decision_engine.lane_change_margin_m))
-        comfortable_dist_threshold = commit_distance + extra_buffer
+        lane_change_margin = float(self.decision_engine.lane_change_margin_m)
+        ambitious_guard_distance = commit_distance + lane_change_margin + 20.0
 
         safe_lane_now_actions = []
         strict_non_lane_actions = []
@@ -762,6 +765,7 @@ class RLTrainingPipeline:
                 destination=destination,
                 recent_history=recent_history,
                 distance_fn=self.get_distance_to_destination,
+                loop_regret_budget_remaining=regret_budget,
             )
             if not safe_ok:
                 continue
@@ -774,22 +778,41 @@ class RLTrainingPipeline:
                 continue
 
             # Non-lane-feasible actions are exposed only in exceptional cases.
-            if cooldown_active:
-                continue
-            if context.commit_window:
-                continue
-            if float(context.speed) < 1.2:
-                continue
-            if int(context.required_lane_shift.get(action, 99)) != 1:
-                continue
-            if float(context.dist_to_end) <= comfortable_dist_threshold:
-                continue
-            strict_non_lane_actions.append(action)
+            allow_ambitious = (
+                (action in dijkstra_prior)
+                and (int(context.required_lane_shift.get(action, 99)) == 1)
+                and (not context.commit_window)
+                and (float(context.dist_to_end) > ambitious_guard_distance)
+            )
+            if allow_ambitious:
+                strict_non_lane_actions.append(action)
+
+        def _sort_by_safety(actions):
+            scored = []
+            for action in actions:
+                next_edge = self.decision_engine.get_next_edge(context.edge_id, action)
+                next_dist = self.get_distance_to_destination(next_edge, destination) if next_edge is not None else math.inf
+                scored.append(
+                    (
+                        int(context.required_lane_shift.get(action, 0)),
+                        0 if action in lane_now else 1,
+                        float(next_dist) if math.isfinite(next_dist) else 1e9,
+                        int(action),
+                    )
+                )
+            scored.sort()
+            return [a[-1] for a in scored]
 
         # Dominant learning space: lane-feasible-now actions if any safe options exist.
-        policy_actions = sorted(set(safe_lane_now_actions)) if safe_lane_now_actions else sorted(set(strict_non_lane_actions))
+        if safe_lane_now_actions:
+            return _sort_by_safety(sorted(set(safe_lane_now_actions)))
+        policy_actions = _sort_by_safety(sorted(set(strict_non_lane_actions))) if strict_non_lane_actions else []
         if not policy_actions:
-            policy_actions = sorted(set(filtered_available_actions))
+            lane_now_filtered = [a for a in filtered_available_actions if a in lane_now]
+            if lane_now_filtered:
+                policy_actions = _sort_by_safety(sorted(set(lane_now_filtered)))
+            else:
+                policy_actions = _sort_by_safety(sorted(set(filtered_available_actions)))
         if not policy_actions:
             return available_actions
         return policy_actions
@@ -1384,9 +1407,12 @@ class RLTrainingPipeline:
             "fragment_build_failures", "fallback_overrides", "fallback_to_lane_feasible_now",
             "pending_decision_timeouts", "deferred_lane_change_actions",
             "lane_change_observe_started", "lane_change_observe_success",
-            "lane_change_observe_abort_no_progress", "lane_change_observe_abort_commit_window",
+            "lane_change_observe_abort_no_progress", "lane_change_observe_abort_low_speed",
+            "lane_change_observe_abort_commit_window",
             "same_edge_pending_released_no_progress", "cooldown_replans_blocked",
             "loop_override_count", "dead_end_reentry_override_count",
+            "pending_progress_timeouts", "revisit_without_progress_interventions",
+            "first_progress_timeout_events", "forced_fallback_after_progress_timeout",
             "batched_policy_calls", "snapshot_cache_hits", "shortest_path_cache_hits",
             "exploration_actions", "policy_actions", "override_ratio",
             "policy_masked_actions_removed", "override_learning_transitions",
@@ -1441,6 +1467,7 @@ class RLTrainingPipeline:
             lane_change_cooldown_until = {}
             recent_edge_history = defaultdict(lambda: deque(maxlen=self.loop_window))
             loop_regret_budget = defaultdict(lambda: float(self.loop_regret_budget_init))
+            recent_progress_timeout_action = {}
             prev_edge_by_vehicle = {}
             decision_metrics = defaultdict(float)
 
@@ -1580,6 +1607,7 @@ class RLTrainingPipeline:
                         prev_edge = prev_edge_by_vehicle.get(vehicle_id)
                         if vehicle_id in pending_decisions and current_edge != pending_decisions[vehicle_id].decision_edge:
                             pending = pending_decisions.pop(vehicle_id)
+                            recent_progress_timeout_action.pop(vehicle_id, None)
                             repeated_recent_edges = sum(1 for e in recent_edge_history[vehicle_id] if e == current_edge)
                             mismatch = not self.decision_engine.route_matches_expected(pending, current_edge)
                             if mismatch:
@@ -1750,6 +1778,9 @@ class RLTrainingPipeline:
                                         prev_edge_by_vehicle[vehicle_id] = current_edge
                                         continue
                                     pending.metadata["phase"] = "route_pending"
+                                    pending.metadata["initial_required_shift"] = int(obs_context.required_lane_shift.get(pending.intended_action, 99))
+                                    pending.metadata["best_required_shift"] = int(obs_context.required_lane_shift.get(pending.intended_action, 99))
+                                    pending.metadata["progress_timeout_strikes"] = 0
                                     pending.intended_next_edge = committed_next_edge
                                     pending.route_fragment = list(full_route[1:]) if full_route else []
                                     pending.context = obs_context
@@ -1764,7 +1795,7 @@ class RLTrainingPipeline:
                                     decision_metrics["lane_change_observe_abort_commit_window"] += 1
                                     pending_pen = self.observe_commit_window_miss_penalty
                                 elif reason == "low_speed":
-                                    decision_metrics["lane_change_observe_abort_no_progress"] += 1
+                                    decision_metrics["lane_change_observe_abort_low_speed"] += 1
                                     pending_pen = self.observe_low_speed_penalty
                                 else:
                                     decision_metrics["lane_change_observe_abort_no_progress"] += 1
@@ -1812,6 +1843,7 @@ class RLTrainingPipeline:
                                 next_state = self.encode_state(
                                     vehicle_id, current_edge, vehicle.destination, context=obs_context, vehicle=vehicle, step=step, snapshot=snapshot
                                 )
+                                recent_progress_timeout_action.pop(vehicle_id, None)
                                 pending_decisions[vehicle_id] = PendingDecision(
                                     state=next_state,
                                     intended_action=fallback_action,
@@ -1828,6 +1860,9 @@ class RLTrainingPipeline:
                                         "phase": "route_pending",
                                         "action_source": "observe_fallback",
                                         "intervention_type": "observe_fallback",
+                                        "initial_required_shift": int(obs_context.required_lane_shift.get(fallback_action, 99)),
+                                        "best_required_shift": int(obs_context.required_lane_shift.get(fallback_action, 99)),
+                                        "progress_timeout_strikes": 0,
                                     },
                                 )
                                 decision_metrics["fallback_overrides"] += 1
@@ -1906,6 +1941,23 @@ class RLTrainingPipeline:
                                 pending.state = next_state
                                 pending.last_credit_edge = current_edge
                                 pending.last_credit_step = step
+                            pending_ctx = self.decision_engine.build_context(
+                                vehicle_id,
+                                current_edge,
+                                vehicle.destination,
+                                step,
+                                snapshot=snapshot,
+                            )
+                            current_shift = int(pending_ctx.required_lane_shift.get(pending.intended_action, 99))
+                            best_shift = int(pending.metadata.get("best_required_shift", current_shift))
+                            pending.metadata["best_required_shift"] = min(best_shift, current_shift)
+                            shift_reduced = current_shift < int(pending.metadata.get("initial_required_shift", current_shift))
+                            became_lane_feasible = pending.intended_action in pending_ctx.lane_feasible_now_actions
+                            progress_timeout = (
+                                pending_age >= self.decision_engine.pending_progress_timeout_steps
+                                and ((not became_lane_feasible) or (not shift_reduced))
+                            )
+
                             if self.decision_engine.should_timeout_pending(pending, step):
                                 timeout_ctx = self.decision_engine.build_context(
                                     vehicle_id,
@@ -1940,13 +1992,115 @@ class RLTrainingPipeline:
                                 lane_change_deferrals[vehicle_id] = 0
                                 lane_change_cooldown_until[(vehicle_id, current_edge)] = step + self.decision_engine.cooldown_steps
                                 continue
-                            pending_ctx = self.decision_engine.build_context(
-                                vehicle_id,
-                                current_edge,
-                                vehicle.destination,
-                                step,
-                                snapshot=snapshot,
-                            )
+                            if progress_timeout:
+                                decision_metrics["pending_progress_timeouts"] += 1
+                                decision_metrics["pending_decision_timeouts"] += 1
+                                decision_metrics["same_edge_pending_released_no_progress"] += 1
+                                timeout_penalty = self._clip_reward(self.pending_replan_penalty)
+                                timeout_state = self.encode_state(
+                                    vehicle_id,
+                                    current_edge,
+                                    vehicle.destination,
+                                    context=pending_ctx,
+                                    vehicle=vehicle,
+                                    step=step,
+                                    snapshot=snapshot,
+                                )
+                                self.trainer.remember(
+                                    pending.state,
+                                    pending.intended_action,
+                                    timeout_penalty,
+                                    timeout_state,
+                                    False,
+                                    next_valid_actions=pending_ctx.available_actions,
+                                    metadata={"pending_timeout_replan": True, "progress_timeout": True},
+                                )
+                                episode_return += timeout_penalty
+                                strikes = int(pending.metadata.get("progress_timeout_strikes", 0)) + 1
+                                pending.metadata["progress_timeout_strikes"] = strikes
+                                force_fallback_now = bool(strikes >= 2 or pending_ctx.commit_window)
+                                if not force_fallback_now:
+                                    decision_metrics["first_progress_timeout_events"] += 1
+                                    recent_progress_timeout_action[vehicle_id] = pending.intended_action
+                                    reevaluated_actions = self._policy_action_candidates(
+                                        context=pending_ctx,
+                                        recent_history=list(recent_edge_history[vehicle_id]),
+                                        cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
+                                        destination=vehicle.destination,
+                                        regret_budget=loop_regret_budget[vehicle_id],
+                                    )
+                                    refreshed_action = pending.intended_action
+                                    if reevaluated_actions:
+                                        selected_action, _ = self.trainer.select_action(timeout_state, reevaluated_actions, return_source=True)
+                                        if selected_action is not None:
+                                            refreshed_action = selected_action
+                                    pending.state = timeout_state
+                                    pending.context = pending_ctx
+                                    pending.last_credit_edge = current_edge
+                                    pending.last_credit_step = step
+                                    if refreshed_action in pending_ctx.available_actions:
+                                        pending.intended_action = refreshed_action
+                                        pending.metadata["best_required_shift"] = int(pending_ctx.required_lane_shift.get(refreshed_action, 99))
+                                        pending.metadata["initial_required_shift"] = int(
+                                            min(
+                                                int(pending.metadata.get("initial_required_shift", 99)),
+                                                int(pending_ctx.required_lane_shift.get(refreshed_action, 99)),
+                                            )
+                                        )
+                                        full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
+                                            vehicle_id, current_edge, refreshed_action, vehicle.destination
+                                        )
+                                        if not apply_error:
+                                            pending.intended_next_edge = committed_next_edge
+                                            pending.route_fragment = list(full_route[1:]) if full_route else []
+                                    pending_decisions[vehicle_id] = pending
+                                    prev_edge_by_vehicle[vehicle_id] = current_edge
+                                    continue
+                                decision_metrics["forced_fallback_after_progress_timeout"] += 1
+                                recent_progress_timeout_action.pop(vehicle_id, None)
+                                pending_decisions.pop(vehicle_id, None)
+                                lane_change_deferrals[vehicle_id] = 0
+                                lane_change_cooldown_until[(vehicle_id, current_edge)] = step + self.decision_engine.cooldown_steps
+                                fallback_action = self._select_fallback_action(
+                                    pending_ctx,
+                                    blocked_action=pending.intended_action,
+                                    destination=vehicle.destination,
+                                    recent_history=list(recent_edge_history[vehicle_id]),
+                                )
+                                if fallback_action is None:
+                                    prev_edge_by_vehicle[vehicle_id] = current_edge
+                                    continue
+                                full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
+                                    vehicle_id, current_edge, fallback_action, vehicle.destination
+                                )
+                                if apply_error:
+                                    prev_edge_by_vehicle[vehicle_id] = current_edge
+                                    continue
+                                pending_decisions[vehicle_id] = PendingDecision(
+                                    state=timeout_state,
+                                    intended_action=fallback_action,
+                                    intended_next_edge=committed_next_edge,
+                                    decision_edge=current_edge,
+                                    decision_step=step,
+                                    last_credit_edge=current_edge,
+                                    last_credit_step=step,
+                                    destination=vehicle.destination,
+                                    context=pending_ctx,
+                                    lane_change_requested=False,
+                                    route_fragment=list(full_route[1:]) if full_route else [],
+                                    metadata={
+                                        "phase": "route_pending",
+                                        "action_source": "progress_timeout_fallback",
+                                        "intervention_type": "progress_timeout_fallback",
+                                        "initial_required_shift": int(pending_ctx.required_lane_shift.get(fallback_action, 99)),
+                                        "best_required_shift": int(pending_ctx.required_lane_shift.get(fallback_action, 99)),
+                                        "progress_timeout_strikes": 0,
+                                    },
+                                )
+                                decision_metrics["fallback_overrides"] += 1
+                                decision_metrics["fallback_to_lane_feasible_now"] += 1
+                                prev_edge_by_vehicle[vehicle_id] = current_edge
+                                continue
                             wrong_lane_commit = (
                                 pending_ctx.commit_window
                                 and pending.intended_action not in pending_ctx.lane_feasible_now_actions
@@ -2033,6 +2187,10 @@ class RLTrainingPipeline:
                             destination=vehicle.destination,
                             recent_history=list(recent_edge_history[vehicle_id]),
                             distance_fn=self.get_distance_to_destination,
+                            loop_regret_budget_remaining=loop_regret_budget[vehicle_id],
+                            pending_action_timed_out_once_recently=(
+                                recent_progress_timeout_action.get(vehicle_id) == action
+                            ),
                         )
                         hard_veto = (
                             (not safe_ok)
@@ -2041,6 +2199,7 @@ class RLTrainingPipeline:
                                 or safety_details.get("aba_bounce")
                                 or safety_details.get("dead_end_reentry")
                                 or safety_details.get("trap_like_reversal")
+                                or safety_details.get("revisit_hard_veto")
                             )
                         )
                         if hard_veto:
@@ -2050,6 +2209,8 @@ class RLTrainingPipeline:
                             decision_metrics["loop_prefilter_overrides"] += 1
                             if safety_details.get("dead_end_reentry"):
                                 decision_metrics["dead_end_reentry_override_count"] += 1
+                            if safety_details.get("revisit_hard_veto"):
+                                decision_metrics["revisit_without_progress_interventions"] += 1
                             action = self._select_fallback_action(
                                 context,
                                 blocked_action=action,
@@ -2164,6 +2325,7 @@ class RLTrainingPipeline:
                                 observe_metadata = self.decision_engine.start_lane_change_observe(
                                     context, action, step, lane_change_requested, lane_change_ok
                                 )
+                                recent_progress_timeout_action.pop(vehicle_id, None)
                                 pending_decisions[vehicle_id] = PendingDecision(
                                     state=state,
                                     intended_action=action,
@@ -2225,6 +2387,7 @@ class RLTrainingPipeline:
 
                         if vehicle_id in pending_decisions:
                             decision_metrics["decisions_superseded"] += 1
+                        recent_progress_timeout_action.pop(vehicle_id, None)
                         pending_decisions[vehicle_id] = PendingDecision(
                             state=state,
                             intended_action=action,
@@ -2241,6 +2404,9 @@ class RLTrainingPipeline:
                                 "action_source": action_source,
                                 "lane_change_deferrals": lane_change_deferrals.get(vehicle_id, 0),
                                 "intervention_type": intervention_label,
+                                "initial_required_shift": int(context.required_lane_shift.get(action, 99)),
+                                "best_required_shift": int(context.required_lane_shift.get(action, 99)),
+                                "progress_timeout_strikes": 0,
                             },
                         )
                         lane_change_deferrals[vehicle_id] = 0
@@ -2727,11 +2893,16 @@ class RLTrainingPipeline:
                         "lane_change_observe_started": decision_metrics["lane_change_observe_started"],
                         "lane_change_observe_success": decision_metrics["lane_change_observe_success"],
                         "lane_change_observe_abort_no_progress": decision_metrics["lane_change_observe_abort_no_progress"],
+                        "lane_change_observe_abort_low_speed": decision_metrics["lane_change_observe_abort_low_speed"],
                         "lane_change_observe_abort_commit_window": decision_metrics["lane_change_observe_abort_commit_window"],
                         "same_edge_pending_released_no_progress": decision_metrics["same_edge_pending_released_no_progress"],
                         "cooldown_replans_blocked": decision_metrics["cooldown_replans_blocked"],
                         "loop_override_count": decision_metrics["loop_override_count"],
                         "dead_end_reentry_override_count": decision_metrics["dead_end_reentry_override_count"],
+                        "pending_progress_timeouts": decision_metrics["pending_progress_timeouts"],
+                        "revisit_without_progress_interventions": decision_metrics["revisit_without_progress_interventions"],
+                        "first_progress_timeout_events": decision_metrics["first_progress_timeout_events"],
+                        "forced_fallback_after_progress_timeout": decision_metrics["forced_fallback_after_progress_timeout"],
                         "batched_policy_calls": decision_metrics["batched_policy_calls"],
                         "snapshot_cache_hits": self._cache_metrics["snapshot_cache_hits"],
                         "shortest_path_cache_hits": self._cache_metrics["shortest_path_cache_hits"],

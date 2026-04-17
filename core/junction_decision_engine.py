@@ -68,12 +68,12 @@ class JunctionDecisionEngine:
         connection_info,
         net,
         direction_choices,
-        pending_timeout_steps: int = 18,
-        pending_progress_timeout_steps: int = 10,
+        pending_timeout_steps: int = 24,
+        pending_progress_timeout_steps: int = 14,
         observe_steps_min: int = 2,
-        observe_steps_max: int = 4,
-        observe_low_speed_mps: float = 0.8,
-        observe_stall_steps: int = 2,
+        observe_steps_max: int = 5,
+        observe_low_speed_mps: float = 0.6,
+        observe_stall_steps: int = 3,
     ):
         self.connection_info = connection_info
         self.net = net
@@ -261,7 +261,10 @@ class JunctionDecisionEngine:
         last_lane = int(observe_meta.get("observe_last_lane_index", context.lane_index))
         last_shift = int(observe_meta.get("observe_last_required_shift", current_shift))
         observe_steps = int(observe_meta.get("observe_steps", 0)) + 1
-        observe_limit = int(observe_meta.get("observe_limit", self.observe_steps_min))
+        observe_limit = min(
+            int(observe_meta.get("observe_limit", self.observe_steps_min)),
+            int(self.observe_steps_max),
+        )
         stall_steps = int(observe_meta.get("observe_stall_steps", 0))
 
         toward_target = current_shift < last_shift
@@ -363,6 +366,8 @@ class JunctionDecisionEngine:
         recent_history: List[str],
         distance_fn: Optional[Callable[[str, str], float]] = None,
         distance_slack: Optional[float] = None,
+        loop_regret_budget_remaining: Optional[float] = None,
+        pending_action_timed_out_once_recently: bool = False,
     ) -> Tuple[bool, Dict[str, bool]]:
         next_edge = self.get_next_edge(context.edge_id, action_idx)
         if next_edge is None:
@@ -374,12 +379,15 @@ class JunctionDecisionEngine:
             edge_distance_lookup = {}
             for edge in set(history_deque) | {next_edge, context.edge_id}:
                 edge_distance_lookup[edge] = distance_fn(edge, destination)
+        lane_now = action_idx in set(context.lane_feasible_now_actions)
+        base_slack = self.loop_distance_slack if distance_slack is None else float(distance_slack)
+        effective_slack = min(base_slack, 18.0) if not lane_now else base_slack
         signals = transition_signal(
             history_deque,
             next_edge,
             edge_out_degree=edge_out_degree,
             edge_distance_lookup=edge_distance_lookup,
-            progress_slack=self.loop_distance_slack,
+            progress_slack=effective_slack,
         )
         trap_like = (
             next_edge != destination
@@ -394,18 +402,27 @@ class JunctionDecisionEngine:
             dist_worsen = would_worsen_distance(
                 current_distance,
                 next_distance,
-                slack=self.loop_distance_slack if distance_slack is None else float(distance_slack),
+                slack=effective_slack,
             )
+        revisit_hard_veto = bool(
+            signals.get("revisit_without_progress")
+            and (
+                dist_worsen
+                or bool(pending_action_timed_out_once_recently)
+            )
+        )
         # Hard vetoes only for immediate loop traps.
         blocked = bool(
             signals.get("short_cycle")
             or signals.get("aba_bounce")
             or signals.get("dead_end_reentry")
             or trap_like
+            or revisit_hard_veto
         )
         details = dict(signals)
         details["trap_like_reversal"] = trap_like
         details["distance_worsen"] = dist_worsen
+        details["revisit_hard_veto"] = revisit_hard_veto
         return (not blocked), details
 
     def dijkstra_prior_actions(
