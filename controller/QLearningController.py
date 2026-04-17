@@ -54,6 +54,7 @@ class QLearningPolicy(RouteController):
             "cooldown_replans_blocked": 0,
             "loop_override_count": 0,
             "dead_end_reentry_override_count": 0,
+            "lane_change_fail": 0,
         }
         self._last_metrics_snapshot = None
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
@@ -185,13 +186,15 @@ class QLearningPolicy(RouteController):
                 continue
             strict_non_lane_actions.append(action)
 
-        if safe_lane_now_actions:
-            return sorted(set(safe_lane_now_actions))
-        if strict_non_lane_actions:
-            return sorted(set(strict_non_lane_actions))
-        if filtered_available_actions:
-            return sorted(set(filtered_available_actions))
-        return available_actions
+        ordered = []
+        seen = set()
+        for pool in (safe_lane_now_actions, strict_non_lane_actions, filtered_available_actions, available_actions):
+            for action in sorted(set(pool)):
+                if action in seen:
+                    continue
+                seen.add(action)
+                ordered.append(action)
+        return ordered
 
     #-----------------------DEBUGGING-------------------------------------
     def _dist_to_dest(self, edge_id, dest_id):
@@ -370,6 +373,7 @@ class QLearningPolicy(RouteController):
                         self._metrics["lane_change_observe_abort_commit_window"] += 1
                     else:
                         self._metrics["lane_change_observe_abort_no_progress"] += 1
+                    self._metrics["lane_change_fail"] += 1
                     self._lane_change_cooldown[(vid, start_edge)] = step + self.decision_engine.cooldown_steps
                     fallback_actions = self.decision_engine.ranked_fallback_actions(
                         context=obs_context,
@@ -479,6 +483,8 @@ class QLearningPolicy(RouteController):
                     action_idx = fallback_actions[0]
                 else:
                     lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action_idx)
+                    if lane_change_requested and not lane_change_ok:
+                        self._metrics["lane_change_fail"] += 1
                     observe_meta = self.decision_engine.start_lane_change_observe(context, action_idx, step, lane_change_requested, lane_change_ok)
                     self._pending_decisions[vid] = PendingDecision(
                         state=None,

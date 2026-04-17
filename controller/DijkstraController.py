@@ -30,7 +30,7 @@ class DijkstraPolicy(RouteController):
             path_lists = {edge: [] for edge in self.connection_info.edge_list} #stores shortest path to each edge using directions
             while True:
                 if current_edge not in self.connection_info.outgoing_edges_dict.keys():
-                    continue
+                    break
                 for direction, outgoing_edge in self.connection_info.outgoing_edges_dict[current_edge].items():
                     if outgoing_edge not in unvisited:
                         continue
@@ -50,6 +50,8 @@ class DijkstraPolicy(RouteController):
                 if current_edge==vehicle.destination:
                     break
                 possible_edges = [edge for edge in unvisited.items() if edge[1]]
+                if not possible_edges:
+                    break
                 current_edge, current_distance = sorted(possible_edges, key=lambda x: x[1])[0]
                 #print('{}:{}------------'.format(current_edge, current_distance))
             #current_edge = vehicle.current_edge

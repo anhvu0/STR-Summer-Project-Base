@@ -20,10 +20,11 @@ def dead_end_reentry_count(
     history: Iterable[str],
     edge_out_degree: Dict[str, int],
     dead_end_max_out: int = 0,
+    min_repeat_before_flag: int = 2,
 ) -> int:
     counts = Counter(history)
     return sum(
-        max(count - 1, 0)
+        max(count - int(min_repeat_before_flag), 0)
         for edge, count in counts.items()
         if edge_out_degree.get(edge, 0) <= dead_end_max_out
     )

@@ -74,6 +74,8 @@ class JunctionDecisionEngine:
         observe_steps_max: int = 4,
         observe_low_speed_mps: float = 0.8,
         observe_stall_steps: int = 2,
+        distance_worsen_soft_slack_m: float = 30.0,
+        distance_worsen_hard_slack_m: float = 90.0,
     ):
         self.connection_info = connection_info
         self.net = net
@@ -93,7 +95,8 @@ class JunctionDecisionEngine:
         self.observe_stall_steps = max(int(observe_stall_steps), 1)
         self.cooldown_steps = 3
         self.pending_progress_timeout_steps = max(int(pending_progress_timeout_steps), 1)
-        self.loop_distance_slack = 30.0
+        self.loop_distance_slack = max(float(distance_worsen_soft_slack_m), 0.0)
+        self.hard_distance_worsen_slack = max(float(distance_worsen_hard_slack_m), self.loop_distance_slack + 1.0)
 
     def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
         if snapshot is not None:
@@ -164,8 +167,8 @@ class JunctionDecisionEngine:
                     continue
                 shift = required_shift.get(idx, 999)
                 dynamic_margin = self.lane_change_margin_m * (1.0 + 0.5 * max(0, shift - 1))
-                low_speed = speed < 1.2
-                aggressive_shift = shift >= 2 and dist_to_end < (dynamic_margin + commit_distance + reaction_distance)
+                low_speed = speed < 0.6
+                aggressive_shift = shift >= 2 and dist_to_end < (0.75 * dynamic_margin + commit_distance + reaction_distance)
                 if low_speed or aggressive_shift:
                     continue
                 if shift < 999 and lane_change_budget >= shift * dynamic_margin and dist_to_end >= reaction_distance:
@@ -383,14 +386,20 @@ class JunctionDecisionEngine:
             and len(history_deque) > 0
             and history_deque[-1] == context.edge_id
         )
-        dist_worsen = False
+        dist_worsen_soft = False
+        dist_worsen_hard = False
         if distance_fn is not None:
             current_distance = distance_fn(context.edge_id, destination)
             next_distance = distance_fn(next_edge, destination)
-            dist_worsen = would_worsen_distance(
+            dist_worsen_soft = would_worsen_distance(
                 current_distance,
                 next_distance,
                 slack=self.loop_distance_slack if distance_slack is None else float(distance_slack),
+            )
+            dist_worsen_hard = would_worsen_distance(
+                current_distance,
+                next_distance,
+                slack=self.hard_distance_worsen_slack,
             )
         blocked = bool(
             signals.get("short_cycle")
@@ -399,11 +408,12 @@ class JunctionDecisionEngine:
             or signals.get("long_horizon_loop")
             or signals.get("revisit_without_progress")
             or trap_like
-            or dist_worsen
+            or dist_worsen_hard
         )
         details = dict(signals)
         details["trap_like_reversal"] = trap_like
-        details["distance_worsen"] = dist_worsen
+        details["distance_worsen"] = dist_worsen_soft
+        details["distance_worsen_hard"] = dist_worsen_hard
         return (not blocked), details
 
     def try_request_lane_change(self, context: DecisionContext, action_idx: int, duration: int = 70) -> Tuple[bool, bool]:

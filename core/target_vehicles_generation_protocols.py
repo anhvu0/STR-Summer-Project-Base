@@ -20,10 +20,8 @@ CURRENT_PY_VERSION = None
 PY_VERSION3 = 3
 PY_VERSION2 = 2.7
 if sys.version_info.major == 3:
-    print("Python 3...")    # TODO: After testing, comment out this line, if appropriate.
     CURRENT_PY_VERSION = PY_VERSION3
 elif sys.version_info.major == 2 and sys.version_info.minor == 7:
-    print("Python 2.7...")  # TODO: After testing, comment out this line, if appropriate.
     CURRENT_PY_VERSION = PY_VERSION2
 else:
     sys.exit("This python version is outdated for the project! Upgrade to python 2.7 or higher!")
@@ -209,7 +207,7 @@ class target_vehicles_generator:
         # TODO: Write the start-point(s) of the vehicle information into the output xml file (Why?):
         
         # Update the generated vehicle count:
-        if __error_message__ != None:
+        if __error_message__ is None:
             target_vehicles_generator.target_vehicles_output_dict[target_xml_file] += num_vehicles
         
         # TODO: The tuple elements for the information of a vehicle are to be determined.
