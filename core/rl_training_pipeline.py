@@ -544,6 +544,11 @@ class RLTrainingPipeline:
         total_controlled,
         arrived_ids,
         decision_metrics,
+        pending_open=0,
+        step_mean_density=0.0,
+        step_peak_density=0.0,
+        step_mean_controlled_speed=0.0,
+        step_low_speed_fraction=0.0,
     ):
         override_total = (
             decision_metrics["safety_overrides"]
@@ -576,6 +581,26 @@ class RLTrainingPipeline:
                 override_total / max(decision_metrics["decisions_opened"], 1.0),
                 int(decision_metrics["route_mismatch"]),
                 int(decision_metrics["teleports"]),
+            )
+        )
+        print(
+            "  pending/overrides: open_pending={} timeout={} fallback={} apply_fail={} "
+            "lane_change(a/s/f)={:.0f}/{:.0f}/{:.0f}".format(
+                int(pending_open),
+                int(decision_metrics["pending_decision_timeouts"]),
+                int(decision_metrics["fallback_overrides"]),
+                int(decision_metrics["route_apply_fail"]),
+                decision_metrics["lane_change_attempts"],
+                decision_metrics["lane_change_success"],
+                decision_metrics["lane_change_fail"],
+            )
+        )
+        print(
+            "  step-traffic: mean_density={:.4f} peak_density={:.4f} mean_speed={:.2f} low_speed_frac={:.1%}".format(
+                float(step_mean_density),
+                float(step_peak_density),
+                float(step_mean_controlled_speed),
+                float(step_low_speed_fraction),
             )
         )
 
@@ -2302,12 +2327,24 @@ class RLTrainingPipeline:
                             self.trainer.replay()
 
                     if step % self.step_log_every == 0:
+                        step_mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
+                        step_peak_density = float(np.max(self._density_vec)) if len(self._density_vec) > 0 else 0.0
+                        step_speeds = [float(s.speed) for s in step_snapshots.values()]
+                        step_mean_controlled_speed = float(np.mean(step_speeds)) if step_speeds else 0.0
+                        step_low_speed_fraction = (
+                            float(sum(1 for s in step_speeds if s <= self.no_progress_low_speed_mps)) / float(max(len(step_speeds), 1))
+                        )
                         self._print_step_progress(
                             episode=episode,
                             step=step,
                             total_controlled=total_controlled,
                             arrived_ids=arrived_ids,
                             decision_metrics=decision_metrics,
+                            pending_open=len(pending_decisions),
+                            step_mean_density=step_mean_density,
+                            step_peak_density=step_peak_density,
+                            step_mean_controlled_speed=step_mean_controlled_speed,
+                            step_low_speed_fraction=step_low_speed_fraction,
                         )
 
                     # process = psutil.Process(os.getpid())
@@ -2493,6 +2530,40 @@ class RLTrainingPipeline:
                         stuck_no_progress_count,
                         decision_metrics["no_progress_events"],
                         avg_queue_wait_before_stuck,
+                    )
+                )
+                print(
+                    "  diagnostics: pending_age(p90/max)={:.1f}/{:.1f} decision_latency(mean/max)={:.1f}/{:.1f} "
+                    "pending_vehicles(mean/p90/max)={:.1f}/{:.1f}/{:.1f}".format(
+                        p90_pending_age,
+                        max_pending_age,
+                        mean_decision_latency_steps,
+                        max_decision_latency_steps,
+                        mean_pending_vehicles,
+                        p90_pending_vehicles,
+                        max_pending_vehicles,
+                    )
+                )
+                print(
+                    "  diagnostics: density(mean/p90/peak_mean)={:.4f}/{:.4f}/{:.4f} "
+                    "speed(mean/p10/low_frac)={:.2f}/{:.2f}/{:.1%}".format(
+                        mean_global_density,
+                        p90_global_density,
+                        mean_peak_edge_density,
+                        mean_controlled_speed,
+                        p10_controlled_speed,
+                        low_speed_controlled_fraction,
+                    )
+                )
+                print(
+                    "  diagnostics: loop_tail(vehicles/events_per_vehicle)={:.0f}/{:.2f} "
+                    "lane_change_success_rate={:.1%} pending_timeout_rate={:.1%} fallback_rate={:.1%} apply_fail_rate={:.1%}".format(
+                        unique_vehicles_with_loops,
+                        loop_events_per_loop_vehicle,
+                        lane_change_success_rate,
+                        pending_timeout_rate_per_open,
+                        fallback_rate_per_open,
+                        route_apply_fail_rate_per_open,
                     )
                 )
 
