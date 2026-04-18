@@ -1458,6 +1458,7 @@ class RLTrainingPipeline:
             decision_debug_rows = []
             arrived_with_prestep_edge_not_destination = 0
             prev_speed_by_vehicle = {}
+            emergency_brake_active_by_vehicle = {}
             mean_density_samples = []
             p95_density_samples = []
             congestion_high_pressure_steps = 0
@@ -1493,11 +1494,15 @@ class RLTrainingPipeline:
                     for vehicle_id in controlled_live_ids:
                         snapshot = step_snapshots.get(vehicle_id)
                         if snapshot is None:
+                            # Reset event latch if we cannot observe this step; avoids stale active flags.
+                            emergency_brake_active_by_vehicle.pop(vehicle_id, None)
                             continue
                         prev_speed = prev_speed_by_vehicle.get(vehicle_id)
                         if prev_speed is not None:
                             decel = max(float(prev_speed) - float(snapshot.speed), 0.0)
-                            if decel >= self.emergency_decel_threshold and prev_speed > 4.0:
+                            hard_brake = decel >= self.emergency_decel_threshold and prev_speed > 4.0
+                            was_hard_brake_active = bool(emergency_brake_active_by_vehicle.get(vehicle_id, False))
+                            if hard_brake and not was_hard_brake_active:
                                 decision_metrics["emergency_brake_events"] += 1
                                 emergency_reason = "other"
                                 try:
@@ -1522,6 +1527,10 @@ class RLTrainingPipeline:
                                     decision_metrics["emergency_brake_near_junction"] += 1
                                 else:
                                     decision_metrics["emergency_brake_other_reason"] += 1
+                            emergency_brake_active_by_vehicle[vehicle_id] = hard_brake
+                        else:
+                            # No prior speed => no detectable braking episode yet; keep latch clear.
+                            emergency_brake_active_by_vehicle[vehicle_id] = False
 
                         current_edge = snapshot.edge_id
                         prev_speed_by_vehicle[vehicle_id] = snapshot.speed
@@ -2337,6 +2346,8 @@ class RLTrainingPipeline:
                             recent_edge_history,
                             last_snapshot_by_vehicle,
                         )
+                        emergency_brake_active_by_vehicle.pop(removed_id, None)
+                        prev_speed_by_vehicle.pop(removed_id, None)
 
                     if step % self.train_every == 0:
                         for _ in range(self.grad_steps):
