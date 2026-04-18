@@ -29,13 +29,13 @@ def build_parser():
     parser.add_argument(
         "--episodes",
         type=int,
-        default=450,
+        default=1000,
         help="Number of training episodes.",
     )
     parser.add_argument(
         "--spawn-interval",
         type=float,
-        default=4.0,
+        default=1.0,
         help="Interval between vehicle spawns.",
     )
     return parser

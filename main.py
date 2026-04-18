@@ -87,7 +87,7 @@ def run_simulation(scheduler, vehicles):
             traci.close()
 
 if __name__ == "__main__":
-    sumo_binary = checkBinary('sumo-gui')
+    sumo_binary = checkBinary('sumo')
     # sumo_binary = checkBinary('sumo')#use this line if you do not want the UI of SUMO
 
     # parse config file for map file name
@@ -103,7 +103,7 @@ if __name__ == "__main__":
     route_file_attr = route_file_node[0].attributes
     route_file = "./configurations/"+route_file_attr['value'].nodeValue
     # Pattern 2: multiple origins with one shared destination.
-    vehicles = get_controlled_vehicles(route_file, init_connection_info, 50, 50, pattern=2)
+    vehicles = get_controlled_vehicles(route_file, init_connection_info, 100, 100, pattern=3)
     #print the controlled vehicles generated
     for vid, v in vehicles.items():
         print("id: {}, destination: {}, start time:{}, deadline: {};".format(vid, \

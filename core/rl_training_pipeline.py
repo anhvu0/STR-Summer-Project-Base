@@ -32,7 +32,7 @@ import sumolib
 In this file, we build a DQN network
 """
 
-MAX_SIMULATION_STEPS = 2000 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
+MAX_SIMULATION_STEPS = 2500 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
 
 class ReplayBuffer:
     """
@@ -258,21 +258,21 @@ class RLTrainingPipeline:
         sumocfg_path,
         model_output_path,
         episodes=10,
-        spawn_interval=4.0,
+        spawn_interval=1.0,
         seed_with_episode=True,
         destination_reward=50.0,
         teleport_penalty=-40.0,
-        epsilon_decay=0.994,
-        epsilon_min=0.08,
+        epsilon_decay=0.995,
+        epsilon_min=0.01,
         gamma=0.97,
         replay_capacity=5000,
         batch_size=128,
-        replay_warmup=256,
+        replay_warmup=512,
         train_every=6,
         grad_steps=1,
         rolling_window=100,
         use_double_dqn=True,
-        target_pattern=2,
+        target_pattern=3,
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
         step_log_every=100,
@@ -1297,8 +1297,8 @@ class RLTrainingPipeline:
         generator = target_vehicles_generator(os.path.join(self.sumocfg_dir, self.net_file))
         route_path = os.path.join(self.sumocfg_dir, self.route_file)
         vehicle_list = generator.generate_vehicles(
-            num_target_vehicles=20,
-            num_random_vehicles=30,
+            num_target_vehicles=100,
+            num_random_vehicles=150,
             pattern=self.target_pattern,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
