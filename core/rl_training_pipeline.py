@@ -1939,6 +1939,8 @@ class RLTrainingPipeline:
                                 decision_metrics["reachable_lane_change_excluded_any"] += 1
                             if reachable_set.isdisjoint(available_set):
                                 decision_metrics["reachable_lane_change_excluded_all"] += 1
+                        if context.skip_reason:
+                            decision_metrics[f"skip_reason_{context.skip_reason}"] += 1
                         if vehicle_id in pending_decisions:
                             decision_metrics["decisions_skipped"] += 1
                             prev_edge_by_vehicle[vehicle_id] = current_edge
