@@ -352,7 +352,7 @@ class RLTrainingPipeline:
         self.reward_clip_low = -20.0
         self.reward_clip_high = 20.0
         self.pending_timeout_penalty = -8.0
-        self.pending_latency_penalty_per_step = 0.015
+        self.pending_latency_penalty_per_step = 0.025
         self.pending_replan_penalty = -1.0
         self.stale_disappeared_penalty = -14.0
         self.non_global_arrival_penalty = -8.0
@@ -783,17 +783,13 @@ class RLTrainingPipeline:
                 continue
 
             # Non-lane-feasible actions are exposed only in exceptional cases.
-            if cooldown_active:
-                continue
-            if context.commit_window:
-                continue
-            if float(context.speed) < 1.2:
-                continue
-            if int(context.required_lane_shift.get(action, 99)) != 1:
-                continue
-            if float(context.dist_to_end) <= comfortable_dist_threshold:
-                continue
-            strict_non_lane_actions.append(action)
+            if self.decision_engine.should_allow_non_lane_policy_action(
+                context=context,
+                action_idx=action,
+                cooldown_active=cooldown_active,
+                comfortable_dist_threshold=comfortable_dist_threshold,
+            ):
+                strict_non_lane_actions.append(action)
 
         # Dominant learning space: lane-feasible-now actions if any safe options exist.
         policy_actions = sorted(set(safe_lane_now_actions)) if safe_lane_now_actions else sorted(set(strict_non_lane_actions))
@@ -1348,7 +1344,7 @@ class RLTrainingPipeline:
         marginal_pressure = max(edge_density - mean_density, 0.0)
         reward -= self.system_congestion_scale * marginal_pressure * elapsed
         reward -= self.pending_latency_penalty_per_step * float(max(pending_age, 0))
-        reward -= 0.02 * float(max(lane_change_deferrals, 0))
+        reward -= 0.04 * float(max(lane_change_deferrals, 0))
         return self._clip_reward(reward)
 
     def generate_episode_vehicles(self, episode_seed=None):

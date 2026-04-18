@@ -21,13 +21,33 @@ MAX_SIMULATION_STEPS = 2000
 
 
 class QLearningPolicy(RouteController):
-    def __init__(self, vehicles, connection_info, model_file, net_xml_file = net_path):
+    def __init__(
+        self,
+        vehicles,
+        connection_info,
+        model_file,
+        net_xml_file=net_path,
+        pending_timeout_steps=16,
+        pending_progress_timeout_steps=9,
+        observe_steps_max=3,
+        observe_low_speed_mps=1.0,
+        observe_stall_steps=1,
+    ):
         super().__init__(connection_info)
         self.model = load_model(model_file)
         self.model_state_size = int(self.model.input_shape[-1])
         self.vehicles = vehicles
         self.net = sumolib.net.readNet(net_xml_file)
-        self.decision_engine = JunctionDecisionEngine(connection_info, self.net, self.direction_choices)
+        self.decision_engine = JunctionDecisionEngine(
+            connection_info,
+            self.net,
+            self.direction_choices,
+            pending_timeout_steps=pending_timeout_steps,
+            pending_progress_timeout_steps=pending_progress_timeout_steps,
+            observe_steps_max=observe_steps_max,
+            observe_low_speed_mps=observe_low_speed_mps,
+            observe_stall_steps=observe_stall_steps,
+        )
         # Legacy per-vehicle visit/distance tracking (previous heuristic override approach).
         # self._visit_count = {}
         # self._best_dist = {}
@@ -173,17 +193,13 @@ class QLearningPolicy(RouteController):
                 safe_lane_now_actions.append(action)
                 continue
 
-            if cooldown_active:
-                continue
-            if context.commit_window:
-                continue
-            if float(context.speed) < 1.2:
-                continue
-            if int(context.required_lane_shift.get(action, 99)) != 1:
-                continue
-            if float(context.dist_to_end) <= comfortable_dist_threshold:
-                continue
-            strict_non_lane_actions.append(action)
+            if self.decision_engine.should_allow_non_lane_policy_action(
+                context=context,
+                action_idx=action,
+                cooldown_active=cooldown_active,
+                comfortable_dist_threshold=comfortable_dist_threshold,
+            ):
+                strict_non_lane_actions.append(action)
 
         if safe_lane_now_actions:
             return sorted(set(safe_lane_now_actions))
