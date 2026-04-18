@@ -23,6 +23,10 @@ class DecisionContext:
     available_actions: List[int]
     required_lane_shift: Dict[int, int] = field(default_factory=dict)
     commit_window: bool = False
+    freeze_window: bool = False
+    distance_to_next_divergence_m: float = float("inf")
+    upstream_planning_window: bool = False
+    late_replan_exception: bool = False
     forced_action: Optional[int] = None
     branch_with_choice: bool = False
     skip_reason: Optional[str] = None
@@ -71,8 +75,13 @@ class JunctionDecisionEngine:
         self.base_reaction_distance = 25.0
         self.reaction_time_s = 1.3
         self.commit_time_s = 0.8
+        self.freeze_time_s = 1.4
         self.lane_change_margin_m = 24.0
         self.commit_min_distance = 14.0
+        self.freeze_min_distance = 32.0
+        self.planning_time_s = 3.0
+        self.planning_min_distance = 60.0
+        self.divergence_horizon_m = 320.0
         self.default_fragment_horizon_m = 180.0
         self.pending_timeout_steps = 18
         self.lane_change_defer_limit = 4
@@ -108,6 +117,35 @@ class JunctionDecisionEngine:
         except Exception:
             return False
 
+    def _distance_to_next_divergence(self, edge_id: str, dist_to_end: float, horizon_m: Optional[float] = None) -> float:
+        """
+        Estimate meters from current vehicle position to the next edge whose
+        outgoing degree offers a branch choice (>1).
+        """
+        horizon = self.divergence_horizon_m if horizon_m is None else max(float(horizon_m), 1.0)
+        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
+        if len(outgoing) > 1:
+            return max(float(dist_to_end), 0.0)
+        if len(outgoing) == 0:
+            return float("inf")
+
+        traversed = max(float(dist_to_end), 0.0)
+        visited = {edge_id}
+        cursor = list(outgoing.values())[0]
+        while traversed <= horizon:
+            if cursor in visited:
+                return float("inf")
+            visited.add(cursor)
+            cursor_outgoing = self.connection_info.outgoing_edges_dict.get(cursor, {})
+            if len(cursor_outgoing) > 1:
+                return traversed
+            if len(cursor_outgoing) != 1:
+                return float("inf")
+            traversed += max(float(self.connection_info.edge_length_dict.get(cursor, 0.0)), 0.0)
+            cursor = list(cursor_outgoing.values())[0]
+
+        return float("inf")
+
     def build_context(
         self,
         vehicle_id: str,
@@ -140,10 +178,15 @@ class JunctionDecisionEngine:
 
         reaction_distance = max(self.base_reaction_distance, speed * self.reaction_time_s)
         commit_distance = max(self.commit_min_distance, speed * self.commit_time_s)
+        freeze_distance = max(self.freeze_min_distance, speed * self.freeze_time_s)
         commit_window = dist_to_end <= commit_distance
+        freeze_window = dist_to_end <= freeze_distance
+        dist_to_divergence = self._distance_to_next_divergence(edge_id, dist_to_end, horizon_m=self.divergence_horizon_m)
+        planning_distance = max(self.planning_min_distance, speed * self.planning_time_s)
+        upstream_planning_window = (not freeze_window) and math.isfinite(dist_to_divergence) and dist_to_divergence <= planning_distance
 
         available = []
-        if commit_window:
+        if freeze_window:
             available = list(lane_now)
         else:
             lane_change_budget = max(dist_to_end - commit_distance, 0.0)
@@ -192,6 +235,10 @@ class JunctionDecisionEngine:
             available_actions=available,
             required_lane_shift=required_shift,
             commit_window=commit_window,
+            freeze_window=freeze_window,
+            distance_to_next_divergence_m=float(dist_to_divergence),
+            upstream_planning_window=bool(upstream_planning_window),
+            late_replan_exception=False,
             forced_action=forced_action,
             branch_with_choice=branch_with_choice,
             skip_reason=skip_reason,
