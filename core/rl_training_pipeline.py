@@ -718,7 +718,14 @@ class RLTrainingPipeline:
         context = self.decision_engine.build_context(vehicle_id, edge_id, destination_edge, step)
         return context.available_actions
 
-    def _policy_action_candidates(self, context, recent_history, cooldown_active, destination):
+    def _policy_action_candidates(
+        self,
+        context,
+        recent_history,
+        cooldown_active,
+        destination,
+        decision_metrics=None,
+    ):
         """
         Build a stricter action subset for policy selection only.
         NOTE:
@@ -777,6 +784,14 @@ class RLTrainingPipeline:
             policy_actions = sorted(set(filtered_available_actions))
         if not policy_actions:
             return available_actions
+        if decision_metrics is not None:
+            available_unique = set(available_actions)
+            lane_now_unique = set(context.lane_feasible_now_actions)
+            policy_unique = set(policy_actions)
+            if len(available_unique) > len(lane_now_unique):
+                decision_metrics["policy_candidates_with_broader_available"] += 1
+                if policy_unique == set(safe_lane_now_actions) and len(policy_unique) < len(available_unique):
+                    decision_metrics["policy_candidates_collapsed_to_lane_now_only"] += 1
         return policy_actions
     
     def dist_to_end(self, vehicle_id, snapshot=None):
@@ -1379,6 +1394,11 @@ class RLTrainingPipeline:
             "actionable_skip_ratio", "pending_resolution_success_rate", "delay_fairness_gini",
             "loop_after_fallback_rate", "p95_to_p50_travel_ratio", "timeout_rate",
             "fallback_rate_per_opened_decision", "controlled_teleport_rate",
+            "skip_reason_forced_by_lane_commit", "skip_reason_too_late_or_unreachable",
+            "skip_reason_forced_single_path", "skip_reason_no_branch",
+            "reachable_lane_change_nonempty", "reachable_lane_change_excluded_any",
+            "reachable_lane_change_excluded_all", "policy_candidates_with_broader_available",
+            "policy_candidates_collapsed_to_lane_now_only",
         ]
         # Rewrite metrics each new training session to avoid schema drift/appending old runs.
         with open(self.metrics_csv_path, "w", newline="") as f:
@@ -1438,6 +1458,7 @@ class RLTrainingPipeline:
             decision_debug_rows = []
             arrived_with_prestep_edge_not_destination = 0
             prev_speed_by_vehicle = {}
+            emergency_brake_active_by_vehicle = {}
             mean_density_samples = []
             p95_density_samples = []
             congestion_high_pressure_steps = 0
@@ -1473,11 +1494,15 @@ class RLTrainingPipeline:
                     for vehicle_id in controlled_live_ids:
                         snapshot = step_snapshots.get(vehicle_id)
                         if snapshot is None:
+                            # Reset event latch if we cannot observe this step; avoids stale active flags.
+                            emergency_brake_active_by_vehicle.pop(vehicle_id, None)
                             continue
                         prev_speed = prev_speed_by_vehicle.get(vehicle_id)
                         if prev_speed is not None:
                             decel = max(float(prev_speed) - float(snapshot.speed), 0.0)
-                            if decel >= self.emergency_decel_threshold and prev_speed > 4.0:
+                            hard_brake = decel >= self.emergency_decel_threshold and prev_speed > 4.0
+                            was_hard_brake_active = bool(emergency_brake_active_by_vehicle.get(vehicle_id, False))
+                            if hard_brake and not was_hard_brake_active:
                                 decision_metrics["emergency_brake_events"] += 1
                                 emergency_reason = "other"
                                 try:
@@ -1502,6 +1527,10 @@ class RLTrainingPipeline:
                                     decision_metrics["emergency_brake_near_junction"] += 1
                                 else:
                                     decision_metrics["emergency_brake_other_reason"] += 1
+                            emergency_brake_active_by_vehicle[vehicle_id] = hard_brake
+                        else:
+                            # No prior speed => no detectable braking episode yet; keep latch clear.
+                            emergency_brake_active_by_vehicle[vehicle_id] = False
 
                         current_edge = snapshot.edge_id
                         prev_speed_by_vehicle[vehicle_id] = snapshot.speed
@@ -1670,6 +1699,7 @@ class RLTrainingPipeline:
                                             recent_history=list(recent_edge_history[vehicle_id]),
                                             cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
                                             destination=vehicle.destination,
+                                            decision_metrics=decision_metrics,
                                         )
                                         self.trainer.remember(
                                             pending.state,
@@ -1779,6 +1809,7 @@ class RLTrainingPipeline:
                                     recent_history=list(recent_edge_history[vehicle_id]),
                                     cooldown_active=True,
                                     destination=vehicle.destination,
+                                    decision_metrics=decision_metrics,
                                 )
                                 imitation_reward = self._clip_reward(0.10)
                                 self.trainer.remember(
@@ -1909,6 +1940,16 @@ class RLTrainingPipeline:
                             step,
                             snapshot=snapshot,
                         )
+                        reachable_set = set(context.reachable_with_lane_change_actions)
+                        available_set = set(context.available_actions)
+                        if reachable_set:
+                            decision_metrics["reachable_lane_change_nonempty"] += 1
+                            if not reachable_set.issubset(available_set):
+                                decision_metrics["reachable_lane_change_excluded_any"] += 1
+                            if reachable_set.isdisjoint(available_set):
+                                decision_metrics["reachable_lane_change_excluded_all"] += 1
+                        if context.skip_reason:
+                            decision_metrics[f"skip_reason_{context.skip_reason}"] += 1
                         if vehicle_id in pending_decisions:
                             decision_metrics["decisions_skipped"] += 1
                             prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -1946,6 +1987,7 @@ class RLTrainingPipeline:
                                 recent_history=list(recent_edge_history[vehicle_id]),
                                 cooldown_active=cooldown_active,
                                 destination=vehicle.destination,
+                                decision_metrics=decision_metrics,
                             )
                             removed_actions = max(len(context.available_actions) - len(policy_actions), 0)
                             decision_metrics["policy_masked_actions_removed"] += removed_actions
@@ -2000,6 +2042,7 @@ class RLTrainingPipeline:
                                 recent_history=list(recent_edge_history[vehicle_id]),
                                 cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
                                 destination=vehicle.destination,
+                                decision_metrics=decision_metrics,
                             )
                             self.trainer.remember(
                                 state,
@@ -2067,6 +2110,7 @@ class RLTrainingPipeline:
                                     recent_history=list(recent_edge_history[vehicle_id]),
                                     cooldown_active=True,
                                     destination=vehicle.destination,
+                                    decision_metrics=decision_metrics,
                                 )
                                 self.trainer.remember(
                                     state,
@@ -2171,6 +2215,7 @@ class RLTrainingPipeline:
                                 recent_history=list(recent_edge_history[vehicle_id]),
                                 cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
                                 destination=vehicle.destination,
+                                decision_metrics=decision_metrics,
                             )
                             self.trainer.remember(
                                 state,
@@ -2300,6 +2345,8 @@ class RLTrainingPipeline:
                             recent_edge_history,
                             last_snapshot_by_vehicle,
                         )
+                        emergency_brake_active_by_vehicle.pop(removed_id, None)
+                        prev_speed_by_vehicle.pop(removed_id, None)
 
                     if step % self.train_every == 0:
                         for _ in range(self.grad_steps):
@@ -2464,6 +2511,14 @@ class RLTrainingPipeline:
                     float(decision_metrics["fallback_overrides"]) / float(max(decision_metrics["decisions_opened"], 1.0))
                 )
                 controlled_teleport_rate = float(len(teleported_controlled_ids)) / float(max(total_controlled, 1))
+                reachable_lane_change_excluded_any_rate = (
+                    float(decision_metrics["reachable_lane_change_excluded_any"])
+                    / float(max(decision_metrics["reachable_lane_change_nonempty"], 1.0))
+                )
+                policy_lane_now_collapse_rate = (
+                    float(decision_metrics["policy_candidates_collapsed_to_lane_now_only"])
+                    / float(max(decision_metrics["policy_candidates_with_broader_available"], 1.0))
+                )
 
                 rolling_teleport_events.append(float(episode_teleport_events))
                 rolling_teleported_controlled.append(float(len(teleported_controlled_ids)))
@@ -2574,6 +2629,20 @@ class RLTrainingPipeline:
                         pending_resolution_success_rate,
                         delay_fairness_gini,
                         loop_after_fallback_rate,
+                    )
+                )
+                print(
+                    "  action-space diagnostics: skip_reason(forced_by_lane_commit/too_late_or_unreachable)={:.0f}/{:.0f} "
+                    "reachable_lane_change_excluded_any={:.0f}/{:.0f}({:.1%}) "
+                    "policy_lane_now_only={:.0f}/{:.0f}({:.1%})".format(
+                        decision_metrics["skip_reason_forced_by_lane_commit"],
+                        decision_metrics["skip_reason_too_late_or_unreachable"],
+                        decision_metrics["reachable_lane_change_excluded_any"],
+                        decision_metrics["reachable_lane_change_nonempty"],
+                        reachable_lane_change_excluded_any_rate,
+                        decision_metrics["policy_candidates_collapsed_to_lane_now_only"],
+                        decision_metrics["policy_candidates_with_broader_available"],
+                        policy_lane_now_collapse_rate,
                     )
                 )
 
@@ -2766,6 +2835,15 @@ class RLTrainingPipeline:
                         "timeout_rate": timeout_rate,
                         "fallback_rate_per_opened_decision": fallback_rate_per_opened_decision,
                         "controlled_teleport_rate": controlled_teleport_rate,
+                        "skip_reason_forced_by_lane_commit": decision_metrics["skip_reason_forced_by_lane_commit"],
+                        "skip_reason_too_late_or_unreachable": decision_metrics["skip_reason_too_late_or_unreachable"],
+                        "skip_reason_forced_single_path": decision_metrics["skip_reason_forced_single_path"],
+                        "skip_reason_no_branch": decision_metrics["skip_reason_no_branch"],
+                        "reachable_lane_change_nonempty": decision_metrics["reachable_lane_change_nonempty"],
+                        "reachable_lane_change_excluded_any": decision_metrics["reachable_lane_change_excluded_any"],
+                        "reachable_lane_change_excluded_all": decision_metrics["reachable_lane_change_excluded_all"],
+                        "policy_candidates_with_broader_available": decision_metrics["policy_candidates_with_broader_available"],
+                        "policy_candidates_collapsed_to_lane_now_only": decision_metrics["policy_candidates_collapsed_to_lane_now_only"],
                     }
                     if set(row.keys()) != set(csv_fields):
                         raise ValueError("rl_episode_metrics.csv row schema does not match header")
