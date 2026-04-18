@@ -63,7 +63,16 @@ class StrSumo:
 
                 # store edge vehicle counts in connection_info.edge_vehicle_count
                 self.get_edge_vehicle_counts()
-                #initialize vehicles to be directed
+                # Initialize vehicles to be directed.
+                #
+                # IMPORTANT (training/inference semantic alignment):
+                # The RL controller maintains pending decision state machines
+                # (observe/cooldown/timeout) that must be progressed every sim step.
+                # Restricting routing calls to only edge-change events can starve
+                # those state machines and create tail-loop artifacts in inference.
+                #
+                # Therefore we pass all live controlled vehicles (except already-at-
+                # destination / off-network) into make_decisions each step.
                 vehicles_to_direct = []
 
                 # iterate through vehicles currently in simulation
@@ -88,11 +97,11 @@ class StrSumo:
                         elif current_edge == self.controlled_vehicles[vehicle_id].destination:
                             continue
 
-                        #print("{} now on: {}, records on {}; {} ".format(vehicle_id, current_edge, self.controlled_vehicles[vehicle_id].current_edge, current_edge!=self.controlled_vehicles[vehicle_id].current_edge))
-                        if current_edge != self.controlled_vehicles[vehicle_id].current_edge:
-                            self.controlled_vehicles[vehicle_id].current_edge = current_edge
-                            self.controlled_vehicles[vehicle_id].current_speed = traci.vehicle.getSpeed(vehicle_id)
-                            vehicles_to_direct.append(self.controlled_vehicles[vehicle_id])
+                        # Keep vehicle state fresh every step and always include
+                        # controlled vehicles for decision progression.
+                        self.controlled_vehicles[vehicle_id].current_edge = current_edge
+                        self.controlled_vehicles[vehicle_id].current_speed = traci.vehicle.getSpeed(vehicle_id)
+                        vehicles_to_direct.append(self.controlled_vehicles[vehicle_id])
                 #print(len(vehicles_to_direct))
                 vehicle_decisions_by_id = self.route_controller.make_decisions(vehicles_to_direct, self.connection_info)
                 for vehicle_id, route_decision in vehicle_decisions_by_id.items():
