@@ -17,6 +17,7 @@ from core.junction_decision_engine import JunctionDecisionEngine, PendingDecisio
 from core.Util import ConnectionInfo
 from core.target_vehicles_generation_protocols import target_vehicles_generator
 from core.route_loop_safety import transition_signal
+from core.rl_constants import EPISODE_STEP_LIMIT, STATE_TIME_NORM_STEPS
 
 if 'SUMO_HOME' in os.environ:
     tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
@@ -32,7 +33,6 @@ import sumolib
 In this file, we build a DQN network
 """
 
-MAX_SIMULATION_STEPS = 2500 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
 
 class ReplayBuffer:
     """
@@ -276,7 +276,7 @@ class RLTrainingPipeline:
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
         step_log_every=100,
-        density_refresh_every=4,
+        density_refresh_every=1,
         normalize_per_step_cost_by_route_difficulty=False,
         route_difficulty_eta_floor=60.0,
         route_difficulty_scale_min=0.35,
@@ -302,6 +302,8 @@ class RLTrainingPipeline:
         """
         self.sumocfg_path = sumocfg_path
         self.model_output_path = model_output_path
+        self.best_model_output_path = os.path.splitext(self.model_output_path)[0] + "_best.keras"
+        self.best_score = None
         self.episodes = episodes
         self.spawn_interval = spawn_interval
         self.seed_with_episode = seed_with_episode
@@ -676,9 +678,9 @@ class RLTrainingPipeline:
                 self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0
             )
 
-            state[objective_base + 0] = min(elapsed / float(MAX_SIMULATION_STEPS), 1.0)
+            state[objective_base + 0] = min(elapsed / float(STATE_TIME_NORM_STEPS), 1.0)
             state[objective_base + 1] = (
-                min(float(remaining_eta) / float(MAX_SIMULATION_STEPS), 1.0)
+                min(float(remaining_eta) / float(STATE_TIME_NORM_STEPS), 1.0)
                 if math.isfinite(remaining_eta) else 1.0
             )
             state[objective_base + 2] = min(float(density), 1.0)
@@ -1247,7 +1249,7 @@ class RLTrainingPipeline:
         if arrived:
             if reached_global_destination:
                 reward += self.destination_reward
-                speed_bonus = max(0.0, 1.0 - (float(step) / float(MAX_SIMULATION_STEPS)))
+                speed_bonus = max(0.0, 1.0 - (float(step) / float(STATE_TIME_NORM_STEPS)))
                 reward += 3.0 * speed_bonus
             elif terminal_outcome == "non_global_arrival":
                 reward += self.non_global_arrival_penalty
@@ -1405,7 +1407,7 @@ class RLTrainingPipeline:
             arrived_with_prestep_edge_not_destination = 0
 
             try:
-                for step in range(MAX_SIMULATION_STEPS):
+                for step in range(EPISODE_STEP_LIMIT):
                     if simulation_get_min_expected() <= 0:
                         break
                     last_step_executed = step
@@ -2195,7 +2197,7 @@ class RLTrainingPipeline:
                     #     )
 
             finally:
-                if last_step_executed >= (MAX_SIMULATION_STEPS - 1):
+                if last_step_executed >= (EPISODE_STEP_LIMIT - 1):
                     alive_at_step_cap_ids = {vid for vid in vehicle_get_ids() if vid in vehicles}
                     for vid in alive_at_step_cap_ids:
                         if vid not in final_outcome_by_vehicle:
@@ -2261,6 +2263,14 @@ class RLTrainingPipeline:
                 roll_completion = sum(rolling_completion_rate) / len(rolling_completion_rate)
                 roll_return = sum(rolling_avg_return) / len(rolling_avg_return)
                 roll_avg_travel_time = sum(rolling_avg_travel_time) / len(rolling_avg_travel_time)
+                candidate_score = (
+                    round(roll_completion, 6),
+                    round(-roll_avg_travel_time, 6),
+                    round(-roll_tele_ctrl, 6),
+                )
+                if self.best_score is None or candidate_score > self.best_score:
+                    self.best_score = candidate_score
+                    self.trainer.model.save(self.best_model_output_path)
                 roll_mismatch = sum(rolling_mismatch) / len(rolling_mismatch)
 
                 self.trainer.epsilon = max(
