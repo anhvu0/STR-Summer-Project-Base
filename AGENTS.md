@@ -69,3 +69,56 @@
 - Known caveat from run logs:
   - Some episodes still end with a few vehicles near step-cap despite good early completion, indicating long-tail policy instability under congestion.
 - See `docs/loop_deadend_tail_analysis.md` for analysis checklist and reporting template.
+
+## Runtime log + CSV glossary (updated April 18, 2026)
+
+Use this section when interpreting `core/rl_training_pipeline.py` console logs and `rl_episode_metrics.csv`.
+
+### Step-progress logs (`[EP ... | STEP ...]`)
+
+- `open/final/skip`: decision lifecycle counters so far this episode.
+- `override`: `(safety_overrides + fallback_overrides + route_apply_fail) / decisions_opened`.
+- `mean_density`: rolling mean of sampled network edge densities this episode.
+- `congested_steps`: step count where `mean_density >= congestion_density_threshold` and controlled mean speed is low.
+- `pending_timeout`: cumulative `pending_decision_timeouts`.
+- `lane_change(a/s/f)`: attempts / successful requests / failed requests.
+- `emergency_brake`: detected hard-deceleration events (heuristic).
+- `teleport(jam/yield)`: inferred teleport split by local edge density threshold.
+- `skip_to_finalized`: `decisions_skipped / decisions_finalized`.
+
+### Episode-end diagnostics (console)
+
+- `density(mean/p95)`: episode mean and p95 of sampled network density.
+- `tail_over_p90`: count of controlled vehicles in the slow tail (>= p90 completed TT) plus unfinished controlled vehicles.
+- `tail_gap_vs_p50`: tail reference travel time minus p50 travel time.
+- `loop_reason`: dominant loop signal among short-cycle / aba-bounce / dead-end-reentry / long-horizon / revisit-without-progress.
+- `social_regret(mean/p90)`: per-decision regret from local social-cost proxy among feasible actions.
+- `social_best_rate`: share of sampled decisions where chosen action matched minimum social-cost proxy.
+- `actionable_skip_ratio`: skips at truly open decision points (`actionable_skips / actionable_decision_points`).
+- `pending_resolution_success`: `pending_resolved_success / (success + timeout + abort_no_progress)`.
+- `gini`: travel-time inequality over completed controlled vehicles (`0` = equal, `1` = highly unequal).
+- `loop_after_fallback_rate`: loop events after fallback-sourced finalized decisions.
+
+### New selfless-routing KPI fields in `rl_episode_metrics.csv`
+
+- Social-choice quality:
+  - `social_regret_mean`
+  - `social_regret_p90`
+  - `social_best_action_chosen_rate`
+- Decision quality:
+  - `actionable_skip_ratio`
+  - `pending_resolution_success_rate`
+  - `fallback_rate_per_opened_decision`
+- Equity/stability:
+  - `delay_fairness_gini`
+  - `p95_to_p50_travel_ratio`
+  - `timeout_rate`
+  - `controlled_teleport_rate`
+- Loop/fallback coupling:
+  - `loop_after_fallback_rate`
+
+### Interpretation guardrails
+
+- Improvement should prioritize lower `avg_travel_time` **without** worsening `p90_travel_time`, `delay_fairness_gini`, `timeout_rate`, or `pending_resolution_success_rate`.
+- High `social_best_action_chosen_rate` with high `actionable_skip_ratio` usually indicates policy is good when it acts, but decision gating/availability is the bottleneck.
+- If `loop_after_fallback_rate` rises while `fallback_rate_per_opened_decision` rises, fallback churn is likely dominating tail failures.
