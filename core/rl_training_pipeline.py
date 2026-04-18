@@ -367,12 +367,13 @@ class RLTrainingPipeline:
 
         # state = [edge_embedding, destination_embedding]
         #         + edge/lane/reachable/available feasibility masks (4*6)
-        #         + commit flag + 3 lane features + 3 travel-time features
-        #         + local congestion summary
+        #         + commit flag + 3 lane features
+        #         + divergence features (distance-to-next-divergence, planning-window flag)
+        #         + 3 travel-time features + local congestion summary
         self.edge_embedding_dim = 8
         self.local_congestion_k = 6
         self._init_edge_embeddings(seed=1337)
-        self.state_size = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 3 + self.local_congestion_k
+        self.state_size = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 2 + 3 + self.local_congestion_k
         self.action_size = 6
         self.metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_episode_metrics.csv")
         self._density_vec = np.zeros(len(self.connection_info.edge_list), dtype=np.float32)
@@ -397,7 +398,8 @@ class RLTrainingPipeline:
         self._decision_debug_fields = [
             "episode", "step", "vehicle_id", "decision_edge", "action", "action_source", "available_actions",
             "forced_action", "lane_feasible_now_actions", "reachable_with_lane_change_actions",
-            "commit_window", "dist_to_end", "intended_next_edge", "actual_next_edge", "finalized",
+            "commit_window", "freeze_window", "dist_to_end", "distance_to_next_divergence_m",
+            "upstream_planning_window", "intended_next_edge", "actual_next_edge", "finalized",
             "finalize_delay_steps", "reward", "done", "route_mismatch", "teleported",
             "reached_global_destination", "prev_eta", "curr_eta", "prev_distance", "curr_distance",
             "edge_density", "mean_density", "externality_penalty", "marginal_pressure",
@@ -466,7 +468,14 @@ class RLTrainingPipeline:
             "lane_feasible_now_actions": json.dumps(context.lane_feasible_now_actions),
             "reachable_with_lane_change_actions": json.dumps(context.reachable_with_lane_change_actions),
             "commit_window": int(bool(context.commit_window)),
+            "freeze_window": int(bool(context.freeze_window)),
             "dist_to_end": float(context.dist_to_end),
+            "distance_to_next_divergence_m": (
+                float(context.distance_to_next_divergence_m)
+                if math.isfinite(context.distance_to_next_divergence_m)
+                else ""
+            ),
+            "upstream_planning_window": int(bool(context.upstream_planning_window)),
             "intended_next_edge": pending.intended_next_edge,
             "actual_next_edge": actual_next_edge,
             "finalized": int(bool(finalized)),
@@ -648,8 +657,16 @@ class RLTrainingPipeline:
         dist_to_end = context.dist_to_end
         state[lane_base + 2] = min(dist_to_end, 200.0) / 200.0
 
+        # Divergence-awareness features
+        divergence_base = lane_base + 3
+        dist_to_div = context.distance_to_next_divergence_m
+        state[divergence_base + 0] = (
+            min(max(float(dist_to_div), 0.0), 320.0) / 320.0 if math.isfinite(dist_to_div) else 1.0
+        )
+        state[divergence_base + 1] = 1.0 if context.upstream_planning_window else 0.0
+
         # Travel-time objective features (normalized)
-        objective_base = lane_base + 3
+        objective_base = divergence_base + 2
         if vehicle is not None:
             if step is None:
                 step = int(snapshot.step) if snapshot is not None else 0
@@ -716,7 +733,11 @@ class RLTrainingPipeline:
             # Non-lane-feasible actions are exposed only in exceptional cases.
             if cooldown_active:
                 continue
+            if not context.upstream_planning_window:
+                continue
             if context.commit_window:
+                continue
+            if context.freeze_window:
                 continue
             if float(context.speed) < 1.2:
                 continue
@@ -975,7 +996,10 @@ class RLTrainingPipeline:
                 "lane_feasible_now_actions": "[]",
                 "reachable_with_lane_change_actions": "[]",
                 "commit_window": "",
+                "freeze_window": "",
                 "dist_to_end": "",
+                "distance_to_next_divergence_m": "",
+                "upstream_planning_window": "",
                 "intended_next_edge": "",
                 "actual_next_edge": vehicle.destination if outcome == "global_arrival" else last_confirmed_edge,
                 "finalized": 1,

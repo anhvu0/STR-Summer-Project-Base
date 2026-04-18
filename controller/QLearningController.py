@@ -65,9 +65,11 @@ class QLearningPolicy(RouteController):
         self.distance_tiebreak_scale = 0.05
         self.edge_embedding_dim = 8
         self.local_congestion_k = 6
-        self.compact_state_size = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 3 + self.local_congestion_k
+        self.compact_state_size = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 2 + 3 + self.local_congestion_k
+        self.compact_state_size_legacy = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 3 + self.local_congestion_k
         self.legacy_state_size = 2 + 6 + 3 + 3 + len(self.connection_info.edge_list)
-        self.use_compact_state = (self.model_state_size == self.compact_state_size)
+        self.use_compact_state = (self.model_state_size in {self.compact_state_size, self.compact_state_size_legacy})
+        self.compact_has_divergence_features = (self.model_state_size == self.compact_state_size)
         self.direction_mask_start = (2 * self.edge_embedding_dim) if self.use_compact_state else 2
         self._init_edge_embeddings(seed=1337)
 
@@ -171,7 +173,11 @@ class QLearningPolicy(RouteController):
 
             if cooldown_active:
                 continue
+            if not context.upstream_planning_window:
+                continue
             if context.commit_window:
+                continue
+            if context.freeze_window:
                 continue
             if float(context.speed) < 1.2:
                 continue
@@ -593,19 +599,26 @@ class QLearningPolicy(RouteController):
         lane_idx_norm = 0.0
         lane_count_norm = 0.0
         dist_to_end_norm = 0.0
+        dist_to_div_norm = 1.0
+        upstream_plan_flag = 0.0
         try:
             lane_idx = context.lane_index
             lane_count = max(context.lane_count, 1)
             dist_to_end = max(context.dist_to_end, 0.0)
+            dist_to_div = context.distance_to_next_divergence_m
 
             lane_idx_norm = lane_idx / max(lane_count - 1, 1)
             lane_count_norm = min(lane_count, 6) / 6.0
             dist_to_end_norm = min(dist_to_end, 200.0) / 200.0
+            dist_to_div_norm = min(max(float(dist_to_div), 0.0), 320.0) / 320.0 if math.isfinite(dist_to_div) else 1.0
+            upstream_plan_flag = 1.0 if context.upstream_planning_window else 0.0
         except traci.TraCIException:
             # Vehicle may have arrived/teleported between steps. Keep neutral defaults.
             pass
 
         state.extend([lane_idx_norm, lane_count_norm, dist_to_end_norm])
+        if self.use_compact_state and self.compact_has_divergence_features:
+            state.extend([dist_to_div_norm, upstream_plan_flag])
         state.extend(self._compute_objective_features(vehicle_id, en, destination_edge))
 
         if self.use_compact_state:
