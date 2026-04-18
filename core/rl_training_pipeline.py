@@ -17,6 +17,7 @@ from core.junction_decision_engine import JunctionDecisionEngine, PendingDecisio
 from core.Util import ConnectionInfo
 from core.target_vehicles_generation_protocols import target_vehicles_generator
 from core.route_loop_safety import transition_signal
+from core.rl_constants import EPISODE_STEP_LIMIT, STATE_TIME_NORM_STEPS
 
 if 'SUMO_HOME' in os.environ:
     tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
@@ -32,7 +33,6 @@ import sumolib
 In this file, we build a DQN network
 """
 
-MAX_SIMULATION_STEPS = 2500 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
 
 class ReplayBuffer:
     """
@@ -276,7 +276,7 @@ class RLTrainingPipeline:
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
         step_log_every=100,
-        density_refresh_every=4,
+        density_refresh_every=1,
         normalize_per_step_cost_by_route_difficulty=False,
         route_difficulty_eta_floor=60.0,
         route_difficulty_scale_min=0.35,
@@ -302,6 +302,8 @@ class RLTrainingPipeline:
         """
         self.sumocfg_path = sumocfg_path
         self.model_output_path = model_output_path
+        self.best_model_output_path = os.path.splitext(self.model_output_path)[0] + "_best.keras"
+        self.best_score = None
         self.episodes = episodes
         self.spawn_interval = spawn_interval
         self.seed_with_episode = seed_with_episode
@@ -405,6 +407,27 @@ class RLTrainingPipeline:
             "edge_density", "mean_density", "externality_penalty", "marginal_pressure",
             "terminal_outcome", "last_confirmed_edge", "destination", "in_arrived_ids", "in_teleport_ids",
         ]
+        self.teleport_emergency_csv_path = os.path.join(
+            self.sumocfg_dir,
+            "rl_teleport_emergency_brake_events.csv",
+        )
+        self._teleport_emergency_fields = [
+            "episode",
+            "step",
+            "vehicle_id",
+            "edge",
+            "lane",
+            "speed",
+            "decel",
+            "emergency_decel_threshold",
+            "dist_to_end",
+            "chosen_action",
+            "lane_feasible_now_actions",
+            "required_lane_shift",
+            "commit_window",
+            "freeze_window",
+            "fallback_happened",
+        ]
 
     def _ensure_decision_debug_csv_header(self):
         if not self.decision_debug_csv_path:
@@ -426,6 +449,18 @@ class RLTrainingPipeline:
             return
         with open(self.decision_debug_csv_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=self._decision_debug_fields)
+            writer.writerows(rows)
+
+    def _ensure_teleport_emergency_csv_header(self):
+        if not os.path.exists(self.teleport_emergency_csv_path):
+            with open(self.teleport_emergency_csv_path, "w", newline="") as f:
+                csv.DictWriter(f, fieldnames=self._teleport_emergency_fields).writeheader()
+
+    def _append_teleport_emergency_rows(self, rows):
+        if not rows:
+            return
+        with open(self.teleport_emergency_csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self._teleport_emergency_fields)
             writer.writerows(rows)
 
     def _build_decision_debug_row(
@@ -676,9 +711,9 @@ class RLTrainingPipeline:
                 self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0
             )
 
-            state[objective_base + 0] = min(elapsed / float(MAX_SIMULATION_STEPS), 1.0)
+            state[objective_base + 0] = min(elapsed / float(STATE_TIME_NORM_STEPS), 1.0)
             state[objective_base + 1] = (
-                min(float(remaining_eta) / float(MAX_SIMULATION_STEPS), 1.0)
+                min(float(remaining_eta) / float(STATE_TIME_NORM_STEPS), 1.0)
                 if math.isfinite(remaining_eta) else 1.0
             )
             state[objective_base + 2] = min(float(density), 1.0)
@@ -1247,7 +1282,7 @@ class RLTrainingPipeline:
         if arrived:
             if reached_global_destination:
                 reward += self.destination_reward
-                speed_bonus = max(0.0, 1.0 - (float(step) / float(MAX_SIMULATION_STEPS)))
+                speed_bonus = max(0.0, 1.0 - (float(step) / float(STATE_TIME_NORM_STEPS)))
                 reward += 3.0 * speed_bonus
             elif terminal_outcome == "non_global_arrival":
                 reward += self.non_global_arrival_penalty
@@ -1345,11 +1380,13 @@ class RLTrainingPipeline:
             "mean_reward_per_finalized_decision", "mean_route_difficulty_eta", "p50_route_difficulty_eta",
             "p90_route_difficulty_eta", "fail_teleport", "fail_timeout", "fail_removed_non_destination",
             "fail_unreachable_transition", "fail_dead_end_no_outgoing",
+            "emergency_brake_before_teleport_controlled",
         ]
         # Rewrite metrics each new training session to avoid schema drift/appending old runs.
         with open(self.metrics_csv_path, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=csv_fields).writeheader()
         self._ensure_decision_debug_csv_header()
+        self._ensure_teleport_emergency_csv_header()
 
         # MAX_CACHE_SIZE = 5000
 
@@ -1375,6 +1412,7 @@ class RLTrainingPipeline:
             simulation_get_arrived_ids = traci.simulation.getArrivedIDList
             vehicle_get_ids = traci.vehicle.getIDList
             pending_decisions = {}
+            last_action_trace_by_vehicle = {}
             lane_change_deferrals = defaultdict(int)
             lane_change_cooldown_until = {}
             recent_edge_history = defaultdict(lambda: deque(maxlen=self.loop_window))
@@ -1403,9 +1441,11 @@ class RLTrainingPipeline:
             pending_debug_logged_ids = set()
             decision_debug_rows = []
             arrived_with_prestep_edge_not_destination = 0
+            emergency_brake_before_teleport_controlled = 0
+            teleport_emergency_rows = []
 
             try:
-                for step in range(MAX_SIMULATION_STEPS):
+                for step in range(EPISODE_STEP_LIMIT):
                     if simulation_get_min_expected() <= 0:
                         break
                     last_step_executed = step
@@ -1681,6 +1721,7 @@ class RLTrainingPipeline:
                                     route_fragment=list(full_route[1:]) if full_route else [],
                                     metadata={"phase": "route_pending", "action_source": "observe_fallback"},
                                 )
+                                self._record_action_trace(last_action_trace_by_vehicle, vehicle_id, obs_context, fallback_action, "observe_fallback")
                                 decision_metrics["fallback_overrides"] += 1
                                 decision_metrics["fallback_to_lane_feasible_now"] += 1
                                 decision_metrics["observe_abort_fallback_overrides"] += 1
@@ -2036,6 +2077,7 @@ class RLTrainingPipeline:
                                     route_fragment=[],
                                     metadata={"action_source": action_source, **observe_metadata},
                                 )
+                                self._record_action_trace(last_action_trace_by_vehicle, vehicle_id, context, action, action_source)
                                 decision_metrics["decisions_opened"] += 1
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
                                 continue
@@ -2096,9 +2138,55 @@ class RLTrainingPipeline:
                             route_fragment=list(full_route[1:]) if full_route else [],
                             metadata={"action_source": action_source, "lane_change_deferrals": lane_change_deferrals.get(vehicle_id, 0)},
                         )
+                        self._record_action_trace(last_action_trace_by_vehicle, vehicle_id, context, action, action_source)
                         lane_change_deferrals[vehicle_id] = 0
                         decision_metrics["decisions_opened"] += 1
                         prev_edge_by_vehicle[vehicle_id] = current_edge
+
+                    pre_step_telemetry = {}
+                    for vehicle_id in controlled_live_ids:
+                        snap = step_snapshots.get(vehicle_id)
+                        if snap is None:
+                            continue
+                        pending = pending_decisions.get(vehicle_id)
+                        trace = last_action_trace_by_vehicle.get(vehicle_id, {})
+                        if pending is not None:
+                            chosen_action = pending.intended_action
+                            lane_feasible_now = list(pending.context.lane_feasible_now_actions)
+                            required_lane_shift = pending.context.required_lane_shift.get(chosen_action, "")
+                            commit_window = int(bool(pending.context.commit_window))
+                            freeze_window = int(bool(pending.context.freeze_window))
+                            fallback_happened = int("fallback" in str(pending.metadata.get("action_source", "")))
+                        else:
+                            chosen_action = trace.get("action", "")
+                            lane_feasible_now = list(trace.get("lane_feasible_now_actions", []))
+                            required_lane_shift = trace.get("required_lane_shift", "")
+                            commit_window = int(trace.get("commit_window", 0))
+                            freeze_window = int(trace.get("freeze_window", 0))
+                            fallback_happened = int(trace.get("fallback_happened", 0))
+                        try:
+                            accel = float(traci.vehicle.getAcceleration(vehicle_id))
+                        except Exception:
+                            accel = float("nan")
+                        try:
+                            emergency_decel_threshold = abs(float(traci.vehicle.getEmergencyDecel(vehicle_id)))
+                        except Exception:
+                            emergency_decel_threshold = 4.5
+                        pre_step_telemetry[vehicle_id] = {
+                            "step": int(step),
+                            "edge": snap.edge_id,
+                            "lane": snap.lane_id,
+                            "speed": float(snap.speed),
+                            "decel": float(accel),
+                            "emergency_decel_threshold": float(emergency_decel_threshold),
+                            "dist_to_end": float(snap.dist_to_end),
+                            "chosen_action": chosen_action,
+                            "lane_feasible_now_actions": lane_feasible_now,
+                            "required_lane_shift": required_lane_shift,
+                            "commit_window": commit_window,
+                            "freeze_window": freeze_window,
+                            "fallback_happened": fallback_happened,
+                        }
 
                     simulation_step()
 
@@ -2127,6 +2215,30 @@ class RLTrainingPipeline:
                             is_live=(removed_id in live_after_step),
                         )
                         final_outcome_by_vehicle[removed_id] = outcome
+                        if outcome == "teleport":
+                            tel = pre_step_telemetry.get(removed_id)
+                            if tel is not None:
+                                decel = float(tel["decel"])
+                                emergency_threshold = float(tel["emergency_decel_threshold"])
+                                if math.isfinite(decel) and decel <= (-1.0 * emergency_threshold):
+                                    emergency_brake_before_teleport_controlled += 1
+                                    teleport_emergency_rows.append({
+                                        "episode": int(episode),
+                                        "step": int(tel["step"]),
+                                        "vehicle_id": removed_id,
+                                        "edge": tel["edge"],
+                                        "lane": tel["lane"],
+                                        "speed": tel["speed"],
+                                        "decel": tel["decel"],
+                                        "emergency_decel_threshold": tel["emergency_decel_threshold"],
+                                        "dist_to_end": tel["dist_to_end"],
+                                        "chosen_action": tel["chosen_action"],
+                                        "lane_feasible_now_actions": json.dumps(tel["lane_feasible_now_actions"]),
+                                        "required_lane_shift": tel["required_lane_shift"],
+                                        "commit_window": tel["commit_window"],
+                                        "freeze_window": tel["freeze_window"],
+                                        "fallback_happened": tel["fallback_happened"],
+                                    })
                         reached_global_destination = (outcome == "global_arrival")
                         if reached_global_destination:
                             arrived_ids.add(removed_id)
@@ -2171,6 +2283,7 @@ class RLTrainingPipeline:
                             recent_edge_history,
                             last_snapshot_by_vehicle,
                         )
+                        last_action_trace_by_vehicle.pop(removed_id, None)
 
                     if step % self.train_every == 0:
                         for _ in range(self.grad_steps):
@@ -2195,7 +2308,7 @@ class RLTrainingPipeline:
                     #     )
 
             finally:
-                if last_step_executed >= (MAX_SIMULATION_STEPS - 1):
+                if last_step_executed >= (EPISODE_STEP_LIMIT - 1):
                     alive_at_step_cap_ids = {vid for vid in vehicle_get_ids() if vid in vehicles}
                     for vid in alive_at_step_cap_ids:
                         if vid not in final_outcome_by_vehicle:
@@ -2261,6 +2374,14 @@ class RLTrainingPipeline:
                 roll_completion = sum(rolling_completion_rate) / len(rolling_completion_rate)
                 roll_return = sum(rolling_avg_return) / len(rolling_avg_return)
                 roll_avg_travel_time = sum(rolling_avg_travel_time) / len(rolling_avg_travel_time)
+                candidate_score = (
+                    round(roll_completion, 6),
+                    round(-roll_avg_travel_time, 6),
+                    round(-roll_tele_ctrl, 6),
+                )
+                if self.best_score is None or candidate_score > self.best_score:
+                    self.best_score = candidate_score
+                    self.trainer.model.save(self.best_model_output_path)
                 roll_mismatch = sum(rolling_mismatch) / len(rolling_mismatch)
 
                 self.trainer.epsilon = max(
@@ -2395,6 +2516,7 @@ class RLTrainingPipeline:
                         finalize_delay_steps=max(last_step_executed - pending.decision_step, 0),
                     ))
                 self._append_decision_debug_rows(decision_debug_rows)
+                self._append_teleport_emergency_rows(teleport_emergency_rows)
                 traci.close()
                 with open(self.metrics_csv_path, "a", newline="") as f:
                     writer = csv.DictWriter(f, fieldnames=csv_fields)
@@ -2474,6 +2596,7 @@ class RLTrainingPipeline:
                         "fail_removed_non_destination": decision_metrics["fail_removed_non_destination"],
                         "fail_unreachable_transition": decision_metrics["fail_unreachable_transition"],
                         "fail_dead_end_no_outgoing": decision_metrics["fail_dead_end_no_outgoing"],
+                        "emergency_brake_before_teleport_controlled": emergency_brake_before_teleport_controlled,
                     }
                     if set(row.keys()) != set(csv_fields):
                         raise ValueError("rl_episode_metrics.csv row schema does not match header")
@@ -2503,3 +2626,16 @@ class RLTrainingPipeline:
             self._density_mean = 0.0
             self._density_std = 0.0
         self._last_density_step = step
+
+    def _record_action_trace(self, trace_map, vehicle_id, context, action, action_source):
+        fallback = "fallback" in str(action_source)
+        required_shift = context.required_lane_shift.get(action, None)
+        trace_map[vehicle_id] = {
+            "action": action,
+            "action_source": action_source,
+            "fallback_happened": int(bool(fallback)),
+            "lane_feasible_now_actions": list(context.lane_feasible_now_actions),
+            "required_lane_shift": required_shift,
+            "commit_window": int(bool(context.commit_window)),
+            "freeze_window": int(bool(context.freeze_window)),
+        }

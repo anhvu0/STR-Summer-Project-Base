@@ -11,14 +11,13 @@ from xml.dom.minidom import parse
 import os
 from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision, VehicleSnapshot
 from core.route_loop_safety import transition_signal, would_worsen_distance
+from core.rl_constants import STATE_TIME_NORM_STEPS
 
 def parse_sumocfg(sumocfg_path):
     dom = parse(sumocfg_path)
     net_file = dom.getElementsByTagName('net-file')[0].attributes['value'].nodeValue
     return os.path.join(os.path.dirname(sumocfg_path), net_file)
 net_path = parse_sumocfg("./configurations/myconfig.sumocfg")
-MAX_SIMULATION_STEPS = 2000
-
 
 class QLearningPolicy(RouteController):
     def __init__(self, vehicles, connection_info, model_file, net_xml_file = net_path):
@@ -132,8 +131,8 @@ class QLearningPolicy(RouteController):
         )
 
         return [
-            min(elapsed / float(MAX_SIMULATION_STEPS), 1.0),
-            min(float(remaining_eta) / float(MAX_SIMULATION_STEPS), 1.0) if math.isfinite(remaining_eta) else 1.0,
+            min(elapsed / float(STATE_TIME_NORM_STEPS), 1.0),
+            min(float(remaining_eta) / float(STATE_TIME_NORM_STEPS), 1.0) if math.isfinite(remaining_eta) else 1.0,
             min(float(density), 1.0),
         ]
 
