@@ -631,3 +631,11 @@ class QLearningPolicy(RouteController):
 
         state = np.reshape(state, [1, len(state)])
         return state
+
+    def get_diagnostics(self):
+        decisions = max(int(self._metrics.get("decisions", 0)), 1)
+        overrides = int(self._metrics.get("overrides", 0))
+        diagnostics = dict(self._metrics)
+        diagnostics["override_ratio"] = overrides / float(decisions)
+        diagnostics["decision_pending_at_episode_end"] = len(self._pending_decisions)
+        return diagnostics
