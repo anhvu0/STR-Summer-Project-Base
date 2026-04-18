@@ -96,6 +96,13 @@ class RouteController(ABC):
     def make_decisions(self, vehicles, connection_info):
         pass
 
+    def get_diagnostics(self):
+        """
+        Optional per-controller diagnostics emitted by the simulator at episode end.
+        Subclasses can override to expose policy-specific telemetry.
+        """
+        return {}
+
 
 class RandomPolicy(RouteController):
     """

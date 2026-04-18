@@ -56,6 +56,8 @@ class StrSumo:
         step = 0
         vehicles_to_direct = [] #  the batch of controlled vehicles passed to make_decisions()
         vehicle_IDs_in_simulation = []
+        controlled_teleport_events = 0
+        controlled_teleported_ids = set()
 
         try:
             while traci.simulation.getMinExpectedNumber() > 0:
@@ -156,6 +158,15 @@ class StrSumo:
                         #traci.getLastStepVehicleNumber(x)
                 traci.simulationStep()
                 step += 1
+                try:
+                    teleported_now = set(traci.simulation.getStartingTeleportIDList())
+                except traci.TraCIException:
+                    teleported_now = set()
+                if teleported_now:
+                    touched = [vid for vid in teleported_now if vid in self.controlled_vehicles]
+                    if touched:
+                        controlled_teleport_events += len(touched)
+                        controlled_teleported_ids.update(touched)
 
                 if step > MAX_SIMULATION_STEPS:
                     print('Ending due to timeout.')
@@ -166,6 +177,15 @@ class StrSumo:
             print(err)
 
         num_deadlines_missed = len(deadlines_missed)
+        print(
+            "Controlled teleport events: {}, unique controlled vehicles teleported: {}"
+            .format(controlled_teleport_events, len(controlled_teleported_ids))
+        )
+        diagnostics = {}
+        if hasattr(self.route_controller, "get_diagnostics"):
+            diagnostics = self.route_controller.get_diagnostics() or {}
+        if diagnostics:
+            print("Controller diagnostics: {}".format(diagnostics))
 
         return total_time, end_number, num_deadlines_missed
 
