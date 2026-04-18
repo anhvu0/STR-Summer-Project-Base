@@ -1962,6 +1962,7 @@ class RLTrainingPipeline:
                             decision_metrics["forced_actions"] += 1
                         elif context.skip_reason:
                             decision_metrics["decisions_skipped"] += 1
+                            decision_metrics[f"skip_reason_{context.skip_reason}"] += 1
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
                         elif not self.decision_engine.is_decision_open(context):
