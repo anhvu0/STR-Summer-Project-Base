@@ -272,7 +272,7 @@ class RLTrainingPipeline:
         grad_steps=1,
         rolling_window=100,
         use_double_dqn=True,
-        target_pattern=2,
+        target_pattern=3,
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
         step_log_every=100,
@@ -1318,8 +1318,8 @@ class RLTrainingPipeline:
         generator = target_vehicles_generator(os.path.join(self.sumocfg_dir, self.net_file))
         route_path = os.path.join(self.sumocfg_dir, self.route_file)
         vehicle_list = generator.generate_vehicles(
-            num_target_vehicles=20,
-            num_random_vehicles=30,
+            num_target_vehicles=200,
+            num_random_vehicles=100,
             pattern=self.target_pattern,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
