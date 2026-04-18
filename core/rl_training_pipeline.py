@@ -381,6 +381,10 @@ class RLTrainingPipeline:
         self._last_density_step = -10**9
         self._lane_length_cache = {}
         self._passenger_edge_set = set(self.connection_info.edge_list)
+        self.congestion_density_threshold = 0.06
+        self.congestion_low_speed_threshold = 2.0
+        self.emergency_decel_threshold = 4.5
+        self.teleport_jam_density_threshold = 0.09
         self.trainer = DQNTrainer(
             self.state_size,
             self.action_size,
@@ -521,6 +525,8 @@ class RLTrainingPipeline:
         total_controlled,
         arrived_ids,
         decision_metrics,
+        mean_density_samples=None,
+        congestion_high_pressure_steps=0,
     ):
         override_total = (
             decision_metrics["safety_overrides"]
@@ -553,6 +559,30 @@ class RLTrainingPipeline:
                 override_total / max(decision_metrics["decisions_opened"], 1.0),
                 int(decision_metrics["route_mismatch"]),
                 int(decision_metrics["teleports"]),
+            )
+        )
+        mean_density = (
+            float(np.mean(mean_density_samples))
+            if mean_density_samples else 0.0
+        )
+        skip_to_final = float(decision_metrics["decisions_skipped"]) / max(
+            float(decision_metrics["decisions_finalized"]),
+            1.0,
+        )
+        print(
+            "  diagnostics: mean_density={:.4f} congested_steps={} pending_timeout={} "
+            "lane_change(a/s/f)={:.0f}/{:.0f}/{:.0f} emergency_brake={} teleport(jam/yield)={:.0f}/{:.0f} "
+            "skip_to_finalized={:.2f}".format(
+                mean_density,
+                int(congestion_high_pressure_steps),
+                int(decision_metrics["pending_decision_timeouts"]),
+                decision_metrics["lane_change_attempts"],
+                decision_metrics["lane_change_success"],
+                decision_metrics["lane_change_fail"],
+                int(decision_metrics["emergency_brake_events"]),
+                decision_metrics["teleport_inferred_jam"],
+                decision_metrics["teleport_inferred_yield_or_deadlock"],
+                skip_to_final,
             )
         )
 
@@ -1321,6 +1351,15 @@ class RLTrainingPipeline:
             "mean_reward_per_finalized_decision", "mean_route_difficulty_eta", "p50_route_difficulty_eta",
             "p90_route_difficulty_eta", "fail_teleport", "fail_timeout", "fail_removed_non_destination",
             "fail_unreachable_transition", "fail_dead_end_no_outgoing",
+            "mean_network_density", "p95_network_density", "congestion_high_pressure_steps",
+            "emergency_brake_events", "emergency_brake_due_to_leader", "emergency_brake_due_to_congestion",
+            "emergency_brake_near_junction", "emergency_brake_other_reason",
+            "teleport_inferred_jam", "teleport_inferred_yield_or_deadlock",
+            "lane_change_success_rate", "lane_change_failure_rate",
+            "tail_vehicles_over_p90_count", "tail_completion_gap_steps",
+            "loop_reason_short_cycle", "loop_reason_aba_bounce", "loop_reason_dead_end_reentry",
+            "loop_reason_long_horizon", "loop_reason_revisit_without_progress", "dominant_loop_reason",
+            "skipped_to_finalized_ratio", "skipped_minus_finalized", "skipped_significantly_gt_finalized",
         ]
         # Rewrite metrics each new training session to avoid schema drift/appending old runs.
         with open(self.metrics_csv_path, "w", newline="") as f:
@@ -1379,6 +1418,10 @@ class RLTrainingPipeline:
             pending_debug_logged_ids = set()
             decision_debug_rows = []
             arrived_with_prestep_edge_not_destination = 0
+            prev_speed_by_vehicle = {}
+            mean_density_samples = []
+            p95_density_samples = []
+            congestion_high_pressure_steps = 0
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
@@ -1391,13 +1434,57 @@ class RLTrainingPipeline:
                     vehicle_ids = list(vehicle_get_ids())
                     controlled_live_ids = [vid for vid in vehicle_ids if vid in vehicles]
                     step_snapshots = self.collect_vehicle_snapshots(controlled_live_ids, step)
+                    if len(self._density_vec) > 0:
+                        step_mean_density = float(np.mean(self._density_vec))
+                        step_p95_density = float(np.percentile(self._density_vec, 95))
+                        mean_density_samples.append(step_mean_density)
+                        p95_density_samples.append(step_p95_density)
+                    else:
+                        step_mean_density = 0.0
+
+                    if step_snapshots:
+                        mean_controlled_speed = float(np.mean([snap.speed for snap in step_snapshots.values()]))
+                        if (
+                            step_mean_density >= self.congestion_density_threshold
+                            and mean_controlled_speed <= self.congestion_low_speed_threshold
+                        ):
+                            congestion_high_pressure_steps += 1
 
                     for vehicle_id in controlled_live_ids:
                         snapshot = step_snapshots.get(vehicle_id)
                         if snapshot is None:
                             continue
+                        prev_speed = prev_speed_by_vehicle.get(vehicle_id)
+                        if prev_speed is not None:
+                            decel = max(float(prev_speed) - float(snapshot.speed), 0.0)
+                            if decel >= self.emergency_decel_threshold and prev_speed > 4.0:
+                                decision_metrics["emergency_brake_events"] += 1
+                                emergency_reason = "other"
+                                try:
+                                    leader_info = traci.vehicle.getLeader(vehicle_id)
+                                except Exception:
+                                    leader_info = None
+                                if leader_info and len(leader_info) >= 2 and float(leader_info[1]) < 10.0:
+                                    emergency_reason = "leader"
+                                else:
+                                    edge_density = self.connection_info.edge_vehicle_count.get(snapshot.edge_id, 0) / max(
+                                        self.connection_info.edge_length_dict.get(snapshot.edge_id, 5.0), 5.0
+                                    )
+                                    if edge_density >= self.congestion_density_threshold:
+                                        emergency_reason = "congestion"
+                                    elif snapshot.dist_to_end <= 20.0:
+                                        emergency_reason = "junction"
+                                if emergency_reason == "leader":
+                                    decision_metrics["emergency_brake_due_to_leader"] += 1
+                                elif emergency_reason == "congestion":
+                                    decision_metrics["emergency_brake_due_to_congestion"] += 1
+                                elif emergency_reason == "junction":
+                                    decision_metrics["emergency_brake_near_junction"] += 1
+                                else:
+                                    decision_metrics["emergency_brake_other_reason"] += 1
 
                         current_edge = snapshot.edge_id
+                        prev_speed_by_vehicle[vehicle_id] = snapshot.speed
 
                         vehicle = vehicles[vehicle_id]
                         vehicle.current_edge = current_edge
@@ -2090,6 +2177,20 @@ class RLTrainingPipeline:
                         episode_teleport_events += len(teleported_ids)
                         decision_metrics["teleports"] += len(teleported_ids)
                         teleported_controlled_ids.update(tid for tid in teleported_ids if tid in vehicles)
+                        for tid in teleported_ids:
+                            if tid not in vehicles:
+                                continue
+                            edge_id = last_seen_edge_by_vehicle.get(tid)
+                            if not edge_id:
+                                decision_metrics["teleport_inferred_yield_or_deadlock"] += 1
+                                continue
+                            edge_density = self.connection_info.edge_vehicle_count.get(edge_id, 0) / max(
+                                self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0
+                            )
+                            if edge_density >= self.teleport_jam_density_threshold:
+                                decision_metrics["teleport_inferred_jam"] += 1
+                            else:
+                                decision_metrics["teleport_inferred_yield_or_deadlock"] += 1
 
                     for removed_id in sorted(removed_controlled_ids):
                         if removed_id in final_outcome_by_vehicle:
@@ -2159,6 +2260,8 @@ class RLTrainingPipeline:
                             total_controlled=total_controlled,
                             arrived_ids=arrived_ids,
                             decision_metrics=decision_metrics,
+                            mean_density_samples=mean_density_samples,
+                            congestion_high_pressure_steps=congestion_high_pressure_steps,
                         )
 
                     # process = psutil.Process(os.getpid())
@@ -2223,6 +2326,51 @@ class RLTrainingPipeline:
                 )
                 p90_route_difficulty_eta = (
                     float(np.percentile(route_difficulty_etas, 90)) if route_difficulty_etas else 0.0
+                )
+                mean_network_density = (
+                    float(np.mean(mean_density_samples)) if mean_density_samples else 0.0
+                )
+                p95_network_density = (
+                    float(np.percentile(p95_density_samples, 95)) if p95_density_samples else 0.0
+                )
+                lane_change_success_rate = (
+                    float(decision_metrics["lane_change_success"]) / float(max(decision_metrics["lane_change_attempts"], 1.0))
+                )
+                lane_change_failure_rate = (
+                    float(decision_metrics["lane_change_fail"]) / float(max(decision_metrics["lane_change_attempts"], 1.0))
+                )
+                if completed_travel_times:
+                    tail_travel_times = [tt for tt in completed_travel_times if tt >= p90_travel_time]
+                else:
+                    tail_travel_times = []
+                unfinished_count = int(alive_at_step_cap_count + removed_nonarrival_count)
+                tail_vehicles_over_p90_count = int(len(tail_travel_times) + unfinished_count)
+                tail_reference = (
+                    float(np.mean(tail_travel_times))
+                    if tail_travel_times else p90_travel_time
+                )
+                if unfinished_count > 0 and last_step_executed >= 0:
+                    # Treat unfinished controlled vehicles as unresolved long-tail travel times.
+                    tail_reference = (
+                        (tail_reference * len(tail_travel_times)) + (float(last_step_executed) * unfinished_count)
+                    ) / max(len(tail_travel_times) + unfinished_count, 1)
+                tail_completion_gap_steps = float(max(tail_reference - p50_travel_time, 0.0))
+                loop_reason_counts = {
+                    "short_cycle": float(decision_metrics["short_cycle_events"]),
+                    "aba_bounce": float(decision_metrics["aba_bounce_events"]),
+                    "dead_end_reentry": float(decision_metrics["dead_end_reentry_events"]),
+                    "long_horizon": float(decision_metrics["long_horizon_loop_events"]),
+                    "revisit_without_progress": float(decision_metrics["revisit_without_progress_events"]),
+                }
+                dominant_loop_reason = "none"
+                if sum(loop_reason_counts.values()) > 0:
+                    dominant_loop_reason = max(loop_reason_counts.items(), key=lambda item: item[1])[0]
+                skipped_to_finalized_ratio = float(decision_metrics["decisions_skipped"]) / float(
+                    max(decision_metrics["decisions_finalized"], 1.0)
+                )
+                skipped_minus_finalized = float(decision_metrics["decisions_skipped"] - decision_metrics["decisions_finalized"])
+                skipped_significantly_gt_finalized = int(
+                    (decision_metrics["decisions_skipped"] >= (1.25 * max(decision_metrics["decisions_finalized"], 1.0)))
                 )
 
                 rolling_teleport_events.append(float(episode_teleport_events))
@@ -2292,6 +2440,35 @@ class RLTrainingPipeline:
                         decision_metrics["policy_actions"],
                         decision_metrics["deferred_lane_change_actions"],
                         decision_metrics["fallback_overrides"],
+                    )
+                )
+                print(
+                    "  diagnostics: density(mean/p95)={:.4f}/{:.4f} congestion_steps={} "
+                    "emergency_brake(total/leader/congestion/junction/other)={:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f} "
+                    "teleport_inferred(jam/yield_or_deadlock)={:.0f}/{:.0f}".format(
+                        mean_network_density,
+                        p95_network_density,
+                        congestion_high_pressure_steps,
+                        decision_metrics["emergency_brake_events"],
+                        decision_metrics["emergency_brake_due_to_leader"],
+                        decision_metrics["emergency_brake_due_to_congestion"],
+                        decision_metrics["emergency_brake_near_junction"],
+                        decision_metrics["emergency_brake_other_reason"],
+                        decision_metrics["teleport_inferred_jam"],
+                        decision_metrics["teleport_inferred_yield_or_deadlock"],
+                    )
+                )
+                print(
+                    "  tail+decision diagnostics: unfinished={} tail_over_p90={} tail_gap_vs_p50={:.1f} "
+                    "loop_reason={} skip/finalized={:.0f}/{:.0f} ratio={:.2f} significant_skip_excess={}".format(
+                        unfinished_count,
+                        tail_vehicles_over_p90_count,
+                        tail_completion_gap_steps,
+                        dominant_loop_reason,
+                        decision_metrics["decisions_skipped"],
+                        decision_metrics["decisions_finalized"],
+                        skipped_to_finalized_ratio,
+                        bool(skipped_significantly_gt_finalized),
                     )
                 )
 
@@ -2450,6 +2627,29 @@ class RLTrainingPipeline:
                         "fail_removed_non_destination": decision_metrics["fail_removed_non_destination"],
                         "fail_unreachable_transition": decision_metrics["fail_unreachable_transition"],
                         "fail_dead_end_no_outgoing": decision_metrics["fail_dead_end_no_outgoing"],
+                        "mean_network_density": mean_network_density,
+                        "p95_network_density": p95_network_density,
+                        "congestion_high_pressure_steps": congestion_high_pressure_steps,
+                        "emergency_brake_events": decision_metrics["emergency_brake_events"],
+                        "emergency_brake_due_to_leader": decision_metrics["emergency_brake_due_to_leader"],
+                        "emergency_brake_due_to_congestion": decision_metrics["emergency_brake_due_to_congestion"],
+                        "emergency_brake_near_junction": decision_metrics["emergency_brake_near_junction"],
+                        "emergency_brake_other_reason": decision_metrics["emergency_brake_other_reason"],
+                        "teleport_inferred_jam": decision_metrics["teleport_inferred_jam"],
+                        "teleport_inferred_yield_or_deadlock": decision_metrics["teleport_inferred_yield_or_deadlock"],
+                        "lane_change_success_rate": lane_change_success_rate,
+                        "lane_change_failure_rate": lane_change_failure_rate,
+                        "tail_vehicles_over_p90_count": tail_vehicles_over_p90_count,
+                        "tail_completion_gap_steps": tail_completion_gap_steps,
+                        "loop_reason_short_cycle": decision_metrics["short_cycle_events"],
+                        "loop_reason_aba_bounce": decision_metrics["aba_bounce_events"],
+                        "loop_reason_dead_end_reentry": decision_metrics["dead_end_reentry_events"],
+                        "loop_reason_long_horizon": decision_metrics["long_horizon_loop_events"],
+                        "loop_reason_revisit_without_progress": decision_metrics["revisit_without_progress_events"],
+                        "dominant_loop_reason": dominant_loop_reason,
+                        "skipped_to_finalized_ratio": skipped_to_finalized_ratio,
+                        "skipped_minus_finalized": skipped_minus_finalized,
+                        "skipped_significantly_gt_finalized": skipped_significantly_gt_finalized,
                     }
                     if set(row.keys()) != set(csv_fields):
                         raise ValueError("rl_episode_metrics.csv row schema does not match header")
