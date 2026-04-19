@@ -366,6 +366,7 @@ class RLTrainingPipeline:
             self.net,
             self.route_helper.direction_choices,
         )
+        self.step_control_extra_buffer_m = 45.0
 
         # state = [edge_embedding, destination_embedding]
         #         + edge/lane/reachable/available feasibility masks (4*6)
@@ -1457,6 +1458,8 @@ class RLTrainingPipeline:
             "policy_candidates_collapsed_to_lane_now_only",
             "soft_commit_window_admissions", "observe_abort_low_speed",
             "pending_commit_window_grace_kept", "proactive_shift2_candidates_kept",
+            "step_control_edge_change", "step_control_pending",
+            "step_control_near_junction", "step_control_lane_change_candidate",
         ]
         # Rewrite metrics each new training session to avoid schema drift/appending old runs.
         with open(self.metrics_csv_path, "w", newline="") as f:
@@ -1611,6 +1614,56 @@ class RLTrainingPipeline:
                             continue
 
                         prev_edge = prev_edge_by_vehicle.get(vehicle_id)
+                        step_control_context = None
+                        if vehicle_id in pending_decisions:
+                            decision_metrics["step_control_pending"] += 1
+                        elif prev_edge is not None and current_edge != prev_edge:
+                            decision_metrics["step_control_edge_change"] += 1
+                        else:
+                            step_control_context = self.decision_engine.build_context(
+                                vehicle_id,
+                                current_edge,
+                                vehicle.destination,
+                                step,
+                                snapshot=snapshot,
+                            )
+                            if len(step_control_context.edge_valid_actions) > 1:
+                                reaction_distance = max(
+                                    float(self.decision_engine.base_reaction_distance),
+                                    float(snapshot.speed) * float(self.decision_engine.reaction_time_s),
+                                )
+                                near_threshold = reaction_distance + float(self.step_control_extra_buffer_m)
+                                near_junction = float(step_control_context.dist_to_end) <= float(near_threshold)
+
+                                commit_distance = max(
+                                    float(self.decision_engine.commit_min_distance),
+                                    float(snapshot.speed) * float(self.decision_engine.commit_time_s),
+                                )
+                                extra_buffer = max(6.0, 0.35 * float(self.decision_engine.lane_change_margin_m))
+                                comfortable_dist_threshold = commit_distance + extra_buffer
+                                proactive_control_threshold = max(
+                                    float(near_threshold),
+                                    float(comfortable_dist_threshold + 1.5 * float(self.decision_engine.lane_change_margin_m)),
+                                )
+
+                                lane_now = set(step_control_context.lane_feasible_now_actions)
+                                proactive_candidates = [
+                                    a for a in step_control_context.available_actions
+                                    if (a not in lane_now and int(step_control_context.required_lane_shift.get(a, 99)) <= 1)
+                                ]
+
+                                cooldown_until = lane_change_cooldown_until.get((vehicle_id, current_edge), -1)
+                                cooldown_active = int(step) < int(cooldown_until)
+
+                                if (
+                                    proactive_candidates
+                                    and not cooldown_active
+                                    and float(step_control_context.dist_to_end) <= proactive_control_threshold
+                                ):
+                                    decision_metrics["step_control_lane_change_candidate"] += 1
+                                elif near_junction and self.decision_engine.is_decision_open(step_control_context):
+                                    decision_metrics["step_control_near_junction"] += 1
+
                         if vehicle_id in pending_decisions and current_edge != pending_decisions[vehicle_id].decision_edge:
                             pending = pending_decisions.pop(vehicle_id)
                             decision_metrics["pending_resolved_success"] += 1
@@ -2020,13 +2073,15 @@ class RLTrainingPipeline:
                                 pending_decisions.pop(vehicle_id, None)
                                 lane_change_cooldown_until[(vehicle_id, current_edge)] = step + self.decision_engine.cooldown_steps
 
-                        context = self.decision_engine.build_context(
-                            vehicle_id,
-                            current_edge,
-                            vehicle.destination,
-                            step,
-                            snapshot=snapshot,
-                        )
+                        context = step_control_context
+                        if context is None:
+                            context = self.decision_engine.build_context(
+                                vehicle_id,
+                                current_edge,
+                                vehicle.destination,
+                                step,
+                                snapshot=snapshot,
+                            )
                         reachable_set = set(context.reachable_with_lane_change_actions)
                         available_set = set(context.available_actions)
                         if reachable_set:
@@ -2959,6 +3014,10 @@ class RLTrainingPipeline:
                         "observe_abort_low_speed": decision_metrics["observe_abort_low_speed"],
                         "pending_commit_window_grace_kept": decision_metrics["pending_commit_window_grace_kept"],
                         "proactive_shift2_candidates_kept": decision_metrics["proactive_shift2_candidates_kept"],
+                        "step_control_edge_change": decision_metrics["step_control_edge_change"],
+                        "step_control_pending": decision_metrics["step_control_pending"],
+                        "step_control_near_junction": decision_metrics["step_control_near_junction"],
+                        "step_control_lane_change_candidate": decision_metrics["step_control_lane_change_candidate"],
                     }
                     if set(row.keys()) != set(csv_fields):
                         raise ValueError("rl_episode_metrics.csv row schema does not match header")

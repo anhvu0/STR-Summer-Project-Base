@@ -82,9 +82,9 @@ class JunctionDecisionEngine:
         self.observe_stall_steps = 5
         self.cooldown_steps = 3
         self.observe_timeout_steps = 16
-        self.route_pending_stall_steps = 8
+        self.route_pending_stall_steps = 10
         self.route_pending_hard_timeout_steps = 60
-        self.route_pending_progress_eps_m = 2.0
+        self.route_pending_progress_eps_m = 1.0
         self.pending_progress_timeout_steps = 22
         self.loop_distance_slack = 30.0
 

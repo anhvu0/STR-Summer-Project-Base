@@ -33,7 +33,7 @@ class QLearningPolicy(RouteController):
         self._pending_decisions = {}
         self._lane_change_deferrals = {}
         self._lane_change_cooldown = {}
-        self.step_control_extra_buffer_m = 35.0
+        self.step_control_extra_buffer_m = 45.0
         self._last_observed_edge = {}
         self._last_control_step = {}
         self._metrics = {
