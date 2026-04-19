@@ -388,7 +388,7 @@ class RLTrainingPipeline:
         self.score_slack = 30.0
         self.reward_clip_low = -20.0
         self.reward_clip_high = 20.0
-        self.pending_timeout_penalty = -8.0
+        self.pending_timeout_penalty = -18.0
         self.pending_latency_penalty_per_step = 0.008
         self.pending_replan_penalty = -0.4
         self.stale_disappeared_penalty = -14.0
@@ -398,6 +398,13 @@ class RLTrainingPipeline:
         self.same_edge_repeat_chase_penalty = -0.5
         self.fallback_missed_lane_penalty = -0.4
         self.loop_trap_override_penalty = -1.4
+        self.tail_delay_threshold_eta_mult = 1.35
+        self.tail_delay_threshold_min_steps = 180.0
+        self.tail_delay_threshold_max_steps = 320.0
+        self.tail_delay_linear_penalty = 0.06
+        self.tail_delay_quadratic_penalty = 0.00012
+        self.tail_arrival_penalty_per_25_steps = 0.75
+        self.tail_arrival_penalty_cap = 8.0
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
@@ -1205,6 +1212,7 @@ class RLTrainingPipeline:
                 vehicle,
                 last_confirmed_edge,
                 elapsed=timeout_elapsed,
+                step=step,
                 pending_age=max(step - pending.decision_step, 0),
                 lane_change_deferrals=pending.metadata.get("lane_change_deferrals", 0),
             ) + self.pending_timeout_penalty
@@ -1313,6 +1321,45 @@ class RLTrainingPipeline:
         distance = path_cost if path_edges is not None else math.inf
         self._distance_cache[key] = distance
         return distance
+
+    def _tail_delay_threshold(self, vehicle, reference_edge):
+        cached = getattr(vehicle, "tail_delay_threshold_steps", None)
+        if cached is not None:
+            return float(cached)
+        initial_eta = self._estimate_remaining_eta(reference_edge, vehicle.destination)
+        threshold = float(
+            np.clip(
+                self.tail_delay_threshold_eta_mult * float(initial_eta),
+                self.tail_delay_threshold_min_steps,
+                self.tail_delay_threshold_max_steps,
+            )
+        )
+        setattr(vehicle, "tail_delay_threshold_steps", threshold)
+        return threshold
+
+    def _tail_delay_penalty_increment(self, vehicle, reference_edge, step, delta_steps):
+        delta_steps = max(float(delta_steps), 0.0)
+        if delta_steps <= 0.0:
+            return 0.0
+        elapsed_now = max(float(step) - float(vehicle.start_time), 0.0)
+        elapsed_prev = max(elapsed_now - delta_steps, 0.0)
+        threshold = self._tail_delay_threshold(vehicle, reference_edge)
+        overflow_now = max(elapsed_now - threshold, 0.0)
+        overflow_prev = max(elapsed_prev - threshold, 0.0)
+        if overflow_now <= overflow_prev:
+            return 0.0
+        linear = self.tail_delay_linear_penalty * (overflow_now - overflow_prev)
+        quadratic = self.tail_delay_quadratic_penalty * ((overflow_now ** 2) - (overflow_prev ** 2))
+        return float(max(linear + quadratic, 0.0))
+
+    def _tail_arrival_penalty(self, vehicle, reference_edge, step):
+        threshold = self._tail_delay_threshold(vehicle, reference_edge)
+        elapsed_now = max(float(step) - float(vehicle.start_time), 0.0)
+        overflow = max(elapsed_now - threshold, 0.0)
+        if overflow <= 0.0:
+            return 0.0
+        penalty = self.tail_arrival_penalty_per_25_steps * (overflow / 25.0)
+        return float(min(penalty, self.tail_arrival_penalty_cap))
     
     def compute_reward(
         self,
@@ -1361,6 +1408,12 @@ class RLTrainingPipeline:
         reward += self.selfless_reward_scale * float(
             np.clip(selfless_delta, -self.selfless_reward_clip, self.selfless_reward_clip)
         )
+        reward -= self._tail_delay_penalty_increment(
+            vehicle,
+            current_edge,
+            step=step,
+            delta_steps=elapsed,
+        )
 
         # Progress shaping using ETA and distance improvement.
         if math.isfinite(prev_eta) and math.isfinite(curr_eta):
@@ -1395,6 +1448,7 @@ class RLTrainingPipeline:
                 reward += self.destination_reward
                 speed_bonus = max(0.0, 1.0 - (float(step) / float(MAX_SIMULATION_STEPS)))
                 reward += 3.0 * speed_bonus
+                reward -= self._tail_arrival_penalty(vehicle, current_edge, step)
             else:
                 reward -= 8.0
             done = True
@@ -1410,7 +1464,7 @@ class RLTrainingPipeline:
     def _clip_reward(self, reward_value):
         return float(np.clip(reward_value, self.reward_clip_low, self.reward_clip_high))
 
-    def compute_pending_step_reward(self, vehicle, edge_id, elapsed, externality_penalty=0.0, pending_age=0, lane_change_deferrals=0):
+    def compute_pending_step_reward(self, vehicle, edge_id, elapsed, step, externality_penalty=0.0, pending_age=0, lane_change_deferrals=0):
         """
         Dense reward used while a decision is pending and has not finalized yet.
         Keeps the training objective travel-time centric without waiting for an edge transition.
@@ -1429,6 +1483,12 @@ class RLTrainingPipeline:
         reward -= self.system_congestion_scale * marginal_pressure * elapsed
         reward -= self.pending_latency_penalty_per_step * float(max(pending_age, 0))
         reward -= 0.02 * float(max(lane_change_deferrals, 0))
+        reward -= self._tail_delay_penalty_increment(
+            vehicle,
+            edge_id,
+            step=step,
+            delta_steps=elapsed,
+        )
         return self._clip_reward(reward)
 
     def generate_episode_vehicles(self, episode_seed=None):
@@ -1967,6 +2027,7 @@ class RLTrainingPipeline:
                                     vehicle,
                                     current_edge,
                                     elapsed=elapsed_pending,
+                                    step=step,
                                     externality_penalty=ext_pen,
                                     pending_age=pending_age,
                                     lane_change_deferrals=pending.metadata.get("lane_change_deferrals", 0),
