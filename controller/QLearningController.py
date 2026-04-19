@@ -45,7 +45,8 @@ class QLearningPolicy(RouteController):
             "deadend_overrides": 0,
             "decision_committed_skips": 0,
             "pending_decision_timeouts": 0,
-            "fallback_to_lane_feasible_now": 0,
+            "fallback_selected_total": 0,
+            "fallback_selected_lane_now": 0,
             "deferred_lane_change_actions": 0,
             "lane_change_observe_started": 0,
             "lane_change_observe_success": 0,
@@ -217,7 +218,7 @@ class QLearningPolicy(RouteController):
             proactive_actions.append(action)
             if required_shift == 2:
                 self._metrics["proactive_shift2_candidates_kept"] += 1
-            if context.commit_window and required_shift == 1:
+            if context.commit_window and required_shift == 1 and action in filtered_available_actions:
                 self._metrics["soft_commit_window_admissions"] += 1
 
         policy_actions = sorted(set(safe_lane_now_actions) | set(proactive_actions))
@@ -226,12 +227,12 @@ class QLearningPolicy(RouteController):
         if not policy_actions:
             return available_actions
 
-        available_unique = set(available_actions)
-        lane_now_unique = set(safe_lane_now_actions)
-        policy_unique = set(policy_actions)
-        if len(available_unique) > len(lane_now_unique):
+        broader_available_set = set(filtered_available_actions)
+        lane_now_set = set(safe_lane_now_actions)
+        policy_set = set(policy_actions)
+        if len(broader_available_set) > len(lane_now_set):
             self._metrics["policy_candidates_with_broader_available"] += 1
-            if policy_unique == lane_now_unique and len(policy_unique) < len(available_unique):
+            if policy_set == lane_now_set and len(policy_set) < len(broader_available_set):
                 self._metrics["policy_candidates_collapsed_to_lane_now_only"] += 1
         return policy_actions
 
@@ -536,7 +537,9 @@ class QLearningPolicy(RouteController):
                     selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
                     if selected_next_edge is None:
                         continue
-                    self._metrics["fallback_to_lane_feasible_now"] += 1
+                    self._metrics["fallback_selected_total"] += 1
+                    if action_idx in obs_context.lane_feasible_now_actions:
+                        self._metrics["fallback_selected_lane_now"] += 1
                     full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
                         str(vid), start_edge, action_idx, vehicle.destination
                     )
@@ -609,6 +612,9 @@ class QLearningPolicy(RouteController):
                 if not fallback_actions:
                     continue
                 action_idx = self.act(state, available_actions=fallback_actions) if context.forced_action is None else fallback_actions[0]
+                self._metrics["fallback_selected_total"] += 1
+                if action_idx in context.lane_feasible_now_actions:
+                    self._metrics["fallback_selected_lane_now"] += 1
 
             selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
             if selected_next_edge is None:
@@ -629,6 +635,9 @@ class QLearningPolicy(RouteController):
                     if not fallback_actions:
                         continue
                     action_idx = fallback_actions[0]
+                    self._metrics["fallback_selected_total"] += 1
+                    if action_idx in context.lane_feasible_now_actions:
+                        self._metrics["fallback_selected_lane_now"] += 1
                 else:
                     lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action_idx)
                     observe_meta = self.decision_engine.start_lane_change_observe(context, action_idx, step, lane_change_requested, lane_change_ok)
