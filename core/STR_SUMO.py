@@ -65,6 +65,7 @@ class StrSumo:
                 self.get_edge_vehicle_counts()
                 #initialize vehicles to be directed
                 vehicles_to_direct = []
+                queued_ids = set()
 
                 # iterate through vehicles currently in simulation
                 for vehicle_id in vehicle_ids:
@@ -88,11 +89,28 @@ class StrSumo:
                         elif current_edge == self.controlled_vehicles[vehicle_id].destination:
                             continue
 
-                        #print("{} now on: {}, records on {}; {} ".format(vehicle_id, current_edge, self.controlled_vehicles[vehicle_id].current_edge, current_edge!=self.controlled_vehicles[vehicle_id].current_edge))
-                        if current_edge != self.controlled_vehicles[vehicle_id].current_edge:
+                        edge_changed = (current_edge != self.controlled_vehicles[vehicle_id].current_edge)
+
+                        should_force_control = False
+                        if hasattr(self.route_controller, "should_control_vehicle"):
+                            try:
+                                should_force_control = bool(
+                                    self.route_controller.should_control_vehicle(
+                                        vehicle_id,
+                                        self.controlled_vehicles[vehicle_id],
+                                        step,
+                                    )
+                                )
+                            except Exception:
+                                should_force_control = False
+
+                        if edge_changed:
                             self.controlled_vehicles[vehicle_id].current_edge = current_edge
+
+                        if (edge_changed or should_force_control) and vehicle_id not in queued_ids:
                             self.controlled_vehicles[vehicle_id].current_speed = traci.vehicle.getSpeed(vehicle_id)
                             vehicles_to_direct.append(self.controlled_vehicles[vehicle_id])
+                            queued_ids.add(vehicle_id)
                 #print(len(vehicles_to_direct))
                 vehicle_decisions_by_id = self.route_controller.make_decisions(vehicles_to_direct, self.connection_info)
                 for vehicle_id, route_decision in vehicle_decisions_by_id.items():
