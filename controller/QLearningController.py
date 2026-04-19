@@ -33,6 +33,9 @@ class QLearningPolicy(RouteController):
         self._pending_decisions = {}
         self._lane_change_deferrals = {}
         self._lane_change_cooldown = {}
+        self.step_control_extra_buffer_m = 12.0
+        self._last_observed_edge = {}
+        self._last_control_step = {}
         self._metrics = {
             "decisions": 0,
             "overrides": 0,
@@ -58,6 +61,10 @@ class QLearningPolicy(RouteController):
             "observe_abort_low_speed": 0,
             "pending_commit_window_grace_kept": 0,
             "proactive_shift2_candidates_kept": 0,
+            "step_control_edge_change": 0,
+            "step_control_pending": 0,
+            "step_control_near_junction": 0,
+            "step_control_lane_change_candidate": 0,
         }
         self._last_metrics_snapshot = None
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
@@ -359,6 +366,78 @@ class QLearningPolicy(RouteController):
             )
         except traci.TraCIException:
             return None
+
+    def should_control_vehicle(self, vehicle_id, vehicle, step):
+        vid = str(vehicle_id)
+
+        # Avoid duplicate same-step work
+        if self._last_control_step.get(vid) == int(step):
+            return False
+
+        try:
+            current_edge = traci.vehicle.getRoadID(vid)
+        except traci.TraCIException:
+            return False
+
+        if current_edge not in self.connection_info.edge_index_dict:
+            return False
+        if current_edge == vehicle.destination:
+            return False
+
+        # Always revisit while a pending decision exists.
+        if vid in self._pending_decisions:
+            self._metrics["step_control_pending"] += 1
+            return True
+
+        # Preserve normal edge-change-driven control.
+        if current_edge != vehicle.current_edge:
+            self._metrics["step_control_edge_change"] += 1
+            return True
+
+        snapshot = self._snapshot_vehicle(vid, current_edge, int(step))
+        if snapshot is None:
+            return False
+
+        context = self.decision_engine.build_context(
+            vid,
+            current_edge,
+            vehicle.destination,
+            int(step),
+            snapshot=snapshot,
+        )
+
+        # Only ask for step-wise control near meaningful junction decision zones.
+        if len(context.edge_valid_actions) <= 1:
+            return False
+
+        reaction_distance = max(
+            float(self.decision_engine.base_reaction_distance),
+            float(snapshot.speed) * float(self.decision_engine.reaction_time_s),
+        )
+        near_threshold = reaction_distance + float(self.step_control_extra_buffer_m)
+        near_junction = float(context.dist_to_end) <= float(near_threshold)
+
+        if not near_junction:
+            return False
+
+        lane_now = set(context.lane_feasible_now_actions)
+        proactive_candidates = [
+            a for a in context.available_actions
+            if (a not in lane_now and int(context.required_lane_shift.get(a, 99)) <= 1)
+        ]
+
+        cooldown_until = self._lane_change_cooldown.get((vid, current_edge), -1)
+        cooldown_active = int(step) < int(cooldown_until)
+
+        if self.decision_engine.is_decision_open(context):
+            self._metrics["step_control_near_junction"] += 1
+            return True
+
+        if proactive_candidates and not cooldown_active:
+            self._metrics["step_control_lane_change_candidate"] += 1
+            return True
+
+        return False
     #----------------------------------------------------------------------
 
 
@@ -376,10 +455,22 @@ class QLearningPolicy(RouteController):
                 continue
 
             vid = vehicle.vehicle_id
+            step = int(traci.simulation.getTime())
+            self._last_control_step[vid] = step
             if vid not in self._recent_edges:
                 self._recent_edges[vid] = deque(maxlen=self.loop_window)
+            prev_seen_edge = self._last_observed_edge.get(vid)
+            edge_changed_runtime = (prev_seen_edge != start_edge)
+
             self._visit_count.setdefault(vid, {})
             self._best_dist.setdefault(vid, float("inf"))
+
+            if prev_seen_edge is None or edge_changed_runtime:
+                self._recent_edges[vid].append(start_edge)
+                self._visit_count[vid][start_edge] = self._visit_count[vid].get(start_edge, 0) + 1
+                self._best_dist[vid] = min(self._best_dist[vid], self._dist_to_dest(start_edge, vehicle.destination))
+
+            self._last_observed_edge[vid] = start_edge
             self._finalize_commitment(vehicle)
 
             if vid in self._pending_decisions:
@@ -468,7 +559,6 @@ class QLearningPolicy(RouteController):
                     continue
                 continue
 
-            step = int(traci.simulation.getTime())
             snapshot = self._snapshot_vehicle(vid, start_edge, step)
             if snapshot is None:
                 continue
@@ -600,6 +690,10 @@ class QLearningPolicy(RouteController):
                 self._metrics["distance_overrides"],
                 self._metrics["impossible_action_overrides"],
                 self._metrics["deadend_overrides"],
+                self._metrics["step_control_edge_change"],
+                self._metrics["step_control_pending"],
+                self._metrics["step_control_near_junction"],
+                self._metrics["step_control_lane_change_candidate"],
             )
             if snapshot == self._last_metrics_snapshot:
                 return local_targets

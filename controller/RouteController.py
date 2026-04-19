@@ -96,6 +96,16 @@ class RouteController(ABC):
     def make_decisions(self, vehicles, connection_info):
         pass
 
+    def should_control_vehicle(self, vehicle_id, vehicle, step):
+        """
+        Optional runtime hook.
+        Return True when the controller wants this vehicle to be included in
+        make_decisions(...) on the current simulation step even if the vehicle
+        has not changed edges.
+        Default False preserves legacy behavior for non-RL controllers.
+        """
+        return False
+
 
 class RandomPolicy(RouteController):
     """
