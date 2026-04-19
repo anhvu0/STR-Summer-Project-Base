@@ -83,6 +83,8 @@ class DQNTrainer:
         epsilon_decay=0.99,
         epsilon_min=0.05,
         replay_capacity=5000,
+        elite_replay_capacity=None,
+        elite_fraction=0.25,
         batch_size=128,
         replay_warmup=1000,
         target_update_every=200,
@@ -109,6 +111,11 @@ class DQNTrainer:
         self.target_soft_tau = float(np.clip(target_soft_tau, 0.0, 1.0))
         self.use_double_dqn = bool(use_double_dqn)
         self.memory = ReplayBuffer(replay_capacity)
+        self.elite_fraction = float(np.clip(elite_fraction, 0.0, 0.5))
+        elite_capacity = elite_replay_capacity if elite_replay_capacity is not None else max(replay_capacity // 4, batch_size * 4)
+        self.elite_memory = ReplayBuffer(elite_capacity)
+        self.elite_transitions_added = 0
+        self.elite_samples_drawn = 0
         self.model = self.build_model(learning_rate)
         self.target_model = self._build_target_model()
         self.train_steps = 0
@@ -192,11 +199,37 @@ class DQNTrainer:
                 results[global_idx] = (int(np.argmax(masked_values)), "policy")
         return results
     
+    def _is_elite_transition(self, reward, done, metadata):
+        metadata = metadata or {}
+        if metadata.get("override_learning", False):
+            return False
+        if metadata.get("imitation_credit", False):
+            return False
+        if metadata.get("pending_timeout_replan", False):
+            return False
+        if metadata.get("synthetic_terminal_no_pending", False):
+            return False
+        terminal_outcome = metadata.get("terminal_outcome")
+        if terminal_outcome in {"teleport", "timeout", "removed_nonarrival"}:
+            return False
+        if not metadata.get("decision_open", False):
+            return False
+        if int(metadata.get("available_count", 0)) < 2:
+            return False
+        if metadata.get("forced_action", False):
+            return False
+        if terminal_outcome == "global_arrival":
+            return True
+        return float(reward) >= 0.25
+
     def remember(self, state, action, reward, next_state, done, next_valid_actions=None, metadata=None):
         """
         Store 1 transition for replay
         """
         self.memory.add(state, action, reward, next_state, done, next_valid_actions, metadata=metadata)
+        if self._is_elite_transition(reward, done, metadata):
+            self.elite_memory.add(state, action, reward, next_state, done, next_valid_actions, metadata=metadata)
+            self.elite_transitions_added += 1
     
     def replay(self):
         """
@@ -204,7 +237,19 @@ class DQNTrainer:
         """
         if len(self.memory) < self.replay_warmup:
             return
-        minibatch = self.memory.sample(self.batch_size)
+        elite_bs = 0
+        if len(self.elite_memory) >= max(8, self.batch_size // 8):
+            elite_bs = min(int(round(self.batch_size * self.elite_fraction)), len(self.elite_memory))
+        base_bs = self.batch_size - elite_bs
+        base_bs = min(base_bs, len(self.memory))
+        if base_bs <= 0:
+            return
+        minibatch = self.memory.sample(base_bs)
+        if elite_bs > 0:
+            elite_batch = self.elite_memory.sample(elite_bs)
+            minibatch += elite_batch
+            self.elite_samples_drawn += elite_bs
+        random.shuffle(minibatch)
         states      = np.vstack([s[0] for s in minibatch])
         actions     = np.array([s[1] for s in minibatch], dtype=np.int32)
         rewards     = np.array([s[2] for s in minibatch], dtype=np.float32)
@@ -399,6 +444,8 @@ class RLTrainingPipeline:
             epsilon_decay=epsilon_decay,
             epsilon_min=epsilon_min,
             replay_capacity=replay_capacity,
+            elite_replay_capacity=max(replay_capacity // 4, batch_size * 4),
+            elite_fraction=0.25,
             batch_size=batch_size,
             replay_warmup=replay_warmup,
             target_update_every=200,
@@ -1183,6 +1230,8 @@ class RLTrainingPipeline:
         else:
             raise ValueError(f"Unknown terminal outcome: {outcome}")
 
+        final_metadata = dict(pending.metadata) if isinstance(pending.metadata, dict) else {}
+        final_metadata["terminal_outcome"] = outcome
         self.trainer.remember(
             pending.state,
             pending.intended_action,
@@ -1190,7 +1239,7 @@ class RLTrainingPipeline:
             next_state,
             done,
             next_valid_actions=[],
-            metadata={"terminal_outcome": outcome},
+            metadata=final_metadata,
         )
         decision_metrics["decisions_finalized"] += 1
         decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
@@ -1414,6 +1463,7 @@ class RLTrainingPipeline:
         rolling_mismatch = deque(maxlen=self.rolling_window)
         csv_fields = [
             "episode", "epsilon", "replay", "train_steps", "mean_loss", "episode_return",
+            "elite_buffer_size", "elite_transitions_added", "elite_samples_drawn",
             "completion_rate", "avg_travel_time", "p50_travel_time", "p90_travel_time", "teleports", "teleported_controlled",
             "forced_actions", "decisions_opened", "decisions_finalized", "decisions_skipped",
             "route_mismatch", "loop_events", "uturn_events",
@@ -1783,6 +1833,11 @@ class RLTrainingPipeline:
                                     pending.metadata["phase"] = "route_pending"
                                     pending.metadata["best_dist_to_end"] = float(obs_context.dist_to_end)
                                     pending.metadata["last_progress_step"] = int(step)
+                                    pending.metadata["decision_open"] = True
+                                    pending.metadata["available_count"] = int(len(obs_context.available_actions))
+                                    pending.metadata["lane_now_count"] = int(len(obs_context.lane_feasible_now_actions))
+                                    pending.metadata["forced_action"] = bool(obs_context.forced_action is not None)
+                                    pending.metadata["action_source"] = pending.metadata.get("action_source", "policy")
                                     pending.intended_next_edge = committed_next_edge
                                     pending.route_fragment = list(full_route[1:]) if full_route else []
                                     pending.context = obs_context
@@ -1859,7 +1914,17 @@ class RLTrainingPipeline:
                                     context=obs_context,
                                     lane_change_requested=False,
                                     route_fragment=list(full_route[1:]) if full_route else [],
-                                    metadata={"phase": "route_pending", "action_source": "observe_fallback", "best_dist_to_end": float(obs_context.dist_to_end), "last_progress_step": int(step)},
+                                    metadata={
+                                        "phase": "route_pending",
+                                        "action_source": "observe_fallback",
+                                        "best_dist_to_end": float(obs_context.dist_to_end),
+                                        "last_progress_step": int(step),
+                                        "decision_open": True,
+                                        "available_count": int(len(obs_context.available_actions)),
+                                        "lane_now_count": int(len(obs_context.lane_feasible_now_actions)),
+                                        "forced_action": bool(obs_context.forced_action is not None),
+                                        "override_learning": True,
+                                    },
                                 )
                                 decision_metrics["fallback_overrides"] += 1
                                 decision_metrics["fallback_selected_total"] += 1
@@ -2363,6 +2428,10 @@ class RLTrainingPipeline:
                                 "phase": "route_pending",
                                 "best_dist_to_end": float(context.dist_to_end),
                                 "last_progress_step": int(step),
+                                "decision_open": True,
+                                "available_count": int(len(context.available_actions)),
+                                "lane_now_count": int(len(context.lane_feasible_now_actions)),
+                                "forced_action": bool(context.forced_action is not None),
                             },
                         )
                         lane_change_deferrals[vehicle_id] = 0
@@ -2843,6 +2912,9 @@ class RLTrainingPipeline:
                         "episode": episode,
                         "epsilon": self.trainer.epsilon,
                         "replay": len(self.trainer.memory),
+                        "elite_buffer_size": len(self.trainer.elite_memory),
+                        "elite_transitions_added": self.trainer.elite_transitions_added,
+                        "elite_samples_drawn": self.trainer.elite_samples_drawn,
                         "train_steps": self.trainer.train_steps,
                         "mean_loss": self.trainer.last_loss if self.trainer.last_loss is not None else "",
                         "episode_return": avg_return,
