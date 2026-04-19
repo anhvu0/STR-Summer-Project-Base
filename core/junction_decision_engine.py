@@ -226,6 +226,9 @@ class JunctionDecisionEngine:
     def is_decision_open(self, context: DecisionContext) -> bool:
         return context.branch_with_choice and len(context.available_actions) > 1
 
+    def broader_available_actions(self, context: DecisionContext) -> List[int]:
+        return sorted(set(context.available_actions) - set(context.lane_feasible_now_actions))
+
     def pending_age_steps(self, pending: PendingDecision, step: int) -> int:
         return max(int(step) - int(pending.decision_step), 0)
 

@@ -33,7 +33,14 @@ class QLearningPolicy(RouteController):
         self._pending_decisions = {}
         self._lane_change_deferrals = {}
         self._lane_change_cooldown = {}
-        self.step_control_extra_buffer_m = 12.0
+        self.step_control_extra_buffer_m = 30.0
+        self.proactive_watch_min_dist_to_end = 55.0
+        self.proactive_watch_max_shift = 1
+        self.proactive_watch_ttl_steps = 6
+        self.proactive_watch_release_dist_m = 10.0
+        self._proactive_watch = {}
+        self._first_proactive_seen = {}
+        self._first_decision_open_seen = {}
         self._last_observed_edge = {}
         self._last_control_step = {}
         self._metrics = {
@@ -65,6 +72,25 @@ class QLearningPolicy(RouteController):
             "step_control_pending": 0,
             "step_control_near_junction": 0,
             "step_control_lane_change_candidate": 0,
+            "step_control_requested": 0,
+            "step_control_requested_open": 0,
+            "step_control_requested_broader_available": 0,
+            "step_control_requested_lane_now_only": 0,
+            "step_control_requested_early_proactive": 0,
+            "proactive_watch_started": 0,
+            "proactive_watch_active": 0,
+            "proactive_watch_kept_alive": 0,
+            "proactive_watch_expired": 0,
+            "first_proactive_seen_count": 0,
+            "first_proactive_seen_dist_sum": 0.0,
+            "first_decision_open_seen_count": 0,
+            "first_decision_open_seen_dist_sum": 0.0,
+            "broader_available_far_80p": 0,
+            "broader_available_mid_40_80": 0,
+            "broader_available_near_40": 0,
+            "lane_now_only_far_80p": 0,
+            "lane_now_only_mid_40_80": 0,
+            "lane_now_only_near_40": 0,
         }
         self._last_metrics_snapshot = None
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
@@ -163,7 +189,44 @@ class QLearningPolicy(RouteController):
             features[base + 4] = min(float(social), 10.0)
         return features
 
-    def _policy_action_candidates(self, context, recent_history, cooldown_active, destination):
+    def _distance_bucket(self, dist_to_end):
+        if float(dist_to_end) > 80.0:
+            return "far_80p"
+        if float(dist_to_end) > 40.0:
+            return "mid_40_80"
+        return "near_40"
+
+    def _proactive_reachable_actions(self, context):
+        lane_now = set(context.lane_feasible_now_actions)
+        actions = []
+        for action in context.reachable_with_lane_change_actions:
+            if action in lane_now:
+                continue
+            if int(context.required_lane_shift.get(action, 99)) <= int(self.proactive_watch_max_shift):
+                actions.append(action)
+        return sorted(set(actions))
+
+    def _update_proactive_watch_metrics(self, vid, context):
+        lane_now = set(context.lane_feasible_now_actions)
+        available = set(context.available_actions)
+        broader_available = len(available - lane_now) > 0
+        bucket = self._distance_bucket(context.dist_to_end)
+        if broader_available:
+            self._metrics[f"broader_available_{bucket}"] += 1
+        if available.issubset(lane_now):
+            self._metrics[f"lane_now_only_{bucket}"] += 1
+
+        proactive_reachable = self._proactive_reachable_actions(context)
+        if vid not in self._first_proactive_seen and proactive_reachable:
+            self._first_proactive_seen[vid] = True
+            self._metrics["first_proactive_seen_count"] += 1
+            self._metrics["first_proactive_seen_dist_sum"] += float(context.dist_to_end)
+        if vid not in self._first_decision_open_seen and self.decision_engine.is_decision_open(context):
+            self._first_decision_open_seen[vid] = True
+            self._metrics["first_decision_open_seen_count"] += 1
+            self._metrics["first_decision_open_seen_dist_sum"] += float(context.dist_to_end)
+
+    def _policy_action_candidates(self, context, recent_history, cooldown_active, destination, vehicle_id=None):
         available_actions = list(context.available_actions)
         if not available_actions:
             return []
@@ -219,6 +282,19 @@ class QLearningPolicy(RouteController):
                 self._metrics["proactive_shift2_candidates_kept"] += 1
             if context.commit_window and required_shift == 1:
                 self._metrics["soft_commit_window_admissions"] += 1
+
+        watch = self._proactive_watch.get(str(vehicle_id)) if vehicle_id is not None else None
+        if watch and watch.get("edge_id") == context.edge_id:
+            preferred_action = watch.get("preferred_action")
+            if (
+                preferred_action in filtered_available_actions
+                and preferred_action not in lane_now
+                and int(context.required_lane_shift.get(preferred_action, 99)) <= 1
+                and float(context.dist_to_end) >= float(self.proactive_watch_release_dist_m)
+                and not cooldown_active
+            ):
+                proactive_actions.append(preferred_action)
+                self._metrics["proactive_watch_kept_alive"] += 1
 
         policy_actions = sorted(set(safe_lane_now_actions) | set(proactive_actions))
         if not policy_actions:
@@ -391,6 +467,9 @@ class QLearningPolicy(RouteController):
 
         # Preserve normal edge-change-driven control.
         if current_edge != vehicle.current_edge:
+            if vid in self._proactive_watch:
+                self._proactive_watch.pop(vid, None)
+                self._metrics["proactive_watch_expired"] += 1
             self._metrics["step_control_edge_change"] += 1
             return True
 
@@ -406,9 +485,23 @@ class QLearningPolicy(RouteController):
             snapshot=snapshot,
         )
 
-        # Only ask for step-wise control near meaningful junction decision zones.
         if len(context.edge_valid_actions) <= 1:
             return False
+        self._metrics["step_control_requested"] += 1
+        self._update_proactive_watch_metrics(vid, context)
+        lane_now = set(context.lane_feasible_now_actions)
+        broader_available = len(set(context.available_actions) - lane_now) > 0
+        proactive_reachable = self._proactive_reachable_actions(context)
+
+        cooldown_until = self._lane_change_cooldown.get((vid, current_edge), -1)
+        cooldown_active = int(step) < int(cooldown_until)
+
+        if self.decision_engine.is_decision_open(context):
+            self._metrics["step_control_requested_open"] += 1
+        if broader_available:
+            self._metrics["step_control_requested_broader_available"] += 1
+        if set(context.available_actions).issubset(lane_now):
+            self._metrics["step_control_requested_lane_now_only"] += 1
 
         reaction_distance = max(
             float(self.decision_engine.base_reaction_distance),
@@ -417,23 +510,42 @@ class QLearningPolicy(RouteController):
         near_threshold = reaction_distance + float(self.step_control_extra_buffer_m)
         near_junction = float(context.dist_to_end) <= float(near_threshold)
 
-        if not near_junction:
-            return False
-
-        lane_now = set(context.lane_feasible_now_actions)
-        proactive_candidates = [
-            a for a in context.available_actions
-            if (a not in lane_now and int(context.required_lane_shift.get(a, 99)) <= 1)
-        ]
-
-        cooldown_until = self._lane_change_cooldown.get((vid, current_edge), -1)
-        cooldown_active = int(step) < int(cooldown_until)
-
-        if self.decision_engine.is_decision_open(context):
-            self._metrics["step_control_near_junction"] += 1
+        if (
+            proactive_reachable
+            and float(context.dist_to_end) >= float(self.proactive_watch_min_dist_to_end)
+            and not cooldown_active
+        ):
+            self._proactive_watch[vid] = {
+                "edge_id": current_edge,
+                "expires_step": int(step) + int(self.proactive_watch_ttl_steps),
+                "preferred_action": proactive_reachable[0],
+            }
+            self._metrics["proactive_watch_started"] += 1
+            self._metrics["step_control_requested_early_proactive"] += 1
             return True
 
-        if proactive_candidates and not cooldown_active:
+        watch = self._proactive_watch.get(vid)
+        if watch is not None:
+            keep_alive = (
+                watch.get("edge_id") == current_edge
+                and int(step) <= int(watch.get("expires_step", -1))
+                and float(context.dist_to_end) >= float(self.proactive_watch_release_dist_m)
+                and len(proactive_reachable) > 0
+            )
+            if keep_alive:
+                if watch.get("preferred_action") not in proactive_reachable:
+                    watch["preferred_action"] = proactive_reachable[0]
+                self._metrics["proactive_watch_active"] += 1
+                return True
+            self._proactive_watch.pop(vid, None)
+            self._metrics["proactive_watch_expired"] += 1
+
+        if self.decision_engine.is_decision_open(context):
+            if near_junction:
+                self._metrics["step_control_near_junction"] += 1
+                return True
+
+        if near_junction and proactive_reachable and not cooldown_active:
             self._metrics["step_control_lane_change_candidate"] += 1
             return True
 
@@ -579,6 +691,7 @@ class QLearningPolicy(RouteController):
                     recent_history=recent,
                     cooldown_active=cooldown_active,
                     destination=vehicle.destination,
+                    vehicle_id=vid,
                 )
                 action_idx = self.act(state, available_actions=policy_actions)
                 self._metrics["decisions"] += 1
