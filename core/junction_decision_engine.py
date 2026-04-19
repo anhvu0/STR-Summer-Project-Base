@@ -70,18 +70,18 @@ class JunctionDecisionEngine:
 
         self.base_reaction_distance = 25.0
         self.reaction_time_s = 1.3
-        self.commit_time_s = 0.8
-        self.lane_change_margin_m = 24.0
-        self.commit_min_distance = 14.0
+        self.commit_time_s = 0.6
+        self.lane_change_margin_m = 18.0
+        self.commit_min_distance = 10.0
         self.default_fragment_horizon_m = 180.0
         self.pending_timeout_steps = 18
         self.lane_change_defer_limit = 4
         self.observe_steps_min = 2
-        self.observe_steps_max = 4
+        self.observe_steps_max = 6
         self.observe_low_speed_mps = 0.8
-        self.observe_stall_steps = 2
-        self.cooldown_steps = 3
-        self.pending_progress_timeout_steps = 10
+        self.observe_stall_steps = 3
+        self.cooldown_steps = 1
+        self.pending_progress_timeout_steps = 14
         self.loop_distance_slack = 30.0
 
     def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
@@ -157,7 +157,8 @@ class JunctionDecisionEngine:
                 aggressive_shift = shift >= 2 and dist_to_end < (dynamic_margin + commit_distance + reaction_distance)
                 if low_speed or aggressive_shift:
                     continue
-                if shift < 999 and lane_change_budget >= shift * dynamic_margin and dist_to_end >= reaction_distance:
+                required_budget = (0.7 * dynamic_margin) if shift == 1 else (shift * dynamic_margin)
+                if shift < 999 and lane_change_budget >= required_budget and dist_to_end >= reaction_distance:
                     available.append(idx)
 
         available = sorted(set(available))
@@ -302,12 +303,13 @@ class JunctionDecisionEngine:
         blocked_action: Optional[int] = None,
         distance_fn: Optional[Callable[[str, str], float]] = None,
     ) -> List[int]:
-        candidate_pool = self.lane_feasible_fallback_actions(context, blocked_action=blocked_action)
-        if not candidate_pool:
-            candidate_pool = self.safe_connected_fallback_actions(context, blocked_action=blocked_action)
+        lane_now_candidates = self.lane_feasible_fallback_actions(context, blocked_action=blocked_action)
+        safe_connected_candidates = self.safe_connected_fallback_actions(context, blocked_action=blocked_action)
+        candidate_pool = sorted(set(lane_now_candidates) | set(safe_connected_candidates))
         if not candidate_pool:
             return []
 
+        lane_now_set = set(context.lane_feasible_now_actions)
         scored = []
         for action in candidate_pool:
             safe_ok, details = self.prefilter_action_for_loops(
@@ -336,6 +338,8 @@ class JunctionDecisionEngine:
                 else:
                     score += 25.0
             score += 0.05 * float(context.required_lane_shift.get(action, 0))
+            if action in lane_now_set:
+                score -= 0.25
             scored.append((score, action))
         scored.sort(key=lambda x: x[0])
         return [action for _, action in scored]
