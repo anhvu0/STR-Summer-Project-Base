@@ -1781,6 +1781,8 @@ class RLTrainingPipeline:
                                         prev_edge_by_vehicle[vehicle_id] = current_edge
                                         continue
                                     pending.metadata["phase"] = "route_pending"
+                                    pending.metadata["best_dist_to_end"] = float(obs_context.dist_to_end)
+                                    pending.metadata["last_progress_step"] = int(step)
                                     pending.intended_next_edge = committed_next_edge
                                     pending.route_fragment = list(full_route[1:]) if full_route else []
                                     pending.context = obs_context
@@ -1857,7 +1859,7 @@ class RLTrainingPipeline:
                                     context=obs_context,
                                     lane_change_requested=False,
                                     route_fragment=list(full_route[1:]) if full_route else [],
-                                    metadata={"phase": "route_pending", "action_source": "observe_fallback"},
+                                    metadata={"phase": "route_pending", "action_source": "observe_fallback", "best_dist_to_end": float(obs_context.dist_to_end), "last_progress_step": int(step)},
                                 )
                                 decision_metrics["fallback_overrides"] += 1
                                 decision_metrics["fallback_selected_total"] += 1
@@ -1950,7 +1952,7 @@ class RLTrainingPipeline:
                                     step=step,
                                     snapshot=snapshot,
                                 )
-                                timeout_penalty = self._clip_reward(self.pending_replan_penalty)
+                                timeout_penalty = self._clip_reward(self.pending_timeout_penalty)
                                 self.trainer.remember(
                                     pending.state,
                                     pending.intended_action,
@@ -1985,15 +1987,36 @@ class RLTrainingPipeline:
                                 and pending.intended_action not in pending_ctx.lane_feasible_now_actions
                                 and not grace_keep
                             )
-                            no_progress_same_edge = (
-                                pending_age >= self.decision_engine.pending_progress_timeout_steps
-                                and current_edge == pending.decision_edge
+                            metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
+                            pending.metadata = metadata
+                            best_dist = float(metadata.get("best_dist_to_end", pending_ctx.dist_to_end))
+                            last_progress_step = int(metadata.get("last_progress_step", pending.decision_step))
+                            if current_edge == pending.decision_edge:
+                                progress_eps = float(self.decision_engine.route_pending_progress_eps_m)
+                                if pending_ctx.dist_to_end <= (best_dist - progress_eps):
+                                    best_dist = float(pending_ctx.dist_to_end)
+                                    last_progress_step = int(step)
+                            metadata["best_dist_to_end"] = float(best_dist)
+                            metadata["last_progress_step"] = int(last_progress_step)
+                            stall_age = max(int(step) - int(last_progress_step), 0)
+                            total_age = max(int(step) - int(pending.decision_step), 0)
+                            stalled_timeout = (
+                                current_edge == pending.decision_edge
+                                and stall_age >= int(self.decision_engine.route_pending_stall_steps)
+                            )
+                            hard_timeout = (
+                                current_edge == pending.decision_edge
+                                and total_age >= int(self.decision_engine.route_pending_hard_timeout_steps)
                             )
                             if pending_ctx.commit_window and pending.intended_action not in pending_ctx.lane_feasible_now_actions and grace_keep:
                                 decision_metrics["pending_commit_window_grace_kept"] += 1
-                            if wrong_lane_commit or no_progress_same_edge:
+                            if wrong_lane_commit or stalled_timeout or hard_timeout:
                                 decision_metrics["same_edge_pending_released_no_progress"] += 1
-                                decision_metrics["pending_resolved_abort_no_progress"] += 1
+                                if stalled_timeout or hard_timeout:
+                                    decision_metrics["pending_decision_timeouts"] += 1
+                                    decision_metrics["pending_resolved_timeout"] += 1
+                                else:
+                                    decision_metrics["pending_resolved_abort_no_progress"] += 1
                                 pending_decisions.pop(vehicle_id, None)
                                 lane_change_cooldown_until[(vehicle_id, current_edge)] = step + self.decision_engine.cooldown_steps
 
@@ -2337,6 +2360,9 @@ class RLTrainingPipeline:
                                 "chosen_social_cost": chosen_cost,
                                 "baseline_social_cost": baseline_cost,
                                 "selfless_delta": selfless_delta,
+                                "phase": "route_pending",
+                                "best_dist_to_end": float(context.dist_to_end),
+                                "last_progress_step": int(step),
                             },
                         )
                         lane_change_deferrals[vehicle_id] = 0
