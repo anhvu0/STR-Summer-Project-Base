@@ -52,6 +52,8 @@ class QLearningPolicy(RouteController):
             "cooldown_replans_blocked": 0,
             "loop_override_count": 0,
             "dead_end_reentry_override_count": 0,
+            "policy_candidates_with_broader_available": 0,
+            "policy_candidates_collapsed_to_lane_now_only": 0,
         }
         self._last_metrics_snapshot = None
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
@@ -64,7 +66,8 @@ class QLearningPolicy(RouteController):
         self.distance_tiebreak_scale = 0.05
         self.edge_embedding_dim = 8
         self.local_congestion_k = 6
-        self.compact_state_size = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 3 + self.local_congestion_k
+        # Must match RLTrainingPipeline compact state size; retrained models are required when this changes.
+        self.compact_state_size = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 3 + self.local_congestion_k + 30
         self.legacy_state_size = 2 + 6 + 3 + 3 + len(self.connection_info.edge_list)
         self.use_compact_state = (self.model_state_size == self.compact_state_size)
         self.density_scale_m = 100.0
@@ -129,6 +132,85 @@ class QLearningPolicy(RouteController):
             current_density - mean_global,
             std_global,
         ]
+
+    def _per_action_branch_features(self, context, destination):
+        features = np.zeros(30, dtype=np.float32)
+        lane_now = set(context.lane_feasible_now_actions)
+        for action_idx in range(6):
+            base = action_idx * 5
+            if action_idx not in context.edge_valid_actions:
+                continue
+            next_edge = self.decision_engine.get_next_edge(context.edge_id, action_idx)
+            if next_edge is None:
+                continue
+            features[base + 0] = float(context.required_lane_shift.get(action_idx, 0)) / 3.0
+            features[base + 1] = 1.0 if action_idx in lane_now else 0.0
+            features[base + 2] = float(self._edge_density(next_edge))
+            eta = self._estimate_eta(next_edge, destination)
+            features[base + 3] = min(float(eta) / 2000.0, 1.0) if np.isfinite(eta) else 1.0
+            social = (1.25 * float(self._edge_density(next_edge))) + (0.01 * float(eta) if np.isfinite(eta) else 20.0)
+            features[base + 4] = min(float(social), 10.0)
+        return features
+
+    def _policy_action_candidates(self, context, recent_history, cooldown_active, destination):
+        available_actions = list(context.available_actions)
+        if not available_actions:
+            return []
+
+        lane_now = set(context.lane_feasible_now_actions)
+        recent_history = list(recent_history or [])
+        commit_distance = max(
+            float(self.decision_engine.commit_min_distance),
+            float(context.speed) * float(self.decision_engine.commit_time_s),
+        )
+        extra_buffer = max(10.0, 0.5 * float(self.decision_engine.lane_change_margin_m))
+        comfortable_dist_threshold = commit_distance + extra_buffer
+
+        safe_lane_now_actions = []
+        strict_non_lane_actions = []
+        filtered_available_actions = []
+
+        for action in available_actions:
+            safe_ok, _ = self.decision_engine.prefilter_action_for_loops(
+                context=context,
+                action_idx=action,
+                destination=destination,
+                recent_history=recent_history,
+                distance_fn=self._dist_to_dest,
+                distance_slack=self.score_slack,
+            )
+            if not safe_ok:
+                continue
+            filtered_available_actions.append(action)
+            if action in lane_now:
+                safe_lane_now_actions.append(action)
+                continue
+            if cooldown_active:
+                continue
+            if context.commit_window:
+                continue
+            if float(context.speed) < 1.2:
+                continue
+            if int(context.required_lane_shift.get(action, 99)) != 1:
+                continue
+            if float(context.dist_to_end) <= comfortable_dist_threshold:
+                continue
+            strict_non_lane_actions.append(action)
+
+        policy_actions = sorted(set(safe_lane_now_actions) | set(strict_non_lane_actions))
+        if not policy_actions:
+            policy_actions = sorted(set(filtered_available_actions))
+        if not policy_actions:
+            return available_actions
+
+        available_unique = set(available_actions)
+        lane_now_unique = set(safe_lane_now_actions)
+        policy_unique = set(policy_actions)
+        if len(available_unique) > len(lane_now_unique):
+            self._metrics["policy_candidates_with_broader_available"] += 1
+            if policy_unique == lane_now_unique and len(policy_unique) < len(available_unique):
+                self._metrics["policy_candidates_collapsed_to_lane_now_only"] += 1
+        return policy_actions
 
 
     
@@ -372,7 +454,16 @@ class QLearningPolicy(RouteController):
                 continue
             else:
                 state = self.getState(vid, start_edge, vehicle.destination, context=context)
-                action_idx = self.act(state, available_actions=context.available_actions)
+                cooldown_until = self._lane_change_cooldown.get((vid, start_edge), -1)
+                cooldown_active = step < cooldown_until
+                recent = list(self._recent_edges.get(vid, deque(maxlen=self.loop_window)))
+                policy_actions = self._policy_action_candidates(
+                    context=context,
+                    recent_history=recent,
+                    cooldown_active=cooldown_active,
+                    destination=vehicle.destination,
+                )
+                action_idx = self.act(state, available_actions=policy_actions)
                 self._metrics["decisions"] += 1
 
             if action_idx not in context.available_actions:
@@ -563,6 +654,7 @@ class QLearningPolicy(RouteController):
 
         if self.use_compact_state:
             state.extend(self._local_congestion_features(en))
+            state.extend(self._per_action_branch_features(context, destination_edge).tolist())
         else:
             for edge_now in self.connection_info.edge_list:
                 state.append(self._edge_density(edge_now))

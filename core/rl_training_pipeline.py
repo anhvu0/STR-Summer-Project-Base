@@ -338,6 +338,7 @@ class RLTrainingPipeline:
         self.travel_time_penalty = 0.05
         self.eta_progress_scale = 0.65
         self.distance_tiebreak_scale = 0.06
+        self.score_slack = 30.0
         self.reward_clip_low = -20.0
         self.reward_clip_high = 20.0
         self.pending_timeout_penalty = -8.0
@@ -369,10 +370,12 @@ class RLTrainingPipeline:
         #         + edge/lane/reachable/available feasibility masks (4*6)
         #         + commit flag + 3 lane features + 3 travel-time features
         #         + local congestion summary
+        #         + per-action branch features (6 actions * 5 features)
+        # NOTE: compact-state size changed; retraining is required.
         self.edge_embedding_dim = 8
         self.local_congestion_k = 6
         self._init_edge_embeddings(seed=1337)
-        self.state_size = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 3 + self.local_congestion_k
+        self.state_size = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 3 + self.local_congestion_k + 30
         self.action_size = 6
         self.metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_episode_metrics.csv")
         self._density_vec = np.zeros(len(self.connection_info.edge_list), dtype=np.float32)
@@ -666,6 +669,28 @@ class RLTrainingPipeline:
             dtype=np.float32,
         )
 
+    def _per_action_branch_features(self, context, destination):
+        features = np.zeros(30, dtype=np.float32)
+        lane_now = set(context.lane_feasible_now_actions)
+        for action_idx in range(6):
+            base = action_idx * 5
+            if action_idx not in context.edge_valid_actions:
+                continue
+            next_edge = self.decision_engine.get_next_edge(context.edge_id, action_idx)
+            if next_edge is None:
+                continue
+            features[base + 0] = float(context.required_lane_shift.get(action_idx, 0)) / 3.0
+            features[base + 1] = 1.0 if action_idx in lane_now else 0.0
+            features[base + 2] = float(self._edge_density(next_edge))
+            eta = self._estimate_remaining_eta(next_edge, destination)
+            features[base + 3] = (
+                min(float(eta) / float(MAX_SIMULATION_STEPS), 1.0)
+                if math.isfinite(eta) else 1.0
+            )
+            social = self._action_social_cost_proxy(context.edge_id, action_idx, destination)
+            features[base + 4] = min(float(social), 10.0) if math.isfinite(social) else 10.0
+        return features
+
     def parse_sumocfg(self, sumocfg_path):
         """
         Parse the SUMO config file and return net and route filenames.
@@ -726,7 +751,10 @@ class RLTrainingPipeline:
             )
             state[objective_base + 2] = min(float(density), 1.0)
 
-        state[objective_base + 3:] = self._local_congestion_features(edge_id)
+        local_congestion = self._local_congestion_features(edge_id)
+        congestion_end = objective_base + 3 + self.local_congestion_k
+        state[objective_base + 3:congestion_end] = local_congestion
+        state[congestion_end:congestion_end + 30] = self._per_action_branch_features(context, destination_edge)
         return state.reshape(1, -1)
     
     def valid_actions_for_vehicle(self, vehicle_id, edge_id, destination_edge, step):
@@ -772,6 +800,7 @@ class RLTrainingPipeline:
                 destination=destination,
                 recent_history=recent_history,
                 distance_fn=self.get_distance_to_destination,
+                distance_slack=self.score_slack,
             )
             if not safe_ok:
                 continue
@@ -793,19 +822,18 @@ class RLTrainingPipeline:
                 continue
             strict_non_lane_actions.append(action)
 
-        # Dominant learning space: lane-feasible-now actions if any safe options exist.
-        policy_actions = sorted(set(safe_lane_now_actions)) if safe_lane_now_actions else sorted(set(strict_non_lane_actions))
+        policy_actions = sorted(set(safe_lane_now_actions) | set(strict_non_lane_actions))
         if not policy_actions:
             policy_actions = sorted(set(filtered_available_actions))
         if not policy_actions:
             return available_actions
         if decision_metrics is not None:
             available_unique = set(available_actions)
-            lane_now_unique = set(context.lane_feasible_now_actions)
+            lane_now_unique = set(safe_lane_now_actions)
             policy_unique = set(policy_actions)
             if len(available_unique) > len(lane_now_unique):
                 decision_metrics["policy_candidates_with_broader_available"] += 1
-                if policy_unique == set(safe_lane_now_actions) and len(policy_unique) < len(available_unique):
+                if policy_unique == lane_now_unique and len(policy_unique) < len(available_unique):
                     decision_metrics["policy_candidates_collapsed_to_lane_now_only"] += 1
         return policy_actions
     
@@ -2434,10 +2462,10 @@ class RLTrainingPipeline:
                 p95_network_density = (
                     float(np.percentile(p95_density_samples, 95)) if p95_density_samples else 0.0
                 )
-                lane_change_success_rate = (
+                lane_change_request_success_rate = (
                     float(decision_metrics["lane_change_success"]) / float(max(decision_metrics["lane_change_attempts"], 1.0))
                 )
-                lane_change_failure_rate = (
+                lane_change_request_failure_rate = (
                     float(decision_metrics["lane_change_fail"]) / float(max(decision_metrics["lane_change_attempts"], 1.0))
                 )
                 if completed_travel_times:
@@ -2493,6 +2521,8 @@ class RLTrainingPipeline:
                 pending_resolution_success_rate = (
                     float(decision_metrics["pending_resolved_success"]) / float(max(pending_resolved_total, 1.0))
                 )
+                lane_change_success_rate = lane_change_request_success_rate
+                lane_change_failure_rate = lane_change_request_failure_rate
                 if len(completed_travel_times) > 1 and avg_travel_time > 0:
                     sorted_tt = sorted(float(tt) for tt in completed_travel_times)
                     n_tt = len(sorted_tt)
@@ -2631,6 +2661,15 @@ class RLTrainingPipeline:
                         pending_resolution_success_rate,
                         delay_fairness_gini,
                         loop_after_fallback_rate,
+                    )
+                )
+                print(
+                    "  lane-change success diagnostics: lane_change_request_success_rate={:.1%} "
+                    "lane_change_request_failure_rate={:.1%} "
+                    "pending_lane_change_resolution_success_rate={:.1%} (main deferred metric)".format(
+                        lane_change_request_success_rate,
+                        lane_change_request_failure_rate,
+                        pending_resolution_success_rate,
                     )
                 )
                 print(
