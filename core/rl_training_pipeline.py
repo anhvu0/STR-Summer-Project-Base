@@ -328,7 +328,9 @@ class RLTrainingPipeline:
         self._distance_cache = {}
         self._cache_metrics = defaultdict(float)
         self.progress_reward_scale = 1.00
-        self.system_congestion_scale = 0.10
+        self.system_congestion_scale = 0.04
+        self.selfless_reward_scale = 0.35
+        self.selfless_reward_clip = 3.0
         self.loop_window = 12
         self.loop_repeat_penalty = 1.5
         # Objective priority:
@@ -1279,6 +1281,7 @@ class RLTrainingPipeline:
         uturn_repeat=False,
         long_horizon_loop=False,
         externality_penalty=0.0,
+        selfless_delta=0.0,
         terminal_outcome=None,
     ):
         """
@@ -1301,12 +1304,14 @@ class RLTrainingPipeline:
         time_cost_scale = self._get_route_difficulty_scale(vehicle, prev_edge)
         reward -= self.travel_time_penalty * time_cost_scale * elapsed
         edge_density = self._edge_density(current_edge)
-        reward -= 0.015 * edge_density * elapsed
-        reward -= float(np.clip(externality_penalty, 0.0, 1.5))
+        reward -= 0.005 * edge_density * elapsed
 
         mean_density = float(self._density_mean)
         marginal_pressure = max(edge_density - mean_density, 0.0)
         reward -= self.system_congestion_scale * marginal_pressure * elapsed
+        reward += self.selfless_reward_scale * float(
+            np.clip(selfless_delta, -self.selfless_reward_clip, self.selfless_reward_clip)
+        )
 
         # Progress shaping using ETA and distance improvement.
         if math.isfinite(prev_eta) and math.isfinite(curr_eta):
@@ -1368,8 +1373,7 @@ class RLTrainingPipeline:
         reward = -self.travel_time_penalty * time_cost_scale * elapsed
 
         edge_density = self._edge_density(edge_id)
-        reward -= 0.015 * edge_density * elapsed
-        reward -= float(np.clip(externality_penalty, 0.0, 1.5))
+        reward -= 0.005 * edge_density * elapsed
 
         mean_density = float(self._density_mean)
         marginal_pressure = max(edge_density - mean_density, 0.0)
@@ -1650,6 +1654,7 @@ class RLTrainingPipeline:
                                 uturn_repeat=loop_signals["aba_bounce"] or loop_signals["short_cycle"],
                                 long_horizon_loop=loop_signals.get("long_horizon_loop") or loop_signals.get("revisit_without_progress"),
                                 externality_penalty=ext_pen,
+                                selfless_delta=float(pending.metadata.get("selfless_delta", 0.0)),
                             )
                             next_ctx = self.decision_engine.build_context(
                                 vehicle_id,
@@ -2247,12 +2252,21 @@ class RLTrainingPipeline:
                             a for a in context.available_actions
                             if self.decision_engine.get_next_edge(current_edge, a) is not None
                         ]
+                        candidate_costs = {
+                            a: self._action_social_cost_proxy(current_edge, a, vehicle.destination)
+                            for a in candidate_actions
+                        }
+                        finite_costs = {a: c for a, c in candidate_costs.items() if math.isfinite(c)}
+                        chosen_cost = float(candidate_costs.get(action, math.inf))
+                        baseline_actions = context.lane_feasible_now_actions if context.lane_feasible_now_actions else candidate_actions
+                        baseline_finite_costs = [
+                            candidate_costs.get(a, math.inf)
+                            for a in baseline_actions
+                            if math.isfinite(candidate_costs.get(a, math.inf))
+                        ]
+                        baseline_cost = float(min(baseline_finite_costs)) if baseline_finite_costs else math.inf
+                        selfless_delta = float(baseline_cost - chosen_cost) if math.isfinite(chosen_cost) and math.isfinite(baseline_cost) else 0.0
                         if len(candidate_actions) > 1:
-                            candidate_costs = {
-                                a: self._action_social_cost_proxy(current_edge, a, vehicle.destination)
-                                for a in candidate_actions
-                            }
-                            finite_costs = {a: c for a, c in candidate_costs.items() if math.isfinite(c)}
                             if finite_costs and action in finite_costs:
                                 best_action = min(finite_costs, key=finite_costs.get)
                                 best_cost = finite_costs[best_action]
@@ -2317,7 +2331,13 @@ class RLTrainingPipeline:
                             context=context,
                             lane_change_requested=lane_change_requested,
                             route_fragment=list(full_route[1:]) if full_route else [],
-                            metadata={"action_source": action_source, "lane_change_deferrals": lane_change_deferrals.get(vehicle_id, 0)},
+                            metadata={
+                                "action_source": action_source,
+                                "lane_change_deferrals": lane_change_deferrals.get(vehicle_id, 0),
+                                "chosen_social_cost": chosen_cost,
+                                "baseline_social_cost": baseline_cost,
+                                "selfless_delta": selfless_delta,
+                            },
                         )
                         lane_change_deferrals[vehicle_id] = 0
                         decision_metrics["decisions_opened"] += 1
