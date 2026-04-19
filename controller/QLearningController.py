@@ -67,6 +67,7 @@ class QLearningPolicy(RouteController):
         self.compact_state_size = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 3 + self.local_congestion_k
         self.legacy_state_size = 2 + 6 + 3 + 3 + len(self.connection_info.edge_list)
         self.use_compact_state = (self.model_state_size == self.compact_state_size)
+        self.density_scale_m = 100.0
         self.direction_mask_start = (2 * self.edge_embedding_dim) if self.use_compact_state else 2
         self._init_edge_embeddings(seed=1337)
 
@@ -83,21 +84,39 @@ class QLearningPolicy(RouteController):
             np.zeros(self.edge_embedding_dim, dtype=np.float32),
         )
 
+    def _edge_lane_count(self, edge_id):
+        return max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1)
+
+    def _edge_lane_meters(self, edge_id):
+        edge_len = max(float(self.connection_info.edge_length_dict.get(edge_id, 5.0)), 5.0)
+        return edge_len * float(self._edge_lane_count(edge_id))
+
+    def _edge_density(self, edge_id):
+        count = traci.edge.getLastStepVehicleNumber(edge_id)
+        return (float(count) * float(self.density_scale_m)) / max(self._edge_lane_meters(edge_id), 5.0)
+
+    def _global_density_stats(self):
+        edge_list = self.connection_info.edge_list
+        if not edge_list:
+            return 0.0, 0.0
+
+        lane_meters = np.array([self._edge_lane_meters(edge) for edge in edge_list], dtype=np.float32)
+        densities = np.array([self._edge_density(edge) for edge in edge_list], dtype=np.float32)
+        total_vehicles = float(sum(traci.edge.getLastStepVehicleNumber(edge) for edge in edge_list))
+        total_lane_meters = float(np.sum(lane_meters))
+        mean_global = (total_vehicles * float(self.density_scale_m)) / max(total_lane_meters, 1.0)
+        std_global = float(np.sqrt(np.average((densities - mean_global) ** 2, weights=lane_meters)))
+        return mean_global, std_global
+
     def _local_congestion_features(self, edge_id):
-        lengths = self.connection_info.edge_length_dict
-        current_density = traci.edge.getLastStepVehicleNumber(edge_id) / max(lengths.get(edge_id, 5.0), 5.0)
+        current_density = self._edge_density(edge_id)
         outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
         outgoing_densities = [
-            traci.edge.getLastStepVehicleNumber(next_edge) / max(lengths.get(next_edge, 5.0), 5.0)
+            self._edge_density(next_edge)
             for next_edge in outgoing.values()
         ]
 
-        all_densities = [
-            traci.edge.getLastStepVehicleNumber(edge) / max(lengths.get(edge, 5.0), 5.0)
-            for edge in self.connection_info.edge_list
-        ]
-        mean_global = float(np.mean(all_densities)) if len(all_densities) > 0 else 0.0
-        std_global = float(np.std(all_densities)) if len(all_densities) > 0 else 0.0
+        mean_global, std_global = self._global_density_stats()
         mean_out = float(np.mean(outgoing_densities)) if outgoing_densities else current_density
         max_out = float(np.max(outgoing_densities)) if outgoing_densities else current_density
         min_out = float(np.min(outgoing_densities)) if outgoing_densities else current_density
@@ -546,9 +565,7 @@ class QLearningPolicy(RouteController):
             state.extend(self._local_congestion_features(en))
         else:
             for edge_now in self.connection_info.edge_list:
-                car_num = traci.edge.getLastStepVehicleNumber(edge_now)
-                density = car_num / self.connection_info.edge_length_dict[edge_now]
-                state.append(density)
+                state.append(self._edge_density(edge_now))
 
         state = np.reshape(state, [1, len(state)])
         return state

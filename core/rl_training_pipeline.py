@@ -328,7 +328,7 @@ class RLTrainingPipeline:
         self._distance_cache = {}
         self._cache_metrics = defaultdict(float)
         self.progress_reward_scale = 1.00
-        self.system_congestion_scale = 0.015
+        self.system_congestion_scale = 0.10
         self.loop_window = 12
         self.loop_repeat_penalty = 1.5
         # Objective priority:
@@ -378,13 +378,16 @@ class RLTrainingPipeline:
         self._density_vec = np.zeros(len(self.connection_info.edge_list), dtype=np.float32)
         self._density_mean = 0.0
         self._density_std = 0.0
+        self._density_p95 = 0.0
+        # Density is now vehicles per 100m per lane; feature scale changed, retraining is required.
+        self.density_scale_m = 100.0
         self._last_density_step = -10**9
         self._lane_length_cache = {}
         self._passenger_edge_set = set(self.connection_info.edge_list)
-        self.congestion_density_threshold = 0.06
+        self.congestion_density_threshold = 0.30
         self.congestion_low_speed_threshold = 2.0
         self.emergency_decel_threshold = 4.5
-        self.teleport_jam_density_threshold = 0.09
+        self.teleport_jam_density_threshold = 0.55
         self.trainer = DQNTrainer(
             self.state_size,
             self.action_size,
@@ -594,12 +597,29 @@ class RLTrainingPipeline:
         next_edge = self.decision_engine.get_next_edge(current_edge, action_idx)
         if next_edge is None:
             return float("inf")
-        edge_len = max(self.connection_info.edge_length_dict.get(next_edge, 5.0), 5.0)
-        density = self.connection_info.edge_vehicle_count.get(next_edge, 0) / edge_len
+        density = self._edge_density(next_edge)
         eta_proxy = self._estimate_remaining_eta(next_edge, destination)
         if not math.isfinite(eta_proxy):
             eta_proxy = float(MAX_SIMULATION_STEPS)
         return (1.25 * float(density)) + (0.01 * float(eta_proxy))
+
+    def _edge_lane_count(self, edge_id):
+        return max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1)
+
+    def _edge_lane_meters(self, edge_id):
+        edge_len = max(float(self.connection_info.edge_length_dict.get(edge_id, 5.0)), 5.0)
+        return edge_len * float(self._edge_lane_count(edge_id))
+
+    def _edge_density(self, edge_id, count=None):
+        if count is None:
+            count = self.connection_info.edge_vehicle_count.get(edge_id, 0)
+        return (float(count) * float(self.density_scale_m)) / max(self._edge_lane_meters(edge_id), 5.0)
+
+    def _occupied_density_p95(self, density_vec):
+        occupied = density_vec[density_vec > 0.0]
+        if occupied.size == 0:
+            return 0.0
+        return float(np.percentile(occupied, 95))
 
     def _init_edge_embeddings(self, seed=1337):
         """
@@ -621,13 +641,10 @@ class RLTrainingPipeline:
         """
         Compact congestion summary around current edge to reduce input noise.
         """
-        counts = self.connection_info.edge_vehicle_count
-        lengths = self.connection_info.edge_length_dict
-
-        current_density = counts.get(edge_id, 0) / max(lengths.get(edge_id, 5.0), 5.0)
+        current_density = self._edge_density(edge_id)
         outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
         outgoing_densities = [
-            counts.get(next_edge, 0) / max(lengths.get(next_edge, 5.0), 5.0)
+            self._edge_density(next_edge)
             for next_edge in outgoing.values()
         ]
 
@@ -700,9 +717,7 @@ class RLTrainingPipeline:
                 step = int(snapshot.step) if snapshot is not None else 0
             elapsed = max(float(step) - float(vehicle.start_time), 0.0)
             remaining_eta = self._estimate_remaining_eta(edge_id, destination_edge)
-            density = self.connection_info.edge_vehicle_count.get(edge_id, 0) / max(
-                self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0
-            )
+            density = self._edge_density(edge_id)
 
             state[objective_base + 0] = min(elapsed / float(MAX_SIMULATION_STEPS), 1.0)
             state[objective_base + 1] = (
@@ -1242,13 +1257,11 @@ class RLTrainingPipeline:
         # Dense shaping: small living/time and congestion costs.
         time_cost_scale = self._get_route_difficulty_scale(vehicle, prev_edge)
         reward -= self.travel_time_penalty * time_cost_scale * elapsed
-        congestion = self.connection_info.edge_vehicle_count.get(current_edge, 0)
-        edge_len = max(self.connection_info.edge_length_dict.get(current_edge, 5.0), 5.0)
-        edge_density = congestion / edge_len
+        edge_density = self._edge_density(current_edge)
         reward -= 0.015 * edge_density * elapsed
         reward -= float(np.clip(externality_penalty, 0.0, 1.5))
 
-        mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
+        mean_density = float(self._density_mean)
         marginal_pressure = max(edge_density - mean_density, 0.0)
         reward -= self.system_congestion_scale * marginal_pressure * elapsed
 
@@ -1313,13 +1326,11 @@ class RLTrainingPipeline:
         time_cost_scale = self._get_route_difficulty_scale(vehicle, edge_id)
         reward = -self.travel_time_penalty * time_cost_scale * elapsed
 
-        congestion = self.connection_info.edge_vehicle_count.get(edge_id, 0)
-        edge_len = max(self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0)
-        edge_density = congestion / edge_len
+        edge_density = self._edge_density(edge_id)
         reward -= 0.015 * edge_density * elapsed
         reward -= float(np.clip(externality_penalty, 0.0, 1.5))
 
-        mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
+        mean_density = float(self._density_mean)
         marginal_pressure = max(edge_density - mean_density, 0.0)
         reward -= self.system_congestion_scale * marginal_pressure * elapsed
         reward -= self.pending_latency_penalty_per_step * float(max(pending_age, 0))
@@ -1475,18 +1486,18 @@ class RLTrainingPipeline:
                     vehicle_ids = list(vehicle_get_ids())
                     controlled_live_ids = [vid for vid in vehicle_ids if vid in vehicles]
                     step_snapshots = self.collect_vehicle_snapshots(controlled_live_ids, step)
-                    if len(self._density_vec) > 0:
-                        step_mean_density = float(np.mean(self._density_vec))
-                        step_p95_density = float(np.percentile(self._density_vec, 95))
-                        mean_density_samples.append(step_mean_density)
-                        p95_density_samples.append(step_p95_density)
-                    else:
-                        step_mean_density = 0.0
+                    step_mean_density = float(self._density_mean)
+                    step_p95_density = float(self._density_p95)
+                    mean_density_samples.append(step_mean_density)
+                    p95_density_samples.append(step_p95_density)
 
                     if step_snapshots:
                         mean_controlled_speed = float(np.mean([snap.speed for snap in step_snapshots.values()]))
+                        mean_controlled_edge_density = float(
+                            np.mean([self._edge_density(snapshot.edge_id) for snapshot in step_snapshots.values()])
+                        )
                         if (
-                            step_mean_density >= self.congestion_density_threshold
+                            mean_controlled_edge_density >= self.congestion_density_threshold
                             and mean_controlled_speed <= self.congestion_low_speed_threshold
                         ):
                             congestion_high_pressure_steps += 1
@@ -1512,9 +1523,7 @@ class RLTrainingPipeline:
                                 if leader_info and len(leader_info) >= 2 and float(leader_info[1]) < 10.0:
                                     emergency_reason = "leader"
                                 else:
-                                    edge_density = self.connection_info.edge_vehicle_count.get(snapshot.edge_id, 0) / max(
-                                        self.connection_info.edge_length_dict.get(snapshot.edge_id, 5.0), 5.0
-                                    )
+                                    edge_density = self._edge_density(snapshot.edge_id)
                                     if edge_density >= self.congestion_density_threshold:
                                         emergency_reason = "congestion"
                                     elif snapshot.dist_to_end <= 20.0:
@@ -1583,7 +1592,7 @@ class RLTrainingPipeline:
                                 decision_metrics["long_horizon_loop_events"] += 1
                             if loop_signals.get("revisit_without_progress"):
                                 decision_metrics["revisit_without_progress_events"] += 1
-                            ext_pen = max(self.connection_info.edge_vehicle_count.get(current_edge, 0) / max(self.connection_info.edge_length_dict.get(current_edge, 10.0), 10.0), 0.0)
+                            ext_pen = max(self._edge_density(current_edge), 0.0)
                             prev_distance = self.get_distance_to_destination(pending.decision_edge, vehicle.destination)
                             curr_distance = self.get_distance_to_destination(current_edge, vehicle.destination)
                             prev_eta = self._estimate_remaining_eta(pending.decision_edge, vehicle.destination)
@@ -1638,10 +1647,8 @@ class RLTrainingPipeline:
                             outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
                             if (not outgoing or len(outgoing) == 0) and current_edge != vehicle.destination:
                                 decision_metrics["fail_dead_end_no_outgoing"] += 1
-                            edge_density = self.connection_info.edge_vehicle_count.get(current_edge, 0) / max(
-                                self.connection_info.edge_length_dict.get(current_edge, 5.0), 5.0
-                            )
-                            mean_density = float(np.mean(self._density_vec)) if len(self._density_vec) > 0 else 0.0
+                            edge_density = self._edge_density(current_edge)
+                            mean_density = float(self._density_mean)
                             marginal_pressure = max(edge_density - mean_density, 0.0)
                             decision_debug_rows.append(self._build_decision_debug_row(
                                 episode=episode,
@@ -1835,11 +1842,7 @@ class RLTrainingPipeline:
                             pending_age_samples.append(float(pending_age))
                             elapsed_pending = max(step - pending.last_credit_step, 0)
                             if elapsed_pending > 0:
-                                ext_pen = max(
-                                    self.connection_info.edge_vehicle_count.get(current_edge, 0)
-                                    / max(self.connection_info.edge_length_dict.get(current_edge, 10.0), 10.0),
-                                    0.0,
-                                )
+                                ext_pen = max(self._edge_density(current_edge), 0.0)
                                 pending_reward = self.compute_pending_step_reward(
                                     vehicle,
                                     current_edge,
@@ -2282,9 +2285,7 @@ class RLTrainingPipeline:
                             if not edge_id:
                                 decision_metrics["teleport_inferred_yield_or_deadlock"] += 1
                                 continue
-                            edge_density = self.connection_info.edge_vehicle_count.get(edge_id, 0) / max(
-                                self.connection_info.edge_length_dict.get(edge_id, 5.0), 5.0
-                            )
+                            edge_density = self._edge_density(edge_id)
                             if edge_density >= self.teleport_jam_density_threshold:
                                 decision_metrics["teleport_inferred_jam"] += 1
                             else:
@@ -2858,19 +2859,23 @@ class RLTrainingPipeline:
 
         counts = self.connection_info.edge_vehicle_count
         edge_list = self.connection_info.edge_list
-        lengths = self.connection_info.edge_length_dict
 
         for edge in edge_list:
             counts[edge] = traci.edge.getLastStepVehicleNumber(edge)
 
-        self._density_vec = np.array(
-            [counts[e] / max(lengths.get(e, 1e-6), 1e-6) for e in edge_list],
-            dtype=np.float32
-        )
-        if len(self._density_vec) > 0:
-            self._density_mean = float(np.mean(self._density_vec))
-            self._density_std = float(np.std(self._density_vec))
+        lane_meters_vec = np.array([self._edge_lane_meters(e) for e in edge_list], dtype=np.float32)
+        self._density_vec = np.array([self._edge_density(e, counts[e]) for e in edge_list], dtype=np.float32)
+
+        if len(self._density_vec) > 0 and len(lane_meters_vec) > 0:
+            total_vehicles = float(sum(counts[e] for e in edge_list))
+            total_lane_meters = float(np.sum(lane_meters_vec))
+            self._density_mean = (total_vehicles * float(self.density_scale_m)) / max(total_lane_meters, 1.0)
+
+            density_diff_sq = (self._density_vec - self._density_mean) ** 2
+            self._density_std = float(np.sqrt(np.average(density_diff_sq, weights=lane_meters_vec)))
+            self._density_p95 = self._occupied_density_p95(self._density_vec)
         else:
             self._density_mean = 0.0
             self._density_std = 0.0
+            self._density_p95 = 0.0
         self._last_density_step = step
