@@ -70,18 +70,18 @@ class JunctionDecisionEngine:
 
         self.base_reaction_distance = 25.0
         self.reaction_time_s = 1.3
-        self.commit_time_s = 0.6
-        self.lane_change_margin_m = 18.0
-        self.commit_min_distance = 10.0
+        self.commit_time_s = 0.45
+        self.lane_change_margin_m = 14.0
+        self.commit_min_distance = 8.0
         self.default_fragment_horizon_m = 180.0
-        self.pending_timeout_steps = 18
-        self.lane_change_defer_limit = 4
+        self.pending_timeout_steps = 22
+        self.lane_change_defer_limit = 6
         self.observe_steps_min = 2
-        self.observe_steps_max = 6
-        self.observe_low_speed_mps = 0.8
-        self.observe_stall_steps = 3
+        self.observe_steps_max = 8
+        self.observe_low_speed_mps = 0.5
+        self.observe_stall_steps = 5
         self.cooldown_steps = 1
-        self.pending_progress_timeout_steps = 14
+        self.pending_progress_timeout_steps = 22
         self.loop_distance_slack = 30.0
 
     def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
@@ -143,22 +143,47 @@ class JunctionDecisionEngine:
         commit_window = dist_to_end <= commit_distance
 
         available = []
+
         if commit_window:
+            # Soft commit window:
+            # keep lane-now actions, but still admit one-lane proactive actions
+            # if there is still a little room left.
             available = list(lane_now)
+            for idx in edge_valid:
+                if idx in lane_now:
+                    continue
+                shift = required_shift.get(idx, 999)
+                if shift != 1:
+                    continue
+                if speed < 0.5:
+                    continue
+                if dist_to_end < max(6.0, 0.75 * commit_distance):
+                    continue
+                available.append(idx)
         else:
             lane_change_budget = max(dist_to_end - commit_distance, 0.0)
             for idx in edge_valid:
                 if idx in lane_now:
                     available.append(idx)
                     continue
+
                 shift = required_shift.get(idx, 999)
-                dynamic_margin = self.lane_change_margin_m * (1.0 + 0.5 * max(0, shift - 1))
-                low_speed = speed < 1.2
-                aggressive_shift = shift >= 2 and dist_to_end < (dynamic_margin + commit_distance + reaction_distance)
-                if low_speed or aggressive_shift:
+                if shift >= 999:
                     continue
-                required_budget = (0.7 * dynamic_margin) if shift == 1 else (shift * dynamic_margin)
-                if shift < 999 and lane_change_budget >= required_budget and dist_to_end >= reaction_distance:
+                if speed < 0.5:
+                    continue
+
+                dynamic_margin = self.lane_change_margin_m * (1.0 + 0.35 * max(0, shift - 1))
+
+                # Softer budget requirements than current code:
+                if shift == 1:
+                    required_budget = 0.55 * dynamic_margin
+                elif shift == 2:
+                    required_budget = 0.85 * (2.0 * self.lane_change_margin_m)
+                else:
+                    continue
+
+                if lane_change_budget >= required_budget and dist_to_end >= max(0.7 * reaction_distance, 12.0):
                     available.append(idx)
 
         available = sorted(set(available))
@@ -253,7 +278,7 @@ class JunctionDecisionEngine:
         toward_target = current_shift < last_shift
         lane_changed = context.lane_index != last_lane
         feasible_now = action_idx in context.lane_feasible_now_actions
-        good_motion = context.speed >= self.observe_low_speed_mps and (not context.commit_window or context.dist_to_end > self.commit_min_distance)
+        good_motion = context.speed >= self.observe_low_speed_mps
         progressing = toward_target or lane_changed or feasible_now or good_motion
         if progressing:
             stall_steps = 0
@@ -267,14 +292,24 @@ class JunctionDecisionEngine:
 
         if feasible_now:
             return "success", None
-        if context.commit_window and action_idx not in context.lane_feasible_now_actions:
+
+        commit_window_grace = (
+            current_shift <= 1
+            and context.dist_to_end >= max(0.5 * self.commit_min_distance, 4.0)
+        )
+
+        if context.commit_window and action_idx not in context.lane_feasible_now_actions and not commit_window_grace:
             return "abort", "commit_window"
-        if context.speed < self.observe_low_speed_mps and observe_steps >= 1:
+
+        if context.speed < self.observe_low_speed_mps and observe_steps >= 2 and stall_steps >= 2:
             return "abort", "low_speed"
+
         if stall_steps >= self.observe_stall_steps:
             return "abort", "no_progress"
-        if observe_steps >= observe_limit:
+
+        if observe_steps >= observe_limit and current_shift >= last_shift and not lane_changed:
             return "abort", "no_progress"
+
         return "continue", None
 
     def lane_feasible_fallback_actions(self, context: DecisionContext, blocked_action: Optional[int] = None) -> List[int]:
@@ -309,7 +344,6 @@ class JunctionDecisionEngine:
         if not candidate_pool:
             return []
 
-        lane_now_set = set(context.lane_feasible_now_actions)
         scored = []
         for action in candidate_pool:
             safe_ok, details = self.prefilter_action_for_loops(
@@ -337,9 +371,7 @@ class JunctionDecisionEngine:
                     score += min(float(next_dist) / 250.0, 10.0)
                 else:
                     score += 25.0
-            score += 0.05 * float(context.required_lane_shift.get(action, 0))
-            if action in lane_now_set:
-                score -= 0.25
+            score += 0.12 * float(context.required_lane_shift.get(action, 0))
             scored.append((score, action))
         scored.sort(key=lambda x: x[0])
         return [action for _, action in scored]

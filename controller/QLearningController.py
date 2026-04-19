@@ -54,6 +54,10 @@ class QLearningPolicy(RouteController):
             "dead_end_reentry_override_count": 0,
             "policy_candidates_with_broader_available": 0,
             "policy_candidates_collapsed_to_lane_now_only": 0,
+            "soft_commit_window_admissions": 0,
+            "observe_abort_low_speed": 0,
+            "pending_commit_window_grace_kept": 0,
+            "proactive_shift2_candidates_kept": 0,
         }
         self._last_metrics_snapshot = None
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
@@ -163,11 +167,11 @@ class QLearningPolicy(RouteController):
             float(self.decision_engine.commit_min_distance),
             float(context.speed) * float(self.decision_engine.commit_time_s),
         )
-        extra_buffer = max(10.0, 0.5 * float(self.decision_engine.lane_change_margin_m))
+        extra_buffer = max(6.0, 0.35 * float(self.decision_engine.lane_change_margin_m))
         comfortable_dist_threshold = commit_distance + extra_buffer
 
         safe_lane_now_actions = []
-        strict_non_lane_actions = []
+        proactive_actions = []
         filtered_available_actions = []
 
         for action in available_actions:
@@ -185,19 +189,31 @@ class QLearningPolicy(RouteController):
             if action in lane_now:
                 safe_lane_now_actions.append(action)
                 continue
-            if cooldown_active:
+            if cooldown_active and len(safe_lane_now_actions) > 0:
                 continue
-            if context.commit_window:
+            if float(context.speed) < 0.5:
                 continue
-            if float(context.speed) < 1.2:
+
+            max_shift = 2 if float(context.dist_to_end) >= (
+                comfortable_dist_threshold + float(self.decision_engine.lane_change_margin_m)
+            ) else 1
+
+            required_shift = int(context.required_lane_shift.get(action, 99))
+
+            if context.commit_window and required_shift > 1:
                 continue
-            if int(context.required_lane_shift.get(action, 99)) != 1:
+            if required_shift > max_shift:
                 continue
             if float(context.dist_to_end) <= comfortable_dist_threshold:
                 continue
-            strict_non_lane_actions.append(action)
 
-        policy_actions = sorted(set(safe_lane_now_actions) | set(strict_non_lane_actions))
+            proactive_actions.append(action)
+            if required_shift == 2:
+                self._metrics["proactive_shift2_candidates_kept"] += 1
+            if context.commit_window and required_shift == 1:
+                self._metrics["soft_commit_window_admissions"] += 1
+
+        policy_actions = sorted(set(safe_lane_now_actions) | set(proactive_actions))
         if not policy_actions:
             policy_actions = sorted(set(filtered_available_actions))
         if not policy_actions:
@@ -309,11 +325,19 @@ class QLearningPolicy(RouteController):
                 self._metrics["same_edge_pending_released_no_progress"] += 1
                 self._lane_change_cooldown[(vid, vehicle.current_edge)] = step + self.decision_engine.cooldown_steps
                 return
-            if context.commit_window and pending.intended_action not in context.lane_feasible_now_actions:
+            current_shift = int(context.required_lane_shift.get(pending.intended_action, 99))
+            grace_keep = (
+                current_shift <= 1
+                and context.dist_to_end >= max(0.5 * self.decision_engine.commit_min_distance, 4.0)
+            )
+
+            if context.commit_window and pending.intended_action not in context.lane_feasible_now_actions and not grace_keep:
                 self._pending_decisions.pop(vid, None)
                 self._metrics["same_edge_pending_released_no_progress"] += 1
                 self._lane_change_cooldown[(vid, vehicle.current_edge)] = step + self.decision_engine.cooldown_steps
                 return
+            if context.commit_window and pending.intended_action not in context.lane_feasible_now_actions and grace_keep:
+                self._metrics["pending_commit_window_grace_kept"] += 1
             self._metrics["decision_committed_skips"] += 1
             return
         self._pending_decisions.pop(vid, None)
@@ -402,6 +426,9 @@ class QLearningPolicy(RouteController):
                         continue
                     if reason == "commit_window":
                         self._metrics["lane_change_observe_abort_commit_window"] += 1
+                    elif reason == "low_speed":
+                        self._metrics["observe_abort_low_speed"] += 1
+                        self._metrics["lane_change_observe_abort_no_progress"] += 1
                     else:
                         self._metrics["lane_change_observe_abort_no_progress"] += 1
                     self._lane_change_cooldown[(vid, start_edge)] = step + self.decision_engine.cooldown_steps
