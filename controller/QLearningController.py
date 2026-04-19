@@ -33,7 +33,7 @@ class QLearningPolicy(RouteController):
         self._pending_decisions = {}
         self._lane_change_deferrals = {}
         self._lane_change_cooldown = {}
-        self.step_control_extra_buffer_m = 12.0
+        self.step_control_extra_buffer_m = 35.0
         self._last_observed_edge = {}
         self._last_control_step = {}
         self._metrics = {
@@ -327,21 +327,37 @@ class QLearningPolicy(RouteController):
             if snapshot is None:
                 return
             context = self.decision_engine.build_context(str(vid), vehicle.current_edge, vehicle.destination, step, snapshot=snapshot)
-            if self.decision_engine.should_timeout_pending(pending, step, max_age_steps=self.decision_engine.pending_progress_timeout_steps):
-                self._pending_decisions.pop(vid, None)
-                self._metrics["pending_decision_timeouts"] += 1
-                self._metrics["same_edge_pending_released_no_progress"] += 1
-                self._lane_change_cooldown[(vid, vehicle.current_edge)] = step + self.decision_engine.cooldown_steps
-                return
+            metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
+            pending.metadata = metadata
+            best_dist = float(metadata.get("best_dist_to_end", context.dist_to_end))
+            last_progress_step = int(metadata.get("last_progress_step", pending.decision_step))
+            progress_eps = float(self.decision_engine.route_pending_progress_eps_m)
+            if context.dist_to_end <= (best_dist - progress_eps):
+                best_dist = float(context.dist_to_end)
+                last_progress_step = int(step)
+            metadata["best_dist_to_end"] = float(best_dist)
+            metadata["last_progress_step"] = int(last_progress_step)
+
             current_shift = int(context.required_lane_shift.get(pending.intended_action, 99))
             grace_keep = (
                 current_shift <= 1
                 and context.dist_to_end >= max(0.5 * self.decision_engine.commit_min_distance, 4.0)
             )
+            wrong_lane_commit = (
+                context.commit_window
+                and pending.intended_action not in context.lane_feasible_now_actions
+                and not grace_keep
+            )
+            stall_age = max(int(step) - int(last_progress_step), 0)
+            total_age = max(int(step) - int(pending.decision_step), 0)
+            stalled_timeout = stall_age >= int(self.decision_engine.route_pending_stall_steps)
+            hard_timeout = total_age >= int(self.decision_engine.route_pending_hard_timeout_steps)
 
-            if context.commit_window and pending.intended_action not in context.lane_feasible_now_actions and not grace_keep:
+            if wrong_lane_commit or stalled_timeout or hard_timeout:
                 self._pending_decisions.pop(vid, None)
                 self._metrics["same_edge_pending_released_no_progress"] += 1
+                if stalled_timeout or hard_timeout:
+                    self._metrics["pending_decision_timeouts"] += 1
                 self._lane_change_cooldown[(vid, vehicle.current_edge)] = step + self.decision_engine.cooldown_steps
                 return
             if context.commit_window and pending.intended_action not in context.lane_feasible_now_actions and grace_keep:
@@ -418,8 +434,16 @@ class QLearningPolicy(RouteController):
         near_threshold = reaction_distance + float(self.step_control_extra_buffer_m)
         near_junction = float(context.dist_to_end) <= float(near_threshold)
 
-        if not near_junction:
-            return False
+        commit_distance = max(
+            float(self.decision_engine.commit_min_distance),
+            float(snapshot.speed) * float(self.decision_engine.commit_time_s),
+        )
+        extra_buffer = max(6.0, 0.35 * float(self.decision_engine.lane_change_margin_m))
+        comfortable_dist_threshold = commit_distance + extra_buffer
+        proactive_control_threshold = max(
+            float(near_threshold),
+            float(comfortable_dist_threshold + 1.5 * float(self.decision_engine.lane_change_margin_m)),
+        )
 
         lane_now = set(context.lane_feasible_now_actions)
         proactive_candidates = [
@@ -430,12 +454,15 @@ class QLearningPolicy(RouteController):
         cooldown_until = self._lane_change_cooldown.get((vid, current_edge), -1)
         cooldown_active = int(step) < int(cooldown_until)
 
-        if self.decision_engine.is_decision_open(context):
-            self._metrics["step_control_near_junction"] += 1
+        if proactive_candidates and not cooldown_active and float(context.dist_to_end) <= proactive_control_threshold:
+            self._metrics["step_control_lane_change_candidate"] += 1
             return True
 
-        if proactive_candidates and not cooldown_active:
-            self._metrics["step_control_lane_change_candidate"] += 1
+        if not near_junction:
+            return False
+
+        if self.decision_engine.is_decision_open(context):
+            self._metrics["step_control_near_junction"] += 1
             return True
 
         return False
@@ -513,7 +540,7 @@ class QLearningPolicy(RouteController):
                             context=context,
                             lane_change_requested=True,
                             route_fragment=list(full_route[1:]) if full_route else [],
-                            metadata={"phase": "route_pending"},
+                            metadata={"phase": "route_pending", "best_dist_to_end": float(obs_context.dist_to_end), "last_progress_step": int(step)},
                         )
                         continue
                     if reason == "commit_window":
@@ -557,7 +584,7 @@ class QLearningPolicy(RouteController):
                         context=obs_context,
                         lane_change_requested=False,
                         route_fragment=list(full_route[1:]) if full_route else [],
-                        metadata={"phase": "route_pending"},
+                        metadata={"phase": "route_pending", "best_dist_to_end": float(obs_context.dist_to_end), "last_progress_step": int(step)},
                     )
                     continue
                 continue
@@ -686,7 +713,7 @@ class QLearningPolicy(RouteController):
                     context=context,
                     lane_change_requested=lane_change_requested,
                     route_fragment=list(full_route[1:]) if full_route else [],
-                    metadata={"phase": "route_pending"},
+                    metadata={"phase": "route_pending", "best_dist_to_end": float(context.dist_to_end), "last_progress_step": int(step)},
                 )
                 self._lane_change_deferrals[vid] = 0
             # Route already committed directly via shared apply_route_decision.
