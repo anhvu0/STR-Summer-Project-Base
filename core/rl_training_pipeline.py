@@ -82,11 +82,11 @@ class DQNTrainer:
         epsilon=1.0,
         epsilon_decay=0.99,
         epsilon_min=0.01,
-        replay_capacity=20000,
+        replay_capacity=100000,
         elite_replay_capacity=None,
         elite_fraction=0.25,
         batch_size=128,
-        replay_warmup=2000,
+        replay_warmup=10000,
         target_update_every=400,
         target_soft_tau=1.0,
         use_double_dqn=True,
@@ -116,6 +116,11 @@ class DQNTrainer:
         self.elite_memory = ReplayBuffer(elite_capacity)
         self.elite_transitions_added = 0
         self.elite_samples_drawn = 0
+        self.replay_main_kept_finalized = 0
+        self.replay_main_kept_pending_timeout = 0
+        self.replay_main_kept_terminal = 0
+        self.replay_main_kept_other = 0
+        self.replay_main_dropped = 0
         self.model = self.build_model(learning_rate)
         self.target_model = self._build_target_model()
         self.train_steps = 0
@@ -222,11 +227,52 @@ class DQNTrainer:
             return True
         return float(reward) >= 0.25
 
+    def _should_store_main_transition(self, reward, done, metadata):
+        metadata = metadata or {}
+        if metadata.get("override_learning", False):
+            return False
+        if metadata.get("imitation_credit", False):
+            return False
+        if metadata.get("synthetic_terminal_no_pending", False):
+            return False
+
+        terminal_outcome = metadata.get("terminal_outcome")
+        if terminal_outcome in {"global_arrival", "teleport", "timeout", "removed_nonarrival"}:
+            return True
+
+        if not metadata.get("decision_open", False):
+            return False
+        if int(metadata.get("available_count", 0)) < 2:
+            return False
+        if metadata.get("forced_action", False):
+            return False
+
+        return bool(
+            metadata.get("decision_finalized", False)
+            or metadata.get("pending_timeout_replan", False)
+            or metadata.get("observe_no_progress", False)
+            or metadata.get("observe_low_speed", False)
+            or metadata.get("observe_commit_window_miss", False)
+        )
+
     def remember(self, state, action, reward, next_state, done, next_valid_actions=None, metadata=None):
         """
         Store 1 transition for replay
         """
-        self.memory.add(state, action, reward, next_state, done, next_valid_actions, metadata=metadata)
+        metadata = metadata or {}
+        if self._should_store_main_transition(reward, done, metadata):
+            self.memory.add(state, action, reward, next_state, done, next_valid_actions, metadata=metadata)
+            terminal_outcome = metadata.get("terminal_outcome")
+            if terminal_outcome in {"global_arrival", "teleport", "timeout", "removed_nonarrival"}:
+                self.replay_main_kept_terminal += 1
+            elif metadata.get("decision_finalized", False):
+                self.replay_main_kept_finalized += 1
+            elif metadata.get("pending_timeout_replan", False):
+                self.replay_main_kept_pending_timeout += 1
+            else:
+                self.replay_main_kept_other += 1
+        else:
+            self.replay_main_dropped += 1
         if self._is_elite_transition(reward, done, metadata):
             self.elite_memory.add(state, action, reward, next_state, done, next_valid_actions, metadata=metadata)
             self.elite_transitions_added += 1
@@ -310,9 +356,9 @@ class RLTrainingPipeline:
         epsilon_decay=0.99,
         epsilon_min=0.01,
         gamma=0.97,
-        replay_capacity=20000,
+        replay_capacity=100000,
         batch_size=128,
-        replay_warmup=2000,
+        replay_warmup=10000,
         train_every=6,
         grad_steps=1,
         rolling_window=100,
@@ -1133,7 +1179,11 @@ class RLTrainingPipeline:
                 next_state,
                 done,
                 next_valid_actions=[],
-                metadata={"terminal_outcome": outcome, "synthetic_terminal_no_pending": True},
+                metadata={
+                    "terminal_outcome": outcome,
+                    "synthetic_terminal_no_pending": True,
+                    "decision_finalized": True,
+                },
             )
             decision_metrics["decisions_finalized"] += 1
             finalized_decision_rewards.append(float(reward))
@@ -1240,6 +1290,7 @@ class RLTrainingPipeline:
 
         final_metadata = dict(pending.metadata) if isinstance(pending.metadata, dict) else {}
         final_metadata["terminal_outcome"] = outcome
+        final_metadata["decision_finalized"] = True
         self.trainer.remember(
             pending.state,
             pending.intended_action,
@@ -1524,6 +1575,8 @@ class RLTrainingPipeline:
         csv_fields = [
             "episode", "epsilon", "replay", "train_steps", "mean_loss", "episode_return",
             "elite_buffer_size", "elite_transitions_added", "elite_samples_drawn",
+            "replay_main_finalized", "replay_main_pending_timeout", "replay_main_terminal",
+            "replay_main_dropped", "replay_main_other_kept",
             "completion_rate", "avg_travel_time", "p50_travel_time", "p90_travel_time", "teleports", "teleported_controlled",
             "forced_actions", "decisions_opened", "decisions_finalized", "decisions_skipped",
             "route_mismatch", "loop_events", "uturn_events",
@@ -1789,7 +1842,12 @@ class RLTrainingPipeline:
                                 next_state,
                                 done,
                                 next_valid_actions=next_ctx.available_actions,
-                                metadata={"forced": pending.context.forced_action is not None, "mismatch": mismatch},
+                                metadata={
+                                    **(pending.metadata if isinstance(pending.metadata, dict) else {}),
+                                    "forced": pending.context.forced_action is not None,
+                                    "mismatch": mismatch,
+                                    "decision_finalized": True,
+                                },
                             )
                             decision_metrics["decisions_finalized"] += 1
                             action_source = str(pending.metadata.get("action_source", ""))
@@ -1883,6 +1941,7 @@ class RLTrainingPipeline:
                                                 "override_cause": "route_apply_failure",
                                                 "route_apply_failed": True,
                                                 "observe_phase": True,
+                                                "decision_finalized": False,
                                             },
                                         )
                                         decision_metrics["override_learning_transitions"] += 1
@@ -1898,6 +1957,7 @@ class RLTrainingPipeline:
                                     pending.metadata["lane_now_count"] = int(len(obs_context.lane_feasible_now_actions))
                                     pending.metadata["forced_action"] = bool(obs_context.forced_action is not None)
                                     pending.metadata["action_source"] = pending.metadata.get("action_source", "policy")
+                                    pending.metadata["decision_finalized"] = False
                                     pending.intended_next_edge = committed_next_edge
                                     pending.route_fragment = list(full_route[1:]) if full_route else []
                                     pending.context = obs_context
@@ -1929,12 +1989,17 @@ class RLTrainingPipeline:
                                     False,
                                     next_valid_actions=obs_context.available_actions,
                                     metadata={
+                                        **(pending.metadata if isinstance(pending.metadata, dict) else {}),
                                         "override_learning": True,
                                         "observe_abort": reason or "no_progress",
+                                        "observe_no_progress": (reason or "no_progress") == "no_progress",
+                                        "observe_low_speed": (reason or "") == "low_speed",
+                                        "observe_commit_window_miss": (reason or "") == "commit_window",
                                         "override_cause": "lane_change_observe_abort",
                                         "abort_reason": reason or "no_progress",
                                         "override_type": "observe_abort_fallback",
                                         "original_action": pending.intended_action,
+                                        "decision_finalized": False,
                                     },
                                 )
                                 decision_metrics["override_learning_transitions"] += 1
@@ -1984,6 +2049,7 @@ class RLTrainingPipeline:
                                         "lane_now_count": int(len(obs_context.lane_feasible_now_actions)),
                                         "forced_action": bool(obs_context.forced_action is not None),
                                         "override_learning": True,
+                                        "decision_finalized": False,
                                     },
                                 )
                                 decision_metrics["fallback_overrides"] += 1
@@ -2012,6 +2078,7 @@ class RLTrainingPipeline:
                                         "original_action": pending.intended_action,
                                         "fallback_action": fallback_action,
                                         "imitation_credit": True,
+                                        "decision_finalized": False,
                                     },
                                 )
                                 decision_metrics["override_learning_transitions"] += 1
@@ -2055,7 +2122,11 @@ class RLTrainingPipeline:
                                     next_state,
                                     False,
                                     next_valid_actions=next_ctx.available_actions,
-                                    metadata={"interim_pending_credit": True},
+                                    metadata={
+                                        **(pending.metadata if isinstance(pending.metadata, dict) else {}),
+                                        "interim_pending_credit": True,
+                                        "decision_finalized": False,
+                                    },
                                 )
                                 episode_return += pending_reward
                                 pending.state = next_state
@@ -2086,7 +2157,11 @@ class RLTrainingPipeline:
                                     timeout_state,
                                     False,
                                     next_valid_actions=timeout_ctx.available_actions,
-                                    metadata={"pending_timeout_replan": True},
+                                    metadata={
+                                        **(pending.metadata if isinstance(pending.metadata, dict) else {}),
+                                        "pending_timeout_replan": True,
+                                        "decision_finalized": False,
+                                    },
                                 )
                                 episode_return += timeout_penalty
                                 decision_metrics["pending_decision_timeouts"] += 1
@@ -2274,6 +2349,7 @@ class RLTrainingPipeline:
                                     "original_action": original_action,
                                     "fallback_action": action,
                                     "override_cause": "loop_prefilter_fallback",
+                                    "decision_finalized": False,
                                 },
                             )
                             decision_metrics["override_learning_transitions"] += 1
@@ -2292,6 +2368,7 @@ class RLTrainingPipeline:
                                     "original_action": original_action,
                                     "fallback_action": action,
                                     "imitation_credit": True,
+                                    "decision_finalized": False,
                                 },
                             )
                             decision_metrics["override_learning_transitions"] += 1
@@ -2344,6 +2421,7 @@ class RLTrainingPipeline:
                                         "original_action": original_action,
                                         "fallback_action": action,
                                         "override_cause": "cooldown_fallback",
+                                        "decision_finalized": False,
                                     },
                                 )
                                 decision_metrics["override_learning_transitions"] += 1
@@ -2362,6 +2440,7 @@ class RLTrainingPipeline:
                                         "original_action": original_action,
                                         "fallback_action": action,
                                         "imitation_credit": True,
+                                        "decision_finalized": False,
                                     },
                                 )
                                 decision_metrics["override_learning_transitions"] += 1
@@ -2391,7 +2470,7 @@ class RLTrainingPipeline:
                                     context=context,
                                     lane_change_requested=lane_change_requested,
                                     route_fragment=[],
-                                    metadata={"action_source": action_source, **observe_metadata},
+                                    metadata={"action_source": action_source, "decision_finalized": False, **observe_metadata},
                                 )
                                 decision_metrics["decisions_opened"] += 1
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -2459,6 +2538,7 @@ class RLTrainingPipeline:
                                     "fallback_action": None,
                                     "override_cause": "route_apply_failure",
                                     "route_apply_failed": True,
+                                    "decision_finalized": False,
                                 },
                             )
                             decision_metrics["override_learning_transitions"] += 1
@@ -2493,6 +2573,7 @@ class RLTrainingPipeline:
                                 "available_count": int(len(context.available_actions)),
                                 "lane_now_count": int(len(context.lane_feasible_now_actions)),
                                 "forced_action": bool(context.forced_action is not None),
+                                "decision_finalized": False,
                             },
                         )
                         lane_change_deferrals[vehicle_id] = 0
@@ -2976,6 +3057,11 @@ class RLTrainingPipeline:
                         "elite_buffer_size": len(self.trainer.elite_memory),
                         "elite_transitions_added": self.trainer.elite_transitions_added,
                         "elite_samples_drawn": self.trainer.elite_samples_drawn,
+                        "replay_main_finalized": self.trainer.replay_main_kept_finalized,
+                        "replay_main_pending_timeout": self.trainer.replay_main_kept_pending_timeout,
+                        "replay_main_terminal": self.trainer.replay_main_kept_terminal,
+                        "replay_main_dropped": self.trainer.replay_main_dropped,
+                        "replay_main_other_kept": self.trainer.replay_main_kept_other,
                         "train_steps": self.trainer.train_steps,
                         "mean_loss": self.trainer.last_loss if self.trainer.last_loss is not None else "",
                         "episode_return": avg_return,
