@@ -352,6 +352,9 @@ class RLTrainingPipeline:
         self.same_edge_repeat_chase_penalty = -0.5
         self.fallback_missed_lane_penalty = -0.4
         self.loop_trap_override_penalty = -1.4
+        self.proactive_watch_min_dist_to_end = 55.0
+        self.proactive_watch_max_shift = 1
+        self.proactive_watch_release_dist_m = 10.0
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
@@ -761,6 +764,43 @@ class RLTrainingPipeline:
         context = self.decision_engine.build_context(vehicle_id, edge_id, destination_edge, step)
         return context.available_actions
 
+    def _distance_bucket(self, dist_to_end):
+        if float(dist_to_end) > 80.0:
+            return "far_80p"
+        if float(dist_to_end) > 40.0:
+            return "mid_40_80"
+        return "near_40"
+
+    def _proactive_reachable_actions(self, context):
+        lane_now = set(context.lane_feasible_now_actions)
+        actions = []
+        for action in context.reachable_with_lane_change_actions:
+            if action in lane_now:
+                continue
+            if int(context.required_lane_shift.get(action, 99)) <= int(self.proactive_watch_max_shift):
+                actions.append(action)
+        return sorted(set(actions))
+
+    def _update_phase5_context_metrics(self, vehicle_id, context, decision_metrics):
+        lane_now = set(context.lane_feasible_now_actions)
+        available = set(context.available_actions)
+        broader_available = len(available - lane_now) > 0
+        bucket = self._distance_bucket(context.dist_to_end)
+        if broader_available:
+            decision_metrics[f"broader_available_{bucket}"] += 1
+        if broader_available and available.issubset(lane_now):
+            decision_metrics[f"lane_now_only_{bucket}"] += 1
+
+        proactive_reachable = self._proactive_reachable_actions(context)
+        if vehicle_id not in self._phase5_first_proactive_seen and proactive_reachable:
+            self._phase5_first_proactive_seen.add(vehicle_id)
+            decision_metrics["first_proactive_seen_count"] += 1
+            decision_metrics["first_proactive_seen_dist_sum"] += float(context.dist_to_end)
+        if vehicle_id not in self._phase5_first_decision_open_seen and self.decision_engine.is_decision_open(context):
+            self._phase5_first_decision_open_seen.add(vehicle_id)
+            decision_metrics["first_decision_open_seen_count"] += 1
+            decision_metrics["first_decision_open_seen_dist_sum"] += float(context.dist_to_end)
+
     def _policy_action_candidates(
         self,
         context,
@@ -825,7 +865,14 @@ class RLTrainingPipeline:
             if required_shift > max_shift:
                 continue
             if float(context.dist_to_end) <= comfortable_dist_threshold:
-                continue
+                keep_alive_proactive = (
+                    action in filtered_available_actions
+                    and action not in lane_now
+                    and required_shift <= 1
+                    and float(context.dist_to_end) >= float(self.proactive_watch_release_dist_m)
+                )
+                if not keep_alive_proactive:
+                    continue
 
             proactive_actions.append(action)
             if decision_metrics is not None and required_shift == 2:
@@ -1451,6 +1498,10 @@ class RLTrainingPipeline:
             "policy_candidates_collapsed_to_lane_now_only",
             "soft_commit_window_admissions", "observe_abort_low_speed",
             "pending_commit_window_grace_kept", "proactive_shift2_candidates_kept",
+            "first_proactive_seen_count", "avg_first_proactive_seen_dist",
+            "first_decision_open_seen_count", "avg_first_decision_open_seen_dist",
+            "broader_available_far_80p", "broader_available_mid_40_80", "broader_available_near_40",
+            "lane_now_only_far_80p", "lane_now_only_mid_40_80", "lane_now_only_near_40",
         ]
         # Rewrite metrics each new training session to avoid schema drift/appending old runs.
         with open(self.metrics_csv_path, "w", newline="") as f:
@@ -1486,6 +1537,20 @@ class RLTrainingPipeline:
             recent_edge_history = defaultdict(lambda: deque(maxlen=self.loop_window))
             prev_edge_by_vehicle = {}
             decision_metrics = defaultdict(float)
+            decision_metrics.update({
+                "first_proactive_seen_count": 0.0,
+                "first_proactive_seen_dist_sum": 0.0,
+                "first_decision_open_seen_count": 0.0,
+                "first_decision_open_seen_dist_sum": 0.0,
+                "broader_available_far_80p": 0.0,
+                "broader_available_mid_40_80": 0.0,
+                "broader_available_near_40": 0.0,
+                "lane_now_only_far_80p": 0.0,
+                "lane_now_only_mid_40_80": 0.0,
+                "lane_now_only_near_40": 0.0,
+            })
+            self._phase5_first_proactive_seen = set()
+            self._phase5_first_decision_open_seen = set()
 
             episode_return = 0.0
             episode_teleport_events = 0
@@ -1993,6 +2058,7 @@ class RLTrainingPipeline:
                             step,
                             snapshot=snapshot,
                         )
+                        self._update_phase5_context_metrics(vehicle_id, context, decision_metrics)
                         reachable_set = set(context.reachable_with_lane_change_actions)
                         available_set = set(context.available_actions)
                         if reachable_set:
@@ -2911,6 +2977,22 @@ class RLTrainingPipeline:
                         "observe_abort_low_speed": decision_metrics["observe_abort_low_speed"],
                         "pending_commit_window_grace_kept": decision_metrics["pending_commit_window_grace_kept"],
                         "proactive_shift2_candidates_kept": decision_metrics["proactive_shift2_candidates_kept"],
+                        "first_proactive_seen_count": decision_metrics["first_proactive_seen_count"],
+                        "avg_first_proactive_seen_dist": (
+                            decision_metrics["first_proactive_seen_dist_sum"]
+                            / max(decision_metrics["first_proactive_seen_count"], 1.0)
+                        ),
+                        "first_decision_open_seen_count": decision_metrics["first_decision_open_seen_count"],
+                        "avg_first_decision_open_seen_dist": (
+                            decision_metrics["first_decision_open_seen_dist_sum"]
+                            / max(decision_metrics["first_decision_open_seen_count"], 1.0)
+                        ),
+                        "broader_available_far_80p": decision_metrics["broader_available_far_80p"],
+                        "broader_available_mid_40_80": decision_metrics["broader_available_mid_40_80"],
+                        "broader_available_near_40": decision_metrics["broader_available_near_40"],
+                        "lane_now_only_far_80p": decision_metrics["lane_now_only_far_80p"],
+                        "lane_now_only_mid_40_80": decision_metrics["lane_now_only_mid_40_80"],
+                        "lane_now_only_near_40": decision_metrics["lane_now_only_near_40"],
                     }
                     if set(row.keys()) != set(csv_fields):
                         raise ValueError("rl_episode_metrics.csv row schema does not match header")
