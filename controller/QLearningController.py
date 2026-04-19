@@ -12,6 +12,16 @@ import os
 from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision, VehicleSnapshot
 from core.route_loop_safety import transition_signal, would_worsen_distance
 
+TRANSITION_TYPES = (
+    "open",
+    "deferred_success",
+    "deferred_timeout",
+    "fallback",
+    "loop",
+    "teleport",
+    "other",
+)
+
 def parse_sumocfg(sumocfg_path):
     dom = parse(sumocfg_path)
     net_file = dom.getElementsByTagName('net-file')[0].attributes['value'].nodeValue

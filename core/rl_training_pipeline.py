@@ -33,6 +33,15 @@ In this file, we build a DQN network
 """
 
 MAX_SIMULATION_STEPS = 2000 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
+TRANSITION_TYPES = (
+    "open",
+    "deferred_success",
+    "deferred_timeout",
+    "fallback",
+    "loop",
+    "teleport",
+    "other",
+)
 
 class ReplayBuffer:
     """
@@ -113,6 +122,8 @@ class DQNTrainer:
         self.target_model = self._build_target_model()
         self.train_steps = 0
         self.last_loss = None
+        self.last_replay_fraction_by_transition_type = {k: 0.0 for k in TRANSITION_TYPES}
+        self.last_td_error_by_transition_type = {k: 0.0 for k in TRANSITION_TYPES}
 
     def _build_target_model(self):
         target_model = clone_model(self.model)
@@ -203,6 +214,8 @@ class DQNTrainer:
         Train the Q-network from replayed experiences. Update q-values of previous state based on the most recent one.
         """
         if len(self.memory) < self.replay_warmup:
+            self.last_replay_fraction_by_transition_type = {k: 0.0 for k in TRANSITION_TYPES}
+            self.last_td_error_by_transition_type = {k: 0.0 for k in TRANSITION_TYPES}
             return
         minibatch = self.memory.sample(self.batch_size)
         states      = np.vstack([s[0] for s in minibatch])
@@ -211,7 +224,21 @@ class DQNTrainer:
         next_states = np.vstack([s[3] for s in minibatch])
         dones       = np.array([s[4] for s in minibatch], dtype=np.bool_)
         next_valid_actions_batch = [s[5] for s in minibatch]
+        metadata_batch = [s[6] if isinstance(s[6], dict) else {} for s in minibatch]
         batch_len = states.shape[0]
+
+        transition_counts = {k: 0 for k in TRANSITION_TYPES}
+        transition_types = []
+        for meta in metadata_batch:
+            transition_type = str(meta.get("transition_type", "other"))
+            if transition_type not in transition_counts:
+                transition_type = "other"
+            transition_types.append(transition_type)
+            transition_counts[transition_type] += 1
+        self.last_replay_fraction_by_transition_type = {
+            k: float(transition_counts[k]) / float(max(batch_len, 1))
+            for k in TRANSITION_TYPES
+        }
 
         # Keep keras inference pattern fast:
         # - Fuse ONLINE model calls for q(s) and q_online(s') in one pass.
@@ -239,6 +266,19 @@ class DQNTrainer:
         target[np.arange(batch_len), actions] = (
             rewards + (1.0 - dones.astype(np.float32)) * self.gamma * bootstrap_values
         )
+
+        pred_q = q[np.arange(batch_len), actions]
+        target_q = target[np.arange(batch_len), actions]
+        abs_td_error = np.abs(target_q - pred_q)
+        td_sums = {k: 0.0 for k in TRANSITION_TYPES}
+        td_counts = {k: 0 for k in TRANSITION_TYPES}
+        for idx, transition_type in enumerate(transition_types):
+            td_sums[transition_type] += float(abs_td_error[idx])
+            td_counts[transition_type] += 1
+        self.last_td_error_by_transition_type = {
+            k: (td_sums[k] / td_counts[k]) if td_counts[k] > 0 else 0.0
+            for k in TRANSITION_TYPES
+        }
 
         loss = self.model.train_on_batch(states, target)
         self.last_loss = float(loss) if loss is not None else None
@@ -1073,7 +1113,10 @@ class RLTrainingPipeline:
                 next_state,
                 done,
                 next_valid_actions=[],
-                metadata={"terminal_outcome": outcome, "synthetic_terminal_no_pending": True},
+                metadata=self._transition_metadata(
+                    {"terminal_outcome": outcome, "synthetic_terminal_no_pending": True},
+                    chosen_action=0,
+                ),
             )
             decision_metrics["decisions_finalized"] += 1
             finalized_decision_rewards.append(float(reward))
@@ -1184,7 +1227,19 @@ class RLTrainingPipeline:
             next_state,
             done,
             next_valid_actions=[],
-            metadata={"terminal_outcome": outcome},
+            metadata=self._transition_metadata(
+                {
+                    "terminal_outcome": outcome,
+                    "action_source": pending.metadata.get("action_source", ""),
+                    "deferred_success": outcome == "global_arrival",
+                    "loop_event": bool(pending.metadata.get("loop_event", False)),
+                    "is_open_decision": pending.metadata.get("is_open_decision", False),
+                    "has_proactive_candidate": pending.metadata.get("has_proactive_candidate", False),
+                    "social_best_action": pending.metadata.get("social_best_action"),
+                    "chosen_action": pending.metadata.get("chosen_action", pending.intended_action),
+                },
+                chosen_action=pending.intended_action,
+            ),
         )
         decision_metrics["decisions_finalized"] += 1
         decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
@@ -1214,6 +1269,63 @@ class RLTrainingPipeline:
             edge: len(self.connection_info.outgoing_edges_dict.get(edge, {}))
             for edge in set(edges)
         }
+
+    def _has_proactive_candidate(self, context):
+        lane_now = set(getattr(context, "lane_feasible_now_actions", []) or [])
+        reachable = set(getattr(context, "reachable_with_lane_change_actions", []) or [])
+        return bool(reachable - lane_now)
+
+    def _classify_transition_type(self, metadata):
+        metadata = metadata or {}
+        action_source = str(metadata.get("action_source", "")).lower()
+        override_type = str(metadata.get("override_type", "")).lower()
+        override_cause = str(metadata.get("override_cause", "")).lower()
+        terminal_outcome = str(metadata.get("terminal_outcome", "")).lower()
+
+        if terminal_outcome == "teleport" or bool(metadata.get("teleported", False)):
+            return "teleport"
+        if (
+            bool(metadata.get("loop_event", False))
+            or "loop" in override_type
+            or "loop" in override_cause
+            or "loop" in action_source
+        ):
+            return "loop"
+        if terminal_outcome == "timeout" or bool(metadata.get("pending_timeout_replan", False)):
+            return "deferred_timeout"
+        if bool(metadata.get("deferred_success", False)):
+            return "deferred_success"
+        if (
+            bool(metadata.get("fallback_action") is not None)
+            or "fallback" in override_type
+            or "fallback" in override_cause
+            or "fallback" in action_source
+        ):
+            return "fallback"
+        if bool(metadata.get("is_open_decision", False)):
+            return "open"
+        return "other"
+
+    def _transition_metadata(
+        self,
+        metadata=None,
+        *,
+        is_open_decision=False,
+        has_proactive_candidate=False,
+        social_best_action=None,
+        chosen_action=None,
+    ):
+        merged = dict(metadata or {})
+        merged["is_open_decision"] = bool(merged.get("is_open_decision", is_open_decision))
+        merged["has_proactive_candidate"] = bool(
+            merged.get("has_proactive_candidate", has_proactive_candidate)
+        )
+        if "social_best_action" not in merged:
+            merged["social_best_action"] = social_best_action
+        if "chosen_action" not in merged:
+            merged["chosen_action"] = chosen_action
+        merged["transition_type"] = self._classify_transition_type(merged)
+        return merged
 
     def _select_fallback_action(self, context, blocked_action, destination, recent_history):
         ranked = self.decision_engine.ranked_fallback_actions(
@@ -1451,6 +1563,12 @@ class RLTrainingPipeline:
             "policy_candidates_collapsed_to_lane_now_only",
             "soft_commit_window_admissions", "observe_abort_low_speed",
             "pending_commit_window_grace_kept", "proactive_shift2_candidates_kept",
+            "policy_vs_social_best_agreement_open_only",
+            "policy_vs_social_best_agreement_open_proactive_only",
+            "replay_fraction_open", "replay_fraction_deferred_success", "replay_fraction_deferred_timeout",
+            "td_error_open", "td_error_deferred_success", "td_error_deferred_timeout",
+            "diagnosis_training_value_problem", "diagnosis_opportunity_problem",
+            "diagnosis_replay_composition_problem",
         ]
         # Rewrite metrics each new training session to avoid schema drift/appending old runs.
         with open(self.metrics_csv_path, "w", newline="") as f:
@@ -1670,7 +1788,20 @@ class RLTrainingPipeline:
                                 next_state,
                                 done,
                                 next_valid_actions=next_ctx.available_actions,
-                                metadata={"forced": pending.context.forced_action is not None, "mismatch": mismatch},
+                                metadata=self._transition_metadata(
+                                    {
+                                        "forced": pending.context.forced_action is not None,
+                                        "mismatch": mismatch,
+                                        "action_source": pending.metadata.get("action_source", ""),
+                                        "deferred_success": True,
+                                        "loop_event": repeated_recent_edges > 1,
+                                        "is_open_decision": pending.metadata.get("is_open_decision", False),
+                                        "has_proactive_candidate": pending.metadata.get("has_proactive_candidate", False),
+                                        "social_best_action": pending.metadata.get("social_best_action"),
+                                        "chosen_action": pending.metadata.get("chosen_action", pending.intended_action),
+                                    },
+                                    chosen_action=pending.intended_action,
+                                ),
                             )
                             decision_metrics["decisions_finalized"] += 1
                             action_source = str(pending.metadata.get("action_source", ""))
@@ -1756,15 +1887,22 @@ class RLTrainingPipeline:
                                             pending.state,
                                             False,
                                             next_valid_actions=obs_policy_actions,
-                                            metadata={
-                                                "override_learning": True,
-                                                "override_type": "route_apply_failure",
-                                                "original_action": pending.intended_action,
-                                                "fallback_action": None,
-                                                "override_cause": "route_apply_failure",
-                                                "route_apply_failed": True,
-                                                "observe_phase": True,
-                                            },
+                                            metadata=self._transition_metadata(
+                                                {
+                                                    "override_learning": True,
+                                                    "override_type": "route_apply_failure",
+                                                    "original_action": pending.intended_action,
+                                                    "fallback_action": None,
+                                                    "override_cause": "route_apply_failure",
+                                                    "route_apply_failed": True,
+                                                    "observe_phase": True,
+                                                    "action_source": pending.metadata.get("action_source", ""),
+                                                },
+                                                is_open_decision=pending.metadata.get("is_open_decision", False),
+                                                has_proactive_candidate=pending.metadata.get("has_proactive_candidate", False),
+                                                social_best_action=pending.metadata.get("social_best_action"),
+                                                chosen_action=pending.intended_action,
+                                            ),
                                         )
                                         decision_metrics["override_learning_transitions"] += 1
                                         decision_metrics["override_learning_negative"] += 1
@@ -1802,14 +1940,21 @@ class RLTrainingPipeline:
                                     ),
                                     False,
                                     next_valid_actions=obs_context.available_actions,
-                                    metadata={
-                                        "override_learning": True,
-                                        "observe_abort": reason or "no_progress",
-                                        "override_cause": "lane_change_observe_abort",
-                                        "abort_reason": reason or "no_progress",
-                                        "override_type": "observe_abort_fallback",
-                                        "original_action": pending.intended_action,
-                                    },
+                                    metadata=self._transition_metadata(
+                                        {
+                                            "override_learning": True,
+                                            "observe_abort": reason or "no_progress",
+                                            "override_cause": "lane_change_observe_abort",
+                                            "abort_reason": reason or "no_progress",
+                                            "override_type": "observe_abort_fallback",
+                                            "original_action": pending.intended_action,
+                                            "action_source": pending.metadata.get("action_source", ""),
+                                        },
+                                        is_open_decision=pending.metadata.get("is_open_decision", False),
+                                        has_proactive_candidate=pending.metadata.get("has_proactive_candidate", False),
+                                        social_best_action=pending.metadata.get("social_best_action"),
+                                        chosen_action=pending.intended_action,
+                                    ),
                                 )
                                 decision_metrics["override_learning_transitions"] += 1
                                 decision_metrics["override_learning_negative"] += 1
@@ -1848,7 +1993,14 @@ class RLTrainingPipeline:
                                     context=obs_context,
                                     lane_change_requested=False,
                                     route_fragment=list(full_route[1:]) if full_route else [],
-                                    metadata={"phase": "route_pending", "action_source": "observe_fallback"},
+                                    metadata={
+                                        "phase": "route_pending",
+                                        "action_source": "observe_fallback",
+                                        "is_open_decision": pending.metadata.get("is_open_decision", False),
+                                        "has_proactive_candidate": pending.metadata.get("has_proactive_candidate", False),
+                                        "social_best_action": pending.metadata.get("social_best_action"),
+                                        "chosen_action": fallback_action,
+                                    },
                                 )
                                 decision_metrics["fallback_overrides"] += 1
                                 decision_metrics["fallback_to_lane_feasible_now"] += 1
@@ -1868,13 +2020,20 @@ class RLTrainingPipeline:
                                     next_state,
                                     False,
                                     next_valid_actions=observe_policy_actions,
-                                    metadata={
-                                        "override_learning": True,
-                                        "override_type": "observe_abort_fallback",
-                                        "original_action": pending.intended_action,
-                                        "fallback_action": fallback_action,
-                                        "imitation_credit": True,
-                                    },
+                                    metadata=self._transition_metadata(
+                                        {
+                                            "override_learning": True,
+                                            "override_type": "observe_abort_fallback",
+                                            "original_action": pending.intended_action,
+                                            "fallback_action": fallback_action,
+                                            "imitation_credit": True,
+                                            "action_source": "observe_fallback",
+                                        },
+                                        is_open_decision=pending.metadata.get("is_open_decision", False),
+                                        has_proactive_candidate=pending.metadata.get("has_proactive_candidate", False),
+                                        social_best_action=pending.metadata.get("social_best_action"),
+                                        chosen_action=fallback_action,
+                                    ),
                                 )
                                 decision_metrics["override_learning_transitions"] += 1
                                 decision_metrics["override_learning_imitation"] += 1
@@ -1916,7 +2075,17 @@ class RLTrainingPipeline:
                                     next_state,
                                     False,
                                     next_valid_actions=next_ctx.available_actions,
-                                    metadata={"interim_pending_credit": True},
+                                    metadata=self._transition_metadata(
+                                        {
+                                            "interim_pending_credit": True,
+                                            "deferred_success": True,
+                                            "action_source": pending.metadata.get("action_source", ""),
+                                        },
+                                        is_open_decision=pending.metadata.get("is_open_decision", False),
+                                        has_proactive_candidate=pending.metadata.get("has_proactive_candidate", False),
+                                        social_best_action=pending.metadata.get("social_best_action"),
+                                        chosen_action=pending.intended_action,
+                                    ),
                                 )
                                 episode_return += pending_reward
                                 pending.state = next_state
@@ -1947,7 +2116,16 @@ class RLTrainingPipeline:
                                     timeout_state,
                                     False,
                                     next_valid_actions=timeout_ctx.available_actions,
-                                    metadata={"pending_timeout_replan": True},
+                                    metadata=self._transition_metadata(
+                                        {
+                                            "pending_timeout_replan": True,
+                                            "action_source": pending.metadata.get("action_source", ""),
+                                        },
+                                        is_open_decision=pending.metadata.get("is_open_decision", False),
+                                        has_proactive_candidate=pending.metadata.get("has_proactive_candidate", False),
+                                        social_best_action=pending.metadata.get("social_best_action"),
+                                        chosen_action=pending.intended_action,
+                                    ),
                                 )
                                 episode_return += timeout_penalty
                                 decision_metrics["pending_decision_timeouts"] += 1
@@ -2017,6 +2195,9 @@ class RLTrainingPipeline:
                             step=step,
                             snapshot=snapshot,
                         )
+                        is_open_decision = bool(self.decision_engine.is_decision_open(context))
+                        has_proactive_candidate = self._has_proactive_candidate(context)
+                        social_best_action = None
                         cooldown_until = lane_change_cooldown_until.get((vehicle_id, current_edge), -1)
                         action_source = "forced" if context.forced_action is not None else ""
                         if context.forced_action is not None:
@@ -2105,13 +2286,19 @@ class RLTrainingPipeline:
                                 state,
                                 False,
                                 next_valid_actions=policy_actions_after_override,
-                                metadata={
-                                    "override_learning": True,
-                                    "override_type": "loop_prefilter_fallback",
-                                    "original_action": original_action,
-                                    "fallback_action": action,
-                                    "override_cause": "loop_prefilter_fallback",
-                                },
+                                metadata=self._transition_metadata(
+                                    {
+                                        "override_learning": True,
+                                        "override_type": "loop_prefilter_fallback",
+                                        "original_action": original_action,
+                                        "fallback_action": action,
+                                        "override_cause": "loop_prefilter_fallback",
+                                        "action_source": "loop_prefilter_fallback",
+                                    },
+                                    is_open_decision=self.decision_engine.is_decision_open(context),
+                                    has_proactive_candidate=self._has_proactive_candidate(context),
+                                    chosen_action=original_action,
+                                ),
                             )
                             decision_metrics["override_learning_transitions"] += 1
                             decision_metrics["override_learning_negative"] += 1
@@ -2123,13 +2310,19 @@ class RLTrainingPipeline:
                                 state,
                                 False,
                                 next_valid_actions=policy_actions_after_override,
-                                metadata={
-                                    "override_learning": True,
-                                    "override_type": "loop_prefilter_fallback",
-                                    "original_action": original_action,
-                                    "fallback_action": action,
-                                    "imitation_credit": True,
-                                },
+                                metadata=self._transition_metadata(
+                                    {
+                                        "override_learning": True,
+                                        "override_type": "loop_prefilter_fallback",
+                                        "original_action": original_action,
+                                        "fallback_action": action,
+                                        "imitation_credit": True,
+                                        "action_source": "loop_prefilter_fallback",
+                                    },
+                                    is_open_decision=self.decision_engine.is_decision_open(context),
+                                    has_proactive_candidate=self._has_proactive_candidate(context),
+                                    chosen_action=action,
+                                ),
                             )
                             decision_metrics["override_learning_transitions"] += 1
                             decision_metrics["override_learning_imitation"] += 1
@@ -2173,13 +2366,19 @@ class RLTrainingPipeline:
                                     state,
                                     False,
                                     next_valid_actions=policy_actions_after_override,
-                                    metadata={
-                                        "override_learning": True,
-                                        "override_type": "cooldown_fallback",
-                                        "original_action": original_action,
-                                        "fallback_action": action,
-                                        "override_cause": "cooldown_fallback",
-                                    },
+                                    metadata=self._transition_metadata(
+                                        {
+                                            "override_learning": True,
+                                            "override_type": "cooldown_fallback",
+                                            "original_action": original_action,
+                                            "fallback_action": action,
+                                            "override_cause": "cooldown_fallback",
+                                            "action_source": "cooldown_fallback",
+                                        },
+                                        is_open_decision=self.decision_engine.is_decision_open(context),
+                                        has_proactive_candidate=self._has_proactive_candidate(context),
+                                        chosen_action=original_action,
+                                    ),
                                 )
                                 decision_metrics["override_learning_transitions"] += 1
                                 decision_metrics["override_learning_negative"] += 1
@@ -2191,13 +2390,19 @@ class RLTrainingPipeline:
                                     state,
                                     False,
                                     next_valid_actions=policy_actions_after_override,
-                                    metadata={
-                                        "override_learning": True,
-                                        "override_type": "cooldown_fallback",
-                                        "original_action": original_action,
-                                        "fallback_action": action,
-                                        "imitation_credit": True,
-                                    },
+                                    metadata=self._transition_metadata(
+                                        {
+                                            "override_learning": True,
+                                            "override_type": "cooldown_fallback",
+                                            "original_action": original_action,
+                                            "fallback_action": action,
+                                            "imitation_credit": True,
+                                            "action_source": "cooldown_fallback",
+                                        },
+                                        is_open_decision=self.decision_engine.is_decision_open(context),
+                                        has_proactive_candidate=self._has_proactive_candidate(context),
+                                        chosen_action=action,
+                                    ),
                                 )
                                 decision_metrics["override_learning_transitions"] += 1
                                 decision_metrics["override_learning_imitation"] += 1
@@ -2226,7 +2431,14 @@ class RLTrainingPipeline:
                                     context=context,
                                     lane_change_requested=lane_change_requested,
                                     route_fragment=[],
-                                    metadata={"action_source": action_source, **observe_metadata},
+                                    metadata={
+                                        "action_source": action_source,
+                                        "is_open_decision": is_open_decision,
+                                        "has_proactive_candidate": has_proactive_candidate,
+                                        "social_best_action": social_best_action,
+                                        "chosen_action": action,
+                                        **observe_metadata,
+                                    },
                                 )
                                 decision_metrics["decisions_opened"] += 1
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -2243,15 +2455,23 @@ class RLTrainingPipeline:
                             }
                             finite_costs = {a: c for a, c in candidate_costs.items() if math.isfinite(c)}
                             if finite_costs and action in finite_costs:
-                                best_action = min(finite_costs, key=finite_costs.get)
-                                best_cost = finite_costs[best_action]
+                                social_best_action = int(min(finite_costs, key=finite_costs.get))
+                                best_cost = finite_costs[social_best_action]
                                 chosen_cost = finite_costs[action]
                                 social_regret = max(float(chosen_cost - best_cost), 0.0)
                                 social_regret_samples.append(social_regret)
                                 decision_metrics["social_regret_sum"] += social_regret
                                 decision_metrics["social_regret_count"] += 1
-                                if action == best_action:
+                                if action == social_best_action:
                                     decision_metrics["social_best_action_chosen"] += 1
+                        if is_open_decision and social_best_action is not None:
+                            decision_metrics["policy_social_open_den"] += 1
+                            if int(action) == int(social_best_action):
+                                decision_metrics["policy_social_open_num"] += 1
+                            if has_proactive_candidate:
+                                decision_metrics["policy_social_open_proactive_den"] += 1
+                                if int(action) == int(social_best_action):
+                                    decision_metrics["policy_social_open_proactive_num"] += 1
 
                         full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
                             vehicle_id,
@@ -2278,14 +2498,20 @@ class RLTrainingPipeline:
                                 state,
                                 False,
                                 next_valid_actions=policy_actions_after_override,
-                                metadata={
-                                    "override_learning": True,
-                                    "override_type": "route_apply_failure",
-                                    "original_action": action,
-                                    "fallback_action": None,
-                                    "override_cause": "route_apply_failure",
-                                    "route_apply_failed": True,
-                                },
+                                metadata=self._transition_metadata(
+                                    {
+                                        "override_learning": True,
+                                        "override_type": "route_apply_failure",
+                                        "original_action": action,
+                                        "fallback_action": None,
+                                        "override_cause": "route_apply_failure",
+                                        "route_apply_failed": True,
+                                        "action_source": action_source,
+                                    },
+                                    is_open_decision=self.decision_engine.is_decision_open(context),
+                                    has_proactive_candidate=self._has_proactive_candidate(context),
+                                    chosen_action=action,
+                                ),
                             )
                             decision_metrics["override_learning_transitions"] += 1
                             decision_metrics["override_learning_negative"] += 1
@@ -2308,7 +2534,14 @@ class RLTrainingPipeline:
                             context=context,
                             lane_change_requested=lane_change_requested,
                             route_fragment=list(full_route[1:]) if full_route else [],
-                            metadata={"action_source": action_source, "lane_change_deferrals": lane_change_deferrals.get(vehicle_id, 0)},
+                            metadata={
+                                "action_source": action_source,
+                                "lane_change_deferrals": lane_change_deferrals.get(vehicle_id, 0),
+                                "is_open_decision": is_open_decision,
+                                "has_proactive_candidate": has_proactive_candidate,
+                                "social_best_action": social_best_action,
+                                "chosen_action": action,
+                            },
                         )
                         lane_change_deferrals[vehicle_id] = 0
                         decision_metrics["decisions_opened"] += 1
@@ -2573,6 +2806,55 @@ class RLTrainingPipeline:
                     float(decision_metrics["policy_candidates_collapsed_to_lane_now_only"])
                     / float(max(decision_metrics["policy_candidates_with_broader_available"], 1.0))
                 )
+                policy_vs_social_best_agreement_open_only = (
+                    float(decision_metrics["policy_social_open_num"])
+                    / float(max(decision_metrics["policy_social_open_den"], 1.0))
+                )
+                policy_vs_social_best_agreement_open_proactive_only = (
+                    float(decision_metrics["policy_social_open_proactive_num"])
+                    / float(max(decision_metrics["policy_social_open_proactive_den"], 1.0))
+                )
+                replay_fraction_open = float(
+                    self.trainer.last_replay_fraction_by_transition_type.get("open", 0.0)
+                )
+                replay_fraction_deferred_success = float(
+                    self.trainer.last_replay_fraction_by_transition_type.get("deferred_success", 0.0)
+                )
+                replay_fraction_deferred_timeout = float(
+                    self.trainer.last_replay_fraction_by_transition_type.get("deferred_timeout", 0.0)
+                )
+                td_error_open = float(self.trainer.last_td_error_by_transition_type.get("open", 0.0))
+                td_error_deferred_success = float(
+                    self.trainer.last_td_error_by_transition_type.get("deferred_success", 0.0)
+                )
+                td_error_deferred_timeout = float(
+                    self.trainer.last_td_error_by_transition_type.get("deferred_timeout", 0.0)
+                )
+
+                opportunity_high_rate_threshold = 0.60
+                learning_agreement_low_threshold = 0.45
+                td_error_open_high_threshold = 1.0
+                replay_focus_min_fraction = 0.25
+
+                diagnosis_opportunity_problem = bool(
+                    policy_lane_now_collapse_rate >= opportunity_high_rate_threshold
+                    or (
+                        float(decision_metrics["skip_reason_forced_by_lane_commit"])
+                        / float(max(decision_metrics["decisions_skipped"], 1.0))
+                    ) >= opportunity_high_rate_threshold
+                    or reachable_lane_change_excluded_any_rate >= opportunity_high_rate_threshold
+                )
+                diagnosis_training_value_problem = bool(
+                    (not diagnosis_opportunity_problem)
+                    and (
+                        policy_vs_social_best_agreement_open_only < learning_agreement_low_threshold
+                        or td_error_open >= td_error_open_high_threshold
+                    )
+                )
+                diagnosis_replay_composition_problem = bool(
+                    (replay_fraction_open + replay_fraction_deferred_success + replay_fraction_deferred_timeout)
+                    < replay_focus_min_fraction
+                )
 
                 rolling_teleport_events.append(float(episode_teleport_events))
                 rolling_teleported_controlled.append(float(len(teleported_controlled_ids)))
@@ -2706,6 +2988,19 @@ class RLTrainingPipeline:
                         decision_metrics["policy_candidates_collapsed_to_lane_now_only"],
                         decision_metrics["policy_candidates_with_broader_available"],
                         policy_lane_now_collapse_rate,
+                    )
+                )
+                print(
+                    "  training diagnosis: opportunity={} training_value={} replay_composition={} "
+                    "open_agree={:.1%} open_td={:.3f} replay(open/deferred_success/deferred_timeout)={:.1%}/{:.1%}/{:.1%}".format(
+                        diagnosis_opportunity_problem,
+                        diagnosis_training_value_problem,
+                        diagnosis_replay_composition_problem,
+                        policy_vs_social_best_agreement_open_only,
+                        td_error_open,
+                        replay_fraction_open,
+                        replay_fraction_deferred_success,
+                        replay_fraction_deferred_timeout,
                     )
                 )
 
@@ -2911,6 +3206,17 @@ class RLTrainingPipeline:
                         "observe_abort_low_speed": decision_metrics["observe_abort_low_speed"],
                         "pending_commit_window_grace_kept": decision_metrics["pending_commit_window_grace_kept"],
                         "proactive_shift2_candidates_kept": decision_metrics["proactive_shift2_candidates_kept"],
+                        "policy_vs_social_best_agreement_open_only": policy_vs_social_best_agreement_open_only,
+                        "policy_vs_social_best_agreement_open_proactive_only": policy_vs_social_best_agreement_open_proactive_only,
+                        "replay_fraction_open": replay_fraction_open,
+                        "replay_fraction_deferred_success": replay_fraction_deferred_success,
+                        "replay_fraction_deferred_timeout": replay_fraction_deferred_timeout,
+                        "td_error_open": td_error_open,
+                        "td_error_deferred_success": td_error_deferred_success,
+                        "td_error_deferred_timeout": td_error_deferred_timeout,
+                        "diagnosis_training_value_problem": diagnosis_training_value_problem,
+                        "diagnosis_opportunity_problem": diagnosis_opportunity_problem,
+                        "diagnosis_replay_composition_problem": diagnosis_replay_composition_problem,
                     }
                     if set(row.keys()) != set(csv_fields):
                         raise ValueError("rl_episode_metrics.csv row schema does not match header")
