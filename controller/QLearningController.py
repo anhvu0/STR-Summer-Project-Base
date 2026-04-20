@@ -36,6 +36,11 @@ class QLearningPolicy(RouteController):
         self.step_control_extra_buffer_m = 35.0
         self._last_observed_edge = {}
         self._last_control_step = {}
+        self._decision_seq = 0
+        # Inference telemetry glossary:
+        # - event counts: increments once per discrete occurrence in this process lifetime
+        # - gauges: instantaneous snapshots (none currently stored in _metrics)
+        # - ratios: derived at print-time only (not stored as counters)
         self._metrics = {
             "decisions": 0,
             "overrides": 0,
@@ -51,6 +56,7 @@ class QLearningPolicy(RouteController):
             "lane_change_observe_started": 0,
             "lane_change_observe_success": 0,
             "lane_change_observe_abort_no_progress": 0,
+            "lane_change_observe_abort_low_speed": 0,
             "lane_change_observe_abort_commit_window": 0,
             "pending_release_observe_abort_no_progress": 0,
             "pending_release_observe_abort_commit_window": 0,
@@ -58,18 +64,19 @@ class QLearningPolicy(RouteController):
             "pending_release_wrong_lane_commit": 0,
             "pending_release_route_stall_timeout": 0,
             "pending_release_route_hard_timeout": 0,
-            "same_edge_release_timeout_total": 0,
-            "same_edge_release_abort_total": 0,
-            "same_edge_pending_released_no_progress": 0,
+            "pending_release_events_total": 0,
+            "pending_release_abort_events_total": 0,
+            "pending_release_timeout_events_total": 0,
             "cooldown_replans_blocked": 0,
             "loop_override_count": 0,
             "dead_end_reentry_override_count": 0,
             "policy_candidates_with_broader_available": 0,
             "policy_candidates_collapsed_to_lane_now_only": 0,
-            "soft_commit_window_admissions": 0,
-            "observe_abort_low_speed": 0,
             "pending_commit_window_grace_kept": 0,
-            "proactive_shift2_candidates_kept": 0,
+            "proactive_shift2_candidates_seen": 0,
+            "proactive_shift2_candidates_rejected": 0,
+            "commit_window_candidates_rejected": 0,
+            "commit_window_non_lane_candidates_seen": 0,
             "step_control_edge_change": 0,
             "step_control_pending": 0,
             "step_control_near_junction": 0,
@@ -93,6 +100,10 @@ class QLearningPolicy(RouteController):
         self.density_scale_m = 100.0
         self.direction_mask_start = (2 * self.edge_embedding_dim) if self.use_compact_state else 2
         self._init_edge_embeddings(seed=1337)
+
+    def _next_decision_id(self):
+        self._decision_seq += 1
+        return f"inf_dec_{self._decision_seq}"
 
     def _init_edge_embeddings(self, seed=1337):
         rng = np.random.default_rng(seed)
@@ -217,22 +228,22 @@ class QLearningPolicy(RouteController):
             if float(context.speed) < 0.5:
                 continue
 
-            max_shift = 1
-
             required_shift = int(context.required_lane_shift.get(action, 99))
 
             if context.commit_window:
+                self._metrics["commit_window_non_lane_candidates_seen"] += 1
+                self._metrics["commit_window_candidates_rejected"] += 1
                 continue
-            if required_shift > max_shift:
+            if required_shift == 2:
+                self._metrics["proactive_shift2_candidates_seen"] += 1
+            if required_shift > 1:
+                if required_shift == 2:
+                    self._metrics["proactive_shift2_candidates_rejected"] += 1
                 continue
             if float(context.dist_to_end) <= comfortable_dist_threshold:
                 continue
 
             proactive_actions.append(action)
-            if required_shift == 2:
-                self._metrics["proactive_shift2_candidates_kept"] += 1
-            if context.commit_window and required_shift == 1 and action in filtered_available_actions:
-                self._metrics["soft_commit_window_admissions"] += 1
 
         policy_actions = sorted(set(safe_lane_now_actions) | set(proactive_actions))
         if not policy_actions:
@@ -403,19 +414,11 @@ class QLearningPolicy(RouteController):
         key = key_map.get(reason)
         if key:
             self._metrics[key] += 1
-        self._metrics["same_edge_release_abort_total"] = (
-            self._metrics["pending_release_observe_abort_no_progress"]
-            + self._metrics["pending_release_observe_abort_commit_window"]
-            + self._metrics["pending_release_observe_abort_low_speed"]
-            + self._metrics["pending_release_wrong_lane_commit"]
-        )
-        self._metrics["same_edge_release_timeout_total"] = (
-            self._metrics["pending_release_route_stall_timeout"]
-            + self._metrics["pending_release_route_hard_timeout"]
-        )
-        self._metrics["same_edge_pending_released_no_progress"] = (
-            self._metrics["same_edge_release_abort_total"] + self._metrics["same_edge_release_timeout_total"]
-        )
+        self._metrics["pending_release_events_total"] += 1
+        if reason in {"route_stall_timeout", "route_hard_timeout"}:
+            self._metrics["pending_release_timeout_events_total"] += 1
+        else:
+            self._metrics["pending_release_abort_events_total"] += 1
 
     def _snapshot_vehicle(self, vid, edge_id, step):
         try:
@@ -577,6 +580,7 @@ class QLearningPolicy(RouteController):
                         )
                         if apply_error:
                             self._metrics["overrides"] += 1
+                            self._metrics["distance_overrides"] += 1
                             continue
                         self._pending_decisions[vid] = PendingDecision(
                             state=None,
@@ -589,20 +593,30 @@ class QLearningPolicy(RouteController):
                             destination=vehicle.destination,
                             context=context,
                             lane_change_requested=True,
+                            decision_id=str((pending.metadata or {}).get("decision_id", pending.decision_id or self._next_decision_id())),
+                            decision_origin_mode=str((pending.metadata or {}).get("decision_origin_mode", pending.decision_origin_mode or "proactive")),
+                            decision_current_phase="route_pending",
+                            decision_open_recorded=True,
                             route_fragment=list(full_route[1:]) if full_route else [],
-                            metadata={"phase": "route_pending", "best_dist_to_end": float(obs_context.dist_to_end), "last_progress_step": int(step)},
+                            metadata={
+                                **(pending.metadata if isinstance(pending.metadata, dict) else {}),
+                                "phase": "route_pending",
+                                "decision_current_phase": "route_pending",
+                                "best_dist_to_end": float(obs_context.dist_to_end),
+                                "last_progress_step": int(step),
+                            },
                         )
                         continue
                     if reason == "commit_window":
                         self._metrics["lane_change_observe_abort_commit_window"] += 1
                         self._record_pending_release("observe_abort_commit_window")
                     elif reason == "low_speed":
-                        self._metrics["observe_abort_low_speed"] += 1
-                        self._metrics["lane_change_observe_abort_no_progress"] += 1
+                        self._metrics["lane_change_observe_abort_low_speed"] += 1
                         self._record_pending_release("observe_abort_low_speed")
                     else:
                         self._metrics["lane_change_observe_abort_no_progress"] += 1
                         self._record_pending_release("observe_abort_no_progress")
+                    self._metrics["overrides"] += 1
                     self._lane_change_cooldown[(vid, start_edge)] = (
                         step + self.decision_engine.cooldown_after_pending_release(timeout=False)
                     )
@@ -638,8 +652,20 @@ class QLearningPolicy(RouteController):
                         destination=vehicle.destination,
                         context=obs_context,
                         lane_change_requested=False,
+                        decision_id=str((pending.metadata or {}).get("decision_id", pending.decision_id or self._next_decision_id())),
+                        decision_origin_mode=str((pending.metadata or {}).get("decision_origin_mode", pending.decision_origin_mode or "proactive")),
+                        decision_current_phase="route_pending",
+                        decision_open_recorded=True,
                         route_fragment=list(full_route[1:]) if full_route else [],
-                        metadata={"phase": "route_pending", "best_dist_to_end": float(obs_context.dist_to_end), "last_progress_step": int(step)},
+                        metadata={
+                            "phase": "route_pending",
+                            "decision_current_phase": "route_pending",
+                            "best_dist_to_end": float(obs_context.dist_to_end),
+                            "last_progress_step": int(step),
+                            "decision_id": str((pending.metadata or {}).get("decision_id", pending.decision_id or self._next_decision_id())),
+                            "decision_origin_mode": str((pending.metadata or {}).get("decision_origin_mode", pending.decision_origin_mode or "proactive")),
+                            "decision_open_recorded": True,
+                        },
                     )
                     continue
                 continue
@@ -669,6 +695,7 @@ class QLearningPolicy(RouteController):
                 self._metrics["decisions"] += 1
 
             if action_idx not in context.available_actions:
+                self._metrics["overrides"] += 1
                 self._metrics["impossible_action_overrides"] += 1
                 continue
             recent = list(self._recent_edges.get(vid, deque(maxlen=self.loop_window)))
@@ -681,9 +708,14 @@ class QLearningPolicy(RouteController):
                 distance_slack=self.score_slack,
             )
             if not safe_ok:
+                self._metrics["overrides"] += 1
+                self._metrics["loop_overrides"] += 1
                 self._metrics["loop_override_count"] += 1
                 if signal.get("dead_end_reentry"):
+                    self._metrics["deadend_overrides"] += 1
                     self._metrics["dead_end_reentry_override_count"] += 1
+                if signal.get("distance_worsen"):
+                    self._metrics["distance_overrides"] += 1
                 fallback_actions = self.decision_engine.ranked_fallback_actions(
                     context=context,
                     destination=vehicle.destination,
@@ -706,6 +738,7 @@ class QLearningPolicy(RouteController):
             if action_idx not in context.lane_feasible_now_actions:
                 cooldown_until = self._lane_change_cooldown.get((vid, start_edge), -1)
                 if step < cooldown_until:
+                    self._metrics["overrides"] += 1
                     self._metrics["cooldown_replans_blocked"] += 1
                     fallback_actions = self.decision_engine.ranked_fallback_actions(
                         context=context,
@@ -734,8 +767,18 @@ class QLearningPolicy(RouteController):
                         destination=vehicle.destination,
                         context=context,
                         lane_change_requested=lane_change_requested,
+                        decision_id=self._next_decision_id(),
+                        decision_origin_mode=("lane_now" if action_idx in context.lane_feasible_now_actions else "proactive"),
+                        decision_current_phase="observe_lane_change",
+                        decision_open_recorded=True,
                         route_fragment=[],
-                        metadata=observe_meta,
+                        metadata={
+                            **observe_meta,
+                            "decision_id": f"inf_dec_{self._decision_seq}",
+                            "decision_origin_mode": ("lane_now" if action_idx in context.lane_feasible_now_actions else "proactive"),
+                            "decision_current_phase": "observe_lane_change",
+                            "decision_open_recorded": True,
+                        },
                     )
                     self._metrics["lane_change_observe_started"] += 1
                     self._metrics["deferred_lane_change_actions"] += 1
@@ -749,6 +792,7 @@ class QLearningPolicy(RouteController):
             )
             if apply_error:
                 self._metrics["overrides"] += 1
+                self._metrics["distance_overrides"] += 1
                 continue
 
             next_edge = committed_next_edge
@@ -767,8 +811,20 @@ class QLearningPolicy(RouteController):
                     destination=vehicle.destination,
                     context=context,
                     lane_change_requested=lane_change_requested,
+                    decision_id=self._next_decision_id(),
+                    decision_origin_mode=("lane_now" if action_idx in context.lane_feasible_now_actions else "proactive"),
+                    decision_current_phase="route_pending",
+                    decision_open_recorded=True,
                     route_fragment=list(full_route[1:]) if full_route else [],
-                    metadata={"phase": "route_pending", "best_dist_to_end": float(context.dist_to_end), "last_progress_step": int(step)},
+                    metadata={
+                        "phase": "route_pending",
+                        "decision_current_phase": "route_pending",
+                        "best_dist_to_end": float(context.dist_to_end),
+                        "last_progress_step": int(step),
+                        "decision_id": f"inf_dec_{self._decision_seq}",
+                        "decision_origin_mode": ("lane_now" if action_idx in context.lane_feasible_now_actions else "proactive"),
+                        "decision_open_recorded": True,
+                    },
                 )
                 self._lane_change_deferrals[vid] = 0
             # Route already committed directly via shared apply_route_decision.
