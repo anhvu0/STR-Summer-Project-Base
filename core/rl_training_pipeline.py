@@ -141,7 +141,7 @@ class StrategicOptionTrainer:
             owner_indices.extend([idx] * len(next_options))
 
         if not owner_indices:
-            return bootstrap
+            return np.zeros(len(transitions), dtype=np.float32)
 
         shared_batch = np.asarray(shared_rows, dtype=np.float32)
         option_batch = np.asarray(option_rows, dtype=np.float32)
@@ -2180,16 +2180,20 @@ class RLTrainingPipeline:
                 if loss is not None:
                     train_updates += 1
 
-                if step % 100 == 0:
+                if step % self.step_log_every == 0:
                     replay_strategic_size = len(self.strategic_trainer.replay.strategic_replay)
                     replay_tactical_failure_size = len(self.strategic_trainer.replay.tactical_failure_replay)
                     replay_terminal_only_size = len(self.strategic_trainer.replay.terminal_only_replay)
                     tactical_failure_total = int(sum(metrics["option_failure_counts"].values()))
+                    strategic_success_rate = float(
+                        metrics["option_success_count"] / max(int(metrics["learned_decision_count"]), 1)
+                    )
                     loss_last = float(getattr(self.strategic_trainer, "last_loss", 0.0) or 0.0)
                     loss_ema = float(getattr(self.strategic_trainer, "loss_ema", 0.0) or 0.0)
                     print(
                         f"[EP {episode+1:03d} | STEP {step:04d}] live_ctrl={len(live_controlled_ids)} "
                         f"arrived={len(arrived_controlled_ids)} active={len(active_decisions)} "
+                        f"eps={self.strategic_trainer.epsilon:.3f} strategic_success_rate={strategic_success_rate:.2%} "
                         f"learned={int(metrics['learned_decision_count'])} "
                         f"success={int(metrics['option_success_count'])} fail={tactical_failure_total} "
                         f"replay(s/t/term)=({replay_strategic_size}/{replay_tactical_failure_size}/{replay_terminal_only_size}) "
