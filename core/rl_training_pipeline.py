@@ -731,8 +731,6 @@ class RLTrainingPipeline:
         ]
 
     def _ensure_episode_metrics_csv_header(self):
-        if os.path.exists(self.metrics_csv_path):
-            return
         with open(self.metrics_csv_path, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=self._episode_metrics_fieldnames()).writeheader()
 
