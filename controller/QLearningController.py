@@ -79,13 +79,15 @@ class QLearningPolicy(RouteController):
         self.loop_window = 10
         self.loop_repeat_threshold = 2
         self.score_slack = 30.0
-        self.deadline_deficit_override_slack = 2.0
+        # Legacy/not-used in redesigned RL training: older deadline-deficit override tuning.
+        # self.deadline_deficit_override_slack = 2.0
         self.distance_tiebreak_scale = 0.05
         self.edge_embedding_dim = 8
         self.local_congestion_k = 6
         # Must match RLTrainingPipeline compact state size; retrained models are required when this changes.
         self.compact_state_size = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 3 + self.local_congestion_k + 30
-        self.legacy_state_size = 2 + 6 + 3 + 3 + len(self.connection_info.edge_list)
+        # Legacy/not-used in redesigned RL training: old dense edge-index state size (pre-compact encoder).
+        # self.legacy_state_size = 2 + 6 + 3 + 3 + len(self.connection_info.edge_list)
         self.use_compact_state = (self.model_state_size == self.compact_state_size)
         self.density_scale_m = 100.0
         self.direction_mask_start = (2 * self.edge_embedding_dim) if self.use_compact_state else 2

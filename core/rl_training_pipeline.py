@@ -610,22 +610,9 @@ class RLTrainingPipeline:
         self.congestion_low_speed_threshold = 2.0
         self.emergency_decel_threshold = 4.5
         self.teleport_jam_density_threshold = 0.55
-        # Legacy DQN trainer remains for backward compatibility but is not used by the RL strategic path.
-        self.trainer = DQNTrainer(
-            self.state_size,
-            self.action_size,
-            gamma=gamma,
-            epsilon_decay=epsilon_decay,
-            epsilon_min=epsilon_min,
-            replay_capacity=replay_capacity,
-            elite_replay_capacity=max(replay_capacity // 4, batch_size * 4),
-            elite_fraction=0.25,
-            batch_size=batch_size,
-            replay_warmup=replay_warmup,
-            target_update_every=400,
-            target_soft_tau=1.0,
-            use_double_dqn=use_double_dqn,
-        )
+        # Legacy DQN trainer path is intentionally disabled in the redesigned strategic-option run loop.
+        # Keep the class definition in this module for backwards-compatible reference only.
+        self.trainer = None
         self.strategic_trainer = StrategicOptionTrainer(
             shared_state_size=self.state_size,
             option_feature_size=self.option_feature_size,
@@ -644,7 +631,7 @@ class RLTrainingPipeline:
             "apply_route_failed",
             "became_impossible_after_selection",
         }
-        print("[RL] Trainer path: option-based StrategicOptionTrainer (legacy DQN trainer disabled for run path)")
+        print("[RL] Trainer path: option-based StrategicOptionTrainer (legacy DQN trainer disabled)")
         self._decision_debug_fields = [
             "episode", "step", "vehicle_id", "decision_edge", "action", "action_source", "available_actions",
             "forced_action", "lane_feasible_now_actions", "reachable_with_lane_change_actions",
@@ -782,15 +769,16 @@ class RLTrainingPipeline:
         )
         completion = (len(arrived_ids) / float(total_controlled)) if total_controlled > 0 else 0.0
         failed = max(total_controlled - len(arrived_ids), 0)
+        strategic_eps = float(getattr(self.strategic_trainer, "epsilon", 0.0))
         print(
             "[EP {:03d} | STEP {:04d}] eps={:.3f} replay={} train={} loss={} "
             "done={}/{} fail={} open/final/skip={:.0f}/{:.0f}/{:.0f} forced={:.0f}".format(
                 episode,
                 step,
-                self.trainer.epsilon,
-                len(self.trainer.memory),
-                self.trainer.train_steps,
-                "n/a" if self.trainer.last_loss is None else f"{self.trainer.last_loss:.4f}",
+                strategic_eps,
+                "legacy_disabled",
+                "strategic_only",
+                "n/a",
                 len(arrived_ids),
                 total_controlled,
                 failed,
@@ -1312,19 +1300,21 @@ class RLTrainingPipeline:
                 decision_metrics["fail_removed_non_destination"] += 1
             else:
                 raise ValueError(f"Unknown terminal outcome: {outcome}")
-            self.trainer.stage_transition(
-                base_state,
-                0,
-                reward,
-                next_state,
-                done,
-                next_valid_actions=[],
-                metadata={
-                    "terminal_outcome": outcome,
-                    "synthetic_terminal_no_pending": True,
-                    "decision_finalized": True,
-                },
-            )
+            # Legacy-only DQN replay transition (not used in redesigned strategic-option run path).
+            if self.trainer is not None:
+                self.trainer.stage_transition(
+                    base_state,
+                    0,
+                    reward,
+                    next_state,
+                    done,
+                    next_valid_actions=[],
+                    metadata={
+                        "terminal_outcome": outcome,
+                        "synthetic_terminal_no_pending": True,
+                        "decision_finalized": True,
+                    },
+                )
             decision_metrics["decisions_finalized"] += 1
             finalized_decision_rewards.append(float(reward))
             decision_debug_rows.append({
@@ -1431,15 +1421,17 @@ class RLTrainingPipeline:
         final_metadata = dict(pending.metadata) if isinstance(pending.metadata, dict) else {}
         final_metadata["terminal_outcome"] = outcome
         final_metadata["decision_finalized"] = True
-        self.trainer.stage_transition(
-            pending.state,
-            pending.intended_action,
-            reward,
-            next_state,
-            done,
-            next_valid_actions=[],
-            metadata=final_metadata,
-        )
+        # Legacy-only DQN replay transition (not used in redesigned strategic-option run path).
+        if self.trainer is not None:
+            self.trainer.stage_transition(
+                pending.state,
+                pending.intended_action,
+                reward,
+                next_state,
+                done,
+                next_valid_actions=[],
+                metadata=final_metadata,
+            )
         decision_metrics["decisions_finalized"] += 1
         decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
         finalized_decision_rewards.append(float(reward))
@@ -1763,7 +1755,7 @@ class RLTrainingPipeline:
         assert hasattr(self, "strategic_trainer"), "Strategic trainer must be initialized."
         if isinstance(self.strategic_trainer.model.input_shape, list):
             assert len(self.strategic_trainer.model.input_shape) == 2, "Strategic model must be two-input shared+option scorer."
-        assert self.trainer is not None, "Legacy trainer object missing unexpectedly."
+        # Legacy DQN trainer is intentionally disabled for redesigned strategic-option training.
 
         for episode in range(self.episodes):
             traci.start([sumo_binary, "-c", self.sumocfg_path, "--start"])
@@ -1895,8 +1887,6 @@ class RLTrainingPipeline:
                 active_decisions.pop(vid, None)
 
             traci.close()
-            assert len(self.trainer.memory) == 0, "Legacy DQN replay should remain unused in redesigned run path."
-
             avg_option_count = metrics["option_count_total"] / max(metrics["decision_open_count"], 1)
             avg_exec_option_count = metrics["executable_option_count_total"] / max(metrics["decision_open_count"], 1)
             avg_horizon = float(np.mean(metrics["decision_horizon_steps"])) if metrics["decision_horizon_steps"] else 0.0
@@ -1909,7 +1899,7 @@ class RLTrainingPipeline:
                 f"{len(self.strategic_trainer.replay.tactical_failure_replay)}/{len(self.strategic_trainer.replay.terminal_only_replay)}) "
                 f"sample_fracs={self.strategic_trainer.last_sample_fractions} "
                 f"sample_counts={self.strategic_trainer.last_sample_counts} "
-                f"legacy_replay_size={len(self.trainer.memory)}"
+                f"legacy_replay_size=legacy_disabled"
             )
 
         self.strategic_trainer.model.save(self.model_output_path)
