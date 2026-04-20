@@ -90,10 +90,10 @@ class JunctionDecisionEngine:
         self.base_reaction_distance = 25.0
         self.reaction_time_s = 1.3
         self.commit_time_s = 0.45
-        self.lane_change_margin_m = 14.0
+        self.lane_change_margin_m = 10.0
         self.commit_min_distance = 8.0
         self.default_fragment_horizon_m = 180.0
-        self.pending_timeout_steps = 22
+        self.pending_timeout_steps = 32
         self.lane_change_defer_limit = 6
         self.observe_steps_min = 2
         self.observe_steps_max = 8
@@ -101,14 +101,14 @@ class JunctionDecisionEngine:
         self.observe_stall_steps = 5
         self.cooldown_steps = 3
         self.observe_timeout_steps = 16
-        self.route_pending_stall_steps = 5
-        self.route_pending_hard_timeout_steps = 36
+        self.route_pending_stall_steps = 8
+        self.route_pending_hard_timeout_steps = 60
         self.route_pending_progress_eps_m = 2.0
         self.route_pending_lane_progress_eps = 0.15
-        self.route_pending_no_progress_window_steps = 3
-        self.pending_progress_timeout_steps = 22
+        self.route_pending_no_progress_window_steps = 5
+        self.pending_progress_timeout_steps = 32
         self.loop_distance_slack = 30.0
-        self.proactive_extra_buffer_m = 10.0
+        self.proactive_extra_buffer_m = 6.0
         self.proactive_safety_margin_m = 8.0
         self.cooldown_after_abort_extra_steps = 2
         self.cooldown_after_timeout_extra_steps = 4
@@ -183,20 +183,33 @@ class JunctionDecisionEngine:
                     available.append(idx)
                     continue
                 shift = required_shift.get(idx, 999)
-                if shift != 1:
+                if shift not in (1, 2):
                     continue
                 if speed < 0.5:
                     continue
-                # Conservative proactive admission: single-shift only with stronger distance buffer.
+                if shift == 1:
+                    required_budget = self.lane_change_margin_m
+                    strong_threshold = (
+                        commit_distance
+                        + max(self.proactive_extra_buffer_m, 0.35 * self.lane_change_margin_m)
+                        + self.proactive_safety_margin_m
+                    )
+                    if lane_change_budget < required_budget:
+                        continue
+                    if dist_to_end >= max(0.75 * reaction_distance, strong_threshold):
+                        available.append(idx)
+                    continue
+
+                required_budget = 1.6 * self.lane_change_margin_m
                 strong_threshold = (
                     commit_distance
-                    + max(self.proactive_extra_buffer_m, 0.5 * self.lane_change_margin_m)
+                    + self.proactive_extra_buffer_m
+                    + (1.10 * self.lane_change_margin_m)
                     + self.proactive_safety_margin_m
                 )
-                dynamic_margin = self.lane_change_margin_m
-                if lane_change_budget < dynamic_margin:
+                if lane_change_budget < required_budget:
                     continue
-                if dist_to_end >= max(0.85 * reaction_distance, strong_threshold):
+                if dist_to_end >= max(1.10 * reaction_distance, strong_threshold):
                     available.append(idx)
 
         available = sorted(set(available))

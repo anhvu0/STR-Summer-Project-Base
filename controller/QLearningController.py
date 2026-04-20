@@ -236,11 +236,14 @@ class QLearningPolicy(RouteController):
                 continue
             if required_shift == 2:
                 self._metrics["proactive_shift2_candidates_seen"] += 1
-            if required_shift > 1:
+            if required_shift not in (1, 2):
+                continue
+            dist_threshold = comfortable_dist_threshold
+            if required_shift == 2:
+                dist_threshold = comfortable_dist_threshold + (0.9 * float(self.decision_engine.lane_change_margin_m))
+            if float(context.dist_to_end) <= dist_threshold:
                 if required_shift == 2:
                     self._metrics["proactive_shift2_candidates_rejected"] += 1
-                continue
-            if float(context.dist_to_end) <= comfortable_dist_threshold:
                 continue
 
             proactive_actions.append(action)
