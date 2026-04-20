@@ -17,6 +17,8 @@ from core.junction_decision_engine import JunctionDecisionEngine, PendingDecisio
 from core.Util import ConnectionInfo
 from core.target_vehicles_generation_protocols import target_vehicles_generator
 from core.route_loop_safety import transition_signal
+from core.strategic_options import ActiveStrategicDecision, ReplayManager, StrategicTransition
+from core.tactical_option_executor import TacticalOptionExecutor
 
 if 'SUMO_HOME' in os.environ:
     tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
@@ -56,6 +58,87 @@ class ReplayBuffer:
     
     def __len__(self):
         return len(self.buffer)
+
+
+
+class StrategicOptionTrainer:
+    """Option-scoring trainer with shared-state encoder and per-option MLP scorer."""
+
+    def __init__(self, shared_state_size, option_feature_size, learning_rate=0.001, gamma=0.97, epsilon=1.0, epsilon_decay=0.99, epsilon_min=0.01, batch_size=64, replay_capacity=100000, replay_warmup=2000):
+        from keras.layers import Input, Dense, Concatenate
+        from keras.models import Model
+
+        self.shared_state_size = int(shared_state_size)
+        self.option_feature_size = int(option_feature_size)
+        self.gamma = float(gamma)
+        self.epsilon = float(epsilon)
+        self.epsilon_decay = float(epsilon_decay)
+        self.epsilon_min = float(epsilon_min)
+        self.batch_size = int(batch_size)
+        self.replay_warmup = int(max(replay_warmup, batch_size))
+
+        shared_in = Input(shape=(self.shared_state_size,), name="shared_state")
+        option_in = Input(shape=(self.option_feature_size,), name="option_features")
+        shared_emb = Dense(128, activation="relu", name="shared_encoder_1")(shared_in)
+        shared_emb = Dense(64, activation="relu", name="shared_encoder_2")(shared_emb)
+        fused = Concatenate(name="fused_shared_option")([shared_emb, option_in])
+        h = Dense(64, activation="relu", name="option_scorer_1")(fused)
+        h = Dense(32, activation="relu", name="option_scorer_2")(h)
+        score_out = Dense(1, activation="linear", name="option_score")(h)
+        self.model = Model(inputs=[shared_in, option_in], outputs=score_out)
+        self.model.compile(loss=Huber(delta=1.0), optimizer=Adam(learning_rate=learning_rate))
+
+        self.replay = ReplayManager(strategic_capacity=replay_capacity)
+        self.last_sample_fractions = {"strategic_fraction": 1.0, "tactical_failure_fraction": 0.0, "terminal_only_fraction": 0.0}
+        self.last_sample_counts = {"strategic": 0, "tactical_failure": 0, "terminal_only": 0, "total": 0}
+
+    def score_options(self, shared_state, option_features):
+        if not option_features:
+            return np.array([], dtype=np.float32)
+        n = len(option_features)
+        shared_batch = np.repeat(np.asarray(shared_state, dtype=np.float32), n, axis=0)
+        option_batch = np.asarray(option_features, dtype=np.float32)
+        scores = self.model.predict([shared_batch, option_batch], verbose=0).reshape(-1)
+        return scores
+
+    def select_option(self, shared_state, option_features):
+        if not option_features:
+            return None, "none"
+        if np.random.rand() <= self.epsilon:
+            return int(np.random.randint(0, len(option_features))), "explore"
+        scores = self.score_options(shared_state, option_features)
+        return int(np.argmax(scores)), "policy"
+
+    def _target_value(self, next_shared, next_option_features, done):
+        if done or next_shared is None or not next_option_features:
+            return 0.0
+        scores = self.score_options(next_shared, next_option_features)
+        return float(np.max(scores)) if len(scores) else 0.0
+
+    def train_step(self):
+        if len(self.replay.strategic_replay) < self.replay_warmup:
+            return None
+        batch, fractions = self.replay.sample_for_training(self.batch_size)
+        self.last_sample_fractions = fractions
+        self.last_sample_counts = {
+            "strategic": int(fractions.get("strategic_count", 0)),
+            "tactical_failure": int(fractions.get("tactical_failure_count", 0)),
+            "terminal_only": int(fractions.get("terminal_only_count", 0)),
+            "total": int(fractions.get("total_count", len(batch))),
+        }
+        losses = []
+        for tr in batch:
+            if tr.chosen_option_idx >= len(tr.state_option_features):
+                continue
+            state_shared = np.asarray(tr.state_shared, dtype=np.float32)
+            option_feat = np.asarray(tr.state_option_features[tr.chosen_option_idx], dtype=np.float32)
+            target = float(tr.aggregated_reward) + (0.0 if tr.done else self.gamma * self._target_value(tr.next_state_shared, tr.next_state_option_features, tr.done))
+            loss = self.model.train_on_batch([state_shared, option_feat], np.array([target], dtype=np.float32))
+            if loss is not None:
+                losses.append(float(loss))
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+        return float(np.mean(losses)) if losses else None
 
 class TrainingRouteHelper(RouteController):
     """
@@ -499,6 +582,7 @@ class RLTrainingPipeline:
             self.net,
             self.route_helper.direction_choices,
         )
+        self.tactical_executor = TacticalOptionExecutor(self.decision_engine)
 
         # state = [edge_embedding, destination_embedding]
         #         + edge/lane/reachable/available feasibility masks (4*6)
@@ -510,6 +594,7 @@ class RLTrainingPipeline:
         self.local_congestion_k = 6
         self._init_edge_embeddings(seed=1337)
         self.state_size = (2 * self.edge_embedding_dim) + 24 + 1 + 3 + 3 + self.local_congestion_k + 30
+        self.option_feature_size = 18
         self.action_size = 6
         self.metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_episode_metrics.csv")
         self._density_vec = np.zeros(len(self.connection_info.edge_list), dtype=np.float32)
@@ -525,6 +610,7 @@ class RLTrainingPipeline:
         self.congestion_low_speed_threshold = 2.0
         self.emergency_decel_threshold = 4.5
         self.teleport_jam_density_threshold = 0.55
+        # Legacy DQN trainer remains for backward compatibility but is not used by the RL strategic path.
         self.trainer = DQNTrainer(
             self.state_size,
             self.action_size,
@@ -540,6 +626,25 @@ class RLTrainingPipeline:
             target_soft_tau=1.0,
             use_double_dqn=use_double_dqn,
         )
+        self.strategic_trainer = StrategicOptionTrainer(
+            shared_state_size=self.state_size,
+            option_feature_size=self.option_feature_size,
+            gamma=gamma,
+            epsilon_decay=epsilon_decay,
+            epsilon_min=epsilon_min,
+            replay_capacity=replay_capacity,
+            batch_size=batch_size,
+            replay_warmup=replay_warmup,
+        )
+        self._strategic_main_allowed_tactical_outcomes = {
+            "success",
+            "commit_window_miss",
+            "stalled_lane_change",
+            "forced_by_lane_commit",
+            "apply_route_failed",
+            "became_impossible_after_selection",
+        }
+        print("[RL] Trainer path: option-based StrategicOptionTrainer (legacy DQN trainer disabled for run path)")
         self._decision_debug_fields = [
             "episode", "step", "vehicle_id", "decision_edge", "action", "action_source", "available_actions",
             "forced_action", "lane_feasible_now_actions", "reachable_with_lane_change_actions",
@@ -1598,1663 +1703,214 @@ class RLTrainingPipeline:
             )
         return {str(vehicle.vehicle_id): vehicle for vehicle in vehicle_list}
 
-    def run(self):
-        """Run RL training with shared junction-aware feasibility + pending-decision finalization."""
-        sumo_binary = checkBinary('sumo')
-        rolling_teleport_events = deque(maxlen=self.rolling_window)
-        rolling_teleported_controlled = deque(maxlen=self.rolling_window)
-        rolling_completion_rate = deque(maxlen=self.rolling_window)
-        rolling_avg_return = deque(maxlen=self.rolling_window)
-        rolling_avg_travel_time = deque(maxlen=self.rolling_window)
-        rolling_mismatch = deque(maxlen=self.rolling_window)
-        csv_fields = [
-            "episode", "epsilon", "replay", "train_steps", "mean_loss", "episode_return",
-            "elite_buffer_size", "elite_transitions_added", "elite_samples_drawn",
-            "replay_main_finalized", "replay_main_pending_timeout", "replay_main_terminal",
-            "replay_main_dropped", "replay_main_other_kept",
-            "completion_rate", "avg_travel_time", "p50_travel_time", "p90_travel_time", "teleports", "teleported_controlled",
-            "forced_actions", "decisions_opened", "decisions_finalized", "decisions_skipped",
-            "route_mismatch", "loop_events", "uturn_events",
-            "short_cycle_events", "aba_bounce_events", "dead_end_reentry_events",
-            "long_horizon_loop_events", "revisit_without_progress_events",
-            "safety_overrides", "loop_avoidance_overrides",
-            "fragment_build_failures", "fallback_overrides", "fallback_selected_total", "fallback_selected_lane_now",
-            "pending_decision_timeouts", "deferred_lane_change_actions",
-            "lane_change_observe_started", "lane_change_observe_success",
-            "lane_change_observe_abort_no_progress", "lane_change_observe_abort_commit_window",
-            "same_edge_pending_released_no_progress", "cooldown_replans_blocked",
-            "loop_override_count", "dead_end_reentry_override_count",
-            "snapshot_cache_hits", "shortest_path_cache_hits",
-            "exploration_actions", "policy_actions", "override_ratio",
-            "policy_masked_actions_removed", "override_learning_transitions",
-            "loop_prefilter_overrides", "cooldown_fallback_overrides",
-            "observe_abort_fallback_overrides", "route_apply_fail_overrides",
-            "override_learning_negative", "override_learning_imitation",
-            "timeout_unfinished_controlled", "exited_without_destination",
-            "alive_at_step_cap", "decision_pending_at_episode_end", "mean_pending_age", "mean_decision_latency_steps",
-            "mean_reward_per_finalized_decision", "mean_route_difficulty_eta", "p50_route_difficulty_eta",
-            "p90_route_difficulty_eta", "fail_teleport", "fail_timeout", "fail_removed_non_destination",
-            "fail_unreachable_transition", "fail_dead_end_no_outgoing",
-            "mean_network_density", "p95_network_density", "congestion_high_pressure_steps",
-            "emergency_brake_events", "emergency_brake_due_to_leader", "emergency_brake_due_to_congestion",
-            "emergency_brake_near_junction", "emergency_brake_other_reason",
-            "teleport_inferred_jam", "teleport_inferred_yield_or_deadlock",
-            "lane_change_request_success_rate", "lane_change_request_failure_rate",
-            "tail_vehicles_over_p90_count", "tail_completion_gap_steps",
-            "loop_reason_short_cycle", "loop_reason_aba_bounce", "loop_reason_dead_end_reentry",
-            "loop_reason_long_horizon", "loop_reason_revisit_without_progress", "dominant_loop_reason",
-            "skipped_to_finalized_ratio", "skipped_minus_finalized", "skipped_significantly_gt_finalized",
-            "social_regret_mean", "social_regret_p90", "social_best_action_chosen_rate",
-            "actionable_skip_ratio", "pending_resolution_success_rate", "delay_fairness_gini",
-            "loop_after_fallback_rate", "p95_to_p50_travel_ratio", "timeout_rate",
-            "fallback_rate_per_opened_decision", "controlled_teleport_rate",
-            "skip_reason_forced_by_lane_commit", "skip_reason_too_late_or_unreachable",
-            "skip_reason_forced_single_path", "skip_reason_no_branch",
-            "reachable_lane_change_nonempty", "reachable_lane_change_excluded_any",
-            "reachable_lane_change_excluded_all", "policy_candidates_with_broader_available",
-            "policy_candidates_collapsed_to_lane_now_only",
-            "soft_commit_window_admissions", "observe_abort_low_speed",
-            "pending_commit_window_grace_kept", "proactive_shift2_candidates_kept",
-        ]
-        # Rewrite metrics each new training session to avoid schema drift/appending old runs.
-        with open(self.metrics_csv_path, "w", newline="") as f:
-            csv.DictWriter(f, fieldnames=csv_fields).writeheader()
-        self._ensure_decision_debug_csv_header()
+    def _build_option_features(self, strategic_context):
+        return [opt.option_features for opt in strategic_context.options if opt.option_features is not None]
 
-        # MAX_CACHE_SIZE = 5000
+    def _queue_len(self, edge_id):
+        try:
+            return traci.edge.getLastStepVehicleNumber(edge_id)
+        except Exception:
+            return 0.0
+
+    def _get_destination_edge(self, vehicle_id, fallback_edge):
+        try:
+            route = traci.vehicle.getRoute(vehicle_id)
+            if route:
+                return route[-1]
+        except Exception:
+            pass
+        return fallback_edge
+
+    def _state_for_context(self, vehicle_id, context, destination):
+        snapshot = VehicleSnapshot(
+            vehicle_id=vehicle_id,
+            step=int(context.step),
+            edge_id=context.edge_id,
+            lane_id=context.lane_id,
+            lane_index=context.lane_index,
+            lane_count=context.lane_count,
+            lane_position=max(float(self.connection_info.edge_length_dict.get(context.edge_id, 5.0)) - float(context.dist_to_end), 0.0),
+            lane_length=max(float(self.connection_info.edge_length_dict.get(context.edge_id, 5.0)), 5.0),
+            dist_to_end=context.dist_to_end,
+            speed=context.speed,
+        )
+        return self.get_state(vehicle_id, context.edge_id, destination, snapshot=snapshot)
+
+    def _init_episode_metrics(self):
+        return {
+            "decision_open_count": 0,
+            "learned_decision_count": 0,
+            "forced_nonlearned_decision_count": 0,
+            "option_count_total": 0,
+            "executable_option_count_total": 0,
+            "option_success_count": 0,
+            "option_failure_counts": defaultdict(int),
+            "decision_horizon_steps": [],
+            "lane_change_attempts": 0,
+            "lane_change_successes": 0,
+            "lane_change_failure_counts": defaultdict(int),
+            "commit_window_miss_count": 0,
+            "stalled_lane_change_count": 0,
+            "forced_by_lane_commit_count": 0,
+            "teleport_during_execution_count": 0,
+            "collision_during_execution_count": 0,
+            "timeout_during_execution_count": 0,
+        }
+
+    def run(self):
+        """Run option-based strategic RL with deterministic tactical execution."""
+        sumo_binary = checkBinary("sumo")
+        assert hasattr(self, "strategic_trainer"), "Strategic trainer must be initialized."
+        if isinstance(self.strategic_trainer.model.input_shape, list):
+            assert len(self.strategic_trainer.model.input_shape) == 2, "Strategic model must be two-input shared+option scorer."
+        assert self.trainer is not None, "Legacy trainer object missing unexpectedly."
 
         for episode in range(self.episodes):
-            episode_seed = episode if self.seed_with_episode else None
-            if episode_seed is not None:
-                random.seed(episode_seed)
-                np.random.seed(episode_seed)
+            traci.start([sumo_binary, "-c", self.sumocfg_path, "--start"])
+            step = 0
+            active_decisions = {}
+            metrics = self._init_episode_metrics()
 
-            # if len(self._distance_cache) > MAX_CACHE_SIZE:
-            #     self._distance_cache.clear()
+            while step < MAX_SIMULATION_STEPS and (traci.simulation.getMinExpectedNumber() > 0):
+                traci.simulationStep()
+                step += 1
+                live_ids = set(traci.vehicle.getIDList())
 
-            vehicles = self.generate_episode_vehicles(episode_seed=episode_seed)
-
-            traci.start([
-                sumo_binary,
-                "-c", self.sumocfg_path,
-                "--tripinfo-output", os.path.join(self.sumocfg_dir, "trips.trips.xml"),
-                "--quit-on-end",
-            ])
-            simulation_get_min_expected = traci.simulation.getMinExpectedNumber
-            simulation_step = traci.simulationStep
-            simulation_get_arrived_ids = traci.simulation.getArrivedIDList
-            vehicle_get_ids = traci.vehicle.getIDList
-            pending_decisions = {}
-            lane_change_deferrals = defaultdict(int)
-            lane_change_cooldown_until = {}
-            recent_edge_history = defaultdict(lambda: deque(maxlen=self.loop_window))
-            prev_edge_by_vehicle = {}
-            decision_metrics = defaultdict(float)
-            decision_metrics["fallback_selected_total"] = 0.0
-            decision_metrics["fallback_selected_lane_now"] = 0.0
-
-            episode_return = 0.0
-            episode_teleport_events = 0
-            teleported_controlled_ids = set()
-            arrived_ids = set()
-            total_controlled = len(vehicles)
-            last_seen_edge_by_vehicle = {}
-            last_planned_terminal_edge_by_vehicle = {}
-            last_snapshot_by_vehicle = {}
-            completed_travel_times = []
-            completed_travel_time_ids = set()
-            terminal_recorded_ids = set()
-            arrived_debug_records = []
-            final_outcome_by_vehicle = {}
-            decision_latency_steps = []
-            pending_age_samples = []
-            finalized_decision_rewards = []
-            route_difficulty_etas = []
-            last_step_executed = -1
-            alive_at_step_cap_ids = set()
-            pending_debug_logged_ids = set()
-            decision_debug_rows = []
-            arrived_with_prestep_edge_not_destination = 0
-            prev_speed_by_vehicle = {}
-            emergency_brake_active_by_vehicle = {}
-            last_observed_brake_step_by_vehicle = {}
-            mean_density_samples = []
-            p95_density_samples = []
-            congestion_high_pressure_steps = 0
-            social_regret_samples = []
-
-            try:
-                for step in range(MAX_SIMULATION_STEPS):
-                    if simulation_get_min_expected() <= 0:
-                        break
-                    last_step_executed = step
-
-                    # Keep density features fresh for routing choices and reward.
-                    self.update_edge_vehicle_counts(step, every=self.density_refresh_every)
-                    vehicle_ids = list(vehicle_get_ids())
-                    controlled_live_ids = [vid for vid in vehicle_ids if vid in vehicles]
-                    step_snapshots = self.collect_vehicle_snapshots(controlled_live_ids, step)
-                    step_mean_density = float(self._density_mean)
-                    step_p95_density = float(self._density_p95)
-                    mean_density_samples.append(step_mean_density)
-                    p95_density_samples.append(step_p95_density)
-
-                    if step_snapshots:
-                        mean_controlled_speed = float(np.mean([snap.speed for snap in step_snapshots.values()]))
-                        mean_controlled_edge_density = float(
-                            np.mean([self._edge_density(snapshot.edge_id) for snapshot in step_snapshots.values()])
-                        )
-                        if (
-                            mean_controlled_edge_density >= self.congestion_density_threshold
-                            and mean_controlled_speed <= self.congestion_low_speed_threshold
-                        ):
-                            congestion_high_pressure_steps += 1
-
-                    for vehicle_id in controlled_live_ids:
-                        snapshot = step_snapshots.get(vehicle_id)
-                        if snapshot is None:
-                            # Reset event latch if we cannot observe this step; avoids stale active flags.
-                            emergency_brake_active_by_vehicle.pop(vehicle_id, None)
-                            prev_speed_by_vehicle.pop(vehicle_id, None)
-                            last_observed_brake_step_by_vehicle.pop(vehicle_id, None)
+                for vid in list(live_ids):
+                    try:
+                        edge_id = traci.vehicle.getRoadID(vid)
+                        if not edge_id or edge_id.startswith(":"):
                             continue
-                        prev_speed = prev_speed_by_vehicle.get(vehicle_id)
-                        observed_prev_step = (last_observed_brake_step_by_vehicle.get(vehicle_id) == (step - 1))
-                        if prev_speed is not None and observed_prev_step:
-                            decel = max(float(prev_speed) - float(snapshot.speed), 0.0)
-                            hard_brake = decel >= self.emergency_decel_threshold and prev_speed > 4.0
-                            was_hard_brake_active = bool(emergency_brake_active_by_vehicle.get(vehicle_id, False))
-                            if hard_brake and not was_hard_brake_active:
-                                decision_metrics["emergency_brake_events"] += 1
-                                emergency_reason = "other"
-                                try:
-                                    leader_info = traci.vehicle.getLeader(vehicle_id)
-                                except Exception:
-                                    leader_info = None
-                                if leader_info and len(leader_info) >= 2 and float(leader_info[1]) < 10.0:
-                                    emergency_reason = "leader"
-                                else:
-                                    edge_density = self._edge_density(snapshot.edge_id)
-                                    if edge_density >= self.congestion_density_threshold:
-                                        emergency_reason = "congestion"
-                                    elif snapshot.dist_to_end <= 20.0:
-                                        emergency_reason = "junction"
-                                if emergency_reason == "leader":
-                                    decision_metrics["emergency_brake_due_to_leader"] += 1
-                                elif emergency_reason == "congestion":
-                                    decision_metrics["emergency_brake_due_to_congestion"] += 1
-                                elif emergency_reason == "junction":
-                                    decision_metrics["emergency_brake_near_junction"] += 1
-                                else:
-                                    decision_metrics["emergency_brake_other_reason"] += 1
-                            emergency_brake_active_by_vehicle[vehicle_id] = hard_brake
-                        else:
-                            # No prior speed => no detectable braking episode yet; keep latch clear.
-                            emergency_brake_active_by_vehicle[vehicle_id] = False
-
-                        current_edge = snapshot.edge_id
-                        prev_speed_by_vehicle[vehicle_id] = snapshot.speed
-                        last_observed_brake_step_by_vehicle[vehicle_id] = step
-
-                        vehicle = vehicles[vehicle_id]
-                        vehicle.current_edge = current_edge
-                        vehicle.current_speed = snapshot.speed
-                        if getattr(vehicle, "_route_difficulty_eta_logged", False) is False:
-                            eta0 = self._estimate_remaining_eta(current_edge, vehicle.destination)
-                            if math.isfinite(eta0):
-                                route_difficulty_etas.append(float(eta0))
-                            vehicle._route_difficulty_eta_logged = True
-                        last_seen_edge_by_vehicle[vehicle_id] = current_edge
-                        last_snapshot_by_vehicle[vehicle_id] = snapshot
-                        recent_edge_history[vehicle_id].append(current_edge)
-
-                        # Do not cleanup pre-step destination reaches yet; terminal transition
-                        # must be written exactly once before any state is removed.
-                        if current_edge == vehicle.destination:
-                            continue
-
-                        prev_edge = prev_edge_by_vehicle.get(vehicle_id)
-                        if vehicle_id in pending_decisions and current_edge != pending_decisions[vehicle_id].decision_edge:
-                            pending = pending_decisions.pop(vehicle_id)
-                            decision_metrics["pending_resolved_success"] += 1
-                            repeated_recent_edges = sum(1 for e in recent_edge_history[vehicle_id] if e == current_edge)
-                            mismatch = not self.decision_engine.route_matches_expected(pending, current_edge)
-                            if mismatch:
-                                decision_metrics["route_mismatch"] += 1
-                            signal_edges = set(recent_edge_history[vehicle_id]) | {current_edge}
-                            edge_distance_lookup = {
-                                edge: self.get_distance_to_destination(edge, vehicle.destination)
-                                for edge in signal_edges
-                            }
-                            loop_signals = transition_signal(
-                                recent_edge_history[vehicle_id],
-                                current_edge,
-                                edge_out_degree=self._edge_out_degree_map(list(recent_edge_history[vehicle_id]) + [current_edge]),
-                                edge_distance_lookup=edge_distance_lookup,
-                                progress_slack=self.decision_engine.loop_distance_slack,
-                            )
-                            if loop_signals["aba_bounce"]:
-                                decision_metrics["aba_bounce_events"] += 1
-                                decision_metrics["uturn_events"] += 1
-                            if loop_signals["short_cycle"]:
-                                decision_metrics["short_cycle_events"] += 1
-                            if loop_signals["dead_end_reentry"]:
-                                decision_metrics["dead_end_reentry_events"] += 1
-                            if loop_signals.get("long_horizon_loop"):
-                                decision_metrics["long_horizon_loop_events"] += 1
-                            if loop_signals.get("revisit_without_progress"):
-                                decision_metrics["revisit_without_progress_events"] += 1
-                            ext_pen = max(self._edge_density(current_edge), 0.0)
-                            prev_distance = self.get_distance_to_destination(pending.decision_edge, vehicle.destination)
-                            curr_distance = self.get_distance_to_destination(current_edge, vehicle.destination)
-                            prev_eta = self._estimate_remaining_eta(pending.decision_edge, vehicle.destination)
-                            curr_eta = self._estimate_remaining_eta(current_edge, vehicle.destination)
-                            reward, done = self.compute_reward(
-                                vehicle, pending.last_credit_edge, current_edge, step, arrived=False,
-                                repeated_recent_edges=repeated_recent_edges,
-                                delta_t=max(step - pending.last_credit_step, 1),
-                                route_mismatch=mismatch,
-                                uturn_repeat=loop_signals["aba_bounce"] or loop_signals["short_cycle"],
-                                long_horizon_loop=loop_signals.get("long_horizon_loop") or loop_signals.get("revisit_without_progress"),
-                                externality_penalty=ext_pen,
-                                selfless_delta=float(pending.metadata.get("selfless_delta", 0.0)),
-                            )
-                            next_ctx = self.decision_engine.build_context(
-                                vehicle_id,
-                                current_edge,
-                                vehicle.destination,
-                                step,
-                                snapshot=snapshot,
-                            )
-                            next_state = self.encode_state(
-                                vehicle_id,
-                                current_edge,
-                                vehicle.destination,
-                                context=next_ctx,
-                                vehicle=vehicle,
-                                step=step,
-                                snapshot=snapshot,
-                            )
-                            self.trainer.stage_transition(
-                                pending.state,
-                                pending.intended_action,
-                                reward,
-                                next_state,
-                                done,
-                                next_valid_actions=next_ctx.available_actions,
-                                metadata={
-                                    **(pending.metadata if isinstance(pending.metadata, dict) else {}),
-                                    "forced": pending.context.forced_action is not None,
-                                    "mismatch": mismatch,
-                                    "decision_finalized": True,
-                                },
-                            )
-                            decision_metrics["decisions_finalized"] += 1
-                            action_source = str(pending.metadata.get("action_source", ""))
-                            if "fallback" in action_source:
-                                decision_metrics["fallback_finalized"] += 1
-                            decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
-                            finalized_decision_rewards.append(float(reward))
-                            episode_return += reward
-                            if repeated_recent_edges > 1:
-                                decision_metrics["loop_events"] += 1
-                                if "fallback" in action_source:
-                                    decision_metrics["loop_after_fallback_events"] += 1
-                            if math.isfinite(prev_distance) and (not math.isfinite(curr_distance)):
-                                decision_metrics["fail_unreachable_transition"] += 1
-                            outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
-                            if (not outgoing or len(outgoing) == 0) and current_edge != vehicle.destination:
-                                decision_metrics["fail_dead_end_no_outgoing"] += 1
-                            edge_density = self._edge_density(current_edge)
-                            mean_density = float(self._density_mean)
-                            marginal_pressure = max(edge_density - mean_density, 0.0)
-                            decision_debug_rows.append(self._build_decision_debug_row(
-                                episode=episode,
-                                step=step,
-                                pending=pending,
-                                actual_next_edge=current_edge,
-                                finalized=1,
-                                finalize_delay_steps=max(step - pending.decision_step, 0),
-                                reward=reward,
-                                done=int(bool(done)),
-                                route_mismatch=int(bool(mismatch)),
-                                teleported=0,
-                                reached_global_destination=0,
-                                prev_eta=prev_eta if math.isfinite(prev_eta) else "",
-                                curr_eta=curr_eta if math.isfinite(curr_eta) else "",
-                                prev_distance=prev_distance if math.isfinite(prev_distance) else "",
-                                curr_distance=curr_distance if math.isfinite(curr_distance) else "",
-                                edge_density=edge_density,
-                                mean_density=mean_density,
-                                externality_penalty=ext_pen,
-                                marginal_pressure=marginal_pressure,
-                            ))
-                        elif vehicle_id in pending_decisions:
-                            pending = pending_decisions[vehicle_id]
-                            pending_phase = pending.metadata.get("phase", "route_pending")
-                            if pending_phase == "observe_lane_change":
-                                obs_context = self.decision_engine.build_context(
-                                    vehicle_id,
-                                    current_edge,
-                                    vehicle.destination,
-                                    step,
-                                    snapshot=snapshot,
-                                )
-                                self._cache_metrics["snapshot_cache_hits"] += 1
-                                status, reason = self.decision_engine.evaluate_lane_change_observation(
-                                    pending.metadata,
-                                    obs_context,
-                                    pending.intended_action,
-                                )
-                                if status == "continue":
-                                    prev_edge_by_vehicle[vehicle_id] = current_edge
-                                    continue
-                                pending_decisions.pop(vehicle_id, None)
-                                if status == "success":
-                                    decision_metrics["lane_change_observe_success"] += 1
-                                    full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
-                                        vehicle_id, current_edge, pending.intended_action, vehicle.destination
-                                    )
-                                    if apply_error:
-                                        decision_metrics["route_apply_fail"] += 1
-                                        decision_metrics["route_apply_fail_overrides"] += 1
-                                        override_penalty = self._clip_reward(-6.0)
-                                        obs_policy_actions = self._policy_action_candidates(
-                                            context=obs_context,
-                                            recent_history=list(recent_edge_history[vehicle_id]),
-                                            cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
-                                            destination=vehicle.destination,
-                                            decision_metrics=decision_metrics,
-                                        )
-                                        self.trainer.stage_transition(
-                                            pending.state,
-                                            pending.intended_action,
-                                            override_penalty,
-                                            pending.state,
-                                            False,
-                                            next_valid_actions=obs_policy_actions,
-                                            metadata={
-                                                "override_learning": True,
-                                                "override_type": "route_apply_failure",
-                                                "original_action": pending.intended_action,
-                                                "fallback_action": None,
-                                                "override_cause": "route_apply_failure",
-                                                "route_apply_failed": True,
-                                                "observe_phase": True,
-                                                "decision_finalized": False,
-                                            },
-                                        )
-                                        decision_metrics["override_learning_transitions"] += 1
-                                        decision_metrics["override_learning_negative"] += 1
-                                        episode_return += override_penalty
-                                        prev_edge_by_vehicle[vehicle_id] = current_edge
-                                        continue
-                                    pending.metadata["phase"] = "route_pending"
-                                    pending.metadata["best_dist_to_end"] = float(obs_context.dist_to_end)
-                                    pending.metadata["last_progress_step"] = int(step)
-                                    pending.metadata["decision_open"] = True
-                                    pending.metadata["available_count"] = int(len(obs_context.available_actions))
-                                    pending.metadata["lane_now_count"] = int(len(obs_context.lane_feasible_now_actions))
-                                    pending.metadata["forced_action"] = bool(obs_context.forced_action is not None)
-                                    pending.metadata["action_source"] = pending.metadata.get("action_source", "policy")
-                                    pending.metadata["decision_finalized"] = False
-                                    pending.intended_next_edge = committed_next_edge
-                                    pending.route_fragment = list(full_route[1:]) if full_route else []
-                                    pending.context = obs_context
-                                    pending.decision_step = step
-                                    pending.last_credit_step = step
-                                    pending.last_credit_edge = current_edge
-                                    pending_decisions[vehicle_id] = pending
-                                    decision_metrics["decisions_opened"] += 1
-                                    prev_edge_by_vehicle[vehicle_id] = current_edge
-                                    continue
-                                if reason == "commit_window":
-                                    decision_metrics["lane_change_observe_abort_commit_window"] += 1
-                                    pending_pen = self.observe_commit_window_miss_penalty
-                                elif reason == "low_speed":
-                                    decision_metrics["observe_abort_low_speed"] += 1
-                                    decision_metrics["lane_change_observe_abort_no_progress"] += 1
-                                    pending_pen = self.observe_low_speed_penalty
-                                else:
-                                    decision_metrics["lane_change_observe_abort_no_progress"] += 1
-                                    pending_pen = self.observe_no_progress_penalty
-                                pending_pen = self._clip_reward(pending_pen + self.same_edge_repeat_chase_penalty)
-                                self.trainer.stage_transition(
-                                    pending.state,
-                                    pending.intended_action,
-                                    pending_pen,
-                                    self.encode_state(
-                                        vehicle_id, current_edge, vehicle.destination, context=obs_context, vehicle=vehicle, step=step, snapshot=snapshot
-                                    ),
-                                    False,
-                                    next_valid_actions=obs_context.available_actions,
-                                    metadata={
-                                        **(pending.metadata if isinstance(pending.metadata, dict) else {}),
-                                        "override_learning": True,
-                                        "observe_abort": reason or "no_progress",
-                                        "observe_no_progress": (reason or "no_progress") == "no_progress",
-                                        "observe_low_speed": (reason or "") == "low_speed",
-                                        "observe_commit_window_miss": (reason or "") == "commit_window",
-                                        "override_cause": "lane_change_observe_abort",
-                                        "abort_reason": reason or "no_progress",
-                                        "override_type": "observe_abort_fallback",
-                                        "original_action": pending.intended_action,
-                                        "decision_finalized": False,
-                                    },
-                                )
-                                decision_metrics["override_learning_transitions"] += 1
-                                decision_metrics["override_learning_negative"] += 1
-                                episode_return += pending_pen
-                                decision_metrics["same_edge_pending_released_no_progress"] += 1
-                                decision_metrics["pending_resolved_abort_no_progress"] += 1
-                                cooldown_key = (vehicle_id, current_edge)
-                                lane_change_cooldown_until[cooldown_key] = step + self.decision_engine.cooldown_steps
-                                fallback_action = self._select_fallback_action(
-                                    obs_context,
-                                    blocked_action=pending.intended_action,
-                                    destination=vehicle.destination,
-                                    recent_history=list(recent_edge_history[vehicle_id]),
-                                )
-                                if fallback_action is None:
-                                    prev_edge_by_vehicle[vehicle_id] = current_edge
-                                    continue
-                                full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
-                                    vehicle_id, current_edge, fallback_action, vehicle.destination
-                                )
-                                if apply_error:
-                                    prev_edge_by_vehicle[vehicle_id] = current_edge
-                                    continue
-                                next_state = self.encode_state(
-                                    vehicle_id, current_edge, vehicle.destination, context=obs_context, vehicle=vehicle, step=step, snapshot=snapshot
-                                )
-                                pending_decisions[vehicle_id] = PendingDecision(
-                                    state=next_state,
-                                    intended_action=fallback_action,
-                                    intended_next_edge=committed_next_edge,
-                                    decision_edge=current_edge,
-                                    decision_step=step,
-                                    last_credit_edge=current_edge,
-                                    last_credit_step=step,
-                                    destination=vehicle.destination,
-                                    context=obs_context,
-                                    lane_change_requested=False,
-                                    route_fragment=list(full_route[1:]) if full_route else [],
-                                    metadata={
-                                        "phase": "route_pending",
-                                        "action_source": "observe_fallback",
-                                        "best_dist_to_end": float(obs_context.dist_to_end),
-                                        "last_progress_step": int(step),
-                                        "decision_open": True,
-                                        "available_count": int(len(obs_context.available_actions)),
-                                        "lane_now_count": int(len(obs_context.lane_feasible_now_actions)),
-                                        "forced_action": bool(obs_context.forced_action is not None),
-                                        "override_learning": True,
-                                        "decision_finalized": False,
-                                    },
-                                )
-                                decision_metrics["fallback_overrides"] += 1
-                                decision_metrics["fallback_selected_total"] += 1
-                                if fallback_action in context.lane_feasible_now_actions:
-                                    decision_metrics["fallback_selected_lane_now"] += 1
-                                decision_metrics["observe_abort_fallback_overrides"] += 1
-                                observe_policy_actions = self._policy_action_candidates(
-                                    context=obs_context,
-                                    recent_history=list(recent_edge_history[vehicle_id]),
-                                    cooldown_active=True,
-                                    destination=vehicle.destination,
-                                    decision_metrics=decision_metrics,
-                                )
-                                imitation_reward = self._clip_reward(0.10)
-                                self.trainer.stage_transition(
-                                    next_state,
-                                    fallback_action,
-                                    imitation_reward,
-                                    next_state,
-                                    False,
-                                    next_valid_actions=observe_policy_actions,
-                                    metadata={
-                                        "override_learning": True,
-                                        "override_type": "observe_abort_fallback",
-                                        "original_action": pending.intended_action,
-                                        "fallback_action": fallback_action,
-                                        "imitation_credit": True,
-                                        "decision_finalized": False,
-                                    },
-                                )
-                                decision_metrics["override_learning_transitions"] += 1
-                                decision_metrics["override_learning_imitation"] += 1
-                                prev_edge_by_vehicle[vehicle_id] = current_edge
-                                continue
-                            pending_age = self.decision_engine.pending_age_steps(pending, step)
-                            pending_age_samples.append(float(pending_age))
-                            elapsed_pending = max(step - pending.last_credit_step, 0)
-                            if elapsed_pending > 0:
-                                ext_pen = max(self._edge_density(current_edge), 0.0)
-                                pending_reward = self.compute_pending_step_reward(
-                                    vehicle,
-                                    current_edge,
-                                    elapsed=elapsed_pending,
-                                    step=step,
-                                    externality_penalty=ext_pen,
-                                    pending_age=pending_age,
-                                    lane_change_deferrals=pending.metadata.get("lane_change_deferrals", 0),
-                                )
-                                next_ctx = self.decision_engine.build_context(
-                                    vehicle_id,
-                                    current_edge,
-                                    vehicle.destination,
-                                    step,
-                                    snapshot=snapshot,
-                                )
-                                next_state = self.encode_state(
-                                    vehicle_id,
-                                    current_edge,
-                                    vehicle.destination,
-                                    context=next_ctx,
-                                    vehicle=vehicle,
-                                    step=step,
-                                    snapshot=snapshot,
-                                )
-                                self.trainer.stage_transition(
-                                    pending.state,
-                                    pending.intended_action,
-                                    pending_reward,
-                                    next_state,
-                                    False,
-                                    next_valid_actions=next_ctx.available_actions,
-                                    metadata={
-                                        **(pending.metadata if isinstance(pending.metadata, dict) else {}),
-                                        "interim_pending_credit": True,
-                                        "decision_finalized": False,
-                                    },
-                                )
-                                episode_return += pending_reward
-                                pending.state = next_state
-                                pending.last_credit_edge = current_edge
-                                pending.last_credit_step = step
-                            if self.decision_engine.should_timeout_pending(pending, step):
-                                timeout_ctx = self.decision_engine.build_context(
-                                    vehicle_id,
-                                    current_edge,
-                                    vehicle.destination,
-                                    step,
-                                    snapshot=snapshot,
-                                )
-                                timeout_state = self.encode_state(
-                                    vehicle_id,
-                                    current_edge,
-                                    vehicle.destination,
-                                    context=timeout_ctx,
-                                    vehicle=vehicle,
-                                    step=step,
-                                    snapshot=snapshot,
-                                )
-                                timeout_penalty = self._clip_reward(self.pending_timeout_penalty)
-                                self.trainer.stage_transition(
-                                    pending.state,
-                                    pending.intended_action,
-                                    timeout_penalty,
-                                    timeout_state,
-                                    False,
-                                    next_valid_actions=timeout_ctx.available_actions,
-                                    metadata={
-                                        **(pending.metadata if isinstance(pending.metadata, dict) else {}),
-                                        "pending_timeout_replan": True,
-                                        "decision_finalized": False,
-                                    },
-                                )
-                                episode_return += timeout_penalty
-                                decision_metrics["pending_decision_timeouts"] += 1
-                                decision_metrics["same_edge_pending_released_no_progress"] += 1
-                                decision_metrics["pending_resolved_timeout"] += 1
-                                pending_decisions.pop(vehicle_id, None)
-                                lane_change_deferrals[vehicle_id] = 0
-                                lane_change_cooldown_until[(vehicle_id, current_edge)] = step + self.decision_engine.cooldown_steps
-                                continue
-                            pending_ctx = self.decision_engine.build_context(
-                                vehicle_id,
-                                current_edge,
-                                vehicle.destination,
-                                step,
-                                snapshot=snapshot,
-                            )
-                            current_shift = int(pending_ctx.required_lane_shift.get(pending.intended_action, 99))
-                            grace_keep = (
-                                current_shift <= 1
-                                and pending_ctx.dist_to_end >= max(0.5 * self.decision_engine.commit_min_distance, 4.0)
-                            )
-                            wrong_lane_commit = (
-                                pending_ctx.commit_window
-                                and pending.intended_action not in pending_ctx.lane_feasible_now_actions
-                                and not grace_keep
-                            )
-                            metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
-                            pending.metadata = metadata
-                            best_dist = float(metadata.get("best_dist_to_end", pending_ctx.dist_to_end))
-                            last_progress_step = int(metadata.get("last_progress_step", pending.decision_step))
-                            if current_edge == pending.decision_edge:
-                                progress_eps = float(self.decision_engine.route_pending_progress_eps_m)
-                                if pending_ctx.dist_to_end <= (best_dist - progress_eps):
-                                    best_dist = float(pending_ctx.dist_to_end)
-                                    last_progress_step = int(step)
-                            metadata["best_dist_to_end"] = float(best_dist)
-                            metadata["last_progress_step"] = int(last_progress_step)
-                            stall_age = max(int(step) - int(last_progress_step), 0)
-                            total_age = max(int(step) - int(pending.decision_step), 0)
-                            stalled_timeout = (
-                                current_edge == pending.decision_edge
-                                and stall_age >= int(self.decision_engine.route_pending_stall_steps)
-                            )
-                            hard_timeout = (
-                                current_edge == pending.decision_edge
-                                and total_age >= int(self.decision_engine.route_pending_hard_timeout_steps)
-                            )
-                            if pending_ctx.commit_window and pending.intended_action not in pending_ctx.lane_feasible_now_actions and grace_keep:
-                                decision_metrics["pending_commit_window_grace_kept"] += 1
-                            if wrong_lane_commit or stalled_timeout or hard_timeout:
-                                decision_metrics["same_edge_pending_released_no_progress"] += 1
-                                if stalled_timeout or hard_timeout:
-                                    decision_metrics["pending_decision_timeouts"] += 1
-                                    decision_metrics["pending_resolved_timeout"] += 1
-                                else:
-                                    decision_metrics["pending_resolved_abort_no_progress"] += 1
-                                pending_decisions.pop(vehicle_id, None)
-                                lane_change_cooldown_until[(vehicle_id, current_edge)] = step + self.decision_engine.cooldown_steps
-
-                        context = self.decision_engine.build_context(
-                            vehicle_id,
-                            current_edge,
-                            vehicle.destination,
-                            step,
-                            snapshot=snapshot,
-                        )
-                        reachable_set = set(context.reachable_with_lane_change_actions)
-                        available_set = set(context.available_actions)
-                        if reachable_set:
-                            decision_metrics["reachable_lane_change_nonempty"] += 1
-                            if not reachable_set.issubset(available_set):
-                                decision_metrics["reachable_lane_change_excluded_any"] += 1
-                            if reachable_set.isdisjoint(available_set):
-                                decision_metrics["reachable_lane_change_excluded_all"] += 1
-                        if vehicle_id in pending_decisions:
-                            decision_metrics["decisions_skipped"] += 1
-                            prev_edge_by_vehicle[vehicle_id] = current_edge
-                            continue
-
-                        state = self.encode_state(
-                            vehicle_id,
-                            current_edge,
-                            vehicle.destination,
-                            context=context,
-                            vehicle=vehicle,
-                            step=step,
-                            snapshot=snapshot,
-                        )
-                        cooldown_until = lane_change_cooldown_until.get((vehicle_id, current_edge), -1)
-                        action_source = "forced" if context.forced_action is not None else ""
-                        if context.forced_action is not None:
-                            action = context.forced_action
-                            decision_metrics["forced_actions"] += 1
-                            if context.skip_reason:
-                                decision_metrics[f"skip_reason_{context.skip_reason}"] += 1
-                        elif context.skip_reason:
-                            decision_metrics["decisions_skipped"] += 1
-                            decision_metrics[f"skip_reason_{context.skip_reason}"] += 1
-                            prev_edge_by_vehicle[vehicle_id] = current_edge
-                            continue
-                        elif not self.decision_engine.is_decision_open(context):
-                            prev_edge_by_vehicle[vehicle_id] = current_edge
-                            continue
-                        else:
-                            decision_metrics["actionable_decision_points"] += 1
-                            # available_actions = executor/safety feasibility set (unchanged semantics).
-                            # policy_actions = stricter learning-time subset to reduce harmful overrides.
-                            # Fallback machinery below remains the final safety layer.
-                            cooldown_active = step < cooldown_until
-                            policy_actions = self._policy_action_candidates(
-                                context=context,
-                                recent_history=list(recent_edge_history[vehicle_id]),
-                                cooldown_active=cooldown_active,
-                                destination=vehicle.destination,
-                                decision_metrics=decision_metrics,
-                            )
-                            removed_actions = max(len(context.available_actions) - len(policy_actions), 0)
-                            decision_metrics["policy_masked_actions_removed"] += removed_actions
-                            action, action_source = self.trainer.select_action(
-                                state, policy_actions, return_source=True
-                            )
-                            if action is None:
-                                decision_metrics["decisions_skipped"] += 1
-                                decision_metrics["actionable_skips"] += 1
-                                prev_edge_by_vehicle[vehicle_id] = current_edge
-                                continue
-                            if action_source == "explore":
-                                decision_metrics["exploration_actions"] += 1
-                            elif action_source == "policy":
-                                decision_metrics["policy_actions"] += 1
-
-                        next_edge = self.decision_engine.get_next_edge(current_edge, action)
-                        if next_edge is None:
-                            decision_metrics["safety_overrides"] += 1
-                            decision_metrics["loop_avoidance_overrides"] += 1
-                            prev_edge_by_vehicle[vehicle_id] = current_edge
-                            continue
-
-                        safe_ok, safety_details = self.decision_engine.prefilter_action_for_loops(
-                            context=context,
-                            action_idx=action,
-                            destination=vehicle.destination,
-                            recent_history=list(recent_edge_history[vehicle_id]),
-                            distance_fn=self.get_distance_to_destination,
-                        )
-                        if not safe_ok:
-                            original_action = action
-                            decision_metrics["loop_override_count"] += 1
-                            decision_metrics["loop_prefilter_overrides"] += 1
-                            if safety_details.get("dead_end_reentry"):
-                                decision_metrics["dead_end_reentry_override_count"] += 1
-                            action = self._select_fallback_action(
-                                context,
-                                blocked_action=action,
-                                destination=vehicle.destination,
-                                recent_history=list(recent_edge_history[vehicle_id]),
-                            )
-                            if action is None:
-                                prev_edge_by_vehicle[vehicle_id] = current_edge
-                                continue
-                            decision_metrics["fallback_overrides"] += 1
-                            decision_metrics["fallback_selected_total"] += 1
-                            if action in context.lane_feasible_now_actions:
-                                decision_metrics["fallback_selected_lane_now"] += 1
-                            decision_metrics["safety_overrides"] += 1
-                            action_source = "loop_prefilter_fallback"
-                            override_penalty = self._clip_reward(self.loop_trap_override_penalty)
-                            policy_actions_after_override = self._policy_action_candidates(
-                                context=context,
-                                recent_history=list(recent_edge_history[vehicle_id]),
-                                cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
-                                destination=vehicle.destination,
-                                decision_metrics=decision_metrics,
-                            )
-                            self.trainer.stage_transition(
-                                state,
-                                original_action,
-                                override_penalty,
-                                state,
-                                False,
-                                next_valid_actions=policy_actions_after_override,
-                                metadata={
-                                    "override_learning": True,
-                                    "override_type": "loop_prefilter_fallback",
-                                    "original_action": original_action,
-                                    "fallback_action": action,
-                                    "override_cause": "loop_prefilter_fallback",
-                                    "decision_finalized": False,
-                                },
-                            )
-                            decision_metrics["override_learning_transitions"] += 1
-                            decision_metrics["override_learning_negative"] += 1
-                            imitation_reward = self._clip_reward(0.15)
-                            self.trainer.stage_transition(
-                                state,
-                                action,
-                                imitation_reward,
-                                state,
-                                False,
-                                next_valid_actions=policy_actions_after_override,
-                                metadata={
-                                    "override_learning": True,
-                                    "override_type": "loop_prefilter_fallback",
-                                    "original_action": original_action,
-                                    "fallback_action": action,
-                                    "imitation_credit": True,
-                                    "decision_finalized": False,
-                                },
-                            )
-                            decision_metrics["override_learning_transitions"] += 1
-                            decision_metrics["override_learning_imitation"] += 1
-                            episode_return += override_penalty
-                            next_edge = self.decision_engine.get_next_edge(current_edge, action)
-                            if next_edge is None:
-                                prev_edge_by_vehicle[vehicle_id] = current_edge
-                                continue
-
-                        lane_change_requested = False
-                        if action not in context.lane_feasible_now_actions:
-                            if step < cooldown_until:
-                                original_action = action
-                                decision_metrics["cooldown_replans_blocked"] += 1
-                                decision_metrics["cooldown_fallback_overrides"] += 1
-                                fallback_action = self._select_fallback_action(
-                                    context,
-                                    blocked_action=action,
-                                    destination=vehicle.destination,
-                                    recent_history=list(recent_edge_history[vehicle_id]),
-                                )
-                                if fallback_action is None:
-                                    prev_edge_by_vehicle[vehicle_id] = current_edge
-                                    continue
-                                action = fallback_action
-                                action_source = "cooldown_fallback"
-                                decision_metrics["fallback_overrides"] += 1
-                                decision_metrics["fallback_selected_total"] += 1
-                                if action in context.lane_feasible_now_actions:
-                                    decision_metrics["fallback_selected_lane_now"] += 1
-                                override_penalty = self._clip_reward(self.same_edge_repeat_chase_penalty)
-                                policy_actions_after_override = self._policy_action_candidates(
-                                    context=context,
-                                    recent_history=list(recent_edge_history[vehicle_id]),
-                                    cooldown_active=True,
-                                    destination=vehicle.destination,
-                                    decision_metrics=decision_metrics,
-                                )
-                                self.trainer.stage_transition(
-                                    state,
-                                    original_action,
-                                    override_penalty,
-                                    state,
-                                    False,
-                                    next_valid_actions=policy_actions_after_override,
-                                    metadata={
-                                        "override_learning": True,
-                                        "override_type": "cooldown_fallback",
-                                        "original_action": original_action,
-                                        "fallback_action": action,
-                                        "override_cause": "cooldown_fallback",
-                                        "decision_finalized": False,
-                                    },
-                                )
-                                decision_metrics["override_learning_transitions"] += 1
-                                decision_metrics["override_learning_negative"] += 1
-                                imitation_reward = self._clip_reward(0.10)
-                                self.trainer.stage_transition(
-                                    state,
-                                    action,
-                                    imitation_reward,
-                                    state,
-                                    False,
-                                    next_valid_actions=policy_actions_after_override,
-                                    metadata={
-                                        "override_learning": True,
-                                        "override_type": "cooldown_fallback",
-                                        "original_action": original_action,
-                                        "fallback_action": action,
-                                        "imitation_credit": True,
-                                        "decision_finalized": False,
-                                    },
-                                )
-                                decision_metrics["override_learning_transitions"] += 1
-                                decision_metrics["override_learning_imitation"] += 1
-                                episode_return += override_penalty
-                            else:
-                                lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action)
-                                decision_metrics["lane_change_attempts"] += 1
-                                if lane_change_ok:
-                                    decision_metrics["lane_change_success"] += 1
-                                else:
-                                    decision_metrics["lane_change_fail"] += 1
-                                decision_metrics["lane_change_observe_started"] += 1
-                                decision_metrics["deferred_lane_change_actions"] += 1
-                                observe_metadata = self.decision_engine.start_lane_change_observe(
-                                    context, action, step, lane_change_requested, lane_change_ok
-                                )
-                                pending_decisions[vehicle_id] = PendingDecision(
-                                    state=state,
-                                    intended_action=action,
-                                    intended_next_edge=next_edge,
-                                    decision_edge=current_edge,
-                                    decision_step=step,
-                                    last_credit_edge=current_edge,
-                                    last_credit_step=step,
-                                    destination=vehicle.destination,
-                                    context=context,
-                                    lane_change_requested=lane_change_requested,
-                                    route_fragment=[],
-                                    metadata={"action_source": action_source, "decision_finalized": False, **observe_metadata},
-                                )
-                                decision_metrics["decisions_opened"] += 1
-                                prev_edge_by_vehicle[vehicle_id] = current_edge
-                                continue
-
-                        candidate_actions = [
-                            a for a in context.available_actions
-                            if self.decision_engine.get_next_edge(current_edge, a) is not None
-                        ]
-                        candidate_costs = {
-                            a: self._action_social_cost_proxy(current_edge, a, vehicle.destination)
-                            for a in candidate_actions
-                        }
-                        finite_costs = {a: c for a, c in candidate_costs.items() if math.isfinite(c)}
-                        chosen_cost = float(candidate_costs.get(action, math.inf))
-                        baseline_actions = context.lane_feasible_now_actions if context.lane_feasible_now_actions else candidate_actions
-                        baseline_finite_costs = [
-                            candidate_costs.get(a, math.inf)
-                            for a in baseline_actions
-                            if math.isfinite(candidate_costs.get(a, math.inf))
-                        ]
-                        baseline_cost = float(min(baseline_finite_costs)) if baseline_finite_costs else math.inf
-                        selfless_delta = float(baseline_cost - chosen_cost) if math.isfinite(chosen_cost) and math.isfinite(baseline_cost) else 0.0
-                        if len(candidate_actions) > 1:
-                            if finite_costs and action in finite_costs:
-                                best_action = min(finite_costs, key=finite_costs.get)
-                                best_cost = finite_costs[best_action]
-                                chosen_cost = finite_costs[action]
-                                social_regret = max(float(chosen_cost - best_cost), 0.0)
-                                social_regret_samples.append(social_regret)
-                                decision_metrics["social_regret_sum"] += social_regret
-                                decision_metrics["social_regret_count"] += 1
-                                if action == best_action:
-                                    decision_metrics["social_best_action_chosen"] += 1
-
-                        full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
-                            vehicle_id,
-                            current_edge,
-                            action,
-                            vehicle.destination,
-                        )
-                        if apply_error:
-                            decision_metrics["route_apply_fail"] += 1
-                            decision_metrics["route_apply_fail_overrides"] += 1
-                            decision_metrics["fragment_build_failures"] += 1
-                            override_penalty = self._clip_reward(-6.0)
-                            policy_actions_after_override = self._policy_action_candidates(
-                                context=context,
-                                recent_history=list(recent_edge_history[vehicle_id]),
-                                cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
-                                destination=vehicle.destination,
-                                decision_metrics=decision_metrics,
-                            )
-                            self.trainer.stage_transition(
-                                state,
-                                action,
-                                override_penalty,
-                                state,
-                                False,
-                                next_valid_actions=policy_actions_after_override,
-                                metadata={
-                                    "override_learning": True,
-                                    "override_type": "route_apply_failure",
-                                    "original_action": action,
-                                    "fallback_action": None,
-                                    "override_cause": "route_apply_failure",
-                                    "route_apply_failed": True,
-                                    "decision_finalized": False,
-                                },
-                            )
-                            decision_metrics["override_learning_transitions"] += 1
-                            decision_metrics["override_learning_negative"] += 1
-                            episode_return += override_penalty
-                            prev_edge_by_vehicle[vehicle_id] = current_edge
-                            continue
-                        last_planned_terminal_edge_by_vehicle[vehicle_id] = full_route[-1] if full_route else vehicle.destination
-
-                        pending_decisions[vehicle_id] = PendingDecision(
-                            state=state,
-                            intended_action=action,
-                            intended_next_edge=committed_next_edge,
-                            decision_edge=current_edge,
-                            decision_step=step,
-                            last_credit_edge=current_edge,
-                            last_credit_step=step,
-                            destination=vehicle.destination,
-                            context=context,
-                            lane_change_requested=lane_change_requested,
-                            route_fragment=list(full_route[1:]) if full_route else [],
-                            metadata={
-                                "action_source": action_source,
-                                "lane_change_deferrals": lane_change_deferrals.get(vehicle_id, 0),
-                                "chosen_social_cost": chosen_cost,
-                                "baseline_social_cost": baseline_cost,
-                                "selfless_delta": selfless_delta,
-                                "phase": "route_pending",
-                                "best_dist_to_end": float(context.dist_to_end),
-                                "last_progress_step": int(step),
-                                "decision_open": True,
-                                "available_count": int(len(context.available_actions)),
-                                "lane_now_count": int(len(context.lane_feasible_now_actions)),
-                                "forced_action": bool(context.forced_action is not None),
-                                "decision_finalized": False,
-                            },
-                        )
-                        lane_change_deferrals[vehicle_id] = 0
-                        decision_metrics["decisions_opened"] += 1
-                        prev_edge_by_vehicle[vehicle_id] = current_edge
-
-                    simulation_step()
-
-                    arrived_this_step = set(simulation_get_arrived_ids())
-                    teleported_ids = self.get_teleport_ids()
-                    live_after_step = set(vehicle_get_ids())
-                    removed_controlled_ids = {
-                        vid for vid in controlled_live_ids
-                        if vid not in live_after_step and vid in vehicles
-                    }
-
-                    if teleported_ids:
-                        episode_teleport_events += len(teleported_ids)
-                        decision_metrics["teleports"] += len(teleported_ids)
-                        teleported_controlled_ids.update(tid for tid in teleported_ids if tid in vehicles)
-                        for tid in teleported_ids:
-                            if tid not in vehicles:
-                                continue
-                            edge_id = last_seen_edge_by_vehicle.get(tid)
-                            if not edge_id:
-                                decision_metrics["teleport_inferred_yield_or_deadlock"] += 1
-                                continue
-                            edge_density = self._edge_density(edge_id)
-                            if edge_density >= self.teleport_jam_density_threshold:
-                                decision_metrics["teleport_inferred_jam"] += 1
-                            else:
-                                decision_metrics["teleport_inferred_yield_or_deadlock"] += 1
-
-                    for removed_id in sorted(removed_controlled_ids):
-                        if removed_id in final_outcome_by_vehicle:
-                            continue
-                        vehicle = vehicles[removed_id]
-                        last_seen_edge = last_seen_edge_by_vehicle.get(removed_id, "<unknown>")
-                        outcome = self._classify_terminal_outcome(
-                            removed_id,
-                            arrived_this_step,
-                            teleported_ids,
-                            is_live=(removed_id in live_after_step),
-                        )
-                        final_outcome_by_vehicle[removed_id] = outcome
-                        reached_global_destination = (outcome == "global_arrival")
-                        if reached_global_destination:
-                            arrived_ids.add(removed_id)
-                            if removed_id not in completed_travel_time_ids:
-                                completed_travel_time_ids.add(removed_id)
-                                completed_travel_times.append(max(float(step) - float(vehicle.start_time), 0.0))
-                            if last_seen_edge != vehicle.destination:
-                                arrived_with_prestep_edge_not_destination += 1
-
-                        arrived_debug_records.append({
-                            "vehicle_id": removed_id,
-                            "global_destination": vehicle.destination,
-                            "last_seen_edge": last_seen_edge,
-                            "observed_destination_edge": reached_global_destination,
-                            "last_planned_terminal_edge": last_planned_terminal_edge_by_vehicle.get(removed_id, "<unset>"),
-                            "reached_global_destination": reached_global_destination,
-                            "terminal_outcome": outcome,
-                        })
-                        episode_return += self._finalize_terminal_transition(
-                            vehicle_id=removed_id,
-                            vehicle=vehicle,
-                            outcome=outcome,
-                            step=step,
-                            pending_decisions=pending_decisions,
-                            terminal_recorded_ids=terminal_recorded_ids,
-                            last_snapshot_by_vehicle=last_snapshot_by_vehicle,
-                            last_seen_edge_by_vehicle=last_seen_edge_by_vehicle,
-                            decision_metrics=decision_metrics,
-                            decision_latency_steps=decision_latency_steps,
-                            finalized_decision_rewards=finalized_decision_rewards,
-                            decision_debug_rows=decision_debug_rows,
-                            episode=episode,
-                            in_arrived_ids=(removed_id in arrived_this_step),
-                            in_teleport_ids=(removed_id in teleported_ids),
-                        )
-                        self.cleanup_vehicle_state(
-                            removed_id,
-                            pending_decisions,
-                            prev_edge_by_vehicle,
-                            last_seen_edge_by_vehicle,
-                            last_planned_terminal_edge_by_vehicle,
-                            recent_edge_history,
-                            last_snapshot_by_vehicle,
-                        )
-                        emergency_brake_active_by_vehicle.pop(removed_id, None)
-                        prev_speed_by_vehicle.pop(removed_id, None)
-                        last_observed_brake_step_by_vehicle.pop(removed_id, None)
-
-                    if step % self.train_every == 0:
-                        for _ in range(self.grad_steps):
-                            self.trainer.replay()
-
-                    if step % self.step_log_every == 0:
-                        self._print_step_progress(
-                            episode=episode,
-                            step=step,
-                            total_controlled=total_controlled,
-                            arrived_ids=arrived_ids,
-                            decision_metrics=decision_metrics,
-                            mean_density_samples=mean_density_samples,
-                            congestion_high_pressure_steps=congestion_high_pressure_steps,
-                        )
-
-                    # process = psutil.Process(os.getpid())
-
-                    # if step % 100 == 0:
-                    #     print(
-                    #         "RAM_MB=", process.memory_info().rss / 1024 / 1024,
-                    #         " replay=", len(self.trainer.memory),
-                    #         " dist_cache=", len(self._distance_cache),
-                    #     )
-
-            finally:
-                if last_step_executed >= (MAX_SIMULATION_STEPS - 1):
-                    alive_at_step_cap_ids = {vid for vid in vehicle_get_ids() if vid in vehicles}
-                    for vid in alive_at_step_cap_ids:
-                        if vid not in final_outcome_by_vehicle:
-                            final_outcome_by_vehicle[vid] = "alive_at_step_cap"
-                        timeout_vehicle = vehicles[vid]
-                        episode_return += self._finalize_terminal_transition(
-                            vehicle_id=vid,
-                            vehicle=timeout_vehicle,
-                            outcome="timeout",
-                            step=last_step_executed,
-                            pending_decisions=pending_decisions,
-                            terminal_recorded_ids=terminal_recorded_ids,
-                            last_snapshot_by_vehicle=last_snapshot_by_vehicle,
-                            last_seen_edge_by_vehicle=last_seen_edge_by_vehicle,
-                            decision_metrics=decision_metrics,
-                            decision_latency_steps=decision_latency_steps,
-                            finalized_decision_rewards=finalized_decision_rewards,
-                            decision_debug_rows=decision_debug_rows,
-                            episode=episode,
-                            in_arrived_ids=False,
-                            in_teleport_ids=False,
-                        )
-                global_arrival_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "global_arrival")
-                terminal_teleport_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "teleport")
-                removed_nonarrival_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "removed_nonarrival")
-                alive_at_step_cap_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "alive_at_step_cap")
-                completion_rate = (
-                    global_arrival_count / float(total_controlled)
-                    if total_controlled > 0 else 0.0
-                )
-                avg_travel_time = float(np.mean(completed_travel_times)) if completed_travel_times else 0.0
-                p50_travel_time = float(np.percentile(completed_travel_times, 50)) if completed_travel_times else 0.0
-                p90_travel_time = float(np.percentile(completed_travel_times, 90)) if completed_travel_times else 0.0
-                avg_return = episode_return / float(total_controlled) if total_controlled > 0 else 0.0
-                mean_pending_age = (
-                    float(np.mean(pending_age_samples)) if pending_age_samples else 0.0
-                )
-                mean_decision_latency_steps = (
-                    float(np.mean(decision_latency_steps)) if decision_latency_steps else 0.0
-                )
-                mean_reward_per_finalized_decision = (
-                    float(np.mean(finalized_decision_rewards)) if finalized_decision_rewards else 0.0
-                )
-                mean_route_difficulty_eta = (
-                    float(np.mean(route_difficulty_etas)) if route_difficulty_etas else 0.0
-                )
-                p50_route_difficulty_eta = (
-                    float(np.percentile(route_difficulty_etas, 50)) if route_difficulty_etas else 0.0
-                )
-                p90_route_difficulty_eta = (
-                    float(np.percentile(route_difficulty_etas, 90)) if route_difficulty_etas else 0.0
-                )
-                mean_network_density = (
-                    float(np.mean(mean_density_samples)) if mean_density_samples else 0.0
-                )
-                p95_network_density = (
-                    float(np.percentile(p95_density_samples, 95)) if p95_density_samples else 0.0
-                )
-                lane_change_request_success_rate = (
-                    float(decision_metrics["lane_change_success"]) / float(max(decision_metrics["lane_change_attempts"], 1.0))
-                )
-                lane_change_request_failure_rate = (
-                    float(decision_metrics["lane_change_fail"]) / float(max(decision_metrics["lane_change_attempts"], 1.0))
-                )
-                if completed_travel_times:
-                    tail_travel_times = [tt for tt in completed_travel_times if tt >= p90_travel_time]
-                else:
-                    tail_travel_times = []
-                unfinished_count = int(alive_at_step_cap_count + removed_nonarrival_count)
-                tail_vehicles_over_p90_count = int(len(tail_travel_times) + unfinished_count)
-                tail_reference = (
-                    float(np.mean(tail_travel_times))
-                    if tail_travel_times else p90_travel_time
-                )
-                if unfinished_count > 0 and last_step_executed >= 0:
-                    # Treat unfinished controlled vehicles as unresolved long-tail travel times.
-                    tail_reference = (
-                        (tail_reference * len(tail_travel_times)) + (float(last_step_executed) * unfinished_count)
-                    ) / max(len(tail_travel_times) + unfinished_count, 1)
-                tail_completion_gap_steps = float(max(tail_reference - p50_travel_time, 0.0))
-                loop_reason_counts = {
-                    "short_cycle": float(decision_metrics["short_cycle_events"]),
-                    "aba_bounce": float(decision_metrics["aba_bounce_events"]),
-                    "dead_end_reentry": float(decision_metrics["dead_end_reentry_events"]),
-                    "long_horizon": float(decision_metrics["long_horizon_loop_events"]),
-                    "revisit_without_progress": float(decision_metrics["revisit_without_progress_events"]),
-                }
-                dominant_loop_reason = "none"
-                if sum(loop_reason_counts.values()) > 0:
-                    dominant_loop_reason = max(loop_reason_counts.items(), key=lambda item: item[1])[0]
-                skipped_to_finalized_ratio = float(decision_metrics["decisions_skipped"]) / float(
-                    max(decision_metrics["decisions_finalized"], 1.0)
-                )
-                skipped_minus_finalized = float(decision_metrics["decisions_skipped"] - decision_metrics["decisions_finalized"])
-                skipped_significantly_gt_finalized = int(
-                    (decision_metrics["decisions_skipped"] >= (1.25 * max(decision_metrics["decisions_finalized"], 1.0)))
-                )
-                social_regret_mean = (
-                    float(np.mean(social_regret_samples)) if social_regret_samples else 0.0
-                )
-                social_regret_p90 = (
-                    float(np.percentile(social_regret_samples, 90)) if social_regret_samples else 0.0
-                )
-                social_best_action_chosen_rate = (
-                    float(decision_metrics["social_best_action_chosen"]) / float(max(decision_metrics["social_regret_count"], 1.0))
-                )
-                actionable_skip_ratio = (
-                    float(decision_metrics["actionable_skips"]) / float(max(decision_metrics["actionable_decision_points"], 1.0))
-                )
-                pending_resolved_total = float(
-                    decision_metrics["pending_resolved_success"]
-                    + decision_metrics["pending_resolved_timeout"]
-                    + decision_metrics["pending_resolved_abort_no_progress"]
-                )
-                pending_resolution_success_rate = (
-                    float(decision_metrics["pending_resolved_success"]) / float(max(pending_resolved_total, 1.0))
-                )
-                if len(completed_travel_times) > 1 and avg_travel_time > 0:
-                    sorted_tt = sorted(float(tt) for tt in completed_travel_times)
-                    n_tt = len(sorted_tt)
-                    weighted_sum = sum((idx + 1) * value for idx, value in enumerate(sorted_tt))
-                    delay_fairness_gini = float((2.0 * weighted_sum) / (n_tt * sum(sorted_tt)) - (n_tt + 1) / n_tt)
-                    delay_fairness_gini = float(np.clip(delay_fairness_gini, 0.0, 1.0))
-                else:
-                    delay_fairness_gini = 0.0
-                loop_after_fallback_rate = (
-                    float(decision_metrics["loop_after_fallback_events"]) / float(max(decision_metrics["fallback_finalized"], 1.0))
-                )
-                p95_to_p50_travel_ratio = (
-                    float(np.percentile(completed_travel_times, 95) / max(p50_travel_time, 1e-6))
-                    if completed_travel_times else 0.0
-                )
-                timeout_rate = float(alive_at_step_cap_count) / float(max(total_controlled, 1))
-                fallback_rate_per_opened_decision = (
-                    float(decision_metrics["fallback_overrides"]) / float(max(decision_metrics["decisions_opened"], 1.0))
-                )
-                controlled_teleport_rate = float(len(teleported_controlled_ids)) / float(max(total_controlled, 1))
-                reachable_lane_change_excluded_any_rate = (
-                    float(decision_metrics["reachable_lane_change_excluded_any"])
-                    / float(max(decision_metrics["reachable_lane_change_nonempty"], 1.0))
-                )
-                policy_lane_now_collapse_rate = (
-                    float(decision_metrics["policy_candidates_collapsed_to_lane_now_only"])
-                    / float(max(decision_metrics["policy_candidates_with_broader_available"], 1.0))
-                )
-
-                rolling_teleport_events.append(float(episode_teleport_events))
-                rolling_teleported_controlled.append(float(len(teleported_controlled_ids)))
-                rolling_completion_rate.append(float(completion_rate))
-                rolling_avg_return.append(float(avg_return))
-                rolling_avg_travel_time.append(float(avg_travel_time))
-                rolling_mismatch.append(float(decision_metrics["route_mismatch"]))
-
-                roll_tele_events = sum(rolling_teleport_events) / len(rolling_teleport_events)
-                roll_tele_ctrl = sum(rolling_teleported_controlled) / len(rolling_teleported_controlled)
-                roll_completion = sum(rolling_completion_rate) / len(rolling_completion_rate)
-                roll_return = sum(rolling_avg_return) / len(rolling_avg_return)
-                roll_avg_travel_time = sum(rolling_avg_travel_time) / len(rolling_avg_travel_time)
-                roll_mismatch = sum(rolling_mismatch) / len(rolling_mismatch)
-
-                self.trainer.flush_staged_episode(
-                    avg_tt=avg_travel_time,
-                    avg_return=avg_return,
-                    completion_rate=completion_rate,
-                    teleported_controlled=len(teleported_controlled_ids),
-                )
-                self.trainer.epsilon = max(
-                    self.trainer.epsilon_min,
-                    self.trainer.epsilon * self.trainer.epsilon_decay
-                )
-                print(
-                    f"\n[EP {episode:03d} DONE] eps={self.trainer.epsilon:.4f} train={self.trainer.train_steps} "
-                    f"replay={len(self.trainer.memory)} ret={avg_return:.3f} "
-                    f"done={global_arrival_count}/{total_controlled} "
-                    f"failed={max(total_controlled-global_arrival_count,0)} avg_tt={avg_travel_time:.2f} "
-                    f"p50_tt={p50_travel_time:.2f} p90_tt={p90_travel_time:.2f}"
-                )
-                print(
-                    f"  rolling({len(rolling_teleport_events)}): completion={roll_completion:.1%} "
-                    f"avg_return={roll_return:.3f} avg_tt={roll_avg_travel_time:.2f} teleports/ep={roll_tele_events:.2f} "
-                    f"teleported_ctrl/ep={roll_tele_ctrl:.2f} mismatch/ep={roll_mismatch:.2f}"
-                )
-                print(
-                    "  decisions: opened={:.0f} finalized={:.0f} skipped={:.0f} forced={:.0f} "
-                    "lane_change(a/s/f)={:.0f}/{:.0f}/{:.0f} loops={:.0f} uturn={:.0f} "
-                    "short_cycle={:.0f} aba={:.0f} dead_end_reentry={:.0f} "
-                    "apply_fail={:.0f} overrides={:.0f} override_ratio={:.1%}".format(
-                        decision_metrics["decisions_opened"],
-                        decision_metrics["decisions_finalized"],
-                        decision_metrics["decisions_skipped"],
-                        decision_metrics["forced_actions"],
-                        decision_metrics["lane_change_attempts"],
-                        decision_metrics["lane_change_success"],
-                        decision_metrics["lane_change_fail"],
-                        decision_metrics["loop_events"],
-                        decision_metrics["uturn_events"],
-                        decision_metrics["short_cycle_events"],
-                        decision_metrics["aba_bounce_events"],
-                        decision_metrics["dead_end_reentry_events"],
-                        decision_metrics["route_apply_fail"],
-                        (
-                            decision_metrics["safety_overrides"]
-                            + decision_metrics["fallback_overrides"]
-                            + decision_metrics["route_apply_fail"]
-                        ),
-                        (
-                            decision_metrics["safety_overrides"]
-                            + decision_metrics["fallback_overrides"]
-                            + decision_metrics["route_apply_fail"]
-                        ) / max(decision_metrics["decisions_opened"], 1.0),
-                    )
-                )
-                print(
-                    "  policy mix: explore={:.0f} policy={:.0f} deferred_lane_change={:.0f} fallback={:.0f}".format(
-                        decision_metrics["exploration_actions"],
-                        decision_metrics["policy_actions"],
-                        decision_metrics["deferred_lane_change_actions"],
-                        decision_metrics["fallback_overrides"],
-                    )
-                )
-                print(
-                    "  diagnostics: density(mean/p95)={:.4f}/{:.4f} congestion_steps={} "
-                    "emergency_brake(total/leader/congestion/junction/other)={:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f} "
-                    "teleport_inferred(jam/yield_or_deadlock)={:.0f}/{:.0f}".format(
-                        mean_network_density,
-                        p95_network_density,
-                        congestion_high_pressure_steps,
-                        decision_metrics["emergency_brake_events"],
-                        decision_metrics["emergency_brake_due_to_leader"],
-                        decision_metrics["emergency_brake_due_to_congestion"],
-                        decision_metrics["emergency_brake_near_junction"],
-                        decision_metrics["emergency_brake_other_reason"],
-                        decision_metrics["teleport_inferred_jam"],
-                        decision_metrics["teleport_inferred_yield_or_deadlock"],
-                    )
-                )
-                print(
-                    "  tail+decision diagnostics: unfinished={} tail_over_p90={} tail_gap_vs_p50={:.1f} "
-                    "loop_reason={} skip/finalized={:.0f}/{:.0f} ratio={:.2f} significant_skip_excess={}".format(
-                        unfinished_count,
-                        tail_vehicles_over_p90_count,
-                        tail_completion_gap_steps,
-                        dominant_loop_reason,
-                        decision_metrics["decisions_skipped"],
-                        decision_metrics["decisions_finalized"],
-                        skipped_to_finalized_ratio,
-                        bool(skipped_significantly_gt_finalized),
-                    )
-                )
-                print(
-                    "  selfless diagnostics: social_regret(mean/p90)={:.3f}/{:.3f} social_best_rate={:.1%} "
-                    "actionable_skip_ratio={:.1%} pending_resolution_success={:.1%} gini={:.3f} "
-                    "loop_after_fallback_rate={:.1%}".format(
-                        social_regret_mean,
-                        social_regret_p90,
-                        social_best_action_chosen_rate,
-                        actionable_skip_ratio,
-                        pending_resolution_success_rate,
-                        delay_fairness_gini,
-                        loop_after_fallback_rate,
-                    )
-                )
-                print(
-                    "  lane-change success diagnostics: lane_change_request_success_rate={:.1%} "
-                    "lane_change_request_failure_rate={:.1%} "
-                    "pending_lane_change_resolution_success_rate={:.1%} (main deferred metric)".format(
-                        lane_change_request_success_rate,
-                        lane_change_request_failure_rate,
-                        pending_resolution_success_rate,
-                    )
-                )
-                print(
-                    "  action-space diagnostics: skip_reason(forced_by_lane_commit/too_late_or_unreachable)={:.0f}/{:.0f} "
-                    "reachable_lane_change_excluded_any={:.0f}/{:.0f}({:.1%}) "
-                    "policy_lane_now_only={:.0f}/{:.0f}({:.1%})".format(
-                        decision_metrics["skip_reason_forced_by_lane_commit"],
-                        decision_metrics["skip_reason_too_late_or_unreachable"],
-                        decision_metrics["reachable_lane_change_excluded_any"],
-                        decision_metrics["reachable_lane_change_nonempty"],
-                        reachable_lane_change_excluded_any_rate,
-                        decision_metrics["policy_candidates_collapsed_to_lane_now_only"],
-                        decision_metrics["policy_candidates_with_broader_available"],
-                        policy_lane_now_collapse_rate,
-                    )
-                )
-
-                exited_without_destination = removed_nonarrival_count
-                print(
-                    f"Controlled exit diagnostics | "
-                    f"arrived={global_arrival_count}/{total_controlled}, "
-                    f"teleported_terminal={terminal_teleport_count}/{total_controlled}, "
-                    f"removed_nonarrival={removed_nonarrival_count}/{total_controlled}, "
-                    f"alive_at_step_cap={alive_at_step_cap_count}/{total_controlled}"
-                )
-                print(
-                    "  terminal_outcomes: "
-                    f"global_arrival={global_arrival_count} "
-                    f"teleport={terminal_teleport_count} "
-                    f"removed_nonarrival={removed_nonarrival_count} "
-                    f"alive_at_step_cap={alive_at_step_cap_count} "
-                    f"arrived_with_prestep_edge_not_destination={arrived_with_prestep_edge_not_destination}"
-                )
-
-                if self.debug_exit_diagnostics:
-                    mismatched_arrivals = [
-                        record for record in arrived_debug_records
-                        if (
-                            record["terminal_outcome"] == "global_arrival"
-                            and record["last_seen_edge"] != record["global_destination"]
-                        )
-                    ]
-                    print(
-                        f"Arrival debug | total_arrived={len(arrived_debug_records)}, "
-                        f"arrived_with_prestep_edge_not_destination={len(mismatched_arrivals)}"
-                    )
-
-                    for record in mismatched_arrivals[:self.debug_exit_diagnostics_limit]:
-                        print(
-                            "  ARRIVED_PRESTEP_EDGE_MISMATCH "
-                            f"vehicle={record['vehicle_id']} "
-                            f"last_seen_edge={record['last_seen_edge']} "
-                            f"last_planned_terminal_edge={record['last_planned_terminal_edge']} "
-                            f"global_destination={record['global_destination']}"
-                        )
-
-                    if len(mismatched_arrivals) > self.debug_exit_diagnostics_limit:
-                        print(
-                            "  ARRIVED_PRESTEP_EDGE_MISMATCH ... "
-                            f"{len(mismatched_arrivals) - self.debug_exit_diagnostics_limit} more vehicles"
-                        )
-
-                    removed_nonarrival_ids = sorted(
-                        [vid for vid, outcome in final_outcome_by_vehicle.items() if outcome == "removed_nonarrival"]
-                    )
-                    for vehicle_id in removed_nonarrival_ids[:self.debug_exit_diagnostics_limit]:
-                        vehicle = vehicles[vehicle_id]
-                        print(
-                            "  EXITED_WITHOUT_DEST "
-                            f"vehicle={vehicle_id} "
-                            f"last_seen_edge={last_seen_edge_by_vehicle.get(vehicle_id, '<unknown>')} "
-                            f"last_planned_terminal_edge={last_planned_terminal_edge_by_vehicle.get(vehicle_id, '<unset>')} "
-                            f"global_destination={vehicle.destination}"
-                        )
-
-                    if len(removed_nonarrival_ids) > self.debug_exit_diagnostics_limit:
-                        print(
-                            "  EXITED_WITHOUT_DEST ... "
-                            f"{len(removed_nonarrival_ids) - self.debug_exit_diagnostics_limit} more vehicles"
-                        )
-                for vid, pending in pending_decisions.items():
-                    if vid in pending_debug_logged_ids:
+                        dest = self._get_destination_edge(vid, edge_id)
+                        context = self.decision_engine.build_context(vid, edge_id, dest, step)
+                    except Exception:
                         continue
-                    decision_debug_rows.append(self._build_decision_debug_row(
-                        episode=episode,
-                        step=last_step_executed,
-                        pending=pending,
-                        actual_next_edge="",
-                        finalized=0,
-                        finalize_delay_steps=max(last_step_executed - pending.decision_step, 0),
-                    ))
-                self._append_decision_debug_rows(decision_debug_rows)
-                traci.close()
-                with open(self.metrics_csv_path, "a", newline="") as f:
-                    writer = csv.DictWriter(f, fieldnames=csv_fields)
-                    row = {
-                        "episode": episode,
-                        "epsilon": self.trainer.epsilon,
-                        "replay": len(self.trainer.memory),
-                        "elite_buffer_size": len(self.trainer.elite_memory),
-                        "elite_transitions_added": self.trainer.elite_transitions_added,
-                        "elite_samples_drawn": self.trainer.elite_samples_drawn,
-                        "replay_main_finalized": self.trainer.replay_main_kept_finalized,
-                        "replay_main_pending_timeout": self.trainer.replay_main_kept_pending_timeout,
-                        "replay_main_terminal": self.trainer.replay_main_kept_terminal,
-                        "replay_main_dropped": self.trainer.replay_main_dropped,
-                        "replay_main_other_kept": self.trainer.replay_main_kept_other,
-                        "train_steps": self.trainer.train_steps,
-                        "mean_loss": self.trainer.last_loss if self.trainer.last_loss is not None else "",
-                        "episode_return": avg_return,
-                        "completion_rate": completion_rate,
-                        "avg_travel_time": avg_travel_time,
-                        "p50_travel_time": p50_travel_time,
-                        "p90_travel_time": p90_travel_time,
-                        "teleports": episode_teleport_events,
-                        "teleported_controlled": len(teleported_controlled_ids),
-                        "forced_actions": decision_metrics["forced_actions"],
-                        "decisions_opened": decision_metrics["decisions_opened"],
-                        "decisions_finalized": decision_metrics["decisions_finalized"],
-                        "decisions_skipped": decision_metrics["decisions_skipped"],
-                        "route_mismatch": decision_metrics["route_mismatch"],
-                        "loop_events": decision_metrics["loop_events"],
-                        "uturn_events": decision_metrics["uturn_events"],
-                        "short_cycle_events": decision_metrics["short_cycle_events"],
-                        "aba_bounce_events": decision_metrics["aba_bounce_events"],
-                        "dead_end_reentry_events": decision_metrics["dead_end_reentry_events"],
-                        "long_horizon_loop_events": decision_metrics["long_horizon_loop_events"],
-                        "revisit_without_progress_events": decision_metrics["revisit_without_progress_events"],
-                        "safety_overrides": decision_metrics["safety_overrides"],
-                        "loop_avoidance_overrides": decision_metrics["loop_avoidance_overrides"],
-                        "fragment_build_failures": decision_metrics["fragment_build_failures"],
-                        "fallback_overrides": decision_metrics["fallback_overrides"],
-                        "fallback_selected_total": decision_metrics["fallback_selected_total"],
-                        "fallback_selected_lane_now": decision_metrics["fallback_selected_lane_now"],
-                        "pending_decision_timeouts": decision_metrics["pending_decision_timeouts"],
-                        "deferred_lane_change_actions": decision_metrics["deferred_lane_change_actions"],
-                        "lane_change_observe_started": decision_metrics["lane_change_observe_started"],
-                        "lane_change_observe_success": decision_metrics["lane_change_observe_success"],
-                        "lane_change_observe_abort_no_progress": decision_metrics["lane_change_observe_abort_no_progress"],
-                        "lane_change_observe_abort_commit_window": decision_metrics["lane_change_observe_abort_commit_window"],
-                        "same_edge_pending_released_no_progress": decision_metrics["same_edge_pending_released_no_progress"],
-                        "cooldown_replans_blocked": decision_metrics["cooldown_replans_blocked"],
-                        "loop_override_count": decision_metrics["loop_override_count"],
-                        "dead_end_reentry_override_count": decision_metrics["dead_end_reentry_override_count"],
-                        "snapshot_cache_hits": self._cache_metrics["snapshot_cache_hits"],
-                        "shortest_path_cache_hits": self._cache_metrics["shortest_path_cache_hits"],
-                        "exploration_actions": decision_metrics["exploration_actions"],
-                        "policy_actions": decision_metrics["policy_actions"],
-                        "override_ratio": (
-                            decision_metrics["safety_overrides"]
-                            + decision_metrics["fallback_overrides"]
-                            + decision_metrics["route_apply_fail"]
-                        ) / max(decision_metrics["decisions_opened"], 1.0),
-                        "policy_masked_actions_removed": decision_metrics["policy_masked_actions_removed"],
-                        "override_learning_transitions": decision_metrics["override_learning_transitions"],
-                        "loop_prefilter_overrides": decision_metrics["loop_prefilter_overrides"],
-                        "cooldown_fallback_overrides": decision_metrics["cooldown_fallback_overrides"],
-                        "observe_abort_fallback_overrides": decision_metrics["observe_abort_fallback_overrides"],
-                        "route_apply_fail_overrides": decision_metrics["route_apply_fail_overrides"],
-                        "override_learning_negative": decision_metrics["override_learning_negative"],
-                        "override_learning_imitation": decision_metrics["override_learning_imitation"],
-                        "timeout_unfinished_controlled": alive_at_step_cap_count,
-                        "exited_without_destination": exited_without_destination,
-                        "alive_at_step_cap": alive_at_step_cap_count,
-                        "decision_pending_at_episode_end": len(pending_decisions),
-                        "mean_pending_age": mean_pending_age,
-                        "mean_decision_latency_steps": mean_decision_latency_steps,
-                        "mean_reward_per_finalized_decision": mean_reward_per_finalized_decision,
-                        "mean_route_difficulty_eta": mean_route_difficulty_eta,
-                        "p50_route_difficulty_eta": p50_route_difficulty_eta,
-                        "p90_route_difficulty_eta": p90_route_difficulty_eta,
-                        "fail_teleport": terminal_teleport_count,
-                        "fail_timeout": decision_metrics["fail_timeout"],
-                        "fail_removed_non_destination": decision_metrics["fail_removed_non_destination"],
-                        "fail_unreachable_transition": decision_metrics["fail_unreachable_transition"],
-                        "fail_dead_end_no_outgoing": decision_metrics["fail_dead_end_no_outgoing"],
-                        "mean_network_density": mean_network_density,
-                        "p95_network_density": p95_network_density,
-                        "congestion_high_pressure_steps": congestion_high_pressure_steps,
-                        "emergency_brake_events": decision_metrics["emergency_brake_events"],
-                        "emergency_brake_due_to_leader": decision_metrics["emergency_brake_due_to_leader"],
-                        "emergency_brake_due_to_congestion": decision_metrics["emergency_brake_due_to_congestion"],
-                        "emergency_brake_near_junction": decision_metrics["emergency_brake_near_junction"],
-                        "emergency_brake_other_reason": decision_metrics["emergency_brake_other_reason"],
-                        "teleport_inferred_jam": decision_metrics["teleport_inferred_jam"],
-                        "teleport_inferred_yield_or_deadlock": decision_metrics["teleport_inferred_yield_or_deadlock"],
-                        "lane_change_request_success_rate": lane_change_request_success_rate,
-                        "lane_change_request_failure_rate": lane_change_request_failure_rate,
-                        "tail_vehicles_over_p90_count": tail_vehicles_over_p90_count,
-                        "tail_completion_gap_steps": tail_completion_gap_steps,
-                        "loop_reason_short_cycle": decision_metrics["short_cycle_events"],
-                        "loop_reason_aba_bounce": decision_metrics["aba_bounce_events"],
-                        "loop_reason_dead_end_reentry": decision_metrics["dead_end_reentry_events"],
-                        "loop_reason_long_horizon": decision_metrics["long_horizon_loop_events"],
-                        "loop_reason_revisit_without_progress": decision_metrics["revisit_without_progress_events"],
-                        "dominant_loop_reason": dominant_loop_reason,
-                        "skipped_to_finalized_ratio": skipped_to_finalized_ratio,
-                        "skipped_minus_finalized": skipped_minus_finalized,
-                        "skipped_significantly_gt_finalized": skipped_significantly_gt_finalized,
-                        "social_regret_mean": social_regret_mean,
-                        "social_regret_p90": social_regret_p90,
-                        "social_best_action_chosen_rate": social_best_action_chosen_rate,
-                        "actionable_skip_ratio": actionable_skip_ratio,
-                        "pending_resolution_success_rate": pending_resolution_success_rate,
-                        "delay_fairness_gini": delay_fairness_gini,
-                        "loop_after_fallback_rate": loop_after_fallback_rate,
-                        "p95_to_p50_travel_ratio": p95_to_p50_travel_ratio,
-                        "timeout_rate": timeout_rate,
-                        "fallback_rate_per_opened_decision": fallback_rate_per_opened_decision,
-                        "controlled_teleport_rate": controlled_teleport_rate,
-                        "skip_reason_forced_by_lane_commit": decision_metrics["skip_reason_forced_by_lane_commit"],
-                        "skip_reason_too_late_or_unreachable": decision_metrics["skip_reason_too_late_or_unreachable"],
-                        "skip_reason_forced_single_path": decision_metrics["skip_reason_forced_single_path"],
-                        "skip_reason_no_branch": decision_metrics["skip_reason_no_branch"],
-                        "reachable_lane_change_nonempty": decision_metrics["reachable_lane_change_nonempty"],
-                        "reachable_lane_change_excluded_any": decision_metrics["reachable_lane_change_excluded_any"],
-                        "reachable_lane_change_excluded_all": decision_metrics["reachable_lane_change_excluded_all"],
-                        "policy_candidates_with_broader_available": decision_metrics["policy_candidates_with_broader_available"],
-                        "policy_candidates_collapsed_to_lane_now_only": decision_metrics["policy_candidates_collapsed_to_lane_now_only"],
-                        "soft_commit_window_admissions": decision_metrics["soft_commit_window_admissions"],
-                        "observe_abort_low_speed": decision_metrics["observe_abort_low_speed"],
-                        "pending_commit_window_grace_kept": decision_metrics["pending_commit_window_grace_kept"],
-                        "proactive_shift2_candidates_kept": decision_metrics["proactive_shift2_candidates_kept"],
-                    }
-                    if set(row.keys()) != set(csv_fields):
-                        raise ValueError("rl_episode_metrics.csv row schema does not match header")
-                    writer.writerow(row)
 
-        self.trainer.model.save(self.model_output_path)
+                    # Open decision if none active.
+                    if vid not in active_decisions:
+                        shared_state = self._state_for_context(vid, context, dest)
+                        strategic_context = self.tactical_executor.build_options(
+                            context,
+                            shared_state,
+                            queue_length_fn=self._queue_len,
+                        )
+                        executable_options = self.tactical_executor.filter_executable_options(strategic_context)
+                        metrics["decision_open_count"] += 1
+                        metrics["option_count_total"] += len(strategic_context.options)
+                        metrics["executable_option_count_total"] += len(executable_options)
 
-    def update_edge_vehicle_counts(self, step, every=10):
-        if hasattr(self, "_last_density_step") and (step - self._last_density_step) < every:
-            return  # reuse cached self._density_vec
+                        if len(executable_options) < 2:
+                            metrics["forced_nonlearned_decision_count"] += 1
+                            continue
 
-        counts = self.connection_info.edge_vehicle_count
-        edge_list = self.connection_info.edge_list
+                        option_features = [opt.option_features for opt in executable_options]
+                        selected_idx, source = self.strategic_trainer.select_option(shared_state, option_features)
+                        if selected_idx is None:
+                            continue
+                        selected_option = executable_options[selected_idx]
+                        tactical_state = self.tactical_executor.begin_execution(vid, selected_option, step)
+                        active_decisions[vid] = ActiveStrategicDecision(
+                            context=strategic_context,
+                            chosen_option_idx=selected_idx,
+                            chosen_option=selected_option,
+                            opened_step=step,
+                            tactical_state=tactical_state,
+                        )
+                        metrics["learned_decision_count"] += 1
 
-        for edge in edge_list:
-            counts[edge] = traci.edge.getLastStepVehicleNumber(edge)
+                    # Step active decision.
+                    active = active_decisions.get(vid)
+                    if not active:
+                        continue
+                    active.reward_accumulator += -float(self.travel_time_penalty)
+                    active.horizon_steps += 1
+                    self.tactical_executor.step_execution(active.tactical_state, context, active.chosen_option, step)
+                    outcome = self.tactical_executor.resolve_execution(active.tactical_state, context, active.chosen_option)
 
-        lane_meters_vec = np.array([self._edge_lane_meters(e) for e in edge_list], dtype=np.float32)
-        self._density_vec = np.array([self._edge_density(e, counts[e]) for e in edge_list], dtype=np.float32)
+                    if outcome == "in_progress":
+                        continue
 
-        if len(self._density_vec) > 0 and len(lane_meters_vec) > 0:
-            total_vehicles = float(sum(counts[e] for e in edge_list))
-            total_lane_meters = float(np.sum(lane_meters_vec))
-            self._density_mean = (total_vehicles * float(self.density_scale_m)) / max(total_lane_meters, 1.0)
+                    done = bool(outcome != "success")
+                    if outcome == "success":
+                        metrics["option_success_count"] += 1
+                    else:
+                        metrics["option_failure_counts"][outcome] += 1
+                        if outcome == "commit_window_miss":
+                            metrics["commit_window_miss_count"] += 1
+                        elif outcome == "stalled_lane_change":
+                            metrics["stalled_lane_change_count"] += 1
+                        elif outcome == "forced_by_lane_commit":
+                            metrics["forced_by_lane_commit_count"] += 1
+                        elif outcome == "teleport":
+                            metrics["teleport_during_execution_count"] += 1
+                        elif outcome == "collision":
+                            metrics["collision_during_execution_count"] += 1
+                        elif outcome == "timeout":
+                            metrics["timeout_during_execution_count"] += 1
 
-            density_diff_sq = (self._density_vec - self._density_mean) ** 2
-            self._density_std = float(np.sqrt(np.average(density_diff_sq, weights=lane_meters_vec)))
-            self._density_p95 = self._occupied_density_p95(self._density_vec)
-        else:
-            self._density_mean = 0.0
-            self._density_std = 0.0
-            self._density_p95 = 0.0
-        self._last_density_step = step
+                    next_shared = None
+                    next_option_features = None
+                    if not done:
+                        next_shared = self._state_for_context(vid, context, dest)
+                        next_ctx = self.tactical_executor.build_options(context, next_shared, queue_length_fn=self._queue_len)
+                        next_option_features = self._build_option_features(next_ctx)
+
+                    transition = StrategicTransition(
+                        state_shared=active.context.shared_state,
+                        state_option_features=self._build_option_features(active.context),
+                        chosen_option_idx=active.chosen_option_idx,
+                        aggregated_reward=float(active.reward_accumulator),
+                        next_state_shared=next_shared,
+                        next_state_option_features=next_option_features,
+                        done=bool(done),
+                        outcome=("resolved" if outcome == "success" else "failed"),
+                        tactical_outcome=None if outcome == "success" else outcome,
+                        horizon_steps=max(active.horizon_steps, 1),
+                    )
+                    if outcome in self._strategic_main_allowed_tactical_outcomes:
+                        self.strategic_trainer.replay.add_strategic(transition)
+                    if outcome != "success":
+                        self.strategic_trainer.replay.add_tactical_failure(transition)
+                    metrics["decision_horizon_steps"].append(float(active.horizon_steps))
+                    active_decisions.pop(vid, None)
+
+                self.strategic_trainer.train_step()
+
+            # Resolve active decisions at episode terminal once.
+            for vid, active in list(active_decisions.items()):
+                transition = StrategicTransition(
+                    state_shared=active.context.shared_state,
+                    state_option_features=self._build_option_features(active.context),
+                    chosen_option_idx=active.chosen_option_idx,
+                    aggregated_reward=float(active.reward_accumulator),
+                    next_state_shared=None,
+                    next_state_option_features=None,
+                    done=True,
+                    outcome="failed",
+                    tactical_outcome="timeout",
+                    horizon_steps=max(active.horizon_steps, 1),
+                )
+                self.strategic_trainer.replay.add_terminal_only(transition)
+                metrics["timeout_during_execution_count"] += 1
+                active_decisions.pop(vid, None)
+
+            traci.close()
+            assert len(self.trainer.memory) == 0, "Legacy DQN replay should remain unused in redesigned run path."
+
+            avg_option_count = metrics["option_count_total"] / max(metrics["decision_open_count"], 1)
+            avg_exec_option_count = metrics["executable_option_count_total"] / max(metrics["decision_open_count"], 1)
+            avg_horizon = float(np.mean(metrics["decision_horizon_steps"])) if metrics["decision_horizon_steps"] else 0.0
+            success_rate = metrics["option_success_count"] / max(metrics["learned_decision_count"], 1)
+            print(
+                f"[EP {episode+1:03d}] open={metrics['decision_open_count']} learned={metrics['learned_decision_count']} "
+                f"forced_nonlearned={metrics['forced_nonlearned_decision_count']} avg_options={avg_option_count:.2f} "
+                f"avg_exec_options={avg_exec_option_count:.2f} strategic_success_rate={success_rate:.2%} "
+                f"avg_horizon={avg_horizon:.2f} replay(s/t/term)=({len(self.strategic_trainer.replay.strategic_replay)}/"
+                f"{len(self.strategic_trainer.replay.tactical_failure_replay)}/{len(self.strategic_trainer.replay.terminal_only_replay)}) "
+                f"sample_fracs={self.strategic_trainer.last_sample_fractions} "
+                f"sample_counts={self.strategic_trainer.last_sample_counts} "
+                f"legacy_replay_size={len(self.trainer.memory)}"
+            )
+
+        self.strategic_trainer.model.save(self.model_output_path)
+        print(f"Option-based strategic model saved to {self.model_output_path}")

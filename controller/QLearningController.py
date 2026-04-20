@@ -10,6 +10,7 @@ from collections import deque
 from xml.dom.minidom import parse
 import os
 from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision, VehicleSnapshot
+from core.tactical_option_executor import TacticalOptionExecutor
 from core.route_loop_safety import transition_signal, would_worsen_distance
 
 def parse_sumocfg(sumocfg_path):
@@ -23,10 +24,14 @@ class QLearningPolicy(RouteController):
     def __init__(self, vehicles, connection_info, model_file, net_xml_file = net_path):
         super().__init__(connection_info)
         self.model = load_model(model_file)
-        self.model_state_size = int(self.model.input_shape[-1])
+        if isinstance(self.model.input_shape, list):
+            self.model_state_size = int(self.model.input_shape[0][-1])
+        else:
+            self.model_state_size = int(self.model.input_shape[-1])
         self.vehicles = vehicles
         self.net = sumolib.net.readNet(net_xml_file)
         self.decision_engine = JunctionDecisionEngine(connection_info, self.net, self.direction_choices)
+        self.tactical_executor = TacticalOptionExecutor(self.decision_engine)
         self._visit_count = {}
         self._best_dist = {}
         self._recent_edges = {}
@@ -610,7 +615,7 @@ class QLearningPolicy(RouteController):
                     cooldown_active=cooldown_active,
                     destination=vehicle.destination,
                 )
-                action_idx = self.act(state, available_actions=policy_actions)
+                action_idx = self.act(state, available_actions=policy_actions, context=context)
                 self._metrics["decisions"] += 1
 
             if action_idx not in context.available_actions:
@@ -638,7 +643,7 @@ class QLearningPolicy(RouteController):
                 )
                 if not fallback_actions:
                     continue
-                action_idx = self.act(state, available_actions=fallback_actions) if context.forced_action is None else fallback_actions[0]
+                action_idx = self.act(state, available_actions=fallback_actions, context=context) if context.forced_action is None else fallback_actions[0]
                 self._metrics["fallback_selected_total"] += 1
                 if action_idx in context.lane_feasible_now_actions:
                     self._metrics["fallback_selected_lane_now"] += 1
@@ -754,15 +759,29 @@ class QLearningPolicy(RouteController):
 
 
     # this function reacheds the Neural Network trained before and let it make a decision for the situation now
-    def act(self, state, available_actions=None):
-        act_values = self.model.predict(state, verbose=0)[0]
+    def act(self, state, available_actions=None, context=None):
         if available_actions is None:
             mask_start = self.direction_mask_start + 18 if self.use_compact_state else self.direction_mask_start
             available = [i for i, v in enumerate(state[0][mask_start:mask_start + 6]) if v > 0.5]
         else:
             available = list(available_actions)
         if not available:
-            return int(np.argmax(act_values))
+            return 0
+
+        # Option-based inference path: model(shared_state, option_features)->score
+        if isinstance(self.model.input_shape, list) and len(self.model.input_shape) == 2 and context is not None:
+            strategic_context = self.tactical_executor.build_options(context, state)
+            option_by_id = {opt.option_id: opt for opt in strategic_context.options}
+            filtered = [option_by_id[a] for a in available if a in option_by_id]
+            if filtered:
+                shared_batch = np.repeat(np.asarray(state, dtype=np.float32), len(filtered), axis=0)
+                option_batch = np.asarray([opt.option_features for opt in filtered], dtype=np.float32)
+                scores = self.model.predict([shared_batch, option_batch], verbose=0).reshape(-1)
+                best_idx = int(np.argmax(scores))
+                return int(filtered[best_idx].option_id)
+
+        # Legacy fallback (kept for backward-compatible checkpoints only).
+        act_values = self.model.predict(state, verbose=0)[0]
         masked = np.full_like(act_values, -1e9)
         masked[available] = act_values[available]
         return int(np.argmax(masked))
