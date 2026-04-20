@@ -2040,7 +2040,7 @@ class RLTrainingPipeline:
                                 next_valid_actions=next_ctx.available_actions,
                                 metadata={
                                     **(pending.metadata if isinstance(pending.metadata, dict) else {}),
-                                    "forced": pending.context.forced_action is not None,
+                                    "forced_action": pending.context.forced_action is not None,
                                     "mismatch": mismatch,
                                     "decision_finalized": True,
                                 },
