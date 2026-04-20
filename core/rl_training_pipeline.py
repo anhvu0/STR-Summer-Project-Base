@@ -102,7 +102,7 @@ class DQNTrainer:
         elite_replay_capacity=None,
         elite_fraction=0.25,
         batch_size=128,
-        replay_warmup=10000,
+        replay_warmup=2000,
         target_update_every=400,
         target_soft_tau=1.0,
         use_double_dqn=True,
@@ -247,7 +247,7 @@ class DQNTrainer:
         return bool(
             metadata.get("decision_finalized", False)
             and (not metadata.get("mismatch", False))
-            and float(reward) >= 0.0
+            and float(reward) >= -0.5
         )
 
     def _should_store_main_transition(self, reward, done, metadata):
@@ -269,6 +269,17 @@ class DQNTrainer:
             return False
         if metadata.get("forced_action", False):
             return False
+
+        is_interim_pending = bool(metadata.get("interim_pending_credit", False))
+        if is_interim_pending:
+            bucket = str(metadata.get("episode_bucket", "bad"))
+            if bucket == "good":
+                keep_prob = 0.50
+            elif bucket == "okay":
+                keep_prob = 0.35
+            else:
+                keep_prob = 0.20
+            return random.random() < keep_prob
 
         is_finalized = bool(metadata.get("decision_finalized", False))
         is_timeout_or_observe = bool(
@@ -295,9 +306,9 @@ class DQNTrainer:
         )
 
     def _episode_bucket(self, avg_tt, avg_return, completion_rate, teleported_controlled):
-        if avg_tt < 210 and avg_return >= 9 and completion_rate >= 0.98 and teleported_controlled <= 3:
+        if avg_tt < 260 and avg_return >= 4 and completion_rate >= 0.98 and teleported_controlled <= 4:
             return "good"
-        if avg_tt < 230 and avg_return >= 4 and completion_rate >= 0.95 and teleported_controlled <= 6:
+        if avg_tt < 300 and avg_return >= 0 and completion_rate >= 0.95 and teleported_controlled <= 6:
             return "okay"
         return "bad"
 
@@ -413,7 +424,7 @@ class RLTrainingPipeline:
         gamma=0.97,
         replay_capacity=100000,
         batch_size=128,
-        replay_warmup=10000,
+        replay_warmup=2000,
         train_every=6,
         grad_steps=1,
         rolling_window=100,
@@ -723,14 +734,18 @@ class RLTrainingPipeline:
             float(np.mean(mean_density_samples))
             if mean_density_samples else 0.0
         )
-        aggregate_skip_to_final = float(decision_metrics["decisions_skipped"]) / max(
+        decisions_skipped_actionable = max(
+            float(decision_metrics["decisions_skipped"]) - float(decision_metrics["skipped_pending_hold"]),
+            0.0,
+        )
+        aggregate_actionable_skip_to_final = decisions_skipped_actionable / max(
             float(decision_metrics["decisions_finalized"]),
             1.0,
         )
         print(
             "  diagnostics: mean_density={:.4f} congested_steps={} pending_timeout={} "
             "lane_change(a/s/f)={:.0f}/{:.0f}/{:.0f} emergency_brake={} teleport(jam/yield)={:.0f}/{:.0f} "
-            "aggregate_skip_to_finalized={:.2f}".format(
+            "actionable_skip_to_finalized={:.2f} skipped_pending_hold={:.0f}".format(
                 mean_density,
                 int(congestion_high_pressure_steps),
                 int(decision_metrics["pending_decision_timeouts"]),
@@ -740,7 +755,8 @@ class RLTrainingPipeline:
                 int(decision_metrics["emergency_brake_events"]),
                 decision_metrics["teleport_inferred_jam"],
                 decision_metrics["teleport_inferred_yield_or_deadlock"],
-                aggregate_skip_to_final,
+                aggregate_actionable_skip_to_final,
+                decision_metrics["skipped_pending_hold"],
             )
         )
 
@@ -1065,11 +1081,16 @@ class RLTrainingPipeline:
                 continue
             if required_shift == 2 and decision_metrics is not None:
                 decision_metrics["proactive_shift2_candidates_seen"] += 1
-            if required_shift > 1:
+            if required_shift not in (1, 2):
                 if required_shift == 2 and decision_metrics is not None:
                     decision_metrics["proactive_shift2_candidates_rejected"] += 1
                 continue
-            if float(context.dist_to_end) <= comfortable_dist_threshold:
+            dist_threshold = comfortable_dist_threshold
+            if required_shift == 2:
+                dist_threshold = comfortable_dist_threshold + (0.9 * float(self.decision_engine.lane_change_margin_m))
+            if float(context.dist_to_end) <= dist_threshold:
+                if required_shift == 2 and decision_metrics is not None:
+                    decision_metrics["proactive_shift2_candidates_rejected"] += 1
                 continue
 
             proactive_actions.append(action)
@@ -1719,6 +1740,7 @@ class RLTrainingPipeline:
             "replay_main_other_kept_episode", "replay_main_other_kept_cumulative",
             "completion_rate", "avg_travel_time", "p50_travel_time", "p90_travel_time", "teleports", "teleported_controlled",
             "forced_actions", "decisions_considered", "decisions_opened", "decisions_finalized", "decisions_skipped",
+            "decisions_skipped_actionable",
             "skipped_pending_hold", "skipped_structural_no_branch", "skipped_structural_forced_single_path",
             "skipped_structural_forced_by_lane_commit", "skipped_structural_too_late_or_unreachable",
             "skipped_actionable_no_candidate", "skipped_other",
@@ -1757,7 +1779,7 @@ class RLTrainingPipeline:
             "tail_vehicles_over_p90_count", "tail_completion_gap_steps",
             "loop_reason_short_cycle", "loop_reason_aba_bounce", "loop_reason_dead_end_reentry",
             "loop_reason_long_horizon", "loop_reason_revisit_without_progress", "dominant_loop_reason",
-            "aggregate_skipped_to_finalized_ratio", "skipped_minus_finalized", "skipped_significantly_gt_finalized",
+            "aggregate_skipped_to_finalized_ratio", "aggregate_actionable_skip_to_finalized_ratio", "skipped_minus_finalized", "skipped_significantly_gt_finalized",
             "social_regret_mean", "social_regret_p90", "social_best_action_chosen_rate",
             "actionable_no_candidate_rate", "structural_skip_ratio",
             "pending_resolution_success_rate", "pending_timeout_rate", "pending_abort_rate", "delay_fairness_gini",
@@ -2018,7 +2040,7 @@ class RLTrainingPipeline:
                                 next_valid_actions=next_ctx.available_actions,
                                 metadata={
                                     **(pending.metadata if isinstance(pending.metadata, dict) else {}),
-                                    "forced": pending.context.forced_action is not None,
+                                    "forced_action": pending.context.forced_action is not None,
                                     "mismatch": mismatch,
                                     "decision_finalized": True,
                                 },
@@ -3091,7 +3113,14 @@ class RLTrainingPipeline:
                 dominant_loop_reason = "none"
                 if sum(loop_reason_counts.values()) > 0:
                     dominant_loop_reason = max(loop_reason_counts.items(), key=lambda item: item[1])[0]
+                decisions_skipped_actionable = max(
+                    float(decision_metrics["decisions_skipped"]) - float(decision_metrics["skipped_pending_hold"]),
+                    0.0,
+                )
                 aggregate_skipped_to_finalized_ratio = float(decision_metrics["decisions_skipped"]) / float(
+                    max(decision_metrics["decisions_finalized"], 1.0)
+                )
+                aggregate_actionable_skip_to_finalized_ratio = decisions_skipped_actionable / float(
                     max(decision_metrics["decisions_finalized"], 1.0)
                 )
                 skipped_minus_finalized = float(decision_metrics["decisions_skipped"] - decision_metrics["decisions_finalized"])
@@ -3253,14 +3282,15 @@ class RLTrainingPipeline:
                 )
                 print(
                     "  tail+decision diagnostics: unfinished={} tail_over_p90={} tail_gap_vs_p50={:.1f} "
-                    "loop_reason={} skip/finalized={:.0f}/{:.0f} ratio={:.2f} significant_skip_excess={}".format(
+                    "loop_reason={} skip/finalized={:.0f}/{:.0f} actionable_ratio={:.2f} pending_hold={:.0f} significant_skip_excess={}".format(
                         unfinished_count,
                         tail_vehicles_over_p90_count,
                         tail_completion_gap_steps,
                         dominant_loop_reason,
                         decision_metrics["decisions_skipped"],
                         decision_metrics["decisions_finalized"],
-                        aggregate_skipped_to_finalized_ratio,
+                        aggregate_actionable_skip_to_finalized_ratio,
+                        decision_metrics["skipped_pending_hold"],
                         bool(skipped_significantly_gt_finalized),
                     )
                 )
@@ -3438,6 +3468,7 @@ class RLTrainingPipeline:
                         "decisions_opened": decision_metrics["decisions_opened"],
                         "decisions_finalized": decision_metrics["decisions_finalized"],
                         "decisions_skipped": decision_metrics["decisions_skipped"],
+                        "decisions_skipped_actionable": decisions_skipped_actionable,
                         "skipped_pending_hold": decision_metrics["skipped_pending_hold"],
                         "skipped_structural_no_branch": decision_metrics["skipped_structural_no_branch"],
                         "skipped_structural_forced_single_path": decision_metrics["skipped_structural_forced_single_path"],
@@ -3532,6 +3563,7 @@ class RLTrainingPipeline:
                         "loop_reason_revisit_without_progress": decision_metrics["revisit_without_progress_events"],
                         "dominant_loop_reason": dominant_loop_reason,
                         "aggregate_skipped_to_finalized_ratio": aggregate_skipped_to_finalized_ratio,
+                        "aggregate_actionable_skip_to_finalized_ratio": aggregate_actionable_skip_to_finalized_ratio,
                         "skipped_minus_finalized": skipped_minus_finalized,
                         "skipped_significantly_gt_finalized": skipped_significantly_gt_finalized,
                         "social_regret_mean": social_regret_mean,
