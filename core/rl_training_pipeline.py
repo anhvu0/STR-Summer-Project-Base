@@ -1962,9 +1962,24 @@ class RLTrainingPipeline:
                         current_context = None
                     else:
                         if vid not in live_controlled_ids:
-                            active.reward_accumulator += float(self.stale_disappeared_penalty)
+                            terminal_outcome = self._classify_terminal_outcome(
+                                vid,
+                                arrived_ids=arrived_ids,
+                                teleport_ids=teleport_ids,
+                                is_live=False,
+                            )
                             active.horizon_steps += 1
-                            outcome = "stale_disappeared"
+                            if terminal_outcome == "global_arrival":
+                                active.reward_accumulator += float(self.destination_reward)
+                                speed_bonus = max(0.0, 1.0 - (float(step) / float(MAX_SIMULATION_STEPS)))
+                                active.reward_accumulator += 3.0 * speed_bonus
+                                outcome = "arrived_destination"
+                            elif terminal_outcome == "teleport":
+                                active.reward_accumulator += -float(self.travel_time_penalty)
+                                outcome = "teleport"
+                            else:
+                                active.reward_accumulator += float(self.stale_disappeared_penalty)
+                                outcome = "stale_disappeared"
                             current_context = None
                         else:
                             try:
@@ -2043,6 +2058,21 @@ class RLTrainingPipeline:
                             done=False,
                             outcome="resolved",
                             tactical_outcome=None,
+                            horizon_steps=max(active.horizon_steps, 1),
+                        )
+                        self.strategic_trainer.replay.add_strategic(transition)
+                    elif outcome == "arrived_destination":
+                        metrics["option_success_count"] += 1
+                        transition = StrategicTransition(
+                            state_shared=active.context.shared_state,
+                            state_option_features=self._build_option_features(active.context),
+                            chosen_option_idx=active.chosen_option_idx,
+                            aggregated_reward=float(self._clip_reward(active.reward_accumulator)),
+                            next_state_shared=None,
+                            next_state_option_features=None,
+                            done=True,
+                            outcome="resolved",
+                            tactical_outcome="global_arrival",
                             horizon_steps=max(active.horizon_steps, 1),
                         )
                         self.strategic_trainer.replay.add_strategic(transition)
