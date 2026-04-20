@@ -20,7 +20,7 @@ SLIGHT_RIGHT = "R"
 
 class RouteController(ABC):
     """
-    Base class for routing policy
+    Base class for routing policy.
 
     To implement a scheduling algorithm, implement the make_decisions() method.
     Please use the boilerplate code from the example, and implement your algorithm between
@@ -126,7 +126,9 @@ class RandomPolicy(RouteController):
           reachable by the decisions - it is not the case that all decisions will always be consumed.
           As soon as there is enough distance between the current edge and the target edge, the compute_target_edge
           function will return.
-        -The 'closest viable edge' is a local target that is used by TRACI to control vehicles
+        -The 'closest viable edge' is a route-fragment control target used by TRACI.
+         (RL controllers typically apply connected route fragments via shared setRoute helpers,
+         rather than relying on legacy single local-target behavior.)
         -The closest viable edge should always be far enough away to ensure that the vehicle is not removed
           from the simulation by TRACI before the vehicle reaches its true destination
 

@@ -34,6 +34,22 @@ In this file, we build a DQN network
 
 MAX_SIMULATION_STEPS = 2000 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
 
+# Compact metric glossary used by training CSV + logs.
+# type ∈ {event_count, gauge, per_episode_aggregate, cumulative_counter, ratio}
+METRIC_DOCS = {
+    "episode_return_total": {"description": "Sum of all rewards in the episode.", "type": "per_episode_aggregate"},
+    "avg_return_per_vehicle": {"description": "episode_return_total / controlled_vehicle_count.", "type": "ratio", "numerator": "episode_return_total", "denominator": "total_controlled"},
+    "episode_mean_loss": {"description": "Mean of replay batch losses observed in this episode.", "type": "per_episode_aggregate"},
+    "last_batch_loss": {"description": "Loss from the latest replay train_on_batch call this episode.", "type": "gauge"},
+    "decisions_opened": {"description": "Unique strategic decisions opened (one count per decision_id).", "type": "event_count", "mutually_exclusive_with_siblings": False},
+    "decisions_finalized": {"description": "Strategic decisions that resolved/finalized; excludes synthetic terminal finalizations.", "type": "event_count"},
+    "synthetic_terminal_finalizations": {"description": "Terminal transitions emitted when no pending strategic decision exists.", "type": "event_count"},
+    "lane_change_observe_abort_rate": {"description": "Observe abort share among observe starts.", "type": "ratio", "numerator": "lane_change_observe_abort_no_progress + lane_change_observe_abort_low_speed + lane_change_observe_abort_commit_window", "denominator": "lane_change_observe_started", "mutually_exclusive_with_siblings": True},
+    "pending_release_events_total": {"description": "Unique pending release events.", "type": "event_count"},
+    "pending_release_abort_events_total": {"description": "Pending releases classified as abort.", "type": "event_count"},
+    "pending_release_timeout_events_total": {"description": "Pending releases classified as timeout.", "type": "event_count"},
+}
+
 class ReplayBuffer:
     """
     This is the replay buffer mechanism in DQN
@@ -114,6 +130,7 @@ class DQNTrainer:
         self.elite_fraction = float(np.clip(elite_fraction, 0.0, 0.5))
         elite_capacity = elite_replay_capacity if elite_replay_capacity is not None else max(replay_capacity // 4, batch_size * 4)
         self.elite_memory = ReplayBuffer(elite_capacity)
+        # Lifetime cumulative replay counters (monotonic across all episodes).
         self.elite_transitions_added = 0
         self.elite_samples_drawn = 0
         self.replay_main_kept_finalized = 0
@@ -126,6 +143,7 @@ class DQNTrainer:
         self.target_model = self._build_target_model()
         self.train_steps = 0
         self.last_loss = None
+        self.episode_loss_values = []
 
     def _build_target_model(self):
         target_model = clone_model(self.model)
@@ -368,6 +386,8 @@ class DQNTrainer:
 
         loss = self.model.train_on_batch(states, target)
         self.last_loss = float(loss) if loss is not None else None
+        if self.last_loss is not None:
+            self.episode_loss_values.append(self.last_loss)
         self.train_steps += 1
         self.update_target_network()
 
@@ -758,6 +778,37 @@ class RLTrainingPipeline:
         if subtype_key:
             decision_metrics[subtype_key] += 1
 
+    def _next_decision_id(self, decision_metrics):
+        decision_metrics["decision_id_sequence"] += 1
+        return f"ep_dec_{int(decision_metrics['decision_id_sequence'])}"
+
+    def _register_decision_open(self, decision_metrics, pending):
+        """
+        Count one unique strategic decision open per decision_id.
+        Phase transitions (observe -> route_pending) must not re-open.
+        """
+        if getattr(pending, "decision_open_recorded", False):
+            return
+        pending.decision_open_recorded = True
+        pending.metadata["decision_open_recorded"] = True
+        decision_metrics["decisions_opened"] += 1
+        origin_mode = str(getattr(pending, "decision_origin_mode", "") or pending.metadata.get("decision_origin_mode", "lane_now"))
+        if origin_mode == "proactive":
+            decision_metrics["proactive_decisions_opened"] += 1
+        else:
+            decision_metrics["lane_now_decisions_opened"] += 1
+
+    def _register_decision_finalized(self, decision_metrics, pending):
+        """
+        Count finalized strategic decisions only (synthetic terminal transitions excluded).
+        """
+        decision_metrics["decisions_finalized"] += 1
+        origin_mode = str(getattr(pending, "decision_origin_mode", "") or pending.metadata.get("decision_origin_mode", "lane_now"))
+        if origin_mode == "proactive":
+            decision_metrics["proactive_decisions_finalized"] += 1
+        else:
+            decision_metrics["lane_now_decisions_finalized"] += 1
+
     def _record_pending_release(self, decision_metrics, release_reason):
         key_map = {
             "observe_abort_no_progress": "pending_release_observe_abort_no_progress",
@@ -770,20 +821,11 @@ class RLTrainingPipeline:
         key = key_map.get(release_reason)
         if key:
             decision_metrics[key] += 1
-        decision_metrics["same_edge_release_abort_total"] = (
-            decision_metrics["pending_release_observe_abort_no_progress"]
-            + decision_metrics["pending_release_observe_abort_commit_window"]
-            + decision_metrics["pending_release_observe_abort_low_speed"]
-            + decision_metrics["pending_release_wrong_lane_commit"]
-        )
-        decision_metrics["same_edge_release_timeout_total"] = (
-            decision_metrics["pending_release_route_stall_timeout"]
-            + decision_metrics["pending_release_route_hard_timeout"]
-        )
-        decision_metrics["same_edge_pending_released_no_progress"] = (
-            decision_metrics["same_edge_release_abort_total"]
-            + decision_metrics["same_edge_release_timeout_total"]
-        )
+        decision_metrics["pending_release_events_total"] += 1
+        if release_reason in {"route_stall_timeout", "route_hard_timeout"}:
+            decision_metrics["pending_release_timeout_events_total"] += 1
+        else:
+            decision_metrics["pending_release_abort_events_total"] += 1
 
     def _action_social_cost_proxy(self, current_edge, action_idx, destination):
         """
@@ -1014,27 +1056,23 @@ class RLTrainingPipeline:
             if float(context.speed) < 0.5:
                 continue
 
-            max_shift = 1
-
             required_shift = int(context.required_lane_shift.get(action, 99))
 
             if context.commit_window:
+                if decision_metrics is not None:
+                    decision_metrics["commit_window_non_lane_candidates_seen"] += 1
+                    decision_metrics["commit_window_candidates_rejected"] += 1
                 continue
-            if required_shift > max_shift:
+            if required_shift == 2 and decision_metrics is not None:
+                decision_metrics["proactive_shift2_candidates_seen"] += 1
+            if required_shift > 1:
+                if required_shift == 2 and decision_metrics is not None:
+                    decision_metrics["proactive_shift2_candidates_rejected"] += 1
                 continue
             if float(context.dist_to_end) <= comfortable_dist_threshold:
                 continue
 
             proactive_actions.append(action)
-            if decision_metrics is not None and required_shift == 2:
-                decision_metrics["proactive_shift2_candidates_kept"] += 1
-            if (
-                decision_metrics is not None
-                and context.commit_window
-                and required_shift == 1
-                and action in filtered_available_actions
-            ):
-                decision_metrics["soft_commit_window_admissions"] += 1
 
         policy_actions = sorted(set(safe_lane_now_actions) | set(proactive_actions))
         if not policy_actions:
@@ -1282,8 +1320,7 @@ class RLTrainingPipeline:
                     "decision_finalized": True,
                 },
             )
-            decision_metrics["decisions_finalized"] += 1
-            finalized_decision_rewards.append(float(reward))
+            decision_metrics["synthetic_terminal_finalizations"] += 1
             decision_debug_rows.append({
                 "episode": episode,
                 "step": step,
@@ -1397,7 +1434,7 @@ class RLTrainingPipeline:
             next_valid_actions=[],
             metadata=final_metadata,
         )
-        decision_metrics["decisions_finalized"] += 1
+        self._register_decision_finalized(decision_metrics, pending)
         decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
         finalized_decision_rewards.append(float(reward))
         terminal_recorded_ids.add(vehicle_id)
@@ -1670,28 +1707,33 @@ class RLTrainingPipeline:
         rolling_avg_travel_time = deque(maxlen=self.rolling_window)
         rolling_mismatch = deque(maxlen=self.rolling_window)
         csv_fields = [
-            "episode", "epsilon", "replay", "train_steps", "mean_loss", "episode_return",
-            "elite_buffer_size", "elite_transitions_added", "elite_samples_drawn",
-            "replay_main_finalized", "replay_main_pending_timeout", "replay_main_terminal",
-            "replay_main_dropped", "replay_main_other_kept",
+            "episode", "epsilon", "replay",
+            "train_steps_cumulative", "train_steps_episode", "episode_mean_loss", "last_batch_loss",
+            "episode_return_total", "avg_return_per_vehicle",
+            "elite_buffer_size", "elite_transitions_added_episode", "elite_transitions_added_cumulative",
+            "elite_samples_drawn_episode", "elite_samples_drawn_cumulative",
+            "replay_main_finalized_episode", "replay_main_finalized_cumulative",
+            "replay_main_pending_timeout_episode", "replay_main_pending_timeout_cumulative",
+            "replay_main_terminal_episode", "replay_main_terminal_cumulative",
+            "replay_main_dropped_episode", "replay_main_dropped_cumulative",
+            "replay_main_other_kept_episode", "replay_main_other_kept_cumulative",
             "completion_rate", "avg_travel_time", "p50_travel_time", "p90_travel_time", "teleports", "teleported_controlled",
             "forced_actions", "decisions_considered", "decisions_opened", "decisions_finalized", "decisions_skipped",
             "skipped_pending_hold", "skipped_structural_no_branch", "skipped_structural_forced_single_path",
             "skipped_structural_forced_by_lane_commit", "skipped_structural_too_late_or_unreachable",
             "skipped_actionable_no_candidate", "skipped_other",
-            "route_mismatch", "loop_events", "uturn_events",
+            "route_mismatch", "loop_events",
             "short_cycle_events", "aba_bounce_events", "dead_end_reentry_events",
             "long_horizon_loop_events", "revisit_without_progress_events",
-            "safety_overrides", "loop_avoidance_overrides",
+            "safety_overrides", "loop_prefilter_overrides",
             "fragment_build_failures", "fallback_overrides", "fallback_selected_total", "fallback_selected_lane_now",
             "pending_decision_timeouts", "deferred_lane_change_actions",
             "lane_change_observe_started", "lane_change_observe_success",
-            "lane_change_observe_abort_no_progress", "lane_change_observe_abort_commit_window",
-            "same_edge_pending_released_no_progress", "cooldown_replans_blocked",
+            "lane_change_observe_abort_no_progress", "lane_change_observe_abort_low_speed", "lane_change_observe_abort_commit_window",
+            "pending_release_events_total", "pending_release_abort_events_total", "pending_release_timeout_events_total", "cooldown_replans_blocked",
             "pending_release_observe_abort_no_progress", "pending_release_observe_abort_commit_window",
             "pending_release_observe_abort_low_speed", "pending_release_wrong_lane_commit",
             "pending_release_route_stall_timeout", "pending_release_route_hard_timeout",
-            "same_edge_release_timeout_total", "same_edge_release_abort_total",
             "loop_override_count", "dead_end_reentry_override_count",
             "snapshot_cache_hits", "shortest_path_cache_hits",
             "exploration_actions", "policy_actions", "override_ratio",
@@ -1702,7 +1744,6 @@ class RLTrainingPipeline:
             "loop_prefilter_overrides", "cooldown_fallback_overrides",
             "observe_abort_fallback_overrides", "route_apply_fail_overrides",
             "override_learning_negative", "override_learning_imitation",
-            "timeout_unfinished_controlled", "exited_without_destination",
             "alive_at_step_cap", "decision_pending_at_episode_end", "mean_pending_age", "mean_decision_latency_steps",
             "mean_reward_per_finalized_decision", "mean_route_difficulty_eta", "p50_route_difficulty_eta",
             "p90_route_difficulty_eta", "fail_teleport", "fail_timeout", "fail_removed_non_destination",
@@ -1718,7 +1759,7 @@ class RLTrainingPipeline:
             "loop_reason_long_horizon", "loop_reason_revisit_without_progress", "dominant_loop_reason",
             "aggregate_skipped_to_finalized_ratio", "skipped_minus_finalized", "skipped_significantly_gt_finalized",
             "social_regret_mean", "social_regret_p90", "social_best_action_chosen_rate",
-            "actionable_skip_ratio", "actionable_skipped_to_opened_ratio", "structural_skip_ratio",
+            "actionable_no_candidate_rate", "structural_skip_ratio",
             "pending_resolution_success_rate", "pending_timeout_rate", "pending_abort_rate", "delay_fairness_gini",
             "loop_after_fallback_rate", "p95_to_p50_travel_ratio", "timeout_rate",
             "fallback_rate_per_opened_decision", "controlled_teleport_rate",
@@ -1727,13 +1768,14 @@ class RLTrainingPipeline:
             "reachable_lane_change_nonempty", "reachable_lane_change_excluded_any",
             "reachable_lane_change_excluded_all", "policy_candidates_with_broader_available",
             "policy_candidates_collapsed_to_lane_now_only",
-            "soft_commit_window_admissions", "observe_abort_low_speed",
-            "pending_commit_window_grace_kept", "proactive_shift2_candidates_kept",
+            "commit_window_non_lane_candidates_seen", "commit_window_candidates_rejected",
+            "proactive_shift2_candidates_seen", "proactive_shift2_candidates_rejected",
+            "pending_commit_window_grace_kept",
             "proactive_decisions_opened", "proactive_decisions_finalized",
             "lane_now_decisions_opened", "lane_now_decisions_finalized",
             "proactive_pending_abort_count", "proactive_pending_timeout_count",
             "fallback_after_observe_abort_count", "fallback_after_timeout_count",
-            "same_edge_reopen_after_abort_count",
+            "same_edge_reopen_after_abort_count", "synthetic_terminal_finalizations",
             "finalized_opened_proactive_ratio", "finalized_opened_lane_now_ratio",
         ]
         # Rewrite metrics each new training session to avoid schema drift/appending old runs.
@@ -1773,8 +1815,19 @@ class RLTrainingPipeline:
             decision_metrics = defaultdict(float)
             decision_metrics["fallback_selected_total"] = 0.0
             decision_metrics["fallback_selected_lane_now"] = 0.0
+            self.trainer.episode_loss_values = []
+            trainer_counter_start = {
+                "train_steps": self.trainer.train_steps,
+                "elite_transitions_added": self.trainer.elite_transitions_added,
+                "elite_samples_drawn": self.trainer.elite_samples_drawn,
+                "replay_main_kept_finalized": self.trainer.replay_main_kept_finalized,
+                "replay_main_kept_pending_timeout": self.trainer.replay_main_kept_pending_timeout,
+                "replay_main_kept_terminal": self.trainer.replay_main_kept_terminal,
+                "replay_main_dropped": self.trainer.replay_main_dropped,
+                "replay_main_kept_other": self.trainer.replay_main_kept_other,
+            }
 
-            episode_return = 0.0
+            episode_return_total = 0.0
             episode_teleport_events = 0
             teleported_controlled_ids = set()
             arrived_ids = set()
@@ -1916,7 +1969,7 @@ class RLTrainingPipeline:
                             )
                             if loop_signals["aba_bounce"]:
                                 decision_metrics["aba_bounce_events"] += 1
-                                decision_metrics["uturn_events"] += 1
+                                
                             if loop_signals["short_cycle"]:
                                 decision_metrics["short_cycle_events"] += 1
                             if loop_signals["dead_end_reentry"]:
@@ -1970,18 +2023,13 @@ class RLTrainingPipeline:
                                     "decision_finalized": True,
                                 },
                             )
-                            decision_metrics["decisions_finalized"] += 1
+                            self._register_decision_finalized(decision_metrics, pending)
                             action_source = str(pending.metadata.get("action_source", ""))
-                            decision_mode = str(pending.metadata.get("decision_mode", ""))
-                            if decision_mode == "proactive":
-                                decision_metrics["proactive_decisions_finalized"] += 1
-                            elif decision_mode == "lane_now":
-                                decision_metrics["lane_now_decisions_finalized"] += 1
                             if "fallback" in action_source:
                                 decision_metrics["fallback_finalized"] += 1
                             decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
                             finalized_decision_rewards.append(float(reward))
-                            episode_return += reward
+                            episode_return_total += reward
                             if repeated_recent_edges > 1:
                                 decision_metrics["loop_events"] += 1
                                 if "fallback" in action_source:
@@ -2073,7 +2121,7 @@ class RLTrainingPipeline:
                                         )
                                         decision_metrics["override_learning_transitions"] += 1
                                         decision_metrics["override_learning_negative"] += 1
-                                        episode_return += override_penalty
+                                        episode_return_total += override_penalty
                                         prev_edge_by_vehicle[vehicle_id] = current_edge
                                         continue
                                     pending.metadata["phase"] = "route_pending"
@@ -2084,10 +2132,16 @@ class RLTrainingPipeline:
                                     pending.metadata["lane_now_count"] = int(len(obs_context.lane_feasible_now_actions))
                                     pending.metadata["forced_action"] = bool(obs_context.forced_action is not None)
                                     pending.metadata["action_source"] = pending.metadata.get("action_source", "policy")
-                                    pending.metadata["decision_mode"] = (
+                                    pending.metadata["decision_resolution_mode"] = (
                                         "lane_now" if pending.intended_action in obs_context.lane_feasible_now_actions else "proactive"
                                     )
+                                    pending.metadata["decision_origin_mode"] = pending.metadata.get(
+                                        "decision_origin_mode",
+                                        pending.decision_origin_mode or "proactive",
+                                    )
                                     pending.metadata["decision_finalized"] = False
+                                    pending.decision_current_phase = "route_pending"
+                                    pending.metadata["decision_current_phase"] = "route_pending"
                                     pending.intended_next_edge = committed_next_edge
                                     pending.route_fragment = list(full_route[1:]) if full_route else []
                                     pending.context = obs_context
@@ -2095,19 +2149,13 @@ class RLTrainingPipeline:
                                     pending.last_credit_step = step
                                     pending.last_credit_edge = current_edge
                                     pending_decisions[vehicle_id] = pending
-                                    decision_metrics["decisions_opened"] += 1
-                                    if pending.metadata["decision_mode"] == "proactive":
-                                        decision_metrics["proactive_decisions_opened"] += 1
-                                    else:
-                                        decision_metrics["lane_now_decisions_opened"] += 1
                                     prev_edge_by_vehicle[vehicle_id] = current_edge
                                     continue
                                 if reason == "commit_window":
                                     decision_metrics["lane_change_observe_abort_commit_window"] += 1
                                     pending_pen = self.observe_commit_window_miss_penalty
                                 elif reason == "low_speed":
-                                    decision_metrics["observe_abort_low_speed"] += 1
-                                    decision_metrics["lane_change_observe_abort_no_progress"] += 1
+                                    decision_metrics["lane_change_observe_abort_low_speed"] += 1
                                     pending_pen = self.observe_low_speed_penalty
                                 else:
                                     decision_metrics["lane_change_observe_abort_no_progress"] += 1
@@ -2138,7 +2186,7 @@ class RLTrainingPipeline:
                                 )
                                 decision_metrics["override_learning_transitions"] += 1
                                 decision_metrics["override_learning_negative"] += 1
-                                episode_return += pending_pen
+                                episode_return_total += pending_pen
                                 decision_metrics["pending_resolved_abort_no_progress"] += 1
                                 if reason == "commit_window":
                                     self._record_pending_release(decision_metrics, "observe_abort_commit_window")
@@ -2146,7 +2194,7 @@ class RLTrainingPipeline:
                                     self._record_pending_release(decision_metrics, "observe_abort_low_speed")
                                 else:
                                     self._record_pending_release(decision_metrics, "observe_abort_no_progress")
-                                if str((pending.metadata or {}).get("decision_mode", "")) == "proactive":
+                                if str((pending.metadata or {}).get("decision_origin_mode", pending.decision_origin_mode)) == "proactive":
                                     decision_metrics["proactive_pending_abort_count"] += 1
                                 cooldown_key = (vehicle_id, current_edge)
                                 lane_change_cooldown_until[cooldown_key] = (
@@ -2182,13 +2230,19 @@ class RLTrainingPipeline:
                                     destination=vehicle.destination,
                                     context=obs_context,
                                     lane_change_requested=False,
+                                    decision_id=str((pending.metadata or {}).get("decision_id", pending.decision_id)),
+                                    decision_origin_mode=str((pending.metadata or {}).get("decision_origin_mode", pending.decision_origin_mode or "proactive")),
+                                    decision_current_phase="route_pending",
+                                    decision_open_recorded=True,
                                     route_fragment=list(full_route[1:]) if full_route else [],
                                     metadata={
                                         "phase": "route_pending",
                                         "action_source": "observe_fallback",
-                                        "decision_mode": (
+                                        "decision_origin_mode": str((pending.metadata or {}).get("decision_origin_mode", pending.decision_origin_mode or "proactive")),
+                                        "decision_resolution_mode": (
                                             "lane_now" if fallback_action in obs_context.lane_feasible_now_actions else "proactive"
                                         ),
+                                        "decision_current_phase": "route_pending",
                                         "best_dist_to_end": float(obs_context.dist_to_end),
                                         "last_progress_step": int(step),
                                         "decision_open": True,
@@ -2197,6 +2251,8 @@ class RLTrainingPipeline:
                                         "forced_action": bool(obs_context.forced_action is not None),
                                         "override_learning": True,
                                         "decision_finalized": False,
+                                        "decision_id": str((pending.metadata or {}).get("decision_id", pending.decision_id)),
+                                        "decision_open_recorded": True,
                                     },
                                 )
                                 decision_metrics["fallback_overrides"] += 1
@@ -2277,7 +2333,7 @@ class RLTrainingPipeline:
                                         "decision_finalized": False,
                                     },
                                 )
-                                episode_return += pending_reward
+                                episode_return_total += pending_reward
                                 pending.state = next_state
                                 pending.last_credit_edge = current_edge
                                 pending.last_credit_step = step
@@ -2312,11 +2368,11 @@ class RLTrainingPipeline:
                                         "decision_finalized": False,
                                     },
                                 )
-                                episode_return += timeout_penalty
+                                episode_return_total += timeout_penalty
                                 decision_metrics["pending_decision_timeouts"] += 1
                                 self._record_pending_release(decision_metrics, "route_stall_timeout")
                                 decision_metrics["pending_resolved_timeout"] += 1
-                                if str((pending.metadata or {}).get("decision_mode", "")) == "proactive":
+                                if str((pending.metadata or {}).get("decision_origin_mode", pending.decision_origin_mode)) == "proactive":
                                     decision_metrics["proactive_pending_timeout_count"] += 1
                                 pending_decisions.pop(vehicle_id, None)
                                 lane_change_deferrals[vehicle_id] = 0
@@ -2381,11 +2437,11 @@ class RLTrainingPipeline:
                                 if stalled_timeout or hard_timeout:
                                     decision_metrics["pending_decision_timeouts"] += 1
                                     decision_metrics["pending_resolved_timeout"] += 1
-                                    if str(metadata.get("decision_mode", "")) == "proactive":
+                                    if str(metadata.get("decision_origin_mode", pending.decision_origin_mode)) == "proactive":
                                         decision_metrics["proactive_pending_timeout_count"] += 1
                                 else:
                                     decision_metrics["pending_resolved_abort_no_progress"] += 1
-                                    if str(metadata.get("decision_mode", "")) == "proactive":
+                                    if str(metadata.get("decision_origin_mode", pending.decision_origin_mode)) == "proactive":
                                         decision_metrics["proactive_pending_abort_count"] += 1
                                 pending_decisions.pop(vehicle_id, None)
                                 release_as_timeout = bool(stalled_timeout or hard_timeout)
@@ -2483,7 +2539,7 @@ class RLTrainingPipeline:
                         next_edge = self.decision_engine.get_next_edge(current_edge, action)
                         if next_edge is None:
                             decision_metrics["safety_overrides"] += 1
-                            decision_metrics["loop_avoidance_overrides"] += 1
+                            decision_metrics["loop_prefilter_overrides"] += 1
                             self._record_override_event(decision_metrics, "invalid_action")
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
@@ -2562,7 +2618,7 @@ class RLTrainingPipeline:
                             )
                             decision_metrics["override_learning_transitions"] += 1
                             decision_metrics["override_learning_imitation"] += 1
-                            episode_return += override_penalty
+                            episode_return_total += override_penalty
                             next_edge = self.decision_engine.get_next_edge(current_edge, action)
                             if next_edge is None:
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -2643,7 +2699,7 @@ class RLTrainingPipeline:
                                 )
                                 decision_metrics["override_learning_transitions"] += 1
                                 decision_metrics["override_learning_imitation"] += 1
-                                episode_return += override_penalty
+                                episode_return_total += override_penalty
                             else:
                                 lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action)
                                 decision_metrics["lane_change_attempts"] += 1
@@ -2656,6 +2712,8 @@ class RLTrainingPipeline:
                                 observe_metadata = self.decision_engine.start_lane_change_observe(
                                     context, action, step, lane_change_requested, lane_change_ok
                                 )
+                                decision_id = self._next_decision_id(decision_metrics)
+                                origin_mode = ("lane_now" if action in context.lane_feasible_now_actions else "proactive")
                                 pending_decisions[vehicle_id] = PendingDecision(
                                     state=state,
                                     intended_action=action,
@@ -2667,19 +2725,23 @@ class RLTrainingPipeline:
                                     destination=vehicle.destination,
                                     context=context,
                                     lane_change_requested=lane_change_requested,
+                                    decision_id=decision_id,
+                                    decision_origin_mode=origin_mode,
+                                    decision_current_phase="observe_lane_change",
+                                    decision_open_recorded=False,
                                     route_fragment=[],
                                     metadata={
                                         "action_source": action_source,
-                                        "decision_mode": ("lane_now" if action in context.lane_feasible_now_actions else "proactive"),
+                                        "decision_id": decision_id,
+                                        "decision_origin_mode": origin_mode,
+                                        "decision_resolution_mode": "",
+                                        "decision_current_phase": "observe_lane_change",
+                                        "decision_open_recorded": False,
                                         "decision_finalized": False,
                                         **observe_metadata,
                                     },
                                 )
-                                decision_metrics["decisions_opened"] += 1
-                                if action in context.lane_feasible_now_actions:
-                                    decision_metrics["lane_now_decisions_opened"] += 1
-                                else:
-                                    decision_metrics["proactive_decisions_opened"] += 1
+                                self._register_decision_open(decision_metrics, pending_decisions[vehicle_id])
                                 release_info = pending_release_info.get(vehicle_id)
                                 if (
                                     release_info
@@ -2759,11 +2821,13 @@ class RLTrainingPipeline:
                             )
                             decision_metrics["override_learning_transitions"] += 1
                             decision_metrics["override_learning_negative"] += 1
-                            episode_return += override_penalty
+                            episode_return_total += override_penalty
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
                         last_planned_terminal_edge_by_vehicle[vehicle_id] = full_route[-1] if full_route else vehicle.destination
 
+                        decision_id = self._next_decision_id(decision_metrics)
+                        origin_mode = ("lane_now" if action in context.lane_feasible_now_actions else "proactive")
                         pending_decisions[vehicle_id] = PendingDecision(
                             state=state,
                             intended_action=action,
@@ -2775,10 +2839,18 @@ class RLTrainingPipeline:
                             destination=vehicle.destination,
                             context=context,
                             lane_change_requested=lane_change_requested,
+                            decision_id=decision_id,
+                            decision_origin_mode=origin_mode,
+                            decision_current_phase="route_pending",
+                            decision_open_recorded=False,
                             route_fragment=list(full_route[1:]) if full_route else [],
                             metadata={
                                 "action_source": action_source,
-                                "decision_mode": ("lane_now" if action in context.lane_feasible_now_actions else "proactive"),
+                                "decision_id": decision_id,
+                                "decision_origin_mode": origin_mode,
+                                "decision_resolution_mode": origin_mode,
+                                "decision_current_phase": "route_pending",
+                                "decision_open_recorded": False,
                                 "lane_change_deferrals": lane_change_deferrals.get(vehicle_id, 0),
                                 "chosen_social_cost": chosen_cost,
                                 "baseline_social_cost": baseline_cost,
@@ -2794,11 +2866,7 @@ class RLTrainingPipeline:
                             },
                         )
                         lane_change_deferrals[vehicle_id] = 0
-                        decision_metrics["decisions_opened"] += 1
-                        if action in context.lane_feasible_now_actions:
-                            decision_metrics["lane_now_decisions_opened"] += 1
-                        else:
-                            decision_metrics["proactive_decisions_opened"] += 1
+                        self._register_decision_open(decision_metrics, pending_decisions[vehicle_id])
                         release_info = pending_release_info.get(vehicle_id)
                         if (
                             release_info
@@ -2866,7 +2934,7 @@ class RLTrainingPipeline:
                             "reached_global_destination": reached_global_destination,
                             "terminal_outcome": outcome,
                         })
-                        episode_return += self._finalize_terminal_transition(
+                        episode_return_total += self._finalize_terminal_transition(
                             vehicle_id=removed_id,
                             vehicle=vehicle,
                             outcome=outcome,
@@ -2927,7 +2995,7 @@ class RLTrainingPipeline:
                         if vid not in final_outcome_by_vehicle:
                             final_outcome_by_vehicle[vid] = "alive_at_step_cap"
                         timeout_vehicle = vehicles[vid]
-                        episode_return += self._finalize_terminal_transition(
+                        episode_return_total += self._finalize_terminal_transition(
                             vehicle_id=vid,
                             vehicle=timeout_vehicle,
                             outcome="timeout",
@@ -2955,7 +3023,7 @@ class RLTrainingPipeline:
                 avg_travel_time = float(np.mean(completed_travel_times)) if completed_travel_times else 0.0
                 p50_travel_time = float(np.percentile(completed_travel_times, 50)) if completed_travel_times else 0.0
                 p90_travel_time = float(np.percentile(completed_travel_times, 90)) if completed_travel_times else 0.0
-                avg_return = episode_return / float(total_controlled) if total_controlled > 0 else 0.0
+                avg_return_per_vehicle = episode_return_total / float(total_controlled) if total_controlled > 0 else 0.0
                 mean_pending_age = (
                     float(np.mean(pending_age_samples)) if pending_age_samples else 0.0
                 )
@@ -2993,8 +3061,8 @@ class RLTrainingPipeline:
                 lane_change_observe_abort_rate = (
                     float(
                         decision_metrics["lane_change_observe_abort_no_progress"]
+                        + decision_metrics["lane_change_observe_abort_low_speed"]
                         + decision_metrics["lane_change_observe_abort_commit_window"]
-                        + decision_metrics["observe_abort_low_speed"]
                     ) / float(max(decision_metrics["lane_change_observe_started"], 1.0))
                 )
                 if completed_travel_times:
@@ -3041,10 +3109,6 @@ class RLTrainingPipeline:
                 )
                 actionable_skip_ratio = (
                     float(decision_metrics["actionable_skips"]) / float(max(decision_metrics["actionable_decision_points"], 1.0))
-                )
-                actionable_skipped_to_opened_ratio = (
-                    float(decision_metrics["skipped_actionable_no_candidate"])
-                    / float(max(decision_metrics["actionable_decision_points"], 1.0))
                 )
                 structural_skip_total = float(
                     decision_metrics["skipped_structural_no_branch"]
@@ -3109,7 +3173,7 @@ class RLTrainingPipeline:
                 rolling_teleport_events.append(float(episode_teleport_events))
                 rolling_teleported_controlled.append(float(len(teleported_controlled_ids)))
                 rolling_completion_rate.append(float(completion_rate))
-                rolling_avg_return.append(float(avg_return))
+                rolling_avg_return.append(float(avg_return_per_vehicle))
                 rolling_avg_travel_time.append(float(avg_travel_time))
                 rolling_mismatch.append(float(decision_metrics["route_mismatch"]))
 
@@ -3122,7 +3186,7 @@ class RLTrainingPipeline:
 
                 self.trainer.flush_staged_episode(
                     avg_tt=avg_travel_time,
-                    avg_return=avg_return,
+                    avg_return=avg_return_per_vehicle,
                     completion_rate=completion_rate,
                     teleported_controlled=len(teleported_controlled_ids),
                 )
@@ -3132,19 +3196,19 @@ class RLTrainingPipeline:
                 )
                 print(
                     f"\n[EP {episode:03d} DONE] eps={self.trainer.epsilon:.4f} train={self.trainer.train_steps} "
-                    f"replay={len(self.trainer.memory)} ret={avg_return:.3f} "
+                    f"replay={len(self.trainer.memory)} ret={avg_return_per_vehicle:.3f} "
                     f"done={global_arrival_count}/{total_controlled} "
                     f"failed={max(total_controlled-global_arrival_count,0)} avg_tt={avg_travel_time:.2f} "
                     f"p50_tt={p50_travel_time:.2f} p90_tt={p90_travel_time:.2f}"
                 )
                 print(
                     f"  rolling({len(rolling_teleport_events)}): completion={roll_completion:.1%} "
-                    f"avg_return={roll_return:.3f} avg_tt={roll_avg_travel_time:.2f} teleports/ep={roll_tele_events:.2f} "
+                    f"avg_return_per_vehicle={roll_return:.3f} avg_tt={roll_avg_travel_time:.2f} teleports/ep={roll_tele_events:.2f} "
                     f"teleported_ctrl/ep={roll_tele_ctrl:.2f} mismatch/ep={roll_mismatch:.2f}"
                 )
                 print(
                     "  decisions: opened={:.0f} finalized={:.0f} skipped={:.0f} forced={:.0f} "
-                    "lane_change(a/s/f)={:.0f}/{:.0f}/{:.0f} loops={:.0f} uturn={:.0f} "
+                    "lane_change(a/s/f)={:.0f}/{:.0f}/{:.0f} loops={:.0f} "
                     "short_cycle={:.0f} aba={:.0f} dead_end_reentry={:.0f} "
                     "apply_fail={:.0f} overrides={:.0f} override_ratio={:.1%}".format(
                         decision_metrics["decisions_opened"],
@@ -3155,7 +3219,6 @@ class RLTrainingPipeline:
                         decision_metrics["lane_change_success"],
                         decision_metrics["lane_change_fail"],
                         decision_metrics["loop_events"],
-                        decision_metrics["uturn_events"],
                         decision_metrics["short_cycle_events"],
                         decision_metrics["aba_bounce_events"],
                         decision_metrics["dead_end_reentry_events"],
@@ -3203,15 +3266,14 @@ class RLTrainingPipeline:
                 )
                 print(
                     "  selfless diagnostics: social_regret(mean/p90)={:.3f}/{:.3f} social_best_rate={:.1%} "
-                    "actionable_skip_ratio={:.1%} actionable_skipped_to_opened={:.1%} structural_skip_ratio={:.1%} "
+                    "actionable_no_candidate_rate={:.1%} structural_skip_ratio={:.1%} "
                     "pending_resolution_success={:.1%} pending_timeout_rate={:.1%} pending_abort_rate={:.1%} gini={:.3f} "
                     "loop_after_fallback_rate={:.1%}".format(
                         social_regret_mean,
                         social_regret_p90,
                         social_best_action_chosen_rate,
                         actionable_skip_ratio,
-                        actionable_skipped_to_opened_ratio,
-                        structural_skip_ratio,
+                                                structural_skip_ratio,
                         pending_resolution_success_rate,
                         pending_timeout_rate,
                         pending_abort_rate,
@@ -3222,7 +3284,7 @@ class RLTrainingPipeline:
                 print(
                     "  lane-change diagnostics: lane_change_request_accepted_rate={:.1%} "
                     "lane_change_request_rejected_rate={:.1%} lane_change_observe_resolution_rate={:.1%} "
-                    "lane_change_observe_abort_rate={:.1%} pending_lane_change_resolution_success_rate={:.1%}".format(
+                    "lane_change_observe_abort_rate={:.1%} pending_resolution_success_rate={:.1%}".format(
                         lane_change_request_accepted_rate,
                         lane_change_request_rejected_rate,
                         lane_change_observe_resolution_rate,
@@ -3263,7 +3325,6 @@ class RLTrainingPipeline:
                     )
                 )
 
-                exited_without_destination = removed_nonarrival_count
                 print(
                     f"Controlled exit diagnostics | "
                     f"arrived={global_arrival_count}/{total_controlled}, "
@@ -3345,17 +3406,27 @@ class RLTrainingPipeline:
                         "episode": episode,
                         "epsilon": self.trainer.epsilon,
                         "replay": len(self.trainer.memory),
+                        "train_steps_cumulative": self.trainer.train_steps,
+                        "train_steps_episode": int(self.trainer.train_steps - trainer_counter_start["train_steps"]),
+                        "episode_mean_loss": (float(np.mean(self.trainer.episode_loss_values)) if self.trainer.episode_loss_values else ""),
+                        "last_batch_loss": self.trainer.last_loss if self.trainer.last_loss is not None else "",
+                        "episode_return_total": episode_return_total,
+                        "avg_return_per_vehicle": avg_return_per_vehicle,
                         "elite_buffer_size": len(self.trainer.elite_memory),
-                        "elite_transitions_added": self.trainer.elite_transitions_added,
-                        "elite_samples_drawn": self.trainer.elite_samples_drawn,
-                        "replay_main_finalized": self.trainer.replay_main_kept_finalized,
-                        "replay_main_pending_timeout": self.trainer.replay_main_kept_pending_timeout,
-                        "replay_main_terminal": self.trainer.replay_main_kept_terminal,
-                        "replay_main_dropped": self.trainer.replay_main_dropped,
-                        "replay_main_other_kept": self.trainer.replay_main_kept_other,
-                        "train_steps": self.trainer.train_steps,
-                        "mean_loss": self.trainer.last_loss if self.trainer.last_loss is not None else "",
-                        "episode_return": avg_return,
+                        "elite_transitions_added_episode": int(self.trainer.elite_transitions_added - trainer_counter_start["elite_transitions_added"]),
+                        "elite_transitions_added_cumulative": self.trainer.elite_transitions_added,
+                        "elite_samples_drawn_episode": int(self.trainer.elite_samples_drawn - trainer_counter_start["elite_samples_drawn"]),
+                        "elite_samples_drawn_cumulative": self.trainer.elite_samples_drawn,
+                        "replay_main_finalized_episode": int(self.trainer.replay_main_kept_finalized - trainer_counter_start["replay_main_kept_finalized"]),
+                        "replay_main_finalized_cumulative": self.trainer.replay_main_kept_finalized,
+                        "replay_main_pending_timeout_episode": int(self.trainer.replay_main_kept_pending_timeout - trainer_counter_start["replay_main_kept_pending_timeout"]),
+                        "replay_main_pending_timeout_cumulative": self.trainer.replay_main_kept_pending_timeout,
+                        "replay_main_terminal_episode": int(self.trainer.replay_main_kept_terminal - trainer_counter_start["replay_main_kept_terminal"]),
+                        "replay_main_terminal_cumulative": self.trainer.replay_main_kept_terminal,
+                        "replay_main_dropped_episode": int(self.trainer.replay_main_dropped - trainer_counter_start["replay_main_dropped"]),
+                        "replay_main_dropped_cumulative": self.trainer.replay_main_dropped,
+                        "replay_main_other_kept_episode": int(self.trainer.replay_main_kept_other - trainer_counter_start["replay_main_kept_other"]),
+                        "replay_main_other_kept_cumulative": self.trainer.replay_main_kept_other,
                         "completion_rate": completion_rate,
                         "avg_travel_time": avg_travel_time,
                         "p50_travel_time": p50_travel_time,
@@ -3376,14 +3447,13 @@ class RLTrainingPipeline:
                         "skipped_other": decision_metrics["skipped_other"],
                         "route_mismatch": decision_metrics["route_mismatch"],
                         "loop_events": decision_metrics["loop_events"],
-                        "uturn_events": decision_metrics["uturn_events"],
                         "short_cycle_events": decision_metrics["short_cycle_events"],
                         "aba_bounce_events": decision_metrics["aba_bounce_events"],
                         "dead_end_reentry_events": decision_metrics["dead_end_reentry_events"],
                         "long_horizon_loop_events": decision_metrics["long_horizon_loop_events"],
                         "revisit_without_progress_events": decision_metrics["revisit_without_progress_events"],
                         "safety_overrides": decision_metrics["safety_overrides"],
-                        "loop_avoidance_overrides": decision_metrics["loop_avoidance_overrides"],
+                        "loop_prefilter_overrides": decision_metrics["loop_prefilter_overrides"],
                         "fragment_build_failures": decision_metrics["fragment_build_failures"],
                         "fallback_overrides": decision_metrics["fallback_overrides"],
                         "fallback_selected_total": decision_metrics["fallback_selected_total"],
@@ -3393,8 +3463,11 @@ class RLTrainingPipeline:
                         "lane_change_observe_started": decision_metrics["lane_change_observe_started"],
                         "lane_change_observe_success": decision_metrics["lane_change_observe_success"],
                         "lane_change_observe_abort_no_progress": decision_metrics["lane_change_observe_abort_no_progress"],
+                        "lane_change_observe_abort_low_speed": decision_metrics["lane_change_observe_abort_low_speed"],
                         "lane_change_observe_abort_commit_window": decision_metrics["lane_change_observe_abort_commit_window"],
-                        "same_edge_pending_released_no_progress": decision_metrics["same_edge_pending_released_no_progress"],
+                        "pending_release_events_total": decision_metrics["pending_release_events_total"],
+                        "pending_release_abort_events_total": decision_metrics["pending_release_abort_events_total"],
+                        "pending_release_timeout_events_total": decision_metrics["pending_release_timeout_events_total"],
                         "cooldown_replans_blocked": decision_metrics["cooldown_replans_blocked"],
                         "pending_release_observe_abort_no_progress": decision_metrics["pending_release_observe_abort_no_progress"],
                         "pending_release_observe_abort_commit_window": decision_metrics["pending_release_observe_abort_commit_window"],
@@ -3402,8 +3475,6 @@ class RLTrainingPipeline:
                         "pending_release_wrong_lane_commit": decision_metrics["pending_release_wrong_lane_commit"],
                         "pending_release_route_stall_timeout": decision_metrics["pending_release_route_stall_timeout"],
                         "pending_release_route_hard_timeout": decision_metrics["pending_release_route_hard_timeout"],
-                        "same_edge_release_timeout_total": decision_metrics["same_edge_release_timeout_total"],
-                        "same_edge_release_abort_total": decision_metrics["same_edge_release_abort_total"],
                         "loop_override_count": decision_metrics["loop_override_count"],
                         "dead_end_reentry_override_count": decision_metrics["dead_end_reentry_override_count"],
                         "snapshot_cache_hits": self._cache_metrics["snapshot_cache_hits"],
@@ -3425,8 +3496,6 @@ class RLTrainingPipeline:
                         "route_apply_fail_overrides": decision_metrics["route_apply_fail_overrides"],
                         "override_learning_negative": decision_metrics["override_learning_negative"],
                         "override_learning_imitation": decision_metrics["override_learning_imitation"],
-                        "timeout_unfinished_controlled": alive_at_step_cap_count,
-                        "exited_without_destination": exited_without_destination,
                         "alive_at_step_cap": alive_at_step_cap_count,
                         "decision_pending_at_episode_end": len(pending_decisions),
                         "mean_pending_age": mean_pending_age,
@@ -3468,8 +3537,7 @@ class RLTrainingPipeline:
                         "social_regret_mean": social_regret_mean,
                         "social_regret_p90": social_regret_p90,
                         "social_best_action_chosen_rate": social_best_action_chosen_rate,
-                        "actionable_skip_ratio": actionable_skip_ratio,
-                        "actionable_skipped_to_opened_ratio": actionable_skipped_to_opened_ratio,
+                        "actionable_no_candidate_rate": actionable_skip_ratio,
                         "structural_skip_ratio": structural_skip_ratio,
                         "pending_resolution_success_rate": pending_resolution_success_rate,
                         "pending_timeout_rate": pending_timeout_rate,
@@ -3489,10 +3557,11 @@ class RLTrainingPipeline:
                         "reachable_lane_change_excluded_all": decision_metrics["reachable_lane_change_excluded_all"],
                         "policy_candidates_with_broader_available": decision_metrics["policy_candidates_with_broader_available"],
                         "policy_candidates_collapsed_to_lane_now_only": decision_metrics["policy_candidates_collapsed_to_lane_now_only"],
-                        "soft_commit_window_admissions": decision_metrics["soft_commit_window_admissions"],
-                        "observe_abort_low_speed": decision_metrics["observe_abort_low_speed"],
+                        "commit_window_non_lane_candidates_seen": decision_metrics["commit_window_non_lane_candidates_seen"],
+                        "commit_window_candidates_rejected": decision_metrics["commit_window_candidates_rejected"],
+                        "proactive_shift2_candidates_seen": decision_metrics["proactive_shift2_candidates_seen"],
+                        "proactive_shift2_candidates_rejected": decision_metrics["proactive_shift2_candidates_rejected"],
                         "pending_commit_window_grace_kept": decision_metrics["pending_commit_window_grace_kept"],
-                        "proactive_shift2_candidates_kept": decision_metrics["proactive_shift2_candidates_kept"],
                         "proactive_decisions_opened": decision_metrics["proactive_decisions_opened"],
                         "proactive_decisions_finalized": decision_metrics["proactive_decisions_finalized"],
                         "lane_now_decisions_opened": decision_metrics["lane_now_decisions_opened"],
@@ -3502,9 +3571,11 @@ class RLTrainingPipeline:
                         "fallback_after_observe_abort_count": decision_metrics["fallback_after_observe_abort_count"],
                         "fallback_after_timeout_count": decision_metrics["fallback_after_timeout_count"],
                         "same_edge_reopen_after_abort_count": decision_metrics["same_edge_reopen_after_abort_count"],
+                        "synthetic_terminal_finalizations": decision_metrics["synthetic_terminal_finalizations"],
                         "finalized_opened_proactive_ratio": finalized_opened_proactive_ratio,
                         "finalized_opened_lane_now_ratio": finalized_opened_lane_now_ratio,
                     }
+                    row = {field: row.get(field, "") for field in csv_fields}
                     if set(row.keys()) != set(csv_fields):
                         raise ValueError("rl_episode_metrics.csv row schema does not match header")
                     writer.writerow(row)

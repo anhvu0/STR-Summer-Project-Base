@@ -8,6 +8,14 @@ from core.route_loop_safety import transition_signal, would_worsen_distance, sho
 
 @dataclass
 class DecisionContext:
+    """
+    Snapshot of one strategic decision point at a specific step.
+
+    Terminology:
+    - commit_window=True means lane-feasible-now only; proactive lane-change actions are rejected.
+    - available_actions is the final action set after feasibility filters.
+    - This object is a gauge/state snapshot (not an event counter).
+    """
     vehicle_id: str
     edge_id: str
     destination: str
@@ -30,6 +38,13 @@ class DecisionContext:
 
 @dataclass
 class PendingDecision:
+    """
+    Lifecycle record for one strategic decision_id while it is unresolved.
+
+    A strategic decision may move across phases (observe_lane_change -> route_pending),
+    but it keeps the same decision_id and decision_origin_mode so telemetry counts it once
+    for opened/finalized semantics.
+    """
     state: object
     intended_action: int
     intended_next_edge: str
@@ -40,6 +55,10 @@ class PendingDecision:
     destination: str
     context: DecisionContext
     lane_change_requested: bool
+    decision_id: str = ""
+    decision_origin_mode: str = "lane_now"
+    decision_current_phase: str = "route_pending"
+    decision_open_recorded: bool = False
     route_fragment: List[str] = field(default_factory=list)
     metadata: Dict[str, object] = field(default_factory=dict)
 
