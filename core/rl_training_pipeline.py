@@ -1282,6 +1282,7 @@ class RLTrainingPipeline:
         episode,
         in_arrived_ids=False,
         in_teleport_ids=False,
+        ever_teleported=False,
     ):
         if vehicle_id in terminal_recorded_ids:
             return 0.0
@@ -1305,6 +1306,9 @@ class RLTrainingPipeline:
                     reached_global_destination=True,
                     terminal_outcome=outcome,
                 )
+                if ever_teleported:
+                    teleport_assisted_arrival_penalty = 8.0
+                    reward = self._clip_reward(reward - teleport_assisted_arrival_penalty)
                 next_state = self.make_terminal_next_state_from_edge(
                     vehicle.destination,
                     vehicle.destination,
@@ -1339,6 +1343,8 @@ class RLTrainingPipeline:
                     "terminal_outcome": outcome,
                     "synthetic_terminal_no_pending": True,
                     "decision_finalized": True,
+                    "ever_teleported": bool(ever_teleported),
+                    "teleport_assisted_arrival": bool(ever_teleported and outcome == "global_arrival"),
                 },
             )
             decision_metrics["synthetic_terminal_finalizations"] += 1
@@ -1394,6 +1400,9 @@ class RLTrainingPipeline:
                 reached_global_destination=True,
                 terminal_outcome=outcome,
             )
+            if ever_teleported:
+                teleport_assisted_arrival_penalty = 8.0
+                reward = self._clip_reward(reward - teleport_assisted_arrival_penalty)
             next_state = self.make_terminal_next_state_from_edge(
                 vehicle.destination,
                 vehicle.destination,
@@ -1446,6 +1455,9 @@ class RLTrainingPipeline:
         final_metadata = dict(pending.metadata) if isinstance(pending.metadata, dict) else {}
         final_metadata["terminal_outcome"] = outcome
         final_metadata["decision_finalized"] = True
+        if ever_teleported:
+            final_metadata["ever_teleported"] = True
+            final_metadata["teleport_assisted_arrival"] = (outcome == "global_arrival")
         self.trainer.stage_transition(
             pending.state,
             pending.intended_action,
@@ -1740,6 +1752,7 @@ class RLTrainingPipeline:
             "replay_main_other_kept_episode", "replay_main_other_kept_cumulative",
             "pending_credit_per_opened_decision",
             "completion_rate", "avg_travel_time", "p50_travel_time", "p90_travel_time", "teleports", "teleported_controlled",
+            "controlled_ever_teleported", "arrived_after_teleport", "clean_arrivals_without_teleport",
             "forced_actions", "decisions_considered", "decisions_opened", "decisions_finalized", "decisions_skipped",
             "decisions_skipped_actionable",
             "skipped_pending_hold", "skipped_structural_no_branch", "skipped_structural_forced_single_path",
@@ -1853,6 +1866,7 @@ class RLTrainingPipeline:
             episode_return_total = 0.0
             episode_teleport_events = 0
             teleported_controlled_ids = set()
+            ever_teleported_controlled_ids = set()
             arrived_ids = set()
             total_controlled = len(vehicles)
             last_seen_edge_by_vehicle = {}
@@ -2906,6 +2920,7 @@ class RLTrainingPipeline:
 
                     arrived_this_step = set(simulation_get_arrived_ids())
                     teleported_ids = self.get_teleport_ids()
+                    ever_teleported_controlled_ids.update(tid for tid in teleported_ids if tid in vehicles)
                     live_after_step = set(vehicle_get_ids())
                     removed_controlled_ids = {
                         vid for vid in controlled_live_ids
@@ -2941,6 +2956,7 @@ class RLTrainingPipeline:
                             is_live=(removed_id in live_after_step),
                         )
                         final_outcome_by_vehicle[removed_id] = outcome
+                        ever_teleported = (removed_id in ever_teleported_controlled_ids)
                         reached_global_destination = (outcome == "global_arrival")
                         if reached_global_destination:
                             arrived_ids.add(removed_id)
@@ -2975,6 +2991,7 @@ class RLTrainingPipeline:
                             episode=episode,
                             in_arrived_ids=(removed_id in arrived_this_step),
                             in_teleport_ids=(removed_id in teleported_ids),
+                            ever_teleported=ever_teleported,
                         )
                         self.cleanup_vehicle_state(
                             removed_id,
@@ -3036,9 +3053,17 @@ class RLTrainingPipeline:
                             episode=episode,
                             in_arrived_ids=False,
                             in_teleport_ids=False,
+                            ever_teleported=(vid in ever_teleported_controlled_ids),
                         )
                 global_arrival_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "global_arrival")
                 terminal_teleport_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "teleport")
+                controlled_ever_teleported = len(ever_teleported_controlled_ids)
+                arrived_after_teleport = sum(
+                    1
+                    for vid, outcome in final_outcome_by_vehicle.items()
+                    if outcome == "global_arrival" and vid in ever_teleported_controlled_ids
+                )
+                clean_arrivals_without_teleport = max(global_arrival_count - arrived_after_teleport, 0)
                 removed_nonarrival_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "removed_nonarrival")
                 alive_at_step_cap_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "alive_at_step_cap")
                 completion_rate = (
@@ -3370,6 +3395,8 @@ class RLTrainingPipeline:
                     f"Controlled exit diagnostics | "
                     f"arrived={global_arrival_count}/{total_controlled}, "
                     f"teleported_terminal={terminal_teleport_count}/{total_controlled}, "
+                    f"ever_teleported={controlled_ever_teleported}/{total_controlled}, "
+                    f"arrived_after_teleport={arrived_after_teleport}/{total_controlled}, "
                     f"removed_nonarrival={removed_nonarrival_count}/{total_controlled}, "
                     f"alive_at_step_cap={alive_at_step_cap_count}/{total_controlled}"
                 )
@@ -3475,6 +3502,9 @@ class RLTrainingPipeline:
                         "p90_travel_time": p90_travel_time,
                         "teleports": episode_teleport_events,
                         "teleported_controlled": len(teleported_controlled_ids),
+                        "controlled_ever_teleported": controlled_ever_teleported,
+                        "arrived_after_teleport": arrived_after_teleport,
+                        "clean_arrivals_without_teleport": clean_arrivals_without_teleport,
                         "forced_actions": decision_metrics["forced_actions"],
                         "decisions_considered": decision_metrics["decisions_considered"],
                         "decisions_opened": decision_metrics["decisions_opened"],
