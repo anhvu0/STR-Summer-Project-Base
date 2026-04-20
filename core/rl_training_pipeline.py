@@ -121,6 +121,7 @@ class DQNTrainer:
         self.replay_main_kept_terminal = 0
         self.replay_main_kept_other = 0
         self.replay_main_dropped = 0
+        self.staged_episode_transitions = []
         self.model = self.build_model(learning_rate)
         self.target_model = self._build_target_model()
         self.train_steps = 0
@@ -210,12 +211,12 @@ class DQNTrainer:
             return False
         if metadata.get("imitation_credit", False):
             return False
-        if metadata.get("pending_timeout_replan", False):
-            return False
         if metadata.get("synthetic_terminal_no_pending", False):
             return False
         terminal_outcome = metadata.get("terminal_outcome")
         if terminal_outcome in {"teleport", "timeout", "removed_nonarrival"}:
+            return False
+        if metadata.get("episode_bucket") != "good":
             return False
         if not metadata.get("decision_open", False):
             return False
@@ -225,7 +226,11 @@ class DQNTrainer:
             return False
         if terminal_outcome == "global_arrival":
             return True
-        return float(reward) >= 0.25
+        return bool(
+            metadata.get("decision_finalized", False)
+            and (not metadata.get("mismatch", False))
+            and float(reward) >= 0.0
+        )
 
     def _should_store_main_transition(self, reward, done, metadata):
         metadata = metadata or {}
@@ -247,35 +252,65 @@ class DQNTrainer:
         if metadata.get("forced_action", False):
             return False
 
-        return bool(
-            metadata.get("decision_finalized", False)
-            or metadata.get("pending_timeout_replan", False)
+        is_finalized = bool(metadata.get("decision_finalized", False))
+        is_timeout_or_observe = bool(
+            metadata.get("pending_timeout_replan", False)
             or metadata.get("observe_no_progress", False)
             or metadata.get("observe_low_speed", False)
             or metadata.get("observe_commit_window_miss", False)
         )
+        if not (is_finalized or is_timeout_or_observe):
+            return False
+
+        bucket = str(metadata.get("episode_bucket", "bad"))
+        if bucket == "good":
+            keep_prob = 1.0 if is_finalized else 0.75
+        elif bucket == "okay":
+            keep_prob = 0.70 if is_finalized else 0.40
+        else:
+            keep_prob = 0.35 if is_finalized else 0.15
+        return random.random() < keep_prob
+
+    def stage_transition(self, state, action, reward, next_state, done, next_valid_actions=None, metadata=None):
+        self.staged_episode_transitions.append(
+            (state, action, reward, next_state, done, next_valid_actions, metadata)
+        )
+
+    def _episode_bucket(self, avg_tt, avg_return, completion_rate, teleported_controlled):
+        if avg_tt < 210 and avg_return >= 9 and completion_rate >= 0.98 and teleported_controlled <= 3:
+            return "good"
+        if avg_tt < 230 and avg_return >= 4 and completion_rate >= 0.95 and teleported_controlled <= 6:
+            return "okay"
+        return "bad"
+
+    def flush_staged_episode(self, avg_tt, avg_return, completion_rate, teleported_controlled):
+        bucket = self._episode_bucket(avg_tt, avg_return, completion_rate, teleported_controlled)
+        for state, action, reward, next_state, done, next_valid_actions, metadata in self.staged_episode_transitions:
+            metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            metadata["episode_bucket"] = bucket
+            if self._should_store_main_transition(reward, done, metadata):
+                self.memory.add(state, action, reward, next_state, done, next_valid_actions, metadata=metadata)
+                terminal_outcome = metadata.get("terminal_outcome")
+                if terminal_outcome in {"global_arrival", "teleport", "timeout", "removed_nonarrival"}:
+                    self.replay_main_kept_terminal += 1
+                elif metadata.get("decision_finalized", False):
+                    self.replay_main_kept_finalized += 1
+                elif metadata.get("pending_timeout_replan", False):
+                    self.replay_main_kept_pending_timeout += 1
+                else:
+                    self.replay_main_kept_other += 1
+            else:
+                self.replay_main_dropped += 1
+            if self._is_elite_transition(reward, done, metadata):
+                self.elite_memory.add(state, action, reward, next_state, done, next_valid_actions, metadata=metadata)
+                self.elite_transitions_added += 1
+        self.staged_episode_transitions.clear()
 
     def remember(self, state, action, reward, next_state, done, next_valid_actions=None, metadata=None):
         """
         Store 1 transition for replay
         """
-        metadata = metadata or {}
-        if self._should_store_main_transition(reward, done, metadata):
-            self.memory.add(state, action, reward, next_state, done, next_valid_actions, metadata=metadata)
-            terminal_outcome = metadata.get("terminal_outcome")
-            if terminal_outcome in {"global_arrival", "teleport", "timeout", "removed_nonarrival"}:
-                self.replay_main_kept_terminal += 1
-            elif metadata.get("decision_finalized", False):
-                self.replay_main_kept_finalized += 1
-            elif metadata.get("pending_timeout_replan", False):
-                self.replay_main_kept_pending_timeout += 1
-            else:
-                self.replay_main_kept_other += 1
-        else:
-            self.replay_main_dropped += 1
-        if self._is_elite_transition(reward, done, metadata):
-            self.elite_memory.add(state, action, reward, next_state, done, next_valid_actions, metadata=metadata)
-            self.elite_transitions_added += 1
+        self.stage_transition(state, action, reward, next_state, done, next_valid_actions, metadata)
     
     def replay(self):
         """
@@ -1172,7 +1207,7 @@ class RLTrainingPipeline:
                 decision_metrics["fail_removed_non_destination"] += 1
             else:
                 raise ValueError(f"Unknown terminal outcome: {outcome}")
-            self.trainer.remember(
+            self.trainer.stage_transition(
                 base_state,
                 0,
                 reward,
@@ -1291,7 +1326,7 @@ class RLTrainingPipeline:
         final_metadata = dict(pending.metadata) if isinstance(pending.metadata, dict) else {}
         final_metadata["terminal_outcome"] = outcome
         final_metadata["decision_finalized"] = True
-        self.trainer.remember(
+        self.trainer.stage_transition(
             pending.state,
             pending.intended_action,
             reward,
@@ -1682,6 +1717,7 @@ class RLTrainingPipeline:
             arrived_with_prestep_edge_not_destination = 0
             prev_speed_by_vehicle = {}
             emergency_brake_active_by_vehicle = {}
+            last_observed_brake_step_by_vehicle = {}
             mean_density_samples = []
             p95_density_samples = []
             congestion_high_pressure_steps = 0
@@ -1719,9 +1755,12 @@ class RLTrainingPipeline:
                         if snapshot is None:
                             # Reset event latch if we cannot observe this step; avoids stale active flags.
                             emergency_brake_active_by_vehicle.pop(vehicle_id, None)
+                            prev_speed_by_vehicle.pop(vehicle_id, None)
+                            last_observed_brake_step_by_vehicle.pop(vehicle_id, None)
                             continue
                         prev_speed = prev_speed_by_vehicle.get(vehicle_id)
-                        if prev_speed is not None:
+                        observed_prev_step = (last_observed_brake_step_by_vehicle.get(vehicle_id) == (step - 1))
+                        if prev_speed is not None and observed_prev_step:
                             decel = max(float(prev_speed) - float(snapshot.speed), 0.0)
                             hard_brake = decel >= self.emergency_decel_threshold and prev_speed > 4.0
                             was_hard_brake_active = bool(emergency_brake_active_by_vehicle.get(vehicle_id, False))
@@ -1755,6 +1794,7 @@ class RLTrainingPipeline:
 
                         current_edge = snapshot.edge_id
                         prev_speed_by_vehicle[vehicle_id] = snapshot.speed
+                        last_observed_brake_step_by_vehicle[vehicle_id] = step
 
                         vehicle = vehicles[vehicle_id]
                         vehicle.current_edge = current_edge
@@ -1835,7 +1875,7 @@ class RLTrainingPipeline:
                                 step=step,
                                 snapshot=snapshot,
                             )
-                            self.trainer.remember(
+                            self.trainer.stage_transition(
                                 pending.state,
                                 pending.intended_action,
                                 reward,
@@ -1926,7 +1966,7 @@ class RLTrainingPipeline:
                                             destination=vehicle.destination,
                                             decision_metrics=decision_metrics,
                                         )
-                                        self.trainer.remember(
+                                        self.trainer.stage_transition(
                                             pending.state,
                                             pending.intended_action,
                                             override_penalty,
@@ -1979,7 +2019,7 @@ class RLTrainingPipeline:
                                     decision_metrics["lane_change_observe_abort_no_progress"] += 1
                                     pending_pen = self.observe_no_progress_penalty
                                 pending_pen = self._clip_reward(pending_pen + self.same_edge_repeat_chase_penalty)
-                                self.trainer.remember(
+                                self.trainer.stage_transition(
                                     pending.state,
                                     pending.intended_action,
                                     pending_pen,
@@ -2065,7 +2105,7 @@ class RLTrainingPipeline:
                                     decision_metrics=decision_metrics,
                                 )
                                 imitation_reward = self._clip_reward(0.10)
-                                self.trainer.remember(
+                                self.trainer.stage_transition(
                                     next_state,
                                     fallback_action,
                                     imitation_reward,
@@ -2115,7 +2155,7 @@ class RLTrainingPipeline:
                                     step=step,
                                     snapshot=snapshot,
                                 )
-                                self.trainer.remember(
+                                self.trainer.stage_transition(
                                     pending.state,
                                     pending.intended_action,
                                     pending_reward,
@@ -2150,7 +2190,7 @@ class RLTrainingPipeline:
                                     snapshot=snapshot,
                                 )
                                 timeout_penalty = self._clip_reward(self.pending_timeout_penalty)
-                                self.trainer.remember(
+                                self.trainer.stage_transition(
                                     pending.state,
                                     pending.intended_action,
                                     timeout_penalty,
@@ -2336,7 +2376,7 @@ class RLTrainingPipeline:
                                 destination=vehicle.destination,
                                 decision_metrics=decision_metrics,
                             )
-                            self.trainer.remember(
+                            self.trainer.stage_transition(
                                 state,
                                 original_action,
                                 override_penalty,
@@ -2355,7 +2395,7 @@ class RLTrainingPipeline:
                             decision_metrics["override_learning_transitions"] += 1
                             decision_metrics["override_learning_negative"] += 1
                             imitation_reward = self._clip_reward(0.15)
-                            self.trainer.remember(
+                            self.trainer.stage_transition(
                                 state,
                                 action,
                                 imitation_reward,
@@ -2408,7 +2448,7 @@ class RLTrainingPipeline:
                                     destination=vehicle.destination,
                                     decision_metrics=decision_metrics,
                                 )
-                                self.trainer.remember(
+                                self.trainer.stage_transition(
                                     state,
                                     original_action,
                                     override_penalty,
@@ -2427,7 +2467,7 @@ class RLTrainingPipeline:
                                 decision_metrics["override_learning_transitions"] += 1
                                 decision_metrics["override_learning_negative"] += 1
                                 imitation_reward = self._clip_reward(0.10)
-                                self.trainer.remember(
+                                self.trainer.stage_transition(
                                     state,
                                     action,
                                     imitation_reward,
@@ -2524,7 +2564,7 @@ class RLTrainingPipeline:
                                 destination=vehicle.destination,
                                 decision_metrics=decision_metrics,
                             )
-                            self.trainer.remember(
+                            self.trainer.stage_transition(
                                 state,
                                 action,
                                 override_penalty,
@@ -2665,6 +2705,7 @@ class RLTrainingPipeline:
                         )
                         emergency_brake_active_by_vehicle.pop(removed_id, None)
                         prev_speed_by_vehicle.pop(removed_id, None)
+                        last_observed_brake_step_by_vehicle.pop(removed_id, None)
 
                     if step % self.train_every == 0:
                         for _ in range(self.grad_steps):
@@ -2852,6 +2893,12 @@ class RLTrainingPipeline:
                 roll_avg_travel_time = sum(rolling_avg_travel_time) / len(rolling_avg_travel_time)
                 roll_mismatch = sum(rolling_mismatch) / len(rolling_mismatch)
 
+                self.trainer.flush_staged_episode(
+                    avg_tt=avg_travel_time,
+                    avg_return=avg_return,
+                    completion_rate=completion_rate,
+                    teleported_controlled=len(teleported_controlled_ids),
+                )
                 self.trainer.epsilon = max(
                     self.trainer.epsilon_min,
                     self.trainer.epsilon * self.trainer.epsilon_decay
