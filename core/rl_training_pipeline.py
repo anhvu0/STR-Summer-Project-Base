@@ -118,6 +118,40 @@ class StrategicOptionTrainer:
         scores = self.score_options(next_shared, next_option_features)
         return float(np.max(scores)) if len(scores) else 0.0
 
+    def _batch_bootstrap_values(self, transitions):
+        """
+        Compute bootstrap max-Q values for a transition batch in a single model pass.
+        Returns float32 vector of size len(transitions).
+        """
+        if not transitions:
+            return np.array([], dtype=np.float32)
+
+        bootstrap = np.full(len(transitions), -np.inf, dtype=np.float32)
+        shared_rows = []
+        option_rows = []
+        owner_indices = []
+
+        for idx, tr in enumerate(transitions):
+            if tr.done or tr.next_state_shared is None or not tr.next_state_option_features:
+                continue
+            next_options = tr.next_state_option_features
+            shared_vec = np.asarray(tr.next_state_shared, dtype=np.float32).reshape(-1)
+            shared_rows.extend([shared_vec] * len(next_options))
+            option_rows.extend(np.asarray(next_options, dtype=np.float32))
+            owner_indices.extend([idx] * len(next_options))
+
+        if not owner_indices:
+            return bootstrap
+
+        shared_batch = np.asarray(shared_rows, dtype=np.float32)
+        option_batch = np.asarray(option_rows, dtype=np.float32)
+        scores = self.model([shared_batch, option_batch], training=False).numpy().reshape(-1)
+        for idx, score in zip(owner_indices, scores):
+            if score > bootstrap[idx]:
+                bootstrap[idx] = float(score)
+        bootstrap[~np.isfinite(bootstrap)] = 0.0
+        return bootstrap
+
     def train_step(self):
         if len(self.replay.strategic_replay) < self.replay_warmup:
             return None
@@ -129,21 +163,37 @@ class StrategicOptionTrainer:
             "terminal_only": int(fractions.get("terminal_only_count", 0)),
             "total": int(fractions.get("total_count", len(batch))),
         }
-        losses = []
-        for tr in batch:
-            if tr.chosen_option_idx >= len(tr.state_option_features):
-                continue
-            state_shared = np.asarray(tr.state_shared, dtype=np.float32)
-            option_feat = np.asarray(tr.state_option_features[tr.chosen_option_idx], dtype=np.float32)
-            target = float(tr.aggregated_reward) + (0.0 if tr.done else self.gamma * self._target_value(tr.next_state_shared, tr.next_state_option_features, tr.done))
-            loss = self.model.train_on_batch([state_shared, option_feat], np.array([target], dtype=np.float32))
-            if loss is not None:
-                losses.append(float(loss))
+        valid_indices = [
+            idx for idx, tr in enumerate(batch)
+            if tr.chosen_option_idx < len(tr.state_option_features)
+        ]
+        if not valid_indices:
+            return None
+
+        valid_batch = [batch[idx] for idx in valid_indices]
+        bootstrap_values = self._batch_bootstrap_values(valid_batch)
+        done_mask = np.asarray([tr.done for tr in valid_batch], dtype=np.float32)
+        rewards = np.asarray([tr.aggregated_reward for tr in valid_batch], dtype=np.float32)
+        targets = rewards + (1.0 - done_mask) * self.gamma * bootstrap_values
+
+        shared_batch = np.asarray(
+            [np.asarray(tr.state_shared, dtype=np.float32).reshape(-1) for tr in valid_batch],
+            dtype=np.float32,
+        )
+        option_batch = np.asarray(
+            [np.asarray(tr.state_option_features[tr.chosen_option_idx], dtype=np.float32).reshape(-1) for tr in valid_batch],
+            dtype=np.float32,
+        )
+
+        loss = self.model.train_on_batch(
+            [shared_batch, option_batch],
+            targets.reshape(-1, 1),
+        )
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
-        if not losses:
+        if loss is None:
             return None
-        mean_loss = float(np.mean(losses))
+        mean_loss = float(loss)
         self.last_loss = mean_loss
         if self.loss_ema == 0.0:
             self.loss_ema = mean_loss
