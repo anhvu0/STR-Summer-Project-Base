@@ -112,3 +112,67 @@ def would_worsen_distance(
     if next_distance == float("inf"):
         return True
     return (next_distance - current_distance) > slack
+
+
+def short_horizon_trap_score(
+    start_edge: str,
+    candidate_edge: str,
+    destination: str,
+    outgoing_lookup: Dict[str, Dict[str, str]],
+    edge_distance_lookup: Optional[Dict[str, float]] = None,
+    recent_history: Optional[Iterable[str]] = None,
+    horizon_steps: int = 3,
+    progress_slack: float = 20.0,
+) -> float:
+    """
+    Heuristic trap-corridor score for fallback ranking:
+    higher = more loop-prone / weak-progress corridor.
+    """
+    history = list(recent_history or [])
+    score = 0.0
+    max_depth = max(1, min(int(horizon_steps), 3))
+    best_known_dist = (
+        edge_distance_lookup.get(start_edge, float("inf"))
+        if edge_distance_lookup else float("inf")
+    )
+
+    probe_edge = candidate_edge
+    for depth in range(1, max_depth + 1):
+        out_map = outgoing_lookup.get(probe_edge, {}) or {}
+        out_degree = len(out_map)
+        dist = edge_distance_lookup.get(probe_edge, float("inf")) if edge_distance_lookup else float("inf")
+
+        if probe_edge != destination and out_degree == 0:
+            score += 10.0 / depth
+            break
+        if probe_edge != destination and out_degree == 1:
+            score += 4.0 / depth
+
+        if probe_edge in history[-8:]:
+            score += 5.0 / depth
+
+        if (
+            edge_distance_lookup
+            and best_known_dist != float("inf")
+            and dist != float("inf")
+            and (dist - best_known_dist) >= float(progress_slack)
+        ):
+            score += 6.0 / depth
+
+        if edge_distance_lookup and dist != float("inf"):
+            best_known_dist = min(best_known_dist, dist)
+
+        # Deterministic look-ahead path: follow min-distance successor.
+        next_edges = [nxt for nxt in out_map.values() if nxt]
+        if not next_edges:
+            break
+        if edge_distance_lookup:
+            finite_next = [e for e in next_edges if edge_distance_lookup.get(e, float("inf")) != float("inf")]
+            if finite_next:
+                probe_edge = min(finite_next, key=lambda e: edge_distance_lookup.get(e, float("inf")))
+            else:
+                probe_edge = sorted(next_edges)[0]
+        else:
+            probe_edge = sorted(next_edges)[0]
+
+    return float(score)

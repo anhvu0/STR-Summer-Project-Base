@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 import math
 import traci
-from core.route_loop_safety import transition_signal, would_worsen_distance
+from core.route_loop_safety import transition_signal, would_worsen_distance, short_horizon_trap_score
 
 
 @dataclass
@@ -82,11 +82,17 @@ class JunctionDecisionEngine:
         self.observe_stall_steps = 5
         self.cooldown_steps = 3
         self.observe_timeout_steps = 16
-        self.route_pending_stall_steps = 8
-        self.route_pending_hard_timeout_steps = 60
+        self.route_pending_stall_steps = 5
+        self.route_pending_hard_timeout_steps = 36
         self.route_pending_progress_eps_m = 2.0
+        self.route_pending_lane_progress_eps = 0.15
+        self.route_pending_no_progress_window_steps = 3
         self.pending_progress_timeout_steps = 22
         self.loop_distance_slack = 30.0
+        self.proactive_extra_buffer_m = 10.0
+        self.proactive_safety_margin_m = 8.0
+        self.cooldown_after_abort_extra_steps = 2
+        self.cooldown_after_timeout_extra_steps = 4
 
     def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
         if snapshot is not None:
@@ -149,45 +155,29 @@ class JunctionDecisionEngine:
         available = []
 
         if commit_window:
-            # Soft commit window:
-            # keep lane-now actions, but still admit one-lane proactive actions
-            # if there is still a little room left.
+            # Hard commit window: lane-feasible-now actions only.
             available = list(lane_now)
-            for idx in edge_valid:
-                if idx in lane_now:
-                    continue
-                shift = required_shift.get(idx, 999)
-                if shift != 1:
-                    continue
-                if speed < 0.5:
-                    continue
-                if dist_to_end < max(6.0, 0.75 * commit_distance):
-                    continue
-                available.append(idx)
         else:
             lane_change_budget = max(dist_to_end - commit_distance, 0.0)
             for idx in edge_valid:
                 if idx in lane_now:
                     available.append(idx)
                     continue
-
                 shift = required_shift.get(idx, 999)
-                if shift >= 999:
+                if shift != 1:
                     continue
                 if speed < 0.5:
                     continue
-
-                dynamic_margin = self.lane_change_margin_m * (1.0 + 0.35 * max(0, shift - 1))
-
-                # Softer budget requirements than current code:
-                if shift == 1:
-                    required_budget = 0.55 * dynamic_margin
-                elif shift == 2:
-                    required_budget = 0.85 * (2.0 * self.lane_change_margin_m)
-                else:
+                # Conservative proactive admission: single-shift only with stronger distance buffer.
+                strong_threshold = (
+                    commit_distance
+                    + max(self.proactive_extra_buffer_m, 0.5 * self.lane_change_margin_m)
+                    + self.proactive_safety_margin_m
+                )
+                dynamic_margin = self.lane_change_margin_m
+                if lane_change_budget < dynamic_margin:
                     continue
-
-                if lane_change_budget >= required_budget and dist_to_end >= max(0.7 * reaction_distance, 12.0):
+                if dist_to_end >= max(0.85 * reaction_distance, strong_threshold):
                     available.append(idx)
 
         available = sorted(set(available))
@@ -236,6 +226,54 @@ class JunctionDecisionEngine:
     def should_timeout_pending(self, pending: PendingDecision, step: int, max_age_steps: Optional[int] = None) -> bool:
         threshold = self.pending_timeout_steps if max_age_steps is None else int(max_age_steps)
         return self.pending_age_steps(pending, step) >= max(threshold, 1)
+
+    def cooldown_after_pending_release(self, timeout: bool = False) -> int:
+        base = int(max(self.cooldown_steps, 1))
+        bonus = self.cooldown_after_timeout_extra_steps if timeout else self.cooldown_after_abort_extra_steps
+        return int(base + max(int(bonus), 0))
+
+    def pending_progress_update(
+        self,
+        pending: PendingDecision,
+        context: DecisionContext,
+        step: int,
+    ) -> Tuple[Dict[str, object], Dict[str, object]]:
+        metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
+        pending.metadata = metadata
+        best_dist = float(metadata.get("best_dist_to_end", context.dist_to_end))
+        last_progress_step = int(metadata.get("last_progress_step", pending.decision_step))
+        best_lane_pos = float(metadata.get("best_lane_position", 0.0))
+        lane_position = max(float(metadata.get("lane_position_now", 0.0)), 0.0)
+
+        progress_eps = float(self.route_pending_progress_eps_m)
+        lane_progress_eps = float(self.route_pending_lane_progress_eps)
+        current_shift = int(context.required_lane_shift.get(pending.intended_action, 99))
+        prior_shift = int(metadata.get("last_required_shift", current_shift))
+        shift_progress = current_shift < prior_shift
+        lane_now_progress = pending.intended_action in context.lane_feasible_now_actions
+        dist_progress = context.dist_to_end <= (best_dist - progress_eps)
+        lane_pos_progress = lane_position >= (best_lane_pos + lane_progress_eps)
+
+        made_progress = bool(dist_progress or shift_progress or lane_now_progress or lane_pos_progress)
+        if made_progress:
+            last_progress_step = int(step)
+            best_dist = min(best_dist, float(context.dist_to_end))
+            best_lane_pos = max(best_lane_pos, lane_position)
+        else:
+            best_dist = min(best_dist, float(context.dist_to_end))
+            best_lane_pos = max(best_lane_pos, lane_position)
+
+        metadata["best_dist_to_end"] = float(best_dist)
+        metadata["last_progress_step"] = int(last_progress_step)
+        metadata["best_lane_position"] = float(best_lane_pos)
+        metadata["last_required_shift"] = int(current_shift)
+        metadata["last_seen_lane_index"] = int(context.lane_index)
+
+        return metadata, {
+            "made_progress": made_progress,
+            "current_shift": int(current_shift),
+            "last_progress_step": int(last_progress_step),
+        }
 
     def lane_change_observe_limit(self, context: DecisionContext) -> int:
         limit = self.observe_steps_min
@@ -299,7 +337,7 @@ class JunctionDecisionEngine:
 
         commit_window_grace = (
             current_shift <= 1
-            and context.dist_to_end >= max(0.5 * self.commit_min_distance, 4.0)
+            and context.dist_to_end >= max(self.commit_min_distance + 2.0, 6.0)
         )
 
         if context.commit_window and action_idx not in context.lane_feasible_now_actions and not commit_window_grace:
@@ -370,11 +408,35 @@ class JunctionDecisionEngine:
                 score += 5.0
             next_edge = self.get_next_edge(context.edge_id, action)
             if distance_fn is not None and next_edge is not None:
+                current_dist = distance_fn(context.edge_id, destination)
                 next_dist = distance_fn(next_edge, destination)
                 if math.isfinite(next_dist):
                     score += min(float(next_dist) / 250.0, 10.0)
                 else:
                     score += 25.0
+                if math.isfinite(current_dist) and math.isfinite(next_dist) and next_dist >= (current_dist - 1.0):
+                    score += 9.0
+                edge_distance_lookup = {
+                    edge: distance_fn(edge, destination)
+                    for edge in set(recent_history) | {context.edge_id, next_edge}
+                }
+                trap_score = short_horizon_trap_score(
+                    start_edge=context.edge_id,
+                    candidate_edge=next_edge,
+                    destination=destination,
+                    outgoing_lookup=self.connection_info.outgoing_edges_dict,
+                    edge_distance_lookup=edge_distance_lookup,
+                    recent_history=recent_history,
+                    horizon_steps=3,
+                    progress_slack=self.loop_distance_slack,
+                )
+                score += 1.5 * float(trap_score)
+                if next_edge in set(recent_history[-6:]):
+                    score += 8.0
+                out_degree = len(self.connection_info.outgoing_edges_dict.get(next_edge, {}))
+                if out_degree == 1 and math.isfinite(current_dist) and math.isfinite(next_dist):
+                    if next_dist >= (current_dist - max(6.0, 0.25 * self.loop_distance_slack)):
+                        score += 10.0
             score += 0.12 * float(context.required_lane_shift.get(action, 0))
             scored.append((score, action))
         scored.sort(key=lambda x: x[0])
