@@ -91,6 +91,9 @@ class StrategicOptionTrainer:
         self.replay = ReplayManager(strategic_capacity=replay_capacity)
         self.last_sample_fractions = {"strategic_fraction": 1.0, "tactical_failure_fraction": 0.0, "terminal_only_fraction": 0.0}
         self.last_sample_counts = {"strategic": 0, "tactical_failure": 0, "terminal_only": 0, "total": 0}
+        self.last_loss = None
+        self.loss_ema = None
+        self.train_steps = 0
 
     def score_options(self, shared_state, option_features):
         if not option_features:
@@ -138,7 +141,16 @@ class StrategicOptionTrainer:
                 losses.append(float(loss))
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
-        return float(np.mean(losses)) if losses else None
+        if not losses:
+            return None
+        mean_loss = float(np.mean(losses))
+        self.last_loss = mean_loss
+        if self.loss_ema is None:
+            self.loss_ema = mean_loss
+        else:
+            self.loss_ema = (0.1 * mean_loss) + (0.9 * float(self.loss_ema))
+        self.train_steps += 1
+        return mean_loss
 
 class TrainingRouteHelper(RouteController):
     """
@@ -663,6 +675,68 @@ class RLTrainingPipeline:
         with open(self.decision_debug_csv_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=self._decision_debug_fields)
             writer.writerows(rows)
+
+    def _episode_metrics_fieldnames(self):
+        return [
+            "episode",
+            "epsilon",
+            "train_steps",
+            "replay_strategic_size",
+            "replay_tactical_failure_size",
+            "replay_terminal_only_size",
+            "sampled_strategic_fraction",
+            "sampled_tactical_failure_fraction",
+            "sampled_terminal_only_fraction",
+            "sampled_strategic_count",
+            "sampled_tactical_failure_count",
+            "sampled_terminal_only_count",
+            "sampled_total_count",
+            "decision_open_count",
+            "learned_decision_count",
+            "forced_nonlearned_decision_count",
+            "decision_open_rate",
+            "strategic_success_rate",
+            "execution_success_rate",
+            "avg_option_count",
+            "avg_executable_option_count",
+            "avg_decision_horizon_steps",
+            "p50_decision_horizon_steps",
+            "p90_decision_horizon_steps",
+            "commit_window_miss_count",
+            "stalled_lane_change_count",
+            "forced_by_lane_commit_count",
+            "teleport_during_execution_count",
+            "collision_during_execution_count",
+            "timeout_during_execution_count",
+            "commit_window_miss_rate",
+            "stalled_lane_change_rate",
+            "forced_by_lane_commit_rate",
+            "teleport_during_execution_rate",
+            "collision_during_execution_rate",
+            "timeout_during_execution_rate",
+            "lane_change_attempts",
+            "lane_change_successes",
+            "lane_change_attempt_rate",
+            "lane_change_success_rate",
+            "loss_last",
+            "loss_ema",
+            "option_failure_commit_window_miss",
+            "option_failure_stalled_lane_change",
+            "option_failure_forced_by_lane_commit",
+            "option_failure_teleport",
+            "option_failure_collision",
+            "option_failure_timeout",
+            "option_failure_apply_route_failed",
+            "option_failure_became_impossible_after_selection",
+        ]
+
+    def _ensure_episode_metrics_csv_header(self):
+        with open(self.metrics_csv_path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=self._episode_metrics_fieldnames()).writeheader()
+
+    def _append_episode_metrics_row(self, row):
+        with open(self.metrics_csv_path, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=self._episode_metrics_fieldnames()).writerow(row)
 
     def _build_decision_debug_row(
         self,
@@ -1756,6 +1830,7 @@ class RLTrainingPipeline:
         if isinstance(self.strategic_trainer.model.input_shape, list):
             assert len(self.strategic_trainer.model.input_shape) == 2, "Strategic model must be two-input shared+option scorer."
         # Legacy DQN trainer is intentionally disabled for redesigned strategic-option training.
+        self._ensure_episode_metrics_csv_header()
 
         for episode in range(self.episodes):
             traci.start([sumo_binary, "-c", self.sumocfg_path, "--start"])
@@ -1887,19 +1962,90 @@ class RLTrainingPipeline:
                 active_decisions.pop(vid, None)
 
             traci.close()
-            avg_option_count = metrics["option_count_total"] / max(metrics["decision_open_count"], 1)
-            avg_exec_option_count = metrics["executable_option_count_total"] / max(metrics["decision_open_count"], 1)
-            avg_horizon = float(np.mean(metrics["decision_horizon_steps"])) if metrics["decision_horizon_steps"] else 0.0
-            success_rate = metrics["option_success_count"] / max(metrics["learned_decision_count"], 1)
+            decision_open_count = int(metrics["decision_open_count"])
+            learned_decision_count = int(metrics["learned_decision_count"])
+            forced_nonlearned_decision_count = int(metrics["forced_nonlearned_decision_count"])
+            option_failure_counts = metrics["option_failure_counts"]
+            horizon_steps = metrics["decision_horizon_steps"]
+
+            avg_option_count = metrics["option_count_total"] / max(decision_open_count, 1)
+            avg_exec_option_count = metrics["executable_option_count_total"] / max(decision_open_count, 1)
+            avg_horizon = float(np.mean(horizon_steps)) if horizon_steps else 0.0
+            p50_horizon = float(np.percentile(horizon_steps, 50)) if horizon_steps else 0.0
+            p90_horizon = float(np.percentile(horizon_steps, 90)) if horizon_steps else 0.0
+            success_rate = metrics["option_success_count"] / max(learned_decision_count, 1)
+
+            replay_strategic_size = len(self.strategic_trainer.replay.strategic_replay)
+            replay_tactical_failure_size = len(self.strategic_trainer.replay.tactical_failure_replay)
+            replay_terminal_only_size = len(self.strategic_trainer.replay.terminal_only_replay)
+            sample_fractions = self.strategic_trainer.last_sample_fractions
+            sample_counts = self.strategic_trainer.last_sample_counts
+            completion_rate = 0.0
+            avg_tt = 0.0
+            p90_tt = 0.0
+
+            episode_row = {
+                "episode": int(episode + 1),
+                "epsilon": float(self.strategic_trainer.epsilon),
+                "train_steps": int(getattr(self.strategic_trainer, "train_steps", 0)),
+                "replay_strategic_size": int(replay_strategic_size),
+                "replay_tactical_failure_size": int(replay_tactical_failure_size),
+                "replay_terminal_only_size": int(replay_terminal_only_size),
+                "sampled_strategic_fraction": float(sample_fractions.get("strategic_fraction", 0.0)),
+                "sampled_tactical_failure_fraction": float(sample_fractions.get("tactical_failure_fraction", 0.0)),
+                "sampled_terminal_only_fraction": float(sample_fractions.get("terminal_only_fraction", 0.0)),
+                "sampled_strategic_count": int(sample_counts.get("strategic", 0)),
+                "sampled_tactical_failure_count": int(sample_counts.get("tactical_failure", 0)),
+                "sampled_terminal_only_count": int(sample_counts.get("terminal_only", 0)),
+                "sampled_total_count": int(sample_counts.get("total", 0)),
+                "decision_open_count": decision_open_count,
+                "learned_decision_count": learned_decision_count,
+                "forced_nonlearned_decision_count": forced_nonlearned_decision_count,
+                "decision_open_rate": float(learned_decision_count / max(decision_open_count, 1)),
+                "strategic_success_rate": float(success_rate),
+                "execution_success_rate": float(success_rate),
+                "avg_option_count": float(avg_option_count),
+                "avg_executable_option_count": float(avg_exec_option_count),
+                "avg_decision_horizon_steps": float(avg_horizon),
+                "p50_decision_horizon_steps": float(p50_horizon),
+                "p90_decision_horizon_steps": float(p90_horizon),
+                "commit_window_miss_count": int(metrics["commit_window_miss_count"]),
+                "stalled_lane_change_count": int(metrics["stalled_lane_change_count"]),
+                "forced_by_lane_commit_count": int(metrics["forced_by_lane_commit_count"]),
+                "teleport_during_execution_count": int(metrics["teleport_during_execution_count"]),
+                "collision_during_execution_count": int(metrics["collision_during_execution_count"]),
+                "timeout_during_execution_count": int(metrics["timeout_during_execution_count"]),
+                "commit_window_miss_rate": float(metrics["commit_window_miss_count"] / max(learned_decision_count, 1)),
+                "stalled_lane_change_rate": float(metrics["stalled_lane_change_count"] / max(learned_decision_count, 1)),
+                "forced_by_lane_commit_rate": float(metrics["forced_by_lane_commit_count"] / max(learned_decision_count, 1)),
+                "teleport_during_execution_rate": float(metrics["teleport_during_execution_count"] / max(learned_decision_count, 1)),
+                "collision_during_execution_rate": float(metrics["collision_during_execution_count"] / max(learned_decision_count, 1)),
+                "timeout_during_execution_rate": float(metrics["timeout_during_execution_count"] / max(learned_decision_count, 1)),
+                "lane_change_attempts": int(metrics["lane_change_attempts"]),
+                "lane_change_successes": int(metrics["lane_change_successes"]),
+                "lane_change_attempt_rate": float(metrics["lane_change_attempts"] / max(learned_decision_count, 1)),
+                "lane_change_success_rate": float(metrics["lane_change_successes"] / max(metrics["lane_change_attempts"], 1)),
+                "loss_last": float(self.strategic_trainer.last_loss) if self.strategic_trainer.last_loss is not None else 0.0,
+                "loss_ema": float(self.strategic_trainer.loss_ema) if self.strategic_trainer.loss_ema is not None else 0.0,
+                "option_failure_commit_window_miss": int(option_failure_counts.get("commit_window_miss", 0)),
+                "option_failure_stalled_lane_change": int(option_failure_counts.get("stalled_lane_change", 0)),
+                "option_failure_forced_by_lane_commit": int(option_failure_counts.get("forced_by_lane_commit", 0)),
+                "option_failure_teleport": int(option_failure_counts.get("teleport", 0)),
+                "option_failure_collision": int(option_failure_counts.get("collision", 0)),
+                "option_failure_timeout": int(option_failure_counts.get("timeout", 0)),
+                "option_failure_apply_route_failed": int(option_failure_counts.get("apply_route_failed", 0)),
+                "option_failure_became_impossible_after_selection": int(option_failure_counts.get("became_impossible_after_selection", 0)),
+            }
+            self._append_episode_metrics_row(episode_row)
+
             print(
-                f"[EP {episode+1:03d}] open={metrics['decision_open_count']} learned={metrics['learned_decision_count']} "
-                f"forced_nonlearned={metrics['forced_nonlearned_decision_count']} avg_options={avg_option_count:.2f} "
-                f"avg_exec_options={avg_exec_option_count:.2f} strategic_success_rate={success_rate:.2%} "
-                f"avg_horizon={avg_horizon:.2f} replay(s/t/term)=({len(self.strategic_trainer.replay.strategic_replay)}/"
-                f"{len(self.strategic_trainer.replay.tactical_failure_replay)}/{len(self.strategic_trainer.replay.terminal_only_replay)}) "
-                f"sample_fracs={self.strategic_trainer.last_sample_fractions} "
-                f"sample_counts={self.strategic_trainer.last_sample_counts} "
-                f"legacy_replay_size=legacy_disabled"
+                f"[EP {episode+1:03d}] eps={self.strategic_trainer.epsilon:.3f} success={success_rate:.2%} "
+                f"completion={completion_rate:.2%} avg_tt={avg_tt:.2f} p90_tt={p90_tt:.2f} "
+                f"learned={learned_decision_count} forced_nonlearned={forced_nonlearned_decision_count} "
+                f"strategic_success_rate={success_rate:.2%} avg_horizon={avg_horizon:.2f} "
+                f"replay(s/t/term)=({replay_strategic_size}/{replay_tactical_failure_size}/{replay_terminal_only_size}) "
+                f"sample_fracs={sample_fractions} "
+                f"loss_last={episode_row['loss_last']:.6f} loss_ema={episode_row['loss_ema']:.6f}"
             )
 
         self.strategic_trainer.model.save(self.model_output_path)
