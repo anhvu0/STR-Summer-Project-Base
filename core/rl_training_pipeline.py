@@ -247,7 +247,7 @@ class DQNTrainer:
         return bool(
             metadata.get("decision_finalized", False)
             and (not metadata.get("mismatch", False))
-            and float(reward) >= -0.5
+            and float(reward) >= -2.0
         )
 
     def _should_store_main_transition(self, reward, done, metadata):
@@ -274,11 +274,11 @@ class DQNTrainer:
         if is_interim_pending:
             bucket = str(metadata.get("episode_bucket", "bad"))
             if bucket == "good":
-                keep_prob = 0.50
-            elif bucket == "okay":
                 keep_prob = 0.35
-            else:
+            elif bucket == "okay":
                 keep_prob = 0.20
+            else:
+                keep_prob = 0.08
             return random.random() < keep_prob
 
         is_finalized = bool(metadata.get("decision_finalized", False))
@@ -306,9 +306,9 @@ class DQNTrainer:
         )
 
     def _episode_bucket(self, avg_tt, avg_return, completion_rate, teleported_controlled):
-        if avg_tt < 260 and avg_return >= 4 and completion_rate >= 0.98 and teleported_controlled <= 4:
+        if avg_tt < 240 and completion_rate >= 0.99 and teleported_controlled <= 2:
             return "good"
-        if avg_tt < 300 and avg_return >= 0 and completion_rate >= 0.95 and teleported_controlled <= 6:
+        if avg_tt < 280 and completion_rate >= 0.97 and teleported_controlled <= 5:
             return "okay"
         return "bad"
 
@@ -1738,6 +1738,7 @@ class RLTrainingPipeline:
             "replay_main_terminal_episode", "replay_main_terminal_cumulative",
             "replay_main_dropped_episode", "replay_main_dropped_cumulative",
             "replay_main_other_kept_episode", "replay_main_other_kept_cumulative",
+            "pending_credit_per_opened_decision",
             "completion_rate", "avg_travel_time", "p50_travel_time", "p90_travel_time", "teleports", "teleported_controlled",
             "forced_actions", "decisions_considered", "decisions_opened", "decisions_finalized", "decisions_skipped",
             "decisions_skipped_actionable",
@@ -2326,6 +2327,8 @@ class RLTrainingPipeline:
                                     pending_age=pending_age,
                                     lane_change_deferrals=pending.metadata.get("lane_change_deferrals", 0),
                                 )
+                                age_scale = 1.0 / (1.0 + 0.10 * max(pending_age - 8, 0))
+                                pending_reward *= age_scale
                                 next_ctx = self.decision_engine.build_context(
                                     vehicle_id,
                                     current_edge,
@@ -3223,6 +3226,12 @@ class RLTrainingPipeline:
                     self.trainer.epsilon_min,
                     self.trainer.epsilon * self.trainer.epsilon_decay
                 )
+                replay_main_other_kept_episode = int(
+                    self.trainer.replay_main_kept_other - trainer_counter_start["replay_main_kept_other"]
+                )
+                pending_credit_per_opened_decision = (
+                    float(replay_main_other_kept_episode) / float(max(decision_metrics["decisions_opened"], 1.0))
+                )
                 print(
                     f"\n[EP {episode:03d} DONE] eps={self.trainer.epsilon:.4f} train={self.trainer.train_steps} "
                     f"replay={len(self.trainer.memory)} ret={avg_return_per_vehicle:.3f} "
@@ -3314,12 +3323,14 @@ class RLTrainingPipeline:
                 print(
                     "  lane-change diagnostics: lane_change_request_accepted_rate={:.1%} "
                     "lane_change_request_rejected_rate={:.1%} lane_change_observe_resolution_rate={:.1%} "
-                    "lane_change_observe_abort_rate={:.1%} pending_resolution_success_rate={:.1%}".format(
+                    "lane_change_observe_abort_rate={:.1%} pending_resolution_success_rate={:.1%} "
+                    "pending_credit_per_opened_decision={:.3f}".format(
                         lane_change_request_accepted_rate,
                         lane_change_request_rejected_rate,
                         lane_change_observe_resolution_rate,
                         lane_change_observe_abort_rate,
                         pending_resolution_success_rate,
+                        pending_credit_per_opened_decision,
                     )
                 )
                 print(
@@ -3455,8 +3466,9 @@ class RLTrainingPipeline:
                         "replay_main_terminal_cumulative": self.trainer.replay_main_kept_terminal,
                         "replay_main_dropped_episode": int(self.trainer.replay_main_dropped - trainer_counter_start["replay_main_dropped"]),
                         "replay_main_dropped_cumulative": self.trainer.replay_main_dropped,
-                        "replay_main_other_kept_episode": int(self.trainer.replay_main_kept_other - trainer_counter_start["replay_main_kept_other"]),
+                        "replay_main_other_kept_episode": replay_main_other_kept_episode,
                         "replay_main_other_kept_cumulative": self.trainer.replay_main_kept_other,
+                        "pending_credit_per_opened_decision": pending_credit_per_opened_decision,
                         "completion_rate": completion_rate,
                         "avg_travel_time": avg_travel_time,
                         "p50_travel_time": p50_travel_time,
