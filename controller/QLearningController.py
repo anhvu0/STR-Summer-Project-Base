@@ -52,6 +52,14 @@ class QLearningPolicy(RouteController):
             "lane_change_observe_success": 0,
             "lane_change_observe_abort_no_progress": 0,
             "lane_change_observe_abort_commit_window": 0,
+            "pending_release_observe_abort_no_progress": 0,
+            "pending_release_observe_abort_commit_window": 0,
+            "pending_release_observe_abort_low_speed": 0,
+            "pending_release_wrong_lane_commit": 0,
+            "pending_release_route_stall_timeout": 0,
+            "pending_release_route_hard_timeout": 0,
+            "same_edge_release_timeout_total": 0,
+            "same_edge_release_abort_total": 0,
             "same_edge_pending_released_no_progress": 0,
             "cooldown_replans_blocked": 0,
             "loop_override_count": 0,
@@ -364,7 +372,12 @@ class QLearningPolicy(RouteController):
 
             if wrong_lane_commit or no_progress_stall or stalled_timeout or hard_timeout:
                 self._pending_decisions.pop(vid, None)
-                self._metrics["same_edge_pending_released_no_progress"] += 1
+                if wrong_lane_commit:
+                    self._record_pending_release("wrong_lane_commit")
+                if no_progress_stall or stalled_timeout:
+                    self._record_pending_release("route_stall_timeout")
+                if hard_timeout:
+                    self._record_pending_release("route_hard_timeout")
                 if stalled_timeout or hard_timeout:
                     self._metrics["pending_decision_timeouts"] += 1
                 self._lane_change_cooldown[(vid, vehicle.current_edge)] = (
@@ -377,6 +390,32 @@ class QLearningPolicy(RouteController):
             return
         self._pending_decisions.pop(vid, None)
         self._lane_change_deferrals[vid] = 0
+
+    def _record_pending_release(self, reason):
+        key_map = {
+            "observe_abort_no_progress": "pending_release_observe_abort_no_progress",
+            "observe_abort_commit_window": "pending_release_observe_abort_commit_window",
+            "observe_abort_low_speed": "pending_release_observe_abort_low_speed",
+            "wrong_lane_commit": "pending_release_wrong_lane_commit",
+            "route_stall_timeout": "pending_release_route_stall_timeout",
+            "route_hard_timeout": "pending_release_route_hard_timeout",
+        }
+        key = key_map.get(reason)
+        if key:
+            self._metrics[key] += 1
+        self._metrics["same_edge_release_abort_total"] = (
+            self._metrics["pending_release_observe_abort_no_progress"]
+            + self._metrics["pending_release_observe_abort_commit_window"]
+            + self._metrics["pending_release_observe_abort_low_speed"]
+            + self._metrics["pending_release_wrong_lane_commit"]
+        )
+        self._metrics["same_edge_release_timeout_total"] = (
+            self._metrics["pending_release_route_stall_timeout"]
+            + self._metrics["pending_release_route_hard_timeout"]
+        )
+        self._metrics["same_edge_pending_released_no_progress"] = (
+            self._metrics["same_edge_release_abort_total"] + self._metrics["same_edge_release_timeout_total"]
+        )
 
     def _snapshot_vehicle(self, vid, edge_id, step):
         try:
@@ -556,11 +595,14 @@ class QLearningPolicy(RouteController):
                         continue
                     if reason == "commit_window":
                         self._metrics["lane_change_observe_abort_commit_window"] += 1
+                        self._record_pending_release("observe_abort_commit_window")
                     elif reason == "low_speed":
                         self._metrics["observe_abort_low_speed"] += 1
                         self._metrics["lane_change_observe_abort_no_progress"] += 1
+                        self._record_pending_release("observe_abort_low_speed")
                     else:
                         self._metrics["lane_change_observe_abort_no_progress"] += 1
+                        self._record_pending_release("observe_abort_no_progress")
                     self._lane_change_cooldown[(vid, start_edge)] = (
                         step + self.decision_engine.cooldown_after_pending_release(timeout=False)
                     )
