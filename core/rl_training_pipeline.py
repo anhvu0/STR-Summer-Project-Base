@@ -1879,8 +1879,8 @@ class RLTrainingPipeline:
                     teleported_controlled_ids.add(vid)
                     removed_controlled_ids.add(vid)
 
-                # Open decisions for vehicles without an active option execution.
-                for vid in list(live_ids):
+                # Open decisions for controlled live vehicles without an active option execution.
+                for vid in list(live_controlled_ids):
                     try:
                         edge_id = traci.vehicle.getRoadID(vid)
                         if not edge_id or edge_id.startswith(":"):
@@ -1952,64 +1952,71 @@ class RLTrainingPipeline:
 
                 # Step and resolve all active decisions using route-progression rules.
                 for vid, active in list(active_decisions.items()):
+                    if vid not in controlled_ids:
+                        active_decisions.pop(vid, None)
+                        continue
                     if vid in teleport_ids:
                         active.reward_accumulator += -float(self.travel_time_penalty)
                         active.horizon_steps += 1
                         outcome = "teleport"
                         current_context = None
                     else:
-                        if vid not in live_ids:
-                            continue
-                        try:
-                            curr_edge = traci.vehicle.getRoadID(vid)
-                            if (not curr_edge) or curr_edge.startswith(":"):
-                                continue
-                            curr_dest = self._get_destination_edge(vid, curr_edge)
-                            current_context = self.decision_engine.build_context(vid, curr_edge, curr_dest, step)
-                        except Exception:
-                            continue
-                        active.reward_accumulator += -float(self.travel_time_penalty)
-                        active.horizon_steps += 1
-                        self.tactical_executor.step_execution(active.tactical_state, current_context, active.chosen_option, step)
-                        executor_outcome = self.tactical_executor.resolve_execution(
-                            active.tactical_state,
-                            current_context,
-                            active.chosen_option,
-                        )
-                        outcome = "in_progress"
-                        if current_context.edge_id == active.chosen_option.outgoing_edge:
-                            outcome = "success"
-                        elif current_context.commit_window and (
-                            current_context.edge_id == active.context.current_edge
-                            and active.chosen_option.option_id not in current_context.lane_feasible_now_actions
-                        ):
-                            outcome = "commit_window_miss"
+                        if vid not in live_controlled_ids:
+                            active.reward_accumulator += float(self.stale_disappeared_penalty)
+                            active.horizon_steps += 1
+                            outcome = "stale_disappeared"
+                            current_context = None
                         else:
-                            needs_lane_change = bool(
-                                active.chosen_option.tactical_risk_flags.get("needs_lane_change", False)
+                            try:
+                                curr_edge = traci.vehicle.getRoadID(vid)
+                                if (not curr_edge) or curr_edge.startswith(":"):
+                                    continue
+                                curr_dest = self._get_destination_edge(vid, curr_edge)
+                                current_context = self.decision_engine.build_context(vid, curr_edge, curr_dest, step)
+                            except Exception:
+                                continue
+                            active.reward_accumulator += -float(self.travel_time_penalty)
+                            active.horizon_steps += 1
+                            self.tactical_executor.step_execution(active.tactical_state, current_context, active.chosen_option, step)
+                            executor_outcome = self.tactical_executor.resolve_execution(
+                                active.tactical_state,
+                                current_context,
+                                active.chosen_option,
                             )
-                            required_shift_map = current_context.required_lane_shift or {}
-                            current_shift = int(required_shift_map.get(active.chosen_option.option_id, 99))
-                            if "best_required_shift" not in active.tactical_state:
-                                active.tactical_state["best_required_shift"] = int(current_shift)
-                                active.tactical_state["last_progress_step"] = int(step)
-                            if current_shift < int(active.tactical_state.get("best_required_shift", 99)):
-                                active.tactical_state["best_required_shift"] = int(current_shift)
-                                active.tactical_state["last_progress_step"] = int(step)
-                            stalled_for = int(step) - int(active.tactical_state.get("last_progress_step", step))
-                            if (
-                                needs_lane_change
-                                and stalled_for >= int(self.decision_engine.route_pending_stall_steps)
-                                and current_context.edge_id == active.context.current_edge
+                            outcome = "in_progress"
+                            if current_context.edge_id == active.chosen_option.outgoing_edge:
+                                outcome = "success"
+                            elif current_context.commit_window and (
+                                current_context.edge_id == active.context.current_edge
+                                and active.chosen_option.option_id not in current_context.lane_feasible_now_actions
                             ):
-                                outcome = "stalled_lane_change"
-                            elif active.horizon_steps >= int(self.decision_engine.route_pending_hard_timeout_steps):
-                                outcome = "timeout"
-                            elif executor_outcome in {
-                                "forced_by_lane_commit",
-                                "became_impossible_after_selection",
-                            }:
-                                outcome = executor_outcome
+                                outcome = "commit_window_miss"
+                            else:
+                                needs_lane_change = bool(
+                                    active.chosen_option.tactical_risk_flags.get("needs_lane_change", False)
+                                )
+                                required_shift_map = current_context.required_lane_shift or {}
+                                current_shift = int(required_shift_map.get(active.chosen_option.option_id, 99))
+                                if "best_required_shift" not in active.tactical_state:
+                                    active.tactical_state["best_required_shift"] = int(current_shift)
+                                    active.tactical_state["last_progress_step"] = int(step)
+                                if current_shift < int(active.tactical_state.get("best_required_shift", 99)):
+                                    active.tactical_state["best_required_shift"] = int(current_shift)
+                                    active.tactical_state["last_progress_step"] = int(step)
+                                stalled_for = int(step) - int(active.tactical_state.get("last_progress_step", step))
+                                if (
+                                    needs_lane_change
+                                    and stalled_for >= int(self.decision_engine.route_pending_stall_steps)
+                                    and current_context.edge_id == active.context.current_edge
+                                ):
+                                    outcome = "stalled_lane_change"
+                                elif active.horizon_steps >= int(self.decision_engine.route_pending_hard_timeout_steps):
+                                    outcome = "timeout"
+                                elif executor_outcome in {
+                                    "forced_by_lane_commit",
+                                    "became_impossible_after_selection",
+                                }:
+                                    outcome = executor_outcome
 
                     if outcome == "in_progress":
                         continue
@@ -2049,6 +2056,8 @@ class RLTrainingPipeline:
                             fail_reward = self._clip_reward(self.teleport_penalty)
                         elif outcome == "timeout":
                             fail_reward = self._clip_reward(self.pending_timeout_penalty)
+                        elif outcome == "stale_disappeared":
+                            fail_reward = self._clip_reward(self.stale_disappeared_penalty)
                         elif outcome == "apply_route_failed":
                             fail_reward = self._clip_reward(-6.0)
                         elif outcome == "became_impossible_after_selection":
