@@ -91,8 +91,8 @@ class StrategicOptionTrainer:
         self.replay = ReplayManager(strategic_capacity=replay_capacity)
         self.last_sample_fractions = {"strategic_fraction": 1.0, "tactical_failure_fraction": 0.0, "terminal_only_fraction": 0.0}
         self.last_sample_counts = {"strategic": 0, "tactical_failure": 0, "terminal_only": 0, "total": 0}
-        self.last_loss = None
-        self.loss_ema = None
+        self.last_loss = 0.0
+        self.loss_ema = 0.0
         self.train_steps = 0
 
     def score_options(self, shared_state, option_features):
@@ -145,7 +145,7 @@ class StrategicOptionTrainer:
             return None
         mean_loss = float(np.mean(losses))
         self.last_loss = mean_loss
-        if self.loss_ema is None:
+        if self.loss_ema == 0.0:
             self.loss_ema = mean_loss
         else:
             self.loss_ema = (0.1 * mean_loss) + (0.9 * float(self.loss_ema))
@@ -708,6 +708,7 @@ class RLTrainingPipeline:
             "teleport_during_execution_count",
             "collision_during_execution_count",
             "timeout_during_execution_count",
+            "unresolved_terminal_forced_count",
             "commit_window_miss_rate",
             "stalled_lane_change_rate",
             "forced_by_lane_commit_rate",
@@ -1821,6 +1822,7 @@ class RLTrainingPipeline:
             "teleport_during_execution_count": 0,
             "collision_during_execution_count": 0,
             "timeout_during_execution_count": 0,
+            "unresolved_terminal_forced_count": 0,
         }
 
     def run(self):
@@ -1833,16 +1835,51 @@ class RLTrainingPipeline:
         self._ensure_episode_metrics_csv_header()
 
         for episode in range(self.episodes):
+            episode_seed = (episode + 1) if self.seed_with_episode else None
+            controlled_vehicles = self.generate_episode_vehicles(episode_seed=episode_seed)
+            controlled_ids = set(controlled_vehicles.keys())
+            arrived_controlled_ids = set()
+            removed_controlled_ids = set()
+            travel_times_completed = []
+            teleported_controlled_ids = set()
+            timeout_controlled_ids = set()
+            seen_live_controlled_ids = set()
             traci.start([sumo_binary, "-c", self.sumocfg_path, "--start"])
             step = 0
             active_decisions = {}
             metrics = self._init_episode_metrics()
+            train_updates = 0
 
             while step < MAX_SIMULATION_STEPS and (traci.simulation.getMinExpectedNumber() > 0):
                 traci.simulationStep()
                 step += 1
                 live_ids = set(traci.vehicle.getIDList())
+                arrived_ids = set(traci.simulation.getArrivedIDList())
+                teleport_ids = self.get_teleport_ids()
+                live_controlled_ids = live_ids & controlled_ids
+                newly_removed = (seen_live_controlled_ids - live_controlled_ids) - removed_controlled_ids
+                if newly_removed:
+                    removed_controlled_ids.update(newly_removed)
+                for vid in live_controlled_ids:
+                    seen_live_controlled_ids.add(vid)
+                    vehicle = controlled_vehicles.get(vid)
+                    if vehicle is None:
+                        continue
+                    vehicle_start_time = getattr(vehicle, "start_time", None)
+                    if vehicle_start_time is None or float(vehicle_start_time) == 0.0:
+                        vehicle.start_time = int(step)
+                for vid in (arrived_ids & controlled_ids):
+                    if vid in arrived_controlled_ids:
+                        continue
+                    arrived_controlled_ids.add(vid)
+                    vehicle = controlled_vehicles.get(vid)
+                    start_time = float(getattr(vehicle, "start_time", step) if vehicle is not None else step)
+                    travel_times_completed.append(max(float(step) - start_time, 0.0))
+                for vid in (teleport_ids & controlled_ids):
+                    teleported_controlled_ids.add(vid)
+                    removed_controlled_ids.add(vid)
 
+                # Open decisions for vehicles without an active option execution.
                 for vid in list(live_ids):
                     try:
                         edge_id = traci.vehicle.getRoadID(vid)
@@ -1875,7 +1912,35 @@ class RLTrainingPipeline:
                         if selected_idx is None:
                             continue
                         selected_option = executable_options[selected_idx]
+                        full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
+                            vid,
+                            edge_id,
+                            selected_option.option_id,
+                            dest,
+                        )
+                        if apply_error is not None:
+                            transition = StrategicTransition(
+                                state_shared=shared_state,
+                                state_option_features=self._build_option_features(strategic_context),
+                                chosen_option_idx=selected_idx,
+                                aggregated_reward=self._clip_reward(-6.0),
+                                next_state_shared=None,
+                                next_state_option_features=None,
+                                done=True,
+                                outcome="failed",
+                                tactical_outcome="apply_route_failed",
+                                horizon_steps=1,
+                            )
+                            self.strategic_trainer.replay.add_tactical_failure(transition)
+                            if "apply_route_failed" in self._strategic_main_allowed_tactical_outcomes:
+                                self.strategic_trainer.replay.add_strategic(transition)
+                            metrics["option_failure_counts"]["apply_route_failed"] += 1
+                            metrics["decision_horizon_steps"].append(1.0)
+                            continue
                         tactical_state = self.tactical_executor.begin_execution(vid, selected_option, step)
+                        tactical_state["committed_next_edge"] = committed_next_edge
+                        tactical_state["full_route"] = list(full_route) if full_route else []
+                        tactical_state["route_applied"] = True
                         active_decisions[vid] = ActiveStrategicDecision(
                             context=strategic_context,
                             chosen_option_idx=selected_idx,
@@ -1885,23 +1950,113 @@ class RLTrainingPipeline:
                         )
                         metrics["learned_decision_count"] += 1
 
-                    # Step active decision.
-                    active = active_decisions.get(vid)
-                    if not active:
-                        continue
-                    active.reward_accumulator += -float(self.travel_time_penalty)
-                    active.horizon_steps += 1
-                    self.tactical_executor.step_execution(active.tactical_state, context, active.chosen_option, step)
-                    outcome = self.tactical_executor.resolve_execution(active.tactical_state, context, active.chosen_option)
+                # Step and resolve all active decisions using route-progression rules.
+                for vid, active in list(active_decisions.items()):
+                    if vid in teleport_ids:
+                        active.reward_accumulator += -float(self.travel_time_penalty)
+                        active.horizon_steps += 1
+                        outcome = "teleport"
+                        current_context = None
+                    else:
+                        if vid not in live_ids:
+                            continue
+                        try:
+                            curr_edge = traci.vehicle.getRoadID(vid)
+                            if (not curr_edge) or curr_edge.startswith(":"):
+                                continue
+                            curr_dest = self._get_destination_edge(vid, curr_edge)
+                            current_context = self.decision_engine.build_context(vid, curr_edge, curr_dest, step)
+                        except Exception:
+                            continue
+                        active.reward_accumulator += -float(self.travel_time_penalty)
+                        active.horizon_steps += 1
+                        self.tactical_executor.step_execution(active.tactical_state, current_context, active.chosen_option, step)
+                        executor_outcome = self.tactical_executor.resolve_execution(
+                            active.tactical_state,
+                            current_context,
+                            active.chosen_option,
+                        )
+                        outcome = "in_progress"
+                        if current_context.edge_id == active.chosen_option.outgoing_edge:
+                            outcome = "success"
+                        elif current_context.commit_window and (
+                            current_context.edge_id == active.context.current_edge
+                            and active.chosen_option.option_id not in current_context.lane_feasible_now_actions
+                        ):
+                            outcome = "commit_window_miss"
+                        else:
+                            needs_lane_change = bool(
+                                active.chosen_option.tactical_risk_flags.get("needs_lane_change", False)
+                            )
+                            required_shift_map = current_context.required_lane_shift or {}
+                            current_shift = int(required_shift_map.get(active.chosen_option.option_id, 99))
+                            if "best_required_shift" not in active.tactical_state:
+                                active.tactical_state["best_required_shift"] = int(current_shift)
+                                active.tactical_state["last_progress_step"] = int(step)
+                            if current_shift < int(active.tactical_state.get("best_required_shift", 99)):
+                                active.tactical_state["best_required_shift"] = int(current_shift)
+                                active.tactical_state["last_progress_step"] = int(step)
+                            stalled_for = int(step) - int(active.tactical_state.get("last_progress_step", step))
+                            if (
+                                needs_lane_change
+                                and stalled_for >= int(self.decision_engine.route_pending_stall_steps)
+                                and current_context.edge_id == active.context.current_edge
+                            ):
+                                outcome = "stalled_lane_change"
+                            elif active.horizon_steps >= int(self.decision_engine.route_pending_hard_timeout_steps):
+                                outcome = "timeout"
+                            elif executor_outcome in {
+                                "forced_by_lane_commit",
+                                "became_impossible_after_selection",
+                            }:
+                                outcome = executor_outcome
 
                     if outcome == "in_progress":
                         continue
 
-                    done = bool(outcome != "success")
                     if outcome == "success":
                         metrics["option_success_count"] += 1
+                        next_shared = self._state_for_context(
+                            vid,
+                            current_context,
+                            self._get_destination_edge(vid, current_context.edge_id),
+                        )
+                        next_ctx = self.tactical_executor.build_options(
+                            current_context,
+                            next_shared,
+                            queue_length_fn=self._queue_len,
+                        )
+                        transition = StrategicTransition(
+                            state_shared=active.context.shared_state,
+                            state_option_features=self._build_option_features(active.context),
+                            chosen_option_idx=active.chosen_option_idx,
+                            aggregated_reward=float(active.reward_accumulator),
+                            next_state_shared=next_shared,
+                            next_state_option_features=self._build_option_features(next_ctx),
+                            done=False,
+                            outcome="resolved",
+                            tactical_outcome=None,
+                            horizon_steps=max(active.horizon_steps, 1),
+                        )
+                        self.strategic_trainer.replay.add_strategic(transition)
                     else:
                         metrics["option_failure_counts"][outcome] += 1
+                        if outcome == "commit_window_miss":
+                            fail_reward = self._clip_reward(-0.7)
+                        elif outcome == "stalled_lane_change":
+                            fail_reward = self._clip_reward(-0.5)
+                        elif outcome == "teleport":
+                            fail_reward = self._clip_reward(self.teleport_penalty)
+                        elif outcome == "timeout":
+                            fail_reward = self._clip_reward(self.pending_timeout_penalty)
+                        elif outcome == "apply_route_failed":
+                            fail_reward = self._clip_reward(-6.0)
+                        elif outcome == "became_impossible_after_selection":
+                            fail_reward = self._clip_reward(-1.0)
+                        elif outcome == "forced_by_lane_commit":
+                            fail_reward = self._clip_reward(-0.4)
+                        else:
+                            fail_reward = self._clip_reward(active.reward_accumulator)
                         if outcome == "commit_window_miss":
                             metrics["commit_window_miss_count"] += 1
                         elif outcome == "stalled_lane_change":
@@ -1914,34 +2069,43 @@ class RLTrainingPipeline:
                             metrics["collision_during_execution_count"] += 1
                         elif outcome == "timeout":
                             metrics["timeout_during_execution_count"] += 1
-
-                    next_shared = None
-                    next_option_features = None
-                    if not done:
-                        next_shared = self._state_for_context(vid, context, dest)
-                        next_ctx = self.tactical_executor.build_options(context, next_shared, queue_length_fn=self._queue_len)
-                        next_option_features = self._build_option_features(next_ctx)
-
-                    transition = StrategicTransition(
-                        state_shared=active.context.shared_state,
-                        state_option_features=self._build_option_features(active.context),
-                        chosen_option_idx=active.chosen_option_idx,
-                        aggregated_reward=float(active.reward_accumulator),
-                        next_state_shared=next_shared,
-                        next_state_option_features=next_option_features,
-                        done=bool(done),
-                        outcome=("resolved" if outcome == "success" else "failed"),
-                        tactical_outcome=None if outcome == "success" else outcome,
-                        horizon_steps=max(active.horizon_steps, 1),
-                    )
-                    if outcome in self._strategic_main_allowed_tactical_outcomes:
-                        self.strategic_trainer.replay.add_strategic(transition)
-                    if outcome != "success":
+                        transition = StrategicTransition(
+                            state_shared=active.context.shared_state,
+                            state_option_features=self._build_option_features(active.context),
+                            chosen_option_idx=active.chosen_option_idx,
+                            aggregated_reward=float(fail_reward),
+                            next_state_shared=None,
+                            next_state_option_features=None,
+                            done=True,
+                            outcome="failed",
+                            tactical_outcome=outcome,
+                            horizon_steps=max(active.horizon_steps, 1),
+                        )
                         self.strategic_trainer.replay.add_tactical_failure(transition)
-                    metrics["decision_horizon_steps"].append(float(active.horizon_steps))
+                        if outcome in self._strategic_main_allowed_tactical_outcomes:
+                            self.strategic_trainer.replay.add_strategic(transition)
+                    metrics["decision_horizon_steps"].append(float(max(active.horizon_steps, 1)))
                     active_decisions.pop(vid, None)
 
-                self.strategic_trainer.train_step()
+                loss = self.strategic_trainer.train_step()
+                if loss is not None:
+                    train_updates += 1
+
+                if step % 100 == 0:
+                    replay_strategic_size = len(self.strategic_trainer.replay.strategic_replay)
+                    replay_tactical_failure_size = len(self.strategic_trainer.replay.tactical_failure_replay)
+                    replay_terminal_only_size = len(self.strategic_trainer.replay.terminal_only_replay)
+                    tactical_failure_total = int(sum(metrics["option_failure_counts"].values()))
+                    loss_last = float(getattr(self.strategic_trainer, "last_loss", 0.0) or 0.0)
+                    loss_ema = float(getattr(self.strategic_trainer, "loss_ema", 0.0) or 0.0)
+                    print(
+                        f"[EP {episode+1:03d} | STEP {step:04d}] live_ctrl={len(live_controlled_ids)} "
+                        f"arrived={len(arrived_controlled_ids)} active={len(active_decisions)} "
+                        f"learned={int(metrics['learned_decision_count'])} "
+                        f"success={int(metrics['option_success_count'])} fail={tactical_failure_total} "
+                        f"replay(s/t/term)=({replay_strategic_size}/{replay_tactical_failure_size}/{replay_terminal_only_size}) "
+                        f"loss_last={loss_last:.6f} loss_ema={loss_ema:.6f} train_updates={train_updates}"
+                    )
 
             # Resolve active decisions at episode terminal once.
             for vid, active in list(active_decisions.items()):
@@ -1959,8 +2123,14 @@ class RLTrainingPipeline:
                 )
                 self.strategic_trainer.replay.add_terminal_only(transition)
                 metrics["timeout_during_execution_count"] += 1
+                metrics["unresolved_terminal_forced_count"] += 1
                 active_decisions.pop(vid, None)
 
+            timeout_controlled_ids = (
+                controlled_ids
+                - arrived_controlled_ids
+                - teleported_controlled_ids
+            )
             traci.close()
             decision_open_count = int(metrics["decision_open_count"])
             learned_decision_count = int(metrics["learned_decision_count"])
@@ -1980,9 +2150,10 @@ class RLTrainingPipeline:
             replay_terminal_only_size = len(self.strategic_trainer.replay.terminal_only_replay)
             sample_fractions = self.strategic_trainer.last_sample_fractions
             sample_counts = self.strategic_trainer.last_sample_counts
-            completion_rate = 0.0
-            avg_tt = 0.0
-            p90_tt = 0.0
+            total_controlled = len(controlled_ids)
+            completion_rate = len(arrived_controlled_ids) / max(total_controlled, 1)
+            avg_tt = float(np.mean(travel_times_completed)) if travel_times_completed else 0.0
+            p90_tt = float(np.percentile(travel_times_completed, 90)) if travel_times_completed else 0.0
 
             episode_row = {
                 "episode": int(episode + 1),
@@ -2015,6 +2186,7 @@ class RLTrainingPipeline:
                 "teleport_during_execution_count": int(metrics["teleport_during_execution_count"]),
                 "collision_during_execution_count": int(metrics["collision_during_execution_count"]),
                 "timeout_during_execution_count": int(metrics["timeout_during_execution_count"]),
+                "unresolved_terminal_forced_count": int(metrics["unresolved_terminal_forced_count"]),
                 "commit_window_miss_rate": float(metrics["commit_window_miss_count"] / max(learned_decision_count, 1)),
                 "stalled_lane_change_rate": float(metrics["stalled_lane_change_count"] / max(learned_decision_count, 1)),
                 "forced_by_lane_commit_rate": float(metrics["forced_by_lane_commit_count"] / max(learned_decision_count, 1)),
@@ -2045,7 +2217,8 @@ class RLTrainingPipeline:
                 f"strategic_success_rate={success_rate:.2%} avg_horizon={avg_horizon:.2f} "
                 f"replay(s/t/term)=({replay_strategic_size}/{replay_tactical_failure_size}/{replay_terminal_only_size}) "
                 f"sample_fracs={sample_fractions} "
-                f"loss_last={episode_row['loss_last']:.6f} loss_ema={episode_row['loss_ema']:.6f}"
+                f"loss_last={episode_row['loss_last']:.6f} loss_ema={episode_row['loss_ema']:.6f} "
+                f"timeout_ctrl={len(timeout_controlled_ids)} unresolved_term={int(metrics['unresolved_terminal_forced_count'])}"
             )
 
         self.strategic_trainer.model.save(self.model_output_path)
