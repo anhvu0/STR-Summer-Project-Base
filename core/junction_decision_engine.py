@@ -277,16 +277,17 @@ class JunctionDecisionEngine:
         best_lane_pos = float(metadata.get("best_lane_position", 0.0))
         lane_position = max(float(metadata.get("lane_position_now", 0.0)), 0.0)
 
-        progress_eps = float(self.route_pending_progress_eps_m)
-        lane_progress_eps = float(self.route_pending_lane_progress_eps)
         current_shift = int(context.required_lane_shift.get(pending.intended_action, 99))
         prior_shift = int(metadata.get("last_required_shift", current_shift))
+        last_seen_lane_index = int(metadata.get("last_seen_lane_index", context.lane_index))
         shift_progress = current_shift < prior_shift
         lane_now_progress = pending.intended_action in context.lane_feasible_now_actions
-        dist_progress = context.dist_to_end <= (best_dist - progress_eps)
-        lane_pos_progress = lane_position >= (best_lane_pos + lane_progress_eps)
+        lane_index_progress = (
+            context.lane_index != last_seen_lane_index
+            and current_shift <= prior_shift
+        )
 
-        made_progress = bool(dist_progress or shift_progress or lane_now_progress or lane_pos_progress)
+        made_progress = bool(shift_progress or lane_now_progress or lane_index_progress)
         if made_progress:
             last_progress_step = int(step)
             best_dist = min(best_dist, float(context.dist_to_end))
@@ -305,6 +306,72 @@ class JunctionDecisionEngine:
             "made_progress": made_progress,
             "current_shift": int(current_shift),
             "last_progress_step": int(last_progress_step),
+        }
+
+    def evaluate_route_pending_release(
+        self,
+        pending: PendingDecision,
+        context: DecisionContext,
+        step: int,
+    ) -> Dict[str, object]:
+        metadata, progress_view = self.pending_progress_update(
+            pending=pending,
+            context=context,
+            step=step,
+        )
+        current_shift = int(context.required_lane_shift.get(pending.intended_action, 99))
+        grace_keep = (
+            current_shift <= 1
+            and context.dist_to_end >= max(self.commit_min_distance + 2.0, 6.0)
+        )
+        wrong_lane_commit = (
+            context.commit_window
+            and pending.intended_action not in context.lane_feasible_now_actions
+            and not grace_keep
+        )
+        last_progress_step = int(metadata.get("last_progress_step", pending.decision_step))
+        stall_age = max(int(step) - int(last_progress_step), 0)
+        total_age = max(int(step) - int(pending.decision_step), 0)
+        on_decision_edge = (context.edge_id == pending.decision_edge)
+        no_progress_stall = (
+            on_decision_edge
+            and stall_age >= int(max(self.route_pending_no_progress_window_steps, 1))
+            and not bool(progress_view["made_progress"])
+        )
+        stalled_timeout = (
+            on_decision_edge
+            and stall_age >= int(self.route_pending_stall_steps)
+        )
+        hard_timeout = (
+            on_decision_edge
+            and total_age >= int(self.route_pending_hard_timeout_steps)
+        )
+
+        release = False
+        release_reason = None
+        release_as_timeout = False
+        if wrong_lane_commit:
+            release = True
+            release_reason = "wrong_lane_commit"
+            release_as_timeout = False
+        elif no_progress_stall or stalled_timeout:
+            release = True
+            release_reason = "route_stall_timeout"
+            release_as_timeout = True
+        elif hard_timeout:
+            release = True
+            release_reason = "route_hard_timeout"
+            release_as_timeout = True
+
+        return {
+            "release": bool(release),
+            "release_reason": release_reason,
+            "release_as_timeout": bool(release_as_timeout),
+            "grace_keep": bool(grace_keep),
+            "made_progress": bool(progress_view["made_progress"]),
+            "stall_age": int(stall_age),
+            "total_age": int(total_age),
+            "current_shift": int(current_shift),
         }
 
     def lane_change_observe_limit(self, context: DecisionContext) -> int:
@@ -352,8 +419,7 @@ class JunctionDecisionEngine:
         toward_target = current_shift < last_shift
         lane_changed = context.lane_index != last_lane
         feasible_now = action_idx in context.lane_feasible_now_actions
-        good_motion = context.speed >= self.observe_low_speed_mps
-        progressing = toward_target or lane_changed or feasible_now or good_motion
+        progressing = toward_target or lane_changed or feasible_now
         if progressing:
             stall_steps = 0
         else:
@@ -377,6 +443,10 @@ class JunctionDecisionEngine:
 
         if context.speed < self.observe_low_speed_mps and observe_steps >= 2 and stall_steps >= 2:
             return "abort", "low_speed"
+
+        observe_hard_cap = min(int(observe_limit), int(self.observe_timeout_steps))
+        if observe_steps >= max(observe_hard_cap, 1) and not feasible_now:
+            return "abort", "no_progress"
 
         if stall_steps >= self.observe_stall_steps:
             return "abort", "no_progress"
@@ -411,10 +481,14 @@ class JunctionDecisionEngine:
         recent_history: List[str],
         blocked_action: Optional[int] = None,
         distance_fn: Optional[Callable[[str, str], float]] = None,
+        lane_now_only: bool = False,
     ) -> List[int]:
         lane_now_candidates = self.lane_feasible_fallback_actions(context, blocked_action=blocked_action)
-        safe_connected_candidates = self.safe_connected_fallback_actions(context, blocked_action=blocked_action)
-        candidate_pool = sorted(set(lane_now_candidates) | set(safe_connected_candidates))
+        if lane_now_only:
+            candidate_pool = list(lane_now_candidates)
+        else:
+            safe_connected_candidates = self.safe_connected_fallback_actions(context, blocked_action=blocked_action)
+            candidate_pool = sorted(set(lane_now_candidates) | set(safe_connected_candidates))
         if not candidate_pool:
             return []
 
