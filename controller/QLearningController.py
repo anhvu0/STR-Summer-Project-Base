@@ -1,4 +1,4 @@
-﻿from controller.RouteController import RouteController
+from controller.RouteController import RouteController
 from core.Util import ConnectionInfo, Vehicle
 from keras.models import load_model
 import numpy as np
@@ -161,6 +161,7 @@ class QLearningPolicy(RouteController):
         if vehicle.current_edge == pending.decision_edge:
             if snapshot is None:
                 return
+            active_pending = self.shared_policy.pending_requires_active_same_edge_monitoring(pending)
             context = self.decision_engine.build_context(str(vid), vehicle.current_edge, vehicle.destination, step, snapshot=snapshot)
             release_eval = self.shared_policy.evaluate_route_pending_release(
                 pending,
@@ -183,7 +184,8 @@ class QLearningPolicy(RouteController):
                 and release_eval.grace_keep
             ):
                 self._metrics["pending_commit_window_grace_kept"] += 1
-            self._metrics["decision_committed_skips"] += 1
+            if active_pending:
+                self._metrics["decision_committed_skips"] += 1
             return
         self._pending_decisions.pop(vid, None)
 
@@ -240,10 +242,27 @@ class QLearningPolicy(RouteController):
         if current_edge == vehicle.destination:
             return False
 
-        # Always revisit while a pending decision exists.
+        # Observe and proactive pendings need active same-edge monitoring.
         if vid in self._pending_decisions:
-            self._metrics["step_control_pending"] += 1
-            return True
+            pending = self._pending_decisions[vid]
+            if self.shared_policy.pending_requires_active_same_edge_monitoring(pending):
+                self._metrics["step_control_pending"] += 1
+                return True
+            if current_edge != pending.decision_edge:
+                self._metrics["step_control_pending"] += 1
+                return True
+            snapshot = self._snapshot_vehicle(vid, current_edge, int(step))
+            if snapshot is not None:
+                context = self.decision_engine.build_context(
+                    vid,
+                    current_edge,
+                    vehicle.destination,
+                    int(step),
+                    snapshot=snapshot,
+                )
+                if context.commit_window and pending.intended_action not in context.lane_feasible_now_actions:
+                    self._metrics["step_control_pending"] += 1
+                    return True
 
         # Preserve normal edge-change-driven control.
         if current_edge != vehicle.current_edge:

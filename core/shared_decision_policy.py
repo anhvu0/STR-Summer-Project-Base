@@ -1,4 +1,4 @@
-﻿from dataclasses import dataclass
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import math
 
@@ -476,6 +476,24 @@ class SharedDecisionPolicy:
             metadata=metadata,
         )
 
+    def pending_phase(self, pending: PendingDecision) -> str:
+        metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
+        phase = metadata.get("phase", pending.decision_current_phase or "route_pending")
+        return str(phase or "route_pending")
+
+    def pending_resolution_mode(self, pending: PendingDecision) -> str:
+        metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
+        resolution_mode = metadata.get("decision_resolution_mode", pending.decision_origin_mode or "lane_now")
+        return str(resolution_mode or "lane_now")
+
+    def pending_requires_active_same_edge_monitoring(self, pending: PendingDecision) -> bool:
+        phase = self.pending_phase(pending)
+        if phase == "observe_lane_change":
+            return True
+        if phase != "route_pending":
+            return True
+        return self.pending_resolution_mode(pending) != "lane_now"
+
     def promote_observe_success(
         self,
         pending: PendingDecision,
@@ -524,6 +542,7 @@ class SharedDecisionPolicy:
             context=context,
             step=step,
         )
+        active_same_edge_monitoring = self.pending_requires_active_same_edge_monitoring(pending)
 
         current_shift = int(context.required_lane_shift.get(pending.intended_action, 99))
         grace_keep = (
@@ -542,16 +561,19 @@ class SharedDecisionPolicy:
         total_age = max(int(step) - int(pending.decision_step), 0)
         no_progress_window = int(self.decision_engine.route_pending_no_progress_window_steps)
         no_progress_stall = (
-            same_edge
+            active_same_edge_monitoring
+            and same_edge
             and stall_age >= max(no_progress_window, 1)
             and not bool(progress_view["made_progress"])
         )
         stalled_timeout = (
-            same_edge
+            active_same_edge_monitoring
+            and same_edge
             and stall_age >= int(self.decision_engine.route_pending_stall_steps)
         )
         hard_timeout = (
-            same_edge
+            active_same_edge_monitoring
+            and same_edge
             and total_age >= int(self.decision_engine.route_pending_hard_timeout_steps)
         )
 

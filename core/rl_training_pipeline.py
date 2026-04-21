@@ -1,4 +1,4 @@
-﻿import numpy as np
+import numpy as np
 import os
 import sys
 import math
@@ -36,7 +36,7 @@ In this file, we build a DQN network
 MAX_SIMULATION_STEPS = 2000 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
 
 # Compact metric glossary used by training CSV + logs.
-# type âˆˆ {event_count, gauge, per_episode_aggregate, cumulative_counter, ratio}
+# type ∈ {event_count, gauge, per_episode_aggregate, cumulative_counter, ratio}
 METRIC_DOCS = {
     "episode_return_total": {"description": "Sum of all rewards in the episode.", "type": "per_episode_aggregate"},
     "avg_return_per_vehicle": {"description": "episode_return_total / controlled_vehicle_count.", "type": "ratio", "numerator": "episode_return_total", "denominator": "total_controlled"},
@@ -2114,7 +2114,9 @@ class RLTrainingPipeline:
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
                                 continue
                             pending_age = self.decision_engine.pending_age_steps(pending, step)
-                            pending_age_samples.append(float(pending_age))
+                            active_pending = self.shared_policy.pending_requires_active_same_edge_monitoring(pending)
+                            if active_pending:
+                                pending_age_samples.append(float(pending_age))
                             elapsed_pending = max(step - pending.last_credit_step, 0)
                             if elapsed_pending > 0:
                                 ext_pen = max(self._edge_density(current_edge), 0.0)
@@ -2162,7 +2164,7 @@ class RLTrainingPipeline:
                                 pending.state = next_state
                                 pending.last_credit_edge = current_edge
                                 pending.last_credit_step = step
-                            if self.decision_engine.should_timeout_pending(pending, step):
+                            if active_pending and self.decision_engine.should_timeout_pending(pending, step):
                                 timeout_ctx = self.decision_engine.build_context(
                                     vehicle_id,
                                     current_edge,
@@ -2264,7 +2266,8 @@ class RLTrainingPipeline:
                             if reachable_set.isdisjoint(available_set):
                                 decision_metrics["reachable_lane_change_excluded_all"] += 1
                         if vehicle_id in pending_decisions:
-                            self._record_skip(decision_metrics, "pending_hold")
+                            if self.shared_policy.pending_requires_active_same_edge_monitoring(pending_decisions[vehicle_id]):
+                                self._record_skip(decision_metrics, "pending_hold")
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
 
@@ -2355,7 +2358,6 @@ class RLTrainingPipeline:
                                 blocked_action=action,
                                 destination=vehicle.destination,
                                 recent_history=list(recent_edge_history[vehicle_id]),
-                                lane_now_only=True,
                             )
                             if action is None:
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
