@@ -102,6 +102,11 @@ class QLearningPolicy(RouteController):
         self.legacy_state_size = self.shared_policy.legacy_state_size(len(self.connection_info.edge_list))
         self.use_compact_state = (self.model_state_size == self.compact_state_size)
         self.density_scale_m = 100.0
+        self._density_vec = np.zeros(len(self.connection_info.edge_list), dtype=np.float32)
+        self._density_mean = 0.0
+        self._density_std = 0.0
+        self._density_p95 = 0.0
+        self._last_density_step = -10**9
         self.direction_mask_start = (2 * self.edge_embedding_dim) if self.use_compact_state else 2
         self._init_edge_embeddings(seed=1337)
 
@@ -133,6 +138,33 @@ class QLearningPolicy(RouteController):
         count = traci.edge.getLastStepVehicleNumber(edge_id)
         return (float(count) * float(self.density_scale_m)) / max(self._edge_lane_meters(edge_id), 5.0)
 
+    def _occupied_density_p95(self, density_vec):
+        occupied = density_vec[density_vec > 0.0]
+        if occupied.size == 0:
+            return 0.0
+        return float(np.percentile(occupied, 95))
+
+    def _refresh_density_stats(self, step, every=1):
+        if hasattr(self, "_last_density_step") and (int(step) - int(self._last_density_step)) < int(every):
+            return
+
+        edge_list = list(self.connection_info.edge_list)
+        lane_meters_vec = np.array([self._edge_lane_meters(edge_id) for edge_id in edge_list], dtype=np.float32)
+        self._density_vec = np.array([self._edge_density(edge_id) for edge_id in edge_list], dtype=np.float32)
+
+        if len(self._density_vec) > 0 and len(lane_meters_vec) > 0:
+            total_vehicles = float(np.sum([traci.edge.getLastStepVehicleNumber(edge_id) for edge_id in edge_list]))
+            total_lane_meters = float(np.sum(lane_meters_vec))
+            self._density_mean = (total_vehicles * float(self.density_scale_m)) / max(total_lane_meters, 1.0)
+            density_diff_sq = (self._density_vec - self._density_mean) ** 2
+            self._density_std = float(np.sqrt(np.average(density_diff_sq, weights=lane_meters_vec)))
+            self._density_p95 = self._occupied_density_p95(self._density_vec)
+        else:
+            self._density_mean = 0.0
+            self._density_std = 0.0
+            self._density_p95 = 0.0
+        self._last_density_step = int(step)
+
     #-----------------------DEBUGGING-------------------------------------
     def _dist_to_dest(self, edge_id, dest_id):
         try:
@@ -156,6 +188,9 @@ class QLearningPolicy(RouteController):
         pending = self._pending_decisions.get(vid)
         if not pending:
             return
+        phase = str((pending.metadata or {}).get("phase", "route_pending"))
+        if phase != "route_pending":
+            return
         step = int(traci.simulation.getTime())
         snapshot = self._snapshot_vehicle(vid, vehicle.current_edge, step)
         if vehicle.current_edge == pending.decision_edge:
@@ -163,6 +198,14 @@ class QLearningPolicy(RouteController):
                 return
             active_pending = self.shared_policy.pending_requires_active_same_edge_monitoring(pending)
             context = self.decision_engine.build_context(str(vid), vehicle.current_edge, vehicle.destination, step, snapshot=snapshot)
+            if active_pending and self.decision_engine.should_timeout_pending(pending, step):
+                self._pending_decisions.pop(vid, None)
+                self._record_pending_release("route_stall_timeout")
+                self._metrics["pending_decision_timeouts"] += 1
+                self._lane_change_cooldown[(vid, vehicle.current_edge)] = (
+                    step + self.decision_engine.cooldown_after_pending_release(timeout=True)
+                )
+                return
             release_eval = self.shared_policy.evaluate_route_pending_release(
                 pending,
                 context=context,
@@ -329,6 +372,7 @@ class QLearningPolicy(RouteController):
 
     def make_decisions(self, vehicles, connection_info: ConnectionInfo):
         local_targets = {}
+        self._refresh_density_stats(int(traci.simulation.getTime()))
 
         if not hasattr(self, "_debug_net_checked"):
             self._debug_net_checked = True
@@ -345,6 +389,7 @@ class QLearningPolicy(RouteController):
             self._last_control_step[vid] = step
             if vid not in self._recent_edges:
                 self._recent_edges[vid] = deque(maxlen=self.loop_window)
+            recent = list(self._recent_edges.get(vid, deque(maxlen=self.loop_window)))
             prev_seen_edge = self._last_observed_edge.get(vid)
             edge_changed_runtime = (prev_seen_edge != start_edge)
 
@@ -462,7 +507,6 @@ class QLearningPolicy(RouteController):
                 state = self.getState(vid, start_edge, vehicle.destination, context=context)
                 cooldown_until = self._lane_change_cooldown.get((vid, start_edge), -1)
                 cooldown_active = step < cooldown_until
-                recent = list(self._recent_edges.get(vid, deque(maxlen=self.loop_window)))
                 policy_actions = self.shared_policy.policy_action_candidates(
                     context,
                     recent_history=recent,
@@ -479,7 +523,6 @@ class QLearningPolicy(RouteController):
                 self._metrics["overrides"] += 1
                 self._metrics["impossible_action_overrides"] += 1
                 continue
-            recent = list(self._recent_edges.get(vid, deque(maxlen=self.loop_window)))
             safe_ok, signal = self.decision_engine.prefilter_action_for_loops(
                 context=context,
                 action_idx=action_idx,
@@ -677,7 +720,7 @@ class QLearningPolicy(RouteController):
                    else 20.0)
                 if self.decision_engine.get_next_edge(current_edge, action_idx) is not None else float("inf")
             ),
-            global_density_stats=self.shared_policy.global_density_stats(self._edge_density, self._edge_lane_meters) if self.use_compact_state else None,
+            global_density_stats=(float(self._density_mean), float(self._density_std)) if self.use_compact_state else None,
             edge_lane_meters_fn=self._edge_lane_meters,
             step=int(traci.simulation.getTime()),
             vehicle_start_time=(float(vehicle_obj.start_time) if vehicle_obj is not None else None),
