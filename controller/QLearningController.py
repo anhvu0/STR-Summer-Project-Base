@@ -62,6 +62,7 @@ class QLearningPolicy(RouteController):
             "pending_release_observe_abort_commit_window": 0,
             "pending_release_observe_abort_low_speed": 0,
             "pending_release_wrong_lane_commit": 0,
+            "pending_release_route_no_progress_abort": 0,
             "pending_release_route_stall_timeout": 0,
             "pending_release_route_hard_timeout": 0,
             "pending_release_events_total": 0,
@@ -386,16 +387,24 @@ class QLearningPolicy(RouteController):
 
             if wrong_lane_commit or no_progress_stall or stalled_timeout or hard_timeout:
                 self._pending_decisions.pop(vid, None)
-                if wrong_lane_commit:
-                    self._record_pending_release("wrong_lane_commit")
-                if no_progress_stall or stalled_timeout:
-                    self._record_pending_release("route_stall_timeout")
+                release_reason = None
+                release_as_timeout = False
                 if hard_timeout:
-                    self._record_pending_release("route_hard_timeout")
-                if stalled_timeout or hard_timeout:
+                    release_reason = "route_hard_timeout"
+                    release_as_timeout = True
+                elif stalled_timeout:
+                    release_reason = "route_stall_timeout"
+                    release_as_timeout = True
+                elif no_progress_stall:
+                    release_reason = "route_no_progress_abort"
+                elif wrong_lane_commit:
+                    release_reason = "wrong_lane_commit"
+                if release_reason is not None:
+                    self._record_pending_release(release_reason)
+                if release_as_timeout:
                     self._metrics["pending_decision_timeouts"] += 1
                 self._lane_change_cooldown[(vid, vehicle.current_edge)] = (
-                    step + self.decision_engine.cooldown_after_pending_release(timeout=(stalled_timeout or hard_timeout))
+                    step + self.decision_engine.cooldown_after_pending_release(timeout=release_as_timeout)
                 )
                 return
             if context.commit_window and pending.intended_action not in context.lane_feasible_now_actions and grace_keep:
@@ -411,6 +420,7 @@ class QLearningPolicy(RouteController):
             "observe_abort_commit_window": "pending_release_observe_abort_commit_window",
             "observe_abort_low_speed": "pending_release_observe_abort_low_speed",
             "wrong_lane_commit": "pending_release_wrong_lane_commit",
+            "route_no_progress_abort": "pending_release_route_no_progress_abort",
             "route_stall_timeout": "pending_release_route_stall_timeout",
             "route_hard_timeout": "pending_release_route_hard_timeout",
         }
