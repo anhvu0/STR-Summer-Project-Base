@@ -101,17 +101,17 @@ class JunctionDecisionEngine:
         self.observe_stall_steps = 5
         self.cooldown_steps = 3
         self.observe_timeout_steps = 16
-        self.route_pending_stall_steps = 8
-        self.route_pending_hard_timeout_steps = 60
-        self.route_pending_progress_eps_m = 2.0
-        self.route_pending_lane_progress_eps = 0.15
-        self.route_pending_no_progress_window_steps = 5
+        self.route_pending_stall_steps = 6
+        self.route_pending_hard_timeout_steps = 42
+        self.route_pending_progress_eps_m = 3.0
+        self.route_pending_lane_progress_eps = 0.25
+        self.route_pending_no_progress_window_steps = 4
         self.pending_progress_timeout_steps = 32
         self.loop_distance_slack = 30.0
         self.proactive_extra_buffer_m = 6.0
         self.proactive_safety_margin_m = 8.0
         self.cooldown_after_abort_extra_steps = 2
-        self.cooldown_after_timeout_extra_steps = 4
+        self.cooldown_after_timeout_extra_steps = 6
 
     def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
         if snapshot is not None:

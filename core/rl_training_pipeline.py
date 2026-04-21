@@ -231,6 +231,8 @@ class DQNTrainer:
             return False
         if metadata.get("synthetic_terminal_no_pending", False):
             return False
+        if metadata.get("teleport_assisted_arrival", False):
+            return False
         terminal_outcome = metadata.get("terminal_outcome")
         if terminal_outcome in {"teleport", "timeout", "removed_nonarrival"}:
             return False
@@ -500,8 +502,10 @@ class RLTrainingPipeline:
         self.score_slack = 30.0
         self.reward_clip_low = -20.0
         self.reward_clip_high = 20.0
-        self.pending_timeout_penalty = -18.0
-        self.pending_latency_penalty_per_step = 0.008
+        self.pending_timeout_penalty = -24.0
+        self.pending_latency_penalty_per_step = 0.015
+        self.wrong_lane_commit_penalty = -1.5
+        self.same_edge_reopen_after_timeout_penalty = -1.0
         self.pending_replan_penalty = -0.4
         self.stale_disappeared_penalty = -14.0
         self.observe_no_progress_penalty = -0.5
@@ -843,6 +847,19 @@ class RLTrainingPipeline:
         else:
             decision_metrics["pending_release_abort_events_total"] += 1
 
+    def _recent_pending_release_same_edge_timeout_or_abort(
+        self, pending_release_info, vehicle_id, edge_id, step
+    ):
+        release_info = pending_release_info.get(vehicle_id)
+        if not release_info or release_info.get("edge") != edge_id:
+            return False
+        reason = str(release_info.get("reason", ""))
+        if reason not in {"timeout", "abort"}:
+            return False
+        release_step = int(release_info.get("step", step))
+        cooldown = self.decision_engine.cooldown_after_pending_release(timeout=(reason == "timeout"))
+        return (int(step) - release_step) <= int(cooldown)
+
     def _action_social_cost_proxy(self, current_edge, action_idx, destination):
         """
         Lower is better for "selfless" local decisions.
@@ -1018,6 +1035,7 @@ class RLTrainingPipeline:
         recent_history,
         cooldown_active,
         destination,
+        recent_pending_release_same_edge_timeout_or_abort=False,
         decision_metrics=None,
     ):
         """
@@ -1065,6 +1083,10 @@ class RLTrainingPipeline:
             filtered_available_actions.append(action)
             if action in lane_now:
                 safe_lane_now_actions.append(action)
+                continue
+            if recent_pending_release_same_edge_timeout_or_abort:
+                if decision_metrics is not None:
+                    decision_metrics["proactive_blocked_recent_release"] += 1
                 continue
 
             if cooldown_active:
@@ -1307,7 +1329,7 @@ class RLTrainingPipeline:
                     terminal_outcome=outcome,
                 )
                 if ever_teleported:
-                    teleport_assisted_arrival_penalty = 8.0
+                    teleport_assisted_arrival_penalty = 14.0
                     reward = self._clip_reward(reward - teleport_assisted_arrival_penalty)
                 next_state = self.make_terminal_next_state_from_edge(
                     vehicle.destination,
@@ -1345,6 +1367,16 @@ class RLTrainingPipeline:
                     "decision_finalized": True,
                     "ever_teleported": bool(ever_teleported),
                     "teleport_assisted_arrival": bool(ever_teleported and outcome == "global_arrival"),
+                    "elite_blocked_reason": (
+                        "teleport_assisted_arrival"
+                        if (ever_teleported and outcome == "global_arrival")
+                        else ""
+                    ),
+                    "terminal_quality": (
+                        "assisted_arrival"
+                        if (ever_teleported and outcome == "global_arrival")
+                        else "clean_terminal"
+                    ),
                 },
             )
             decision_metrics["synthetic_terminal_finalizations"] += 1
@@ -1401,7 +1433,7 @@ class RLTrainingPipeline:
                 terminal_outcome=outcome,
             )
             if ever_teleported:
-                teleport_assisted_arrival_penalty = 8.0
+                teleport_assisted_arrival_penalty = 14.0
                 reward = self._clip_reward(reward - teleport_assisted_arrival_penalty)
             next_state = self.make_terminal_next_state_from_edge(
                 vehicle.destination,
@@ -1458,6 +1490,9 @@ class RLTrainingPipeline:
         if ever_teleported:
             final_metadata["ever_teleported"] = True
             final_metadata["teleport_assisted_arrival"] = (outcome == "global_arrival")
+            if outcome == "global_arrival":
+                final_metadata["elite_blocked_reason"] = "teleport_assisted_arrival"
+                final_metadata["terminal_quality"] = "assisted_arrival"
         self.trainer.stage_transition(
             pending.state,
             pending.intended_action,
@@ -1804,6 +1839,7 @@ class RLTrainingPipeline:
             "reachable_lane_change_nonempty", "reachable_lane_change_excluded_any",
             "reachable_lane_change_excluded_all", "policy_candidates_with_broader_available",
             "policy_candidates_collapsed_to_lane_now_only",
+            "proactive_blocked_recent_release",
             "commit_window_non_lane_candidates_seen", "commit_window_candidates_rejected",
             "proactive_shift2_candidates_seen", "proactive_shift2_candidates_rejected",
             "pending_commit_window_grace_kept",
@@ -2136,6 +2172,9 @@ class RLTrainingPipeline:
                                             recent_history=list(recent_edge_history[vehicle_id]),
                                             cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
                                             destination=vehicle.destination,
+                                            recent_pending_release_same_edge_timeout_or_abort=self._recent_pending_release_same_edge_timeout_or_abort(
+                                                pending_release_info, vehicle_id, current_edge, step
+                                            ),
                                             decision_metrics=decision_metrics,
                                         )
                                         self.trainer.stage_transition(
@@ -2304,6 +2343,7 @@ class RLTrainingPipeline:
                                     recent_history=list(recent_edge_history[vehicle_id]),
                                     cooldown_active=True,
                                     destination=vehicle.destination,
+                                    recent_pending_release_same_edge_timeout_or_abort=True,
                                     decision_metrics=decision_metrics,
                                 )
                                 imitation_reward = self._clip_reward(0.10)
@@ -2467,6 +2507,35 @@ class RLTrainingPipeline:
                             if wrong_lane_commit or no_progress_stall or stalled_timeout or hard_timeout:
                                 if wrong_lane_commit:
                                     self._record_pending_release(decision_metrics, "wrong_lane_commit")
+                                    wrong_lane_state = self.encode_state(
+                                        vehicle_id,
+                                        current_edge,
+                                        vehicle.destination,
+                                        context=pending_ctx,
+                                        vehicle=vehicle,
+                                        step=step,
+                                        snapshot=snapshot,
+                                    )
+                                    wrong_lane_penalty = self._clip_reward(self.wrong_lane_commit_penalty)
+                                    self.trainer.stage_transition(
+                                        pending.state,
+                                        pending.intended_action,
+                                        wrong_lane_penalty,
+                                        wrong_lane_state,
+                                        False,
+                                        next_valid_actions=pending_ctx.available_actions,
+                                        metadata={
+                                            **(metadata if isinstance(metadata, dict) else {}),
+                                            "override_learning": True,
+                                            "override_type": "wrong_lane_commit_release",
+                                            "override_cause": "wrong_lane_commit_release",
+                                            "wrong_lane_commit_release": True,
+                                            "decision_finalized": False,
+                                        },
+                                    )
+                                    decision_metrics["override_learning_transitions"] += 1
+                                    decision_metrics["override_learning_negative"] += 1
+                                    episode_return_total += wrong_lane_penalty
                                 if no_progress_stall:
                                     self._record_pending_release(decision_metrics, "route_stall_timeout")
                                 if stalled_timeout:
@@ -2558,6 +2627,9 @@ class RLTrainingPipeline:
                                 recent_history=list(recent_edge_history[vehicle_id]),
                                 cooldown_active=cooldown_active,
                                 destination=vehicle.destination,
+                                recent_pending_release_same_edge_timeout_or_abort=self._recent_pending_release_same_edge_timeout_or_abort(
+                                    pending_release_info, vehicle_id, current_edge, step
+                                ),
                                 decision_metrics=decision_metrics,
                             )
                             removed_actions = max(len(context.available_actions) - len(policy_actions), 0)
@@ -2618,6 +2690,9 @@ class RLTrainingPipeline:
                                 recent_history=list(recent_edge_history[vehicle_id]),
                                 cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
                                 destination=vehicle.destination,
+                                recent_pending_release_same_edge_timeout_or_abort=self._recent_pending_release_same_edge_timeout_or_abort(
+                                    pending_release_info, vehicle_id, current_edge, step
+                                ),
                                 decision_metrics=decision_metrics,
                             )
                             self.trainer.stage_transition(
@@ -2699,6 +2774,7 @@ class RLTrainingPipeline:
                                     recent_history=list(recent_edge_history[vehicle_id]),
                                     cooldown_active=True,
                                     destination=vehicle.destination,
+                                    recent_pending_release_same_edge_timeout_or_abort=True,
                                     decision_metrics=decision_metrics,
                                 )
                                 self.trainer.stage_transition(
@@ -2789,6 +2865,38 @@ class RLTrainingPipeline:
                                     and (step - int(release_info.get("step", step))) <= self.decision_engine.cooldown_after_pending_release(timeout=False)
                                 ):
                                     decision_metrics["same_edge_reopen_after_abort_count"] += 1
+                                elif (
+                                    release_info
+                                    and release_info.get("reason") == "timeout"
+                                    and release_info.get("edge") == current_edge
+                                    and (step - int(release_info.get("step", step))) <= self.decision_engine.cooldown_after_pending_release(timeout=True)
+                                ):
+                                    reopen_penalty = self._clip_reward(self.same_edge_reopen_after_timeout_penalty)
+                                    policy_actions_reopen = self._policy_action_candidates(
+                                        context=obs_context,
+                                        recent_history=list(recent_edge_history[vehicle_id]),
+                                        cooldown_active=True,
+                                        destination=vehicle.destination,
+                                        recent_pending_release_same_edge_timeout_or_abort=True,
+                                        decision_metrics=decision_metrics,
+                                    )
+                                    self.trainer.stage_transition(
+                                        next_state,
+                                        fallback_action,
+                                        reopen_penalty,
+                                        next_state,
+                                        False,
+                                        next_valid_actions=policy_actions_reopen,
+                                        metadata={
+                                            "override_learning": True,
+                                            "override_type": "same_edge_reopen_after_timeout",
+                                            "override_cause": "same_edge_reopen_after_timeout",
+                                            "decision_finalized": False,
+                                        },
+                                    )
+                                    decision_metrics["override_learning_transitions"] += 1
+                                    decision_metrics["override_learning_negative"] += 1
+                                    episode_return_total += reopen_penalty
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
                                 continue
 
@@ -2839,6 +2947,9 @@ class RLTrainingPipeline:
                                 recent_history=list(recent_edge_history[vehicle_id]),
                                 cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
                                 destination=vehicle.destination,
+                                recent_pending_release_same_edge_timeout_or_abort=self._recent_pending_release_same_edge_timeout_or_abort(
+                                    pending_release_info, vehicle_id, current_edge, step
+                                ),
                                 decision_metrics=decision_metrics,
                             )
                             self.trainer.stage_transition(
@@ -2914,6 +3025,38 @@ class RLTrainingPipeline:
                             and (step - int(release_info.get("step", step))) <= self.decision_engine.cooldown_after_pending_release(timeout=False)
                         ):
                             decision_metrics["same_edge_reopen_after_abort_count"] += 1
+                        elif (
+                            release_info
+                            and release_info.get("reason") == "timeout"
+                            and release_info.get("edge") == current_edge
+                            and (step - int(release_info.get("step", step))) <= self.decision_engine.cooldown_after_pending_release(timeout=True)
+                        ):
+                            reopen_penalty = self._clip_reward(self.same_edge_reopen_after_timeout_penalty)
+                            policy_actions_reopen = self._policy_action_candidates(
+                                context=context,
+                                recent_history=list(recent_edge_history[vehicle_id]),
+                                cooldown_active=True,
+                                destination=vehicle.destination,
+                                recent_pending_release_same_edge_timeout_or_abort=True,
+                                decision_metrics=decision_metrics,
+                            )
+                            self.trainer.stage_transition(
+                                state,
+                                action,
+                                reopen_penalty,
+                                state,
+                                False,
+                                next_valid_actions=policy_actions_reopen,
+                                metadata={
+                                    "override_learning": True,
+                                    "override_type": "same_edge_reopen_after_timeout",
+                                    "override_cause": "same_edge_reopen_after_timeout",
+                                    "decision_finalized": False,
+                                },
+                            )
+                            decision_metrics["override_learning_transitions"] += 1
+                            decision_metrics["override_learning_negative"] += 1
+                            episode_return_total += reopen_penalty
                         prev_edge_by_vehicle[vehicle_id] = current_edge
 
                     simulation_step()
@@ -3379,7 +3522,8 @@ class RLTrainingPipeline:
                 print(
                     "  action-space diagnostics: skip_reason(forced_by_lane_commit/too_late_or_unreachable)={:.0f}/{:.0f} "
                     "reachable_lane_change_excluded_any={:.0f}/{:.0f}({:.1%}) "
-                    "policy_lane_now_only={:.0f}/{:.0f}({:.1%})".format(
+                    "policy_lane_now_only={:.0f}/{:.0f}({:.1%}) "
+                    "proactive_blocked_recent_release={:.0f}".format(
                         decision_metrics["skip_reason_forced_by_lane_commit"],
                         decision_metrics["skip_reason_too_late_or_unreachable"],
                         decision_metrics["reachable_lane_change_excluded_any"],
@@ -3388,6 +3532,7 @@ class RLTrainingPipeline:
                         decision_metrics["policy_candidates_collapsed_to_lane_now_only"],
                         decision_metrics["policy_candidates_with_broader_available"],
                         policy_lane_now_collapse_rate,
+                        decision_metrics["proactive_blocked_recent_release"],
                     )
                 )
 
@@ -3631,6 +3776,7 @@ class RLTrainingPipeline:
                         "reachable_lane_change_excluded_all": decision_metrics["reachable_lane_change_excluded_all"],
                         "policy_candidates_with_broader_available": decision_metrics["policy_candidates_with_broader_available"],
                         "policy_candidates_collapsed_to_lane_now_only": decision_metrics["policy_candidates_collapsed_to_lane_now_only"],
+                        "proactive_blocked_recent_release": decision_metrics["proactive_blocked_recent_release"],
                         "commit_window_non_lane_candidates_seen": decision_metrics["commit_window_non_lane_candidates_seen"],
                         "commit_window_candidates_rejected": decision_metrics["commit_window_candidates_rejected"],
                         "proactive_shift2_candidates_seen": decision_metrics["proactive_shift2_candidates_seen"],
