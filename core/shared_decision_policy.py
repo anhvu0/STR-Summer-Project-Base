@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+﻿from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import math
 
@@ -357,18 +357,21 @@ class SharedDecisionPolicy:
         destination: str,
         recent_history: Sequence[str],
         distance_fn: Callable[[str, str], float],
+        lane_now_only: bool = False,
     ) -> Optional[int]:
-        ranked = self.decision_engine.ranked_fallback_actions(
-            context=context,
-            destination=destination,
-            recent_history=list(recent_history or []),
-            blocked_action=blocked_action,
-            distance_fn=distance_fn,
-        )
+        if lane_now_only:
+            ranked = self.decision_engine.lane_feasible_fallback_actions(context, blocked_action=blocked_action)
+        else:
+            ranked = self.decision_engine.ranked_fallback_actions(
+                context=context,
+                destination=destination,
+                recent_history=list(recent_history or []),
+                blocked_action=blocked_action,
+                distance_fn=distance_fn,
+            )
         if ranked:
             return int(ranked[0])
         return None
-
     def build_observe_pending(
         self,
         *,
@@ -574,3 +577,4 @@ class SharedDecisionPolicy:
             stall_age=stall_age,
             total_age=total_age,
         )
+

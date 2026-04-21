@@ -1,4 +1,4 @@
-from collections import deque
+﻿from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 import math
@@ -281,12 +281,21 @@ class JunctionDecisionEngine:
         lane_progress_eps = float(self.route_pending_lane_progress_eps)
         current_shift = int(context.required_lane_shift.get(pending.intended_action, 99))
         prior_shift = int(metadata.get("last_required_shift", current_shift))
-        shift_progress = current_shift < prior_shift
-        lane_now_progress = pending.intended_action in context.lane_feasible_now_actions
-        dist_progress = context.dist_to_end <= (best_dist - progress_eps)
-        lane_pos_progress = lane_position >= (best_lane_pos + lane_progress_eps)
+        resolution_mode = str(metadata.get("decision_resolution_mode", pending.decision_origin_mode or "proactive"))
+        is_proactive_pending = resolution_mode != "lane_now"
 
-        made_progress = bool(dist_progress or shift_progress or lane_now_progress or lane_pos_progress)
+        if is_proactive_pending:
+            strong_dist_eps = max(float(progress_eps) * 4.0, float(self.lane_change_margin_m) * 0.8, 8.0)
+            dist_progress = context.dist_to_end <= (best_dist - strong_dist_eps)
+            lane_now_progress = pending.intended_action in context.lane_feasible_now_actions and prior_shift > 0
+            made_progress = bool(dist_progress or lane_now_progress)
+        else:
+            shift_progress = current_shift < prior_shift
+            lane_now_progress = pending.intended_action in context.lane_feasible_now_actions
+            dist_progress = context.dist_to_end <= (best_dist - progress_eps)
+            lane_pos_progress = lane_position >= (best_lane_pos + lane_progress_eps)
+            made_progress = bool(dist_progress or shift_progress or lane_now_progress or lane_pos_progress)
+
         if made_progress:
             last_progress_step = int(step)
             best_dist = min(best_dist, float(context.dist_to_end))
@@ -306,7 +315,6 @@ class JunctionDecisionEngine:
             "current_shift": int(current_shift),
             "last_progress_step": int(last_progress_step),
         }
-
     def lane_change_observe_limit(self, context: DecisionContext) -> int:
         limit = self.observe_steps_min
         if context.speed >= 8.0 and context.dist_to_end >= 55.0:
@@ -655,3 +663,5 @@ class JunctionDecisionEngine:
         reach_mask = [1.0 if i in context.reachable_with_lane_change_actions else 0.0 for i in range(len(self.direction_choices))]
         avail_mask = [1.0 if i in context.available_actions else 0.0 for i in range(len(self.direction_choices))]
         return edge_mask, lane_mask, reach_mask, avail_mask
+
+

@@ -1,4 +1,4 @@
-from controller.RouteController import RouteController
+﻿from controller.RouteController import RouteController
 from core.Util import ConnectionInfo, Vehicle
 from keras.models import load_model
 import numpy as np
@@ -396,6 +396,7 @@ class QLearningPolicy(RouteController):
                         destination=vehicle.destination,
                         recent_history=recent,
                         distance_fn=self._dist_to_dest,
+                        lane_now_only=True,
                     )
                     if action_idx is None:
                         continue
@@ -507,6 +508,7 @@ class QLearningPolicy(RouteController):
                         destination=vehicle.destination,
                         recent_history=recent,
                         distance_fn=self._dist_to_dest,
+                        lane_now_only=True,
                     )
                     if action_idx is None:
                         continue
@@ -664,3 +666,5 @@ class QLearningPolicy(RouteController):
             legacy_aux_features=deadline_features,
             legacy_density_values=[self._edge_density(edge_id) for edge_id in self.connection_info.edge_list] if not self.use_compact_state else None,
         )
+
+
