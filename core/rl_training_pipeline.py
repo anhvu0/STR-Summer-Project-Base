@@ -851,14 +851,19 @@ class RLTrainingPipeline:
         self, pending_release_info, vehicle_id, edge_id, step
     ):
         release_info = pending_release_info.get(vehicle_id)
-        if not release_info or release_info.get("edge") != edge_id:
-            return False
-        reason = str(release_info.get("reason", ""))
-        if reason not in {"timeout", "abort"}:
-            return False
-        release_step = int(release_info.get("step", step))
-        cooldown = self.decision_engine.cooldown_after_pending_release(timeout=(reason == "timeout"))
-        return (int(step) - release_step) <= int(cooldown)
+        return self.decision_engine.pending_release_cooldown_active(
+            release_info=release_info,
+            edge_id=edge_id,
+            step=step,
+        )
+
+    def _blocked_action_during_release_cooldown(self, pending_release_info, vehicle_id, edge_id, step):
+        release_info = pending_release_info.get(vehicle_id)
+        return self.decision_engine.released_action_in_cooldown(
+            release_info=release_info,
+            edge_id=edge_id,
+            step=step,
+        )
 
     def _action_social_cost_proxy(self, current_edge, action_idx, destination):
         """
@@ -1036,6 +1041,7 @@ class RLTrainingPipeline:
         cooldown_active,
         destination,
         recent_pending_release_same_edge_timeout_or_abort=False,
+        blocked_action_during_release_cooldown=None,
         decision_metrics=None,
     ):
         """
@@ -1070,6 +1076,11 @@ class RLTrainingPipeline:
         filtered_available_actions = []
 
         for action in available_actions:
+            if (
+                blocked_action_during_release_cooldown is not None
+                and int(action) == int(blocked_action_during_release_cooldown)
+            ):
+                continue
             safe_ok, _ = self.decision_engine.prefilter_action_for_loops(
                 context=context,
                 action_idx=action,
@@ -1531,12 +1542,13 @@ class RLTrainingPipeline:
             for edge in set(edges)
         }
 
-    def _select_fallback_action(self, context, blocked_action, destination, recent_history):
+    def _select_fallback_action(self, context, blocked_action, destination, recent_history, lane_now_only=False):
         ranked = self.decision_engine.ranked_fallback_actions(
             context=context,
             destination=destination,
             recent_history=recent_history,
             blocked_action=blocked_action,
+            lane_now_only=lane_now_only,
             distance_fn=self.get_distance_to_destination,
         )
         if ranked:
@@ -2276,12 +2288,18 @@ class RLTrainingPipeline:
                                 lane_change_cooldown_until[cooldown_key] = (
                                     step + self.decision_engine.cooldown_after_pending_release(timeout=False)
                                 )
-                                pending_release_info[vehicle_id] = {"edge": current_edge, "step": int(step), "reason": "abort"}
+                                pending_release_info[vehicle_id] = {
+                                    "edge": current_edge,
+                                    "step": int(step),
+                                    "reason": "abort",
+                                    "blocked_action": int(pending.intended_action),
+                                }
                                 fallback_action = self._select_fallback_action(
                                     obs_context,
                                     blocked_action=pending.intended_action,
                                     destination=vehicle.destination,
                                     recent_history=list(recent_edge_history[vehicle_id]),
+                                    lane_now_only=True,
                                 )
                                 if fallback_action is None:
                                     prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -2458,7 +2476,12 @@ class RLTrainingPipeline:
                                 lane_change_cooldown_until[(vehicle_id, current_edge)] = (
                                     step + self.decision_engine.cooldown_after_pending_release(timeout=True)
                                 )
-                                pending_release_info[vehicle_id] = {"edge": current_edge, "step": int(step), "reason": "timeout"}
+                                pending_release_info[vehicle_id] = {
+                                    "edge": current_edge,
+                                    "step": int(step),
+                                    "reason": "timeout",
+                                    "blocked_action": int(pending.intended_action),
+                                }
                                 continue
                             pending_ctx = self.decision_engine.build_context(
                                 vehicle_id,
@@ -2468,15 +2491,6 @@ class RLTrainingPipeline:
                                 snapshot=snapshot,
                             )
                             current_shift = int(pending_ctx.required_lane_shift.get(pending.intended_action, 99))
-                            grace_keep = (
-                                current_shift <= 1
-                                and pending_ctx.dist_to_end >= max(self.decision_engine.commit_min_distance + 2.0, 6.0)
-                            )
-                            wrong_lane_commit = (
-                                pending_ctx.commit_window
-                                and pending.intended_action not in pending_ctx.lane_feasible_now_actions
-                                and not grace_keep
-                            )
                             metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
                             pending.metadata = metadata
                             metadata["lane_position_now"] = float(snapshot.lane_position)
@@ -2488,61 +2502,30 @@ class RLTrainingPipeline:
                             last_progress_step = int(progress_view["last_progress_step"])
                             stall_age = max(int(step) - int(last_progress_step), 0)
                             total_age = max(int(step) - int(pending.decision_step), 0)
-                            no_progress_window = int(self.decision_engine.route_pending_no_progress_window_steps)
-                            no_progress_stall = (
-                                current_edge == pending.decision_edge
-                                and stall_age >= max(no_progress_window, 1)
-                                and not bool(progress_view["made_progress"])
-                            )
-                            stalled_timeout = (
-                                current_edge == pending.decision_edge
-                                and stall_age >= int(self.decision_engine.route_pending_stall_steps)
+                            stale_pending, stale_reason, release_as_timeout = self.decision_engine.evaluate_stale_pending(
+                                pending=pending,
+                                context=pending_ctx,
+                                step=step,
+                                progress_view=progress_view,
                             )
                             hard_timeout = (
                                 current_edge == pending.decision_edge
                                 and total_age >= int(self.decision_engine.route_pending_hard_timeout_steps)
                             )
-                            if pending_ctx.commit_window and pending.intended_action not in pending_ctx.lane_feasible_now_actions and grace_keep:
-                                decision_metrics["pending_commit_window_grace_kept"] += 1
-                            if wrong_lane_commit or no_progress_stall or stalled_timeout or hard_timeout:
-                                if wrong_lane_commit:
+                            if hard_timeout:
+                                stale_pending = True
+                                stale_reason = "route_hard_timeout"
+                                release_as_timeout = True
+                            if stale_pending:
+                                if stale_reason in {"stale_near_commit_not_lane_now"}:
                                     self._record_pending_release(decision_metrics, "wrong_lane_commit")
-                                    wrong_lane_state = self.encode_state(
-                                        vehicle_id,
-                                        current_edge,
-                                        vehicle.destination,
-                                        context=pending_ctx,
-                                        vehicle=vehicle,
-                                        step=step,
-                                        snapshot=snapshot,
-                                    )
-                                    wrong_lane_penalty = self._clip_reward(self.wrong_lane_commit_penalty)
-                                    self.trainer.stage_transition(
-                                        pending.state,
-                                        pending.intended_action,
-                                        wrong_lane_penalty,
-                                        wrong_lane_state,
-                                        False,
-                                        next_valid_actions=pending_ctx.available_actions,
-                                        metadata={
-                                            **(metadata if isinstance(metadata, dict) else {}),
-                                            "override_learning": True,
-                                            "override_type": "wrong_lane_commit_release",
-                                            "override_cause": "wrong_lane_commit_release",
-                                            "wrong_lane_commit_release": True,
-                                            "decision_finalized": False,
-                                        },
-                                    )
-                                    decision_metrics["override_learning_transitions"] += 1
-                                    decision_metrics["override_learning_negative"] += 1
-                                    episode_return_total += wrong_lane_penalty
-                                if no_progress_stall:
-                                    self._record_pending_release(decision_metrics, "route_stall_timeout")
-                                if stalled_timeout:
-                                    self._record_pending_release(decision_metrics, "route_stall_timeout")
-                                if hard_timeout:
+                                elif stale_reason in {"stale_low_speed"}:
+                                    self._record_pending_release(decision_metrics, "observe_abort_low_speed")
+                                elif stale_reason in {"route_hard_timeout"}:
                                     self._record_pending_release(decision_metrics, "route_hard_timeout")
-                                if stalled_timeout or hard_timeout:
+                                else:
+                                    self._record_pending_release(decision_metrics, "route_stall_timeout")
+                                if release_as_timeout:
                                     decision_metrics["pending_decision_timeouts"] += 1
                                     decision_metrics["pending_resolved_timeout"] += 1
                                     if str(metadata.get("decision_origin_mode", pending.decision_origin_mode)) == "proactive":
@@ -2552,7 +2535,6 @@ class RLTrainingPipeline:
                                     if str(metadata.get("decision_origin_mode", pending.decision_origin_mode)) == "proactive":
                                         decision_metrics["proactive_pending_abort_count"] += 1
                                 pending_decisions.pop(vehicle_id, None)
-                                release_as_timeout = bool(stalled_timeout or hard_timeout)
                                 lane_change_cooldown_until[(vehicle_id, current_edge)] = (
                                     step + self.decision_engine.cooldown_after_pending_release(timeout=release_as_timeout)
                                 )
@@ -2560,7 +2542,62 @@ class RLTrainingPipeline:
                                     "edge": current_edge,
                                     "step": int(step),
                                     "reason": "timeout" if release_as_timeout else "abort",
+                                    "blocked_action": int(pending.intended_action),
                                 }
+                                fallback_action = self._select_fallback_action(
+                                    pending_ctx,
+                                    blocked_action=pending.intended_action,
+                                    destination=vehicle.destination,
+                                    recent_history=list(recent_edge_history[vehicle_id]),
+                                    lane_now_only=True,
+                                )
+                                if fallback_action is not None:
+                                    full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
+                                        vehicle_id, current_edge, fallback_action, vehicle.destination
+                                    )
+                                    if not apply_error:
+                                        fallback_state = self.encode_state(
+                                            vehicle_id, current_edge, vehicle.destination, context=pending_ctx, vehicle=vehicle, step=step, snapshot=snapshot
+                                        )
+                                        pending_decisions[vehicle_id] = PendingDecision(
+                                            state=fallback_state,
+                                            intended_action=fallback_action,
+                                            intended_next_edge=committed_next_edge,
+                                            decision_edge=current_edge,
+                                            decision_step=step,
+                                            last_credit_edge=current_edge,
+                                            last_credit_step=step,
+                                            destination=vehicle.destination,
+                                            context=pending_ctx,
+                                            lane_change_requested=False,
+                                            decision_id=str((metadata or {}).get("decision_id", pending.decision_id)),
+                                            decision_origin_mode=str((metadata or {}).get("decision_origin_mode", pending.decision_origin_mode or "proactive")),
+                                            decision_current_phase="route_pending",
+                                            decision_open_recorded=True,
+                                            route_fragment=list(full_route[1:]) if full_route else [],
+                                            metadata={
+                                                "phase": "route_pending",
+                                                "action_source": "stale_release_fallback",
+                                                "decision_origin_mode": str((metadata or {}).get("decision_origin_mode", pending.decision_origin_mode or "proactive")),
+                                                "decision_resolution_mode": (
+                                                    "lane_now" if fallback_action in pending_ctx.lane_feasible_now_actions else "proactive"
+                                                ),
+                                                "decision_current_phase": "route_pending",
+                                                "best_dist_to_end": float(pending_ctx.dist_to_end),
+                                                "last_progress_step": int(step),
+                                                "decision_open": True,
+                                                "available_count": int(len(pending_ctx.available_actions)),
+                                                "lane_now_count": int(len(pending_ctx.lane_feasible_now_actions)),
+                                                "forced_action": bool(pending_ctx.forced_action is not None),
+                                                "decision_finalized": False,
+                                                "decision_id": str((metadata or {}).get("decision_id", pending.decision_id)),
+                                                "decision_open_recorded": True,
+                                            },
+                                        )
+                                        decision_metrics["fallback_overrides"] += 1
+                                        decision_metrics["fallback_selected_total"] += 1
+                                        if fallback_action in pending_ctx.lane_feasible_now_actions:
+                                            decision_metrics["fallback_selected_lane_now"] += 1
 
                         context = self.decision_engine.build_context(
                             vehicle_id,
@@ -2622,6 +2659,9 @@ class RLTrainingPipeline:
                             # policy_actions = stricter learning-time subset to reduce harmful overrides.
                             # Fallback machinery below remains the final safety layer.
                             cooldown_active = step < cooldown_until
+                            blocked_action_during_release_cooldown = self._blocked_action_during_release_cooldown(
+                                pending_release_info, vehicle_id, current_edge, step
+                            )
                             policy_actions = self._policy_action_candidates(
                                 context=context,
                                 recent_history=list(recent_edge_history[vehicle_id]),
@@ -2630,6 +2670,7 @@ class RLTrainingPipeline:
                                 recent_pending_release_same_edge_timeout_or_abort=self._recent_pending_release_same_edge_timeout_or_abort(
                                     pending_release_info, vehicle_id, current_edge, step
                                 ),
+                                blocked_action_during_release_cooldown=blocked_action_during_release_cooldown,
                                 decision_metrics=decision_metrics,
                             )
                             removed_actions = max(len(context.available_actions) - len(policy_actions), 0)
@@ -2693,6 +2734,9 @@ class RLTrainingPipeline:
                                 recent_pending_release_same_edge_timeout_or_abort=self._recent_pending_release_same_edge_timeout_or_abort(
                                     pending_release_info, vehicle_id, current_edge, step
                                 ),
+                                blocked_action_during_release_cooldown=self._blocked_action_during_release_cooldown(
+                                    pending_release_info, vehicle_id, current_edge, step
+                                ),
                                 decision_metrics=decision_metrics,
                             )
                             self.trainer.stage_transition(
@@ -2749,6 +2793,7 @@ class RLTrainingPipeline:
                                     blocked_action=action,
                                     destination=vehicle.destination,
                                     recent_history=list(recent_edge_history[vehicle_id]),
+                                    lane_now_only=True,
                                 )
                                 if fallback_action is None:
                                     prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -2775,6 +2820,9 @@ class RLTrainingPipeline:
                                     cooldown_active=True,
                                     destination=vehicle.destination,
                                     recent_pending_release_same_edge_timeout_or_abort=True,
+                                    blocked_action_during_release_cooldown=self._blocked_action_during_release_cooldown(
+                                        pending_release_info, vehicle_id, current_edge, step
+                                    ),
                                     decision_metrics=decision_metrics,
                                 )
                                 self.trainer.stage_transition(
@@ -2878,6 +2926,9 @@ class RLTrainingPipeline:
                                         cooldown_active=True,
                                         destination=vehicle.destination,
                                         recent_pending_release_same_edge_timeout_or_abort=True,
+                                        blocked_action_during_release_cooldown=self._blocked_action_during_release_cooldown(
+                                            pending_release_info, vehicle_id, current_edge, step
+                                        ),
                                         decision_metrics=decision_metrics,
                                     )
                                     self.trainer.stage_transition(
@@ -2948,6 +2999,9 @@ class RLTrainingPipeline:
                                 cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
                                 destination=vehicle.destination,
                                 recent_pending_release_same_edge_timeout_or_abort=self._recent_pending_release_same_edge_timeout_or_abort(
+                                    pending_release_info, vehicle_id, current_edge, step
+                                ),
+                                blocked_action_during_release_cooldown=self._blocked_action_during_release_cooldown(
                                     pending_release_info, vehicle_id, current_edge, step
                                 ),
                                 decision_metrics=decision_metrics,
@@ -3038,6 +3092,9 @@ class RLTrainingPipeline:
                                 cooldown_active=True,
                                 destination=vehicle.destination,
                                 recent_pending_release_same_edge_timeout_or_abort=True,
+                                blocked_action_during_release_cooldown=self._blocked_action_during_release_cooldown(
+                                    pending_release_info, vehicle_id, current_edge, step
+                                ),
                                 decision_metrics=decision_metrics,
                             )
                             self.trainer.stage_transition(

@@ -96,16 +96,18 @@ class JunctionDecisionEngine:
         self.pending_timeout_steps = 32
         self.lane_change_defer_limit = 6
         self.observe_steps_min = 2
-        self.observe_steps_max = 8
+        self.observe_steps_max = 4
         self.observe_low_speed_mps = 0.5
-        self.observe_stall_steps = 5
+        self.observe_stall_steps = 2
         self.cooldown_steps = 3
         self.observe_timeout_steps = 16
-        self.route_pending_stall_steps = 6
-        self.route_pending_hard_timeout_steps = 42
+        self.route_pending_stall_steps = 4
+        self.route_pending_hard_timeout_steps = 24
         self.route_pending_progress_eps_m = 3.0
         self.route_pending_lane_progress_eps = 0.25
-        self.route_pending_no_progress_window_steps = 4
+        self.route_pending_no_progress_window_steps = 3
+        self.route_pending_near_commit_buffer_m = 7.0
+        self.route_pending_low_speed_abort_mps = 0.45
         self.pending_progress_timeout_steps = 32
         self.loop_distance_slack = 30.0
         self.proactive_extra_buffer_m = 6.0
@@ -300,12 +302,98 @@ class JunctionDecisionEngine:
         metadata["best_lane_position"] = float(best_lane_pos)
         metadata["last_required_shift"] = int(current_shift)
         metadata["last_seen_lane_index"] = int(context.lane_index)
+        last_shift_improve_step = int(metadata.get("last_shift_improve_step", pending.decision_step))
+        last_lane_pos_improve_step = int(metadata.get("last_lane_pos_improve_step", pending.decision_step))
+        if shift_progress or lane_now_progress:
+            last_shift_improve_step = int(step)
+        if lane_pos_progress:
+            last_lane_pos_improve_step = int(step)
+        metadata["last_shift_improve_step"] = int(last_shift_improve_step)
+        metadata["last_lane_pos_improve_step"] = int(last_lane_pos_improve_step)
 
         return metadata, {
             "made_progress": made_progress,
             "current_shift": int(current_shift),
             "last_progress_step": int(last_progress_step),
+            "shift_progress": bool(shift_progress or lane_now_progress),
+            "lane_position_progress": bool(lane_pos_progress),
+            "last_shift_improve_step": int(last_shift_improve_step),
+            "last_lane_pos_improve_step": int(last_lane_pos_improve_step),
         }
+
+    def pending_release_cooldown_active(
+        self,
+        release_info: Optional[Dict[str, object]],
+        edge_id: str,
+        step: int,
+    ) -> bool:
+        if not release_info:
+            return False
+        if str(release_info.get("edge")) != str(edge_id):
+            return False
+        reason = str(release_info.get("reason", ""))
+        if reason not in {"abort", "timeout"}:
+            return False
+        release_step = int(release_info.get("step", step))
+        cooldown = self.cooldown_after_pending_release(timeout=(reason == "timeout"))
+        return (int(step) - release_step) <= int(cooldown)
+
+    def released_action_in_cooldown(
+        self,
+        release_info: Optional[Dict[str, object]],
+        edge_id: str,
+        step: int,
+    ) -> Optional[int]:
+        if not self.pending_release_cooldown_active(release_info, edge_id, step):
+            return None
+        blocked_action = release_info.get("blocked_action") if isinstance(release_info, dict) else None
+        if blocked_action is None:
+            return None
+        try:
+            return int(blocked_action)
+        except Exception:
+            return None
+
+    def evaluate_stale_pending(
+        self,
+        pending: PendingDecision,
+        context: DecisionContext,
+        step: int,
+        progress_view: Dict[str, object],
+    ) -> Tuple[bool, str, bool]:
+        if pending.intended_action in context.lane_feasible_now_actions:
+            return False, "", False
+        short_window = max(int(self.route_pending_no_progress_window_steps), 1)
+        shift_stale = (
+            int(step) - int(progress_view.get("last_shift_improve_step", pending.decision_step))
+        ) >= short_window
+        lane_pos_stale = (
+            int(step) - int(progress_view.get("last_lane_pos_improve_step", pending.decision_step))
+        ) >= short_window
+        commit_distance = max(
+            float(self.commit_min_distance),
+            float(context.speed) * float(self.commit_time_s),
+        )
+        nearing_commit = float(context.dist_to_end) <= (
+            commit_distance + float(self.route_pending_near_commit_buffer_m)
+        )
+        low_speed = float(context.speed) <= float(self.route_pending_low_speed_abort_mps)
+
+        stale_pending = bool(
+            (nearing_commit and pending.intended_action not in context.lane_feasible_now_actions)
+            or shift_stale
+            or lane_pos_stale
+            or low_speed
+        )
+        if not stale_pending:
+            return False, "", False
+        if low_speed:
+            return True, "stale_low_speed", False
+        if nearing_commit:
+            return True, "stale_near_commit_not_lane_now", False
+        if shift_stale:
+            return True, "stale_shift_no_improve", True
+        return True, "stale_lane_pos_no_improve", True
 
     def lane_change_observe_limit(self, context: DecisionContext) -> int:
         limit = self.observe_steps_min
@@ -410,13 +498,19 @@ class JunctionDecisionEngine:
         destination: str,
         recent_history: List[str],
         blocked_action: Optional[int] = None,
+        lane_now_only: bool = False,
         distance_fn: Optional[Callable[[str, str], float]] = None,
     ) -> List[int]:
         lane_now_candidates = self.lane_feasible_fallback_actions(context, blocked_action=blocked_action)
-        safe_connected_candidates = self.safe_connected_fallback_actions(context, blocked_action=blocked_action)
-        candidate_pool = sorted(set(lane_now_candidates) | set(safe_connected_candidates))
-        if not candidate_pool:
-            return []
+        if lane_now_only:
+            candidate_pool = sorted(set(lane_now_candidates))
+            if not candidate_pool:
+                return []
+        else:
+            safe_connected_candidates = self.safe_connected_fallback_actions(context, blocked_action=blocked_action)
+            candidate_pool = sorted(set(lane_now_candidates) | set(safe_connected_candidates))
+            if not candidate_pool:
+                return []
 
         scored = []
         for action in candidate_pool:
