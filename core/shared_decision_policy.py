@@ -360,7 +360,18 @@ class SharedDecisionPolicy:
         lane_now_only: bool = False,
     ) -> Optional[int]:
         if lane_now_only:
-            ranked = self.decision_engine.lane_feasible_fallback_actions(context, blocked_action=blocked_action)
+            lane_now_candidates = self.decision_engine.lane_feasible_fallback_actions(
+                context,
+                blocked_action=blocked_action,
+            )
+            ranked = self.decision_engine.ranked_fallback_actions(
+                context=context,
+                destination=destination,
+                recent_history=list(recent_history or []),
+                blocked_action=blocked_action,
+                distance_fn=distance_fn,
+                candidate_actions=lane_now_candidates,
+            )
         else:
             ranked = self.decision_engine.ranked_fallback_actions(
                 context=context,

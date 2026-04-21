@@ -419,10 +419,18 @@ class JunctionDecisionEngine:
         recent_history: List[str],
         blocked_action: Optional[int] = None,
         distance_fn: Optional[Callable[[str, str], float]] = None,
+        candidate_actions: Optional[List[int]] = None,
     ) -> List[int]:
         lane_now_candidates = self.lane_feasible_fallback_actions(context, blocked_action=blocked_action)
         safe_connected_candidates = self.safe_connected_fallback_actions(context, blocked_action=blocked_action)
-        candidate_pool = sorted(set(lane_now_candidates) | set(safe_connected_candidates))
+        if candidate_actions is not None:
+            allowed = set(candidate_actions)
+            candidate_pool = sorted(
+                set(action for action in lane_now_candidates if action in allowed)
+                | set(action for action in safe_connected_candidates if action in allowed)
+            )
+        else:
+            candidate_pool = sorted(set(lane_now_candidates) | set(safe_connected_candidates))
         if not candidate_pool:
             return []
 

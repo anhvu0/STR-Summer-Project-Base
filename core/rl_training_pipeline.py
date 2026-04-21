@@ -503,13 +503,15 @@ class RLTrainingPipeline:
         self.same_edge_repeat_chase_penalty = -0.5
         self.fallback_missed_lane_penalty = -0.4
         self.loop_trap_override_penalty = -1.4
+        self.hard_brake_event_penalty = 0.35
         self.tail_delay_threshold_eta_mult = 1.35
         self.tail_delay_threshold_min_steps = 180.0
         self.tail_delay_threshold_max_steps = 320.0
-        self.tail_delay_linear_penalty = 0.06
-        self.tail_delay_quadratic_penalty = 0.00012
-        self.tail_arrival_penalty_per_25_steps = 0.75
+        self.tail_delay_linear_penalty = 0.075
+        self.tail_delay_quadratic_penalty = 0.00016
+        self.tail_arrival_penalty_per_25_steps = 0.90
         self.tail_arrival_penalty_cap = 8.0
+        self.hard_brake_attribution_window_steps = 24
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
         self.net_file, self.route_file = self.parse_sumocfg(sumocfg_path)
@@ -958,6 +960,42 @@ class RLTrainingPipeline:
             distance_fn=self.get_distance_to_destination,
             lane_now_only=lane_now_only,
         )
+
+    def _record_recent_decision_attribution(self, decision_attribution_by_vehicle, vehicle_id, step, action_source, resolution_mode):
+        decision_attribution_by_vehicle[str(vehicle_id)] = {
+            "step": int(step),
+            "action_source": str(action_source or ""),
+            "resolution_mode": str(resolution_mode or "lane_now"),
+            "is_fallback": ("fallback" in str(action_source or "")),
+        }
+
+    def _attribute_hard_brake_event(self, decision_metrics, decision_attribution_by_vehicle, vehicle_id, step):
+        record = decision_attribution_by_vehicle.get(str(vehicle_id))
+        if not record:
+            decision_metrics["emergency_brake_without_recent_decision"] += 1
+            return
+
+        age = max(int(step) - int(record.get("step", step)), 0)
+        if age > int(self.hard_brake_attribution_window_steps):
+            decision_metrics["emergency_brake_without_recent_decision"] += 1
+            return
+
+        if bool(record.get("is_fallback", False)):
+            decision_metrics["emergency_brake_after_fallback"] += 1
+            return
+
+        if str(record.get("resolution_mode", "lane_now")) == "proactive":
+            decision_metrics["emergency_brake_after_proactive"] += 1
+            return
+
+        decision_metrics["emergency_brake_after_lane_now"] += 1
+
+    def _consume_hard_brake_events(self, hard_brake_counts_by_vehicle, vehicle_id):
+        vehicle_key = str(vehicle_id)
+        count = int(hard_brake_counts_by_vehicle.get(vehicle_key, 0))
+        if count > 0:
+            hard_brake_counts_by_vehicle[vehicle_key] = 0
+        return max(count, 0)
     def dist_to_end(self, vehicle_id, snapshot=None):
         """
         Distance (meters) from the vehicle to the end of its current lane.
@@ -1128,6 +1166,7 @@ class RLTrainingPipeline:
         finalized_decision_rewards,
         decision_debug_rows,
         episode,
+        hard_brake_counts_by_vehicle,
         in_arrived_ids=False,
         in_teleport_ids=False,
         ever_teleported=False,
@@ -1135,6 +1174,7 @@ class RLTrainingPipeline:
         if vehicle_id in terminal_recorded_ids:
             return 0.0
         pending = pending_decisions.get(vehicle_id)
+        hard_brake_events = self._consume_hard_brake_events(hard_brake_counts_by_vehicle, vehicle_id)
         if pending is None:
             last_confirmed_edge = last_seen_edge_by_vehicle.get(vehicle_id, vehicle.destination)
             snapshot = last_snapshot_by_vehicle.get(vehicle_id)
@@ -1152,6 +1192,7 @@ class RLTrainingPipeline:
                     step,
                     arrived=True,
                     reached_global_destination=True,
+                    hard_brake_events=hard_brake_events,
                     terminal_outcome=outcome,
                 )
                 if ever_teleported:
@@ -1246,6 +1287,7 @@ class RLTrainingPipeline:
                 arrived=True,
                 delta_t=max(step - pending.last_credit_step, 1),
                 reached_global_destination=True,
+                hard_brake_events=hard_brake_events,
                 terminal_outcome=outcome,
             )
             if ever_teleported:
@@ -1277,6 +1319,7 @@ class RLTrainingPipeline:
                 step=step,
                 pending_age=max(step - pending.decision_step, 0),
                 lane_change_deferrals=pending.metadata.get("lane_change_deferrals", 0),
+                hard_brake_events=hard_brake_events,
             ) + self.pending_timeout_penalty
             reward = self._clip_reward(reward)
             done = True
@@ -1432,6 +1475,7 @@ class RLTrainingPipeline:
         long_horizon_loop=False,
         externality_penalty=0.0,
         selfless_delta=0.0,
+        hard_brake_events=0,
         terminal_outcome=None,
     ):
         """
@@ -1491,6 +1535,8 @@ class RLTrainingPipeline:
             reward -= 2.0
         if route_apply_failed:
             reward -= 6.0
+        if hard_brake_events > 0:
+            reward -= self.hard_brake_event_penalty * min(float(hard_brake_events), 2.0)
 
         # Unreachable transition after a decision is strongly terminal-negative.
         if math.isfinite(prev_distance) and not math.isfinite(curr_distance):
@@ -1518,7 +1564,7 @@ class RLTrainingPipeline:
     def _clip_reward(self, reward_value):
         return float(np.clip(reward_value, self.reward_clip_low, self.reward_clip_high))
 
-    def compute_pending_step_reward(self, vehicle, edge_id, elapsed, step, externality_penalty=0.0, pending_age=0, lane_change_deferrals=0):
+    def compute_pending_step_reward(self, vehicle, edge_id, elapsed, step, externality_penalty=0.0, pending_age=0, lane_change_deferrals=0, hard_brake_events=0):
         """
         Dense reward used while a decision is pending and has not finalized yet.
         Keeps the training objective travel-time centric without waiting for an edge transition.
@@ -1537,6 +1583,8 @@ class RLTrainingPipeline:
         reward -= self.system_congestion_scale * marginal_pressure * elapsed
         reward -= self.pending_latency_penalty_per_step * float(max(pending_age, 0))
         reward -= 0.02 * float(max(lane_change_deferrals, 0))
+        if hard_brake_events > 0:
+            reward -= (0.6 * self.hard_brake_event_penalty) * min(float(hard_brake_events), 2.0)
         reward -= self._tail_delay_penalty_increment(
             vehicle,
             edge_id,
@@ -1613,8 +1661,11 @@ class RLTrainingPipeline:
             "mean_network_density", "p95_network_density", "congestion_high_pressure_steps",
             "emergency_brake_events", "emergency_brake_due_to_leader", "emergency_brake_due_to_congestion",
             "emergency_brake_near_junction", "emergency_brake_other_reason",
+            "emergency_brake_after_fallback", "emergency_brake_after_proactive",
+            "emergency_brake_after_lane_now", "emergency_brake_without_recent_decision",
             "teleport_inferred_jam", "teleport_inferred_yield_or_deadlock",
             "lane_change_request_accepted_rate", "lane_change_observe_resolution_rate",
+            "lane_change_observe_success_overcount",
             "tail_vehicles_over_p90_count", "tail_completion_gap_steps",
             "loop_reason_short_cycle", "loop_reason_aba_bounce", "loop_reason_dead_end_reentry",
             "loop_reason_long_horizon", "loop_reason_revisit_without_progress", "dominant_loop_reason",
@@ -1711,7 +1762,9 @@ class RLTrainingPipeline:
             arrived_with_prestep_edge_not_destination = 0
             prev_speed_by_vehicle = {}
             emergency_brake_active_by_vehicle = {}
+            hard_brake_counts_by_vehicle = defaultdict(int)
             last_observed_brake_step_by_vehicle = {}
+            decision_attribution_by_vehicle = {}
             mean_density_samples = []
             p95_density_samples = []
             congestion_high_pressure_steps = 0
@@ -1760,6 +1813,7 @@ class RLTrainingPipeline:
                             was_hard_brake_active = bool(emergency_brake_active_by_vehicle.get(vehicle_id, False))
                             if hard_brake and not was_hard_brake_active:
                                 decision_metrics["emergency_brake_events"] += 1
+                                hard_brake_counts_by_vehicle[vehicle_id] += 1
                                 emergency_reason = "other"
                                 try:
                                     leader_info = traci.vehicle.getLeader(vehicle_id)
@@ -1781,6 +1835,12 @@ class RLTrainingPipeline:
                                     decision_metrics["emergency_brake_near_junction"] += 1
                                 else:
                                     decision_metrics["emergency_brake_other_reason"] += 1
+                                self._attribute_hard_brake_event(
+                                    decision_metrics,
+                                    decision_attribution_by_vehicle,
+                                    vehicle_id,
+                                    step,
+                                )
                             emergency_brake_active_by_vehicle[vehicle_id] = hard_brake
                         else:
                             # No prior speed => no detectable braking episode yet; keep latch clear.
@@ -1852,6 +1912,7 @@ class RLTrainingPipeline:
                                 long_horizon_loop=loop_signals.get("long_horizon_loop") or loop_signals.get("revisit_without_progress"),
                                 externality_penalty=ext_pen,
                                 selfless_delta=float(pending.metadata.get("selfless_delta", 0.0)),
+                                hard_brake_events=self._consume_hard_brake_events(hard_brake_counts_by_vehicle, vehicle_id),
                             )
                             next_ctx = self.decision_engine.build_context(
                                 vehicle_id,
@@ -1991,6 +2052,13 @@ class RLTrainingPipeline:
                                         committed_next_edge=committed_next_edge,
                                         full_route=full_route,
                                     )
+                                    self._record_recent_decision_attribution(
+                                        decision_attribution_by_vehicle,
+                                        vehicle_id,
+                                        step,
+                                        str((pending.metadata or {}).get("action_source", "policy")),
+                                        "proactive",
+                                    )
                                     prev_edge_by_vehicle[vehicle_id] = current_edge
                                     continue
                                 if reason == "commit_window":
@@ -2078,6 +2146,13 @@ class RLTrainingPipeline:
                                     decision_open_recorded=True,
                                     extra_metadata={"override_learning": True},
                                 )
+                                self._record_recent_decision_attribution(
+                                    decision_attribution_by_vehicle,
+                                    vehicle_id,
+                                    step,
+                                    "observe_fallback",
+                                    "lane_now",
+                                )
                                 decision_metrics["fallback_overrides"] += 1
                                 decision_metrics["fallback_selected_total"] += 1
                                 self._record_override_event(decision_metrics, "observe_abort_fallback")
@@ -2128,6 +2203,7 @@ class RLTrainingPipeline:
                                     externality_penalty=ext_pen,
                                     pending_age=pending_age,
                                     lane_change_deferrals=pending.metadata.get("lane_change_deferrals", 0),
+                                    hard_brake_events=self._consume_hard_brake_events(hard_brake_counts_by_vehicle, vehicle_id),
                                 )
                                 age_scale = 1.0 / (1.0 + 0.10 * max(pending_age - 8, 0))
                                 pending_reward *= age_scale
@@ -2526,6 +2602,13 @@ class RLTrainingPipeline:
                                     observe_metadata=observe_metadata,
                                     decision_open_recorded=False,
                                 )
+                                self._record_recent_decision_attribution(
+                                    decision_attribution_by_vehicle,
+                                    vehicle_id,
+                                    step,
+                                    action_source or "policy",
+                                    "proactive",
+                                )
                                 self._register_decision_open(decision_metrics, pending_decisions[vehicle_id])
                                 release_info = pending_release_info.get(vehicle_id)
                                 if (
@@ -2634,6 +2717,13 @@ class RLTrainingPipeline:
                                 "selfless_delta": selfless_delta,
                             },
                         )
+                        self._record_recent_decision_attribution(
+                            decision_attribution_by_vehicle,
+                            vehicle_id,
+                            step,
+                            action_source,
+                            "lane_now",
+                        )
                         lane_change_deferrals[vehicle_id] = 0
                         self._register_decision_open(decision_metrics, pending_decisions[vehicle_id])
                         release_info = pending_release_info.get(vehicle_id)
@@ -2719,6 +2809,7 @@ class RLTrainingPipeline:
                             finalized_decision_rewards=finalized_decision_rewards,
                             decision_debug_rows=decision_debug_rows,
                             episode=episode,
+                            hard_brake_counts_by_vehicle=hard_brake_counts_by_vehicle,
                             in_arrived_ids=(removed_id in arrived_this_step),
                             in_teleport_ids=(removed_id in teleported_ids),
                             ever_teleported=ever_teleported,
@@ -2781,6 +2872,7 @@ class RLTrainingPipeline:
                             finalized_decision_rewards=finalized_decision_rewards,
                             decision_debug_rows=decision_debug_rows,
                             episode=episode,
+                            hard_brake_counts_by_vehicle=hard_brake_counts_by_vehicle,
                             in_arrived_ids=False,
                             in_teleport_ids=False,
                             ever_teleported=(vid in ever_teleported_controlled_ids),
@@ -2832,8 +2924,12 @@ class RLTrainingPipeline:
                     float(decision_metrics["lane_change_success"]) / float(max(decision_metrics["lane_change_attempts"], 1.0))
                 )
                 lane_change_observe_resolution_rate = (
-                    float(decision_metrics["lane_change_observe_success"])
+                    float(min(decision_metrics["lane_change_observe_success"], decision_metrics["lane_change_observe_started"]))
                     / float(max(decision_metrics["lane_change_observe_started"], 1.0))
+                )
+                lane_change_observe_success_overcount = max(
+                    float(decision_metrics["lane_change_observe_success"]) - float(decision_metrics["lane_change_observe_started"]),
+                    0.0,
                 )
                 if completed_travel_times:
                     tail_travel_times = [tt for tt in completed_travel_times if tt >= p90_travel_time]
@@ -3227,10 +3323,15 @@ class RLTrainingPipeline:
                         "emergency_brake_due_to_congestion": decision_metrics["emergency_brake_due_to_congestion"],
                         "emergency_brake_near_junction": decision_metrics["emergency_brake_near_junction"],
                         "emergency_brake_other_reason": decision_metrics["emergency_brake_other_reason"],
+                        "emergency_brake_after_fallback": decision_metrics["emergency_brake_after_fallback"],
+                        "emergency_brake_after_proactive": decision_metrics["emergency_brake_after_proactive"],
+                        "emergency_brake_after_lane_now": decision_metrics["emergency_brake_after_lane_now"],
+                        "emergency_brake_without_recent_decision": decision_metrics["emergency_brake_without_recent_decision"],
                         "teleport_inferred_jam": decision_metrics["teleport_inferred_jam"],
                         "teleport_inferred_yield_or_deadlock": decision_metrics["teleport_inferred_yield_or_deadlock"],
                         "lane_change_request_accepted_rate": lane_change_request_accepted_rate,
                         "lane_change_observe_resolution_rate": lane_change_observe_resolution_rate,
+                        "lane_change_observe_success_overcount": lane_change_observe_success_overcount,
                         "tail_vehicles_over_p90_count": tail_vehicles_over_p90_count,
                         "tail_completion_gap_steps": tail_completion_gap_steps,
                         "loop_reason_short_cycle": decision_metrics["short_cycle_events"],
