@@ -394,7 +394,7 @@ class QLearningPolicy(RouteController):
                         obs_context,
                         blocked_action=pending.intended_action,
                         destination=vehicle.destination,
-                        recent_history=recent_history,
+                        recent_history=recent,
                         distance_fn=self._dist_to_dest,
                     )
                     if action_idx is None:
