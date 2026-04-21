@@ -1,4 +1,4 @@
-import numpy as np
+﻿import numpy as np
 import os
 import sys
 import math
@@ -96,7 +96,7 @@ class DQNTrainer:
         gamma=0.95,
         epsilon=1.0,
         epsilon_decay=0.99,
-        epsilon_min=0.05,
+        epsilon_min=0.01,
         replay_capacity=100000,
         elite_replay_capacity=None,
         elite_fraction=0.25,
@@ -413,7 +413,7 @@ class RLTrainingPipeline:
         destination_reward=50.0,
         teleport_penalty=-40.0,
         epsilon_decay=0.99,
-        epsilon_min=0.05,
+        epsilon_min=0.01,
         gamma=0.97,
         replay_capacity=100000,
         batch_size=128,
@@ -947,6 +947,7 @@ class RLTrainingPipeline:
             cooldown_active=cooldown_active,
             destination=destination,
             distance_fn=self.get_distance_to_destination,
+            edge_density_fn=self._edge_density,
             metrics=decision_metrics,
             distance_slack=self.score_slack,
         )
@@ -1680,6 +1681,8 @@ class RLTrainingPipeline:
             "policy_candidates_collapsed_to_lane_now_only",
             "commit_window_non_lane_candidates_seen", "commit_window_candidates_rejected",
             "proactive_shift2_candidates_seen", "proactive_shift2_candidates_rejected",
+            "proactive_brake_risk_candidates_seen", "proactive_brake_risk_candidates_rejected",
+            "proactive_brake_risk_fallback_kept",
             "pending_commit_window_grace_kept",
             "proactive_decisions_opened", "proactive_decisions_finalized",
             "lane_now_decisions_opened", "lane_now_decisions_finalized",
@@ -3368,6 +3371,9 @@ class RLTrainingPipeline:
                         "commit_window_candidates_rejected": decision_metrics["commit_window_candidates_rejected"],
                         "proactive_shift2_candidates_seen": decision_metrics["proactive_shift2_candidates_seen"],
                         "proactive_shift2_candidates_rejected": decision_metrics["proactive_shift2_candidates_rejected"],
+                        "proactive_brake_risk_candidates_seen": decision_metrics["proactive_brake_risk_candidates_seen"],
+                        "proactive_brake_risk_candidates_rejected": decision_metrics["proactive_brake_risk_candidates_rejected"],
+                        "proactive_brake_risk_fallback_kept": decision_metrics["proactive_brake_risk_fallback_kept"],
                         "pending_commit_window_grace_kept": decision_metrics["pending_commit_window_grace_kept"],
                         "proactive_decisions_opened": decision_metrics["proactive_decisions_opened"],
                         "proactive_decisions_finalized": decision_metrics["proactive_decisions_finalized"],

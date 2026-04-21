@@ -75,6 +75,9 @@ class QLearningPolicy(RouteController):
             "pending_commit_window_grace_kept": 0,
             "proactive_shift2_candidates_seen": 0,
             "proactive_shift2_candidates_rejected": 0,
+            "proactive_brake_risk_candidates_seen": 0,
+            "proactive_brake_risk_candidates_rejected": 0,
+            "proactive_brake_risk_fallback_kept": 0,
             "commit_window_candidates_rejected": 0,
             "commit_window_non_lane_candidates_seen": 0,
             "step_control_edge_change": 0,
@@ -513,6 +516,7 @@ class QLearningPolicy(RouteController):
                     cooldown_active=cooldown_active,
                     destination=vehicle.destination,
                     distance_fn=self._dist_to_dest,
+                    edge_density_fn=self._edge_density,
                     metrics=self._metrics,
                     distance_slack=self.score_slack,
                 )

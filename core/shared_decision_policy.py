@@ -58,6 +58,9 @@ class SharedDecisionPolicy:
         self.local_congestion_k = int(local_congestion_k)
         self.density_scale_m = float(density_scale_m)
         self.max_simulation_steps = max(int(max_simulation_steps), 1)
+        self.proactive_brake_risk_speed_floor = 4.5
+        self.proactive_brake_risk_density_threshold = 0.30
+        self.proactive_brake_risk_high_density_threshold = 0.45
 
         self.compact_state_size = (
             (2 * self.edge_embedding_dim)
@@ -264,6 +267,7 @@ class SharedDecisionPolicy:
         cooldown_active: bool,
         destination: str,
         distance_fn: Callable[[str, str], float],
+        edge_density_fn: Optional[Callable[[str], float]] = None,
         metrics: Optional[Dict[str, float]] = None,
         distance_slack: Optional[float] = None,
     ) -> List[int]:
@@ -290,6 +294,7 @@ class SharedDecisionPolicy:
 
         safe_lane_now_actions = []
         proactive_actions = []
+        proactive_risk_scored = []
         filtered_available_actions = []
 
         for action in available_actions:
@@ -313,15 +318,15 @@ class SharedDecisionPolicy:
 
             required_shift = int(context.required_lane_shift.get(action, 99))
             if context.commit_window:
-                self._increment_metric(metrics, "commit_window_non_lane_candidates_seen")
-                self._increment_metric(metrics, "commit_window_candidates_rejected")
+                self._increment_metric(metrics, 'commit_window_non_lane_candidates_seen')
+                self._increment_metric(metrics, 'commit_window_candidates_rejected')
                 continue
 
             if required_shift == 2:
-                self._increment_metric(metrics, "proactive_shift2_candidates_seen")
+                self._increment_metric(metrics, 'proactive_shift2_candidates_seen')
             if required_shift not in (1, 2):
                 if required_shift == 2:
-                    self._increment_metric(metrics, "proactive_shift2_candidates_rejected")
+                    self._increment_metric(metrics, 'proactive_shift2_candidates_rejected')
                 continue
 
             dist_threshold = comfortable_dist_threshold
@@ -329,12 +334,28 @@ class SharedDecisionPolicy:
                 dist_threshold = comfortable_dist_threshold + (0.9 * float(self.decision_engine.lane_change_margin_m))
             if float(context.dist_to_end) <= dist_threshold:
                 if required_shift == 2:
-                    self._increment_metric(metrics, "proactive_shift2_candidates_rejected")
+                    self._increment_metric(metrics, 'proactive_shift2_candidates_rejected')
+                continue
+
+            brake_risk_score = self._proactive_brake_risk_score(
+                context=context,
+                action_idx=action,
+                comfortable_dist_threshold=comfortable_dist_threshold,
+                edge_density_fn=edge_density_fn,
+            )
+            if brake_risk_score > 0.0:
+                self._increment_metric(metrics, 'proactive_brake_risk_candidates_seen')
+                self._increment_metric(metrics, 'proactive_brake_risk_candidates_rejected')
+                proactive_risk_scored.append((float(brake_risk_score), action))
                 continue
 
             proactive_actions.append(action)
 
         policy_actions = sorted(set(safe_lane_now_actions) | set(proactive_actions))
+        if not policy_actions and proactive_risk_scored:
+            proactive_risk_scored.sort(key=lambda item: (item[0], item[1]))
+            policy_actions = [int(proactive_risk_scored[0][1])]
+            self._increment_metric(metrics, 'proactive_brake_risk_fallback_kept')
         if not policy_actions:
             policy_actions = sorted(set(filtered_available_actions))
         if not policy_actions:
@@ -344,10 +365,56 @@ class SharedDecisionPolicy:
         lane_now_set = set(safe_lane_now_actions)
         policy_set = set(policy_actions)
         if len(broader_available_set) > len(lane_now_set):
-            self._increment_metric(metrics, "policy_candidates_with_broader_available")
+            self._increment_metric(metrics, 'policy_candidates_with_broader_available')
             if policy_set == lane_now_set and len(policy_set) < len(broader_available_set):
-                self._increment_metric(metrics, "policy_candidates_collapsed_to_lane_now_only")
+                self._increment_metric(metrics, 'policy_candidates_collapsed_to_lane_now_only')
         return policy_actions
+
+
+    def _proactive_brake_risk_score(
+        self,
+        *,
+        context: DecisionContext,
+        action_idx: int,
+        comfortable_dist_threshold: float,
+        edge_density_fn: Optional[Callable[[str], float]],
+    ) -> float:
+        if edge_density_fn is None:
+            return 0.0
+
+        required_shift = int(context.required_lane_shift.get(action_idx, 99))
+        if required_shift not in (1, 2):
+            return 0.0
+
+        speed = float(context.speed)
+        if speed < self.proactive_brake_risk_speed_floor:
+            return 0.0
+
+        next_edge = self.decision_engine.get_next_edge(context.edge_id, action_idx)
+        if next_edge is None:
+            return 0.0
+
+        current_density = max(float(edge_density_fn(context.edge_id)), 0.0)
+        next_density = max(float(edge_density_fn(next_edge)), 0.0)
+        density_pressure = max(current_density, next_density)
+        if density_pressure < self.proactive_brake_risk_density_threshold:
+            return 0.0
+
+        extra_distance = max(float(context.dist_to_end) - float(comfortable_dist_threshold), 0.0)
+        extra_time_headroom = extra_distance / max(speed, 1.0)
+
+        required_extra_time = 0.45 if required_shift == 1 else 0.90
+        if density_pressure >= self.proactive_brake_risk_density_threshold:
+            required_extra_time += 0.35
+        if density_pressure >= self.proactive_brake_risk_high_density_threshold:
+            required_extra_time += 0.25
+        if next_density >= (current_density + 0.08):
+            required_extra_time += 0.15
+
+        risk_score = required_extra_time - extra_time_headroom
+        if required_shift == 2 and density_pressure >= self.proactive_brake_risk_density_threshold:
+            risk_score += 0.10
+        return float(risk_score)
 
     def select_fallback_action(
         self,
