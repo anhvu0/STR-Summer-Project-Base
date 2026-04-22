@@ -1,88 +1,109 @@
 ***Selfless Traffic Routing testbed based on SUMO (STR-SUMO)***
 
-This project is built based on SUMO (https://sumo.dlr.de/docs/index.html#introduction), which offers a traffic simulation platform.
-The goal of STR-SUMO is to offer a testbed that can benchmark the performance of a routing policy under the following constraints:
-- Some vehicles are controlled by the scheudling algorithm;
-- Each controlled vehicle has the key trip parameters: 1. start point (an edge), 2. destination (an edge), 3. time to set off (deadline fields may still exist in legacy scenarios for compatibility).
-The goal of the routing policy, i.e., the metrics used, includes:
-- Average travel time of controlled vehicles -- the smaller the better;
-- Tail travel-time metrics such as p50/p90 travel time -- the smaller the better;
-- Completion rate and robustness signals (teleports/loops/mismatches) for training stability.
+This project uses SUMO ([https://sumo.dlr.de/docs/index.html#introduction](https://sumo.dlr.de/docs/index.html#introduction)) as the traffic simulation backend.
+The goal of STR-SUMO is to benchmark routing policies for a subset of controlled vehicles while preserving realistic map, lane, and route-continuity constraints.
 
-***pre-requisite***
+The current RL objective is travel-time centric:
+- lower average travel time,
+- better tail travel-time behavior (`p50`, `p90`),
+- stronger completion rate,
+- fewer routing pathologies such as loops, route mismatches, teleports, and long pending-decision stalls.
 
-It is recommended to use Python 3.x, the packages required are included in requirements.txt. 
-You can use pip to install them directly (for Python 3.x):
-```
-pip3 install requirements.txt
-```
-You also need to install SUMO properly: https://sumo.dlr.de/docs/Installing/index.html
+Vehicle deadlines may still exist in legacy vehicle objects for compatibility, but they are not the primary optimization target in the current RL pipeline.
 
+***Pre-requisites***
 
-***Layout of the repository***
+Use Python 3.x and install the dependencies from `requirements.txt`:
 
-main.py: The entrance of the project. Can simply run it when all pre-requisites are installed using:
-```
-python3 main.py
-```
-It will show the benchmarking results of the Dijkstra routing policy for a set of vehicles sharing the same start point and the same destination.
-
-Next, we walk through each subdirectory.
-
-**configurations**
-
-Includes the mandatory configuration file: \*.sumocfg and \*.net.xml. Note that the \*.net.xml you specify in the sumocfg file must be placed directly in the configuration file repository.
-More maps are given in “maps" subdirectory.
-
-**core**
-
-Includes the core files of STR-SUMO. 
-- Util.py: includes the data structure used to store vehicle and map information;
-- network_map_data_structure.py: includes the useful operations to get infromation of the current map;
-- target_vehicles_generation_protocols.py: includes functions used to generate vehicles (including controlled vehicles' information and uncontrolled vehicles' routes)
-- STR-SUMO.py: takes in a routing policy and performs the simulation to benchmark the performance of the target policy under a given set of map and vehicle sets.
-- rl_training_pipeline.py: a Deep Q-Learning training pipeline for routing decisions.
-
-
-**controller**
-
-Includes different scheduling policies.
-- RouteController.py: the base class of all routing policies;
-- DijkstraController.py: the routing plicy that employs Dijkstra to find the shortest path (without considering the congestion) for each controlled vehicles;
-- QLearningController.py: a simple routing policy using a trained agent. Specifically trained for map test.net.xml.
-
-**test**
-
-Includes the unit test for different core files.
-The test scripts should be placed in the main repository.
-
-***Reinforcement Learning Training Pipeline***
-
-The repository includes a DQN-based training pipeline that spawns vehicles at a configurable interval and trains a routing policy for **system-wide travel-time efficiency**.
-
-Current high-level architecture/flow:
-1. Build lane/junction-feasible action sets with `JunctionDecisionEngine`.
-2. Encode state with edge embeddings, feasibility masks, lane features, travel-time features, and local congestion features.
-3. Use DQN (with target network + replay buffer) to choose feasible routing actions.
-4. Apply route fragments and finalize transitions when vehicles move to the next edge.
-5. Optimize reward for lower trip time while penalizing congestion externalities and unsafe/unstable control outcomes.
-6. Track episode metrics including `completion_rate`, `avg_travel_time`, `p50_travel_time`, and `p90_travel_time`.
-
-To train a model:
-```
-python3 train_rl.py --sumocfg ./test/myconfig.sumocfg --model-output ./test/rl_model.h5 --episodes 10 --spawn-interval 0.0 (Those are optional arguments. Just use train_rl.py only for default settings)
+```bash
+pip3 install -r requirements.txt
 ```
 
-The resulting model can be used with `QLearningController.py` by pointing it to the saved model file.
+You also need a working SUMO installation:
+[https://sumo.dlr.de/docs/Installing/index.html](https://sumo.dlr.de/docs/Installing/index.html)
 
-***Contribution Guidance***
+***Repository layout***
 
-**Codes**
+`main.py`
+- Main benchmark entry point.
+- Runs Dijkstra and the trained Q-learning controller on the configured SUMO scenario.
+- Inference now supports `--spawn-interval` and `--seed` so you can match training-style generation when comparing controllers.
 
-Please add comments for each function using the style pydoc can recognize: https://stackoverflow.com/questions/13040646/how-do-i-create-documentation-with-pydoc
+Example:
 
-You are also recommended to add brief comments to state the function of each block of codes. Naming variables using convention lowercae_with_underscores is suggested.
+```bash
+python3 main.py --spawn-interval 2.0 --seed 42
+```
 
-**Tests**
+`configurations`
+- SUMO config files, network files, route files, trained models, and episode metrics.
 
-For important functions, please write a simple test case naming as test_function_name.py. After the test is passed, archive it in the test directory. When reviewing codes, this would be helpful for code reviewers to understand the usage of functions and to expand the tests with some border cases.
+`core`
+- `Util.py`: data structures for vehicles and network information.
+- `target_vehicles_generation_protocols.py`: route and vehicle generation utilities.
+- `STR_SUMO.py`: SUMO runtime wrapper used by evaluation/inference.
+- `junction_decision_engine.py`: lane-feasibility, commit-window, and route-application logic.
+- `shared_decision_policy.py`: shared decision lifecycle logic used by both training and inference.
+- `rl_training_pipeline.py`: DQN training pipeline plus held-out frozen evaluation and best-checkpoint selection.
+
+`controller`
+- `RouteController.py`: base controller interface.
+- `DijkstraController.py`: shortest-path baseline.
+- `QLearningController.py`: trained-policy inference controller.
+
+`docs`
+- Analysis and operational notes for loop mitigation, telemetry interpretation, and training/inference workflow.
+
+***Training the RL policy***
+
+Basic training:
+
+```bash
+python3 train_rl.py
+```
+
+Useful options:
+
+```bash
+python3 train_rl.py   --sumocfg ./configurations/myconfig.sumocfg   --model-output ./configurations/model/rl_model_map.h5   --episodes 500   --spawn-interval 2.0   --eval-every 25   --eval-seeds 1001,1002,1003   --eval-spawn-interval 2.0
+```
+
+What the outputs mean:
+- `rl_episode_metrics.csv`: training-rollout metrics. These runs still include replay updates during the episode, so they are useful for training trends but are not a pure deployment-quality inference measure.
+- `rl_frozen_eval_metrics.csv`: held-out frozen evaluation metrics. These runs use the saved checkpoint with no online learning and average results across held-out seeds.
+- `<model-output>`: the final checkpoint at the end of training.
+- `<model-output>.best.h5`: the best held-out frozen-eval checkpoint, selected by completion rate first, then timeout rate, average travel time, `p90` travel time, and deadline misses.
+- `<model-output>.best.h5.meta.json`: aggregate and per-seed metadata for the best held-out checkpoint.
+
+This workflow is the recommended way to choose a deployment checkpoint.
+Inference itself does not learn; it only applies the checkpoint you trained.
+
+***Recent stability fixes reflected in the codebase***
+
+Loop and dead-end mitigation:
+- pre-commit loop/trap filtering,
+- ranked fallback selection instead of first-available fallback,
+- observe/cooldown flow for proactive lane changes,
+- active vs passive pending handling to avoid timing out healthy lane-now queueing.
+
+Hard-brake diagnostics:
+- emergency-brake telemetry is tracked as a stress/safety signal,
+- attribution is split across leader, congestion, near-junction, and residual cases,
+- recent decision attribution helps distinguish policy-caused stress from background traffic noise.
+
+Inference parity improvements:
+- `main.py` can now match training generation via `--spawn-interval` and `--seed`.
+- `QLearningController.should_control_vehicle(...)` now wakes the inference controller on the same structural `forced` and `open` decision cases that training evaluates, instead of relying on an extra near-junction heuristic gate.
+- Training now supports held-out frozen evaluation so checkpoint selection is based on deployment-style behavior instead of optimistic in-training rollouts.
+
+***Contribution guidance***
+
+Code:
+- Use pydoc-style function docstrings where appropriate.
+- Prefer concise comments for non-obvious logic.
+- Follow `lowercase_with_underscores` naming.
+
+Tests:
+- Add focused tests for important functions when feasible.
+- Put test files in the `test` directory.
+- For RL changes, prefer short smoke checks plus telemetry-based validation over long ad hoc debugging runs.

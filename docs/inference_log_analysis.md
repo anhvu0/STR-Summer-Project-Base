@@ -1,79 +1,77 @@
-# Inference Log Analysis: Dijkstra vs Q-Learning (main.py)
+# Inference Quality Analysis and Fix Summary
 
-## What the log shows
+Updated: April 21, 2026
 
-The log appears to include two back-to-back inference runs:
+## Problem
 
-1. **Dijkstra route controller** summary (first block).
-2. **Q-Learning route controller** summary (second block, beginning at `Testing Q Learning Route Controller`).
+The late rows in `rl_episode_metrics.csv` can look strong, but `main.py` inference can still perform much worse:
+- more teleports,
+- more hard braking,
+- more timeouts at step cap,
+- worse average and tail travel time.
 
-## High-level comparison
+## Root cause
 
-### Dijkstra (first run)
-- Vehicles reached destination: **10/10**.
-- Average timespan: **70.7**.
-- Deadlines missed: **0**.
-- Per-vehicle completion lines indicate all vehicles `40..49` finished successfully.
+The main issue was not that inference should keep learning.
+The issue was that training and deployment were being measured under different conditions.
 
-### Q-Learning (second run)
-- Vehicles reached destination: **9/10**.
-- Average timespan: **75.22222222222223**.
-- Deadlines missed: **0**.
-- `Vehicle 49 reaches the destination: False` indicates one failure.
+### 1. Training CSV was optimistic
 
-## Performance interpretation
+`rl_episode_metrics.csv` comes from training rollouts.
+During those episodes the training loop is still performing replay updates, so the policy is not fully frozen while the episode is being measured.
+That means late training rows can look better than the saved checkpoint behaves when reused later in deployment.
 
-Compared with Dijkstra, Q-Learning is currently:
-- **Less reliable** on this scenario (90% vs 100% success).
-- **Slightly slower** for successful trips on average (75.22 vs 70.7).
+### 2. Inference rollout cadence was more restrictive
 
-This suggests the Q policy is not yet stable/robust enough for inference-only deployment in this map/traffic setup.
+Training evaluates decision opportunities aggressively over the controlled set each step.
+Inference used a stricter wake-up rule and could skip some structural decision points that training would still process.
+That gap made deployment behavior worse even when the model weights themselves matched.
 
-## Behavioral diagnosis from route-choice traces
+### 3. Traffic generation had to be matched
 
-The Q-Learning section repeatedly logs `[OVERRIDE] ... chosen=... best_dir=...` immediately followed by
-`Choice ... is: <best_dir>`.
+If inference uses a different `spawn_interval` or seed regime than training, congestion severity changes and the policy may be judged on a harder distribution than the one it was trained on.
 
-This indicates the inference pipeline includes a **distance-based safety override** that corrects poor policy actions.
+## Fixes now reflected in the repo
 
-Observed issues:
-- **Oscillation / ping-pong behavior** at local edge pairs, especially:
-  - Vehicle 49 around `44884821#2` and `-44884821#2`, with visit counts climbing to 11.
-  - Vehicle 44 around `597602756#6/#7/#8` and reverse edges.
-  - Vehicle 46 around `597602756#5/#6/#7/#8` and reverse edges.
-- Frequent overrides where proposed action increases distance (`prop_d`) while `best_dir` has lower distance (`best_d`).
+### Inference-side parity fixes
 
-These patterns are consistent with either:
-- insufficient state representation (cannot disambiguate near-symmetric local states),
-- Q-values not fully converged in these intersections,
-- or action-value ties/noise causing unstable turn decisions.
+`main.py`
+- added `--spawn-interval`
+- added `--seed`
 
-## Why Vehicle 49 failed
+This lets inference reproduce the same vehicle-generation settings used in training.
 
-Vehicle 49 shows repeated loop-like transitions with increasing `visit=` counts in the same local area before final failure line.
-This strongly indicates the controller got trapped in a local oscillation and did not make net progress to destination.
+`controller/QLearningController.py`
+- `should_control_vehicle(...)` now wakes on the same structural `forced` and `open` decision cases that training evaluates.
+- active pending and edge-change handling remain intact.
 
-## GPU/NUMA messages
+This reduces training-vs-inference decision-cadence mismatch.
 
-TensorFlow NUMA warnings are informational in this environment:
-- `could not open file to read NUMA node`
-- `defaulting to 0`
+### Training-side deployment-quality fixes
 
-The model still initializes on GPU (`Created device ... NVIDIA GeForce RTX 3070`), so these messages are likely not the cause of routing quality problems.
+`core/rl_training_pipeline.py`
+- added configurable held-out frozen evaluation (`eval_every`, `eval_seeds`, `eval_spawn_interval`),
+- added `rl_frozen_eval_metrics.csv`,
+- added best-checkpoint saving to `<model-output>.best.h5`,
+- added metadata export to `<model-output>.best.h5.meta.json`.
 
-## Recommended next steps
+Frozen evaluation runs the current checkpoint without online learning and scores it on held-out seeds using the real inference controller.
 
-1. **Add anti-loop penalties** during training and/or inference:
-   - penalize revisits to recent edges,
-   - cap repeated traversals in a sliding window.
-2. **Strengthen progress-based shaping**:
-   - reward reduction in shortest-path distance to destination each step,
-   - penalize action when `prop_d > best_d`.
-3. **Use deterministic tie-breaking** for near-equal Q-values to avoid oscillation.
-4. **Keep override telemetry** and add per-vehicle counters (override ratio, unique edges visited, loop score).
-5. **Regression target** for this map: recover at least Dijkstra-level reliability (10/10) before optimizing travel time.
+## What to trust now
+
+Use these outputs for different questions:
+- `rl_episode_metrics.csv`: "Is training improving?"
+- `rl_frozen_eval_metrics.csv`: "How good is the saved checkpoint when deployed?"
+- `<model-output>.best.h5`: "Which checkpoint should I actually use for inference?"
+
+## Recommended workflow
+
+1. Train with held-out frozen evaluation enabled.
+2. Match inference `spawn_interval` and `seed` to the scenario you want to compare.
+3. Choose the best held-out checkpoint, not automatically the final checkpoint.
+4. Judge success by completion, timeout rate, average travel time, and `p90` travel time together.
 
 ## Bottom line
 
-From this log alone, Dijkstra is currently the better inference controller for this scenario.
-Q-Learning is close on average delay but still exhibits local cycling and one hard failure, which is unacceptable for parity with deterministic shortest-path routing.
+Inference does not learn online in the normal deployment path, and it should not be expected to.
+The correct way to make inference better is to train better, evaluate checkpoints in a truly frozen way, and deploy the checkpoint that already works well under frozen held-out evaluation.

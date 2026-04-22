@@ -10,6 +10,13 @@ import argparse
 from core.rl_training_pipeline import RLTrainingPipeline
 
 
+def parse_eval_seeds(raw_value):
+    raw_value = (raw_value or "").strip()
+    if not raw_value:
+        return []
+    return [int(token.strip()) for token in raw_value.split(",") if token.strip()]
+
+
 def build_parser():
     """
     Build the CLI argument parser.
@@ -27,6 +34,11 @@ def build_parser():
         help="Path to save the trained model.",
     )
     parser.add_argument(
+        "--best-model-output",
+        default="./configurations/model/rl_model_map.best.h5",
+        help="Optional path for the best held-out frozen-eval checkpoint. Defaults to <model-output>.best.h5.",
+    )
+    parser.add_argument(
         "--episodes",
         type=int,
         default=500,
@@ -37,6 +49,23 @@ def build_parser():
         type=float,
         default=2.0,
         help="Interval between vehicle spawns.",
+    )
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=25,
+        help="Run frozen held-out inference evaluation every N episodes. 0 disables frozen evaluation.",
+    )
+    parser.add_argument(
+        "--eval-seeds",
+        default="2,100,200",
+        help="Comma-separated held-out seeds for frozen inference evaluation.",
+    )
+    parser.add_argument(
+        "--eval-spawn-interval",
+        type=float,
+        default=2.0,
+        help="Optional spawn interval override for held-out frozen inference evaluation.",
     )
     return parser
 
@@ -52,8 +81,12 @@ def main():
     pipeline = RLTrainingPipeline(
         sumocfg_path=args.sumocfg,
         model_output_path=args.model_output,
+        best_model_output_path=args.best_model_output,
         episodes=args.episodes,
         spawn_interval=args.spawn_interval,
+        eval_every=args.eval_every,
+        frozen_eval_seeds=parse_eval_seeds(args.eval_seeds),
+        eval_spawn_interval=args.eval_spawn_interval,
     )
     pipeline.run()
 

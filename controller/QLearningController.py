@@ -1,4 +1,4 @@
-from controller.RouteController import RouteController
+﻿from controller.RouteController import RouteController
 from core.Util import ConnectionInfo, Vehicle
 from keras.models import load_model
 import numpy as np
@@ -327,48 +327,13 @@ class QLearningPolicy(RouteController):
             snapshot=snapshot,
         )
 
-        # Only ask for step-wise control near meaningful junction decision zones.
-        if len(context.edge_valid_actions) <= 1:
-            return False
-
-        reaction_distance = max(
-            float(self.decision_engine.base_reaction_distance),
-            float(snapshot.speed) * float(self.decision_engine.reaction_time_s),
-        )
-        near_threshold = reaction_distance + float(self.step_control_extra_buffer_m)
-        near_junction = float(context.dist_to_end) <= float(near_threshold)
-
-        commit_distance = max(
-            float(self.decision_engine.commit_min_distance),
-            float(snapshot.speed) * float(self.decision_engine.commit_time_s),
-        )
-        extra_buffer = max(6.0, 0.35 * float(self.decision_engine.lane_change_margin_m))
-        comfortable_dist_threshold = commit_distance + extra_buffer
-        proactive_control_threshold = max(
-            float(near_threshold),
-            float(comfortable_dist_threshold + 1.5 * float(self.decision_engine.lane_change_margin_m)),
-        )
-
-        lane_now = set(context.lane_feasible_now_actions)
-        proactive_candidates = [
-            a for a in context.available_actions
-            if (a not in lane_now and int(context.required_lane_shift.get(a, 99)) <= 1)
-        ]
-
-        cooldown_until = self._lane_change_cooldown.get((vid, current_edge), -1)
-        cooldown_active = int(step) < int(cooldown_until)
-
-        if proactive_candidates and not cooldown_active and float(context.dist_to_end) <= proactive_control_threshold:
-            self._metrics["step_control_lane_change_candidate"] += 1
+        # Match training more closely:
+        # - forced decisions are always evaluated
+        # - open decisions are always evaluated
+        # - everything else is left to edge-change / pending monitoring
+        decision_mode = self.shared_policy.classify_decision(context)
+        if decision_mode.mode in {"forced", "open"}:
             return True
-
-        if not near_junction:
-            return False
-
-        if self.decision_engine.is_decision_open(context):
-            self._metrics["step_control_near_junction"] += 1
-            return True
-
         return False
     #----------------------------------------------------------------------
 
@@ -732,5 +697,8 @@ class QLearningPolicy(RouteController):
             legacy_aux_features=deadline_features,
             legacy_density_values=[self._edge_density(edge_id) for edge_id in self.connection_info.edge_list] if not self.use_compact_state else None,
         )
+
+
+
 
 

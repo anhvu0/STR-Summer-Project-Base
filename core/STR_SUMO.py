@@ -13,6 +13,7 @@ else:
 
 import traci
 import sumolib
+import numpy as np
 from controller.RouteController import *
 
 """
@@ -42,16 +43,27 @@ class StrSumo:
         self.controlled_vehicles =  controlled_vehicles # dictionary of Vehicles by id
         #print(self.controlled_vehicles)
 
-    def run(self):
+    def run(self, verbose=True, return_stats=False):
         """
-        Runs the SUMO simulation
-        At each time-step, cars that have moved edges make a decision based on user-supplied scheduler algorithm
-        Decisions are enforced in SUMO by setting the destination of the vehicle to the result of the
-        :returns: total time, number of cars that reached their destination, number of deadlines missed
+        Runs the SUMO simulation.
+
+        At each time-step, cars that have moved edges make a decision based on the user-supplied scheduler algorithm.
+
+        Args:
+            verbose: If False, suppress per-vehicle arrival and timeout prints.
+            return_stats: If True, append a stats dictionary to the return tuple.
+
+        Returns:
+            By default: (total_time, number_reached_destination, deadlines_missed_count)
+            If return_stats=True: (..., stats_dict)
         """
         total_time = 0
         end_number = 0
         deadlines_missed = []
+        completed_travel_times = []
+        arrived_controlled_ids = set()
+        alive_at_step_cap_ids = set()
+        step_limit_reached = False
 
         step = 0
         vehicles_to_direct = [] #  the batch of controlled vehicles passed to make_decisions()
@@ -72,8 +84,6 @@ class StrSumo:
 
                     #should not be added because there is no corresponding -1, this makes edge_vehicle_count becomes the total number of vehicles that used to be on this edge.
                     #self.connection_info.edge_vehicle_count[traci.vehicle.getRoadID(vehicle_id)] += 1
-                    
-                    
 
                     # handle newly arrived controlled vehicles
                     if vehicle_id not in vehicle_IDs_in_simulation and vehicle_id in self.controlled_vehicles:
@@ -114,14 +124,7 @@ class StrSumo:
                 #print(len(vehicles_to_direct))
                 vehicle_decisions_by_id = self.route_controller.make_decisions(vehicles_to_direct, self.connection_info)
                 for vehicle_id, route_decision in vehicle_decisions_by_id.items():
-                    # if decision not in self.connection_info.outgoing_edges_dict[self.controlled_vehicles[vehicle_id].current_edge]:
-                    #     raise ValueError(f'{decision} does not lead to a valid edge from edge '
-                    #                      f'{self.controlled_vehicles[vehicle_id].current_edge}')
-                    #
-                    # current_edge_of_vehicle = self.controlled_vehicles[vehicle_id].current_edge
-                    # target_edge = self.connection_info.outgoing_edges_dict[current_edge_of_vehicle][decision]
                     if vehicle_id in traci.vehicle.getIDList():
-                        #print("Changing the target of {} to {} with length {}".format(vehicle_id, local_target_edge, self.connection_info.edge_length_dict[local_target_edge]))
                         try:
                             if isinstance(route_decision, (list, tuple)) and len(route_decision) >= 2:
                                 # Preferred path: apply one contiguous explicit route.
@@ -147,35 +150,63 @@ class StrSumo:
 
                 for vehicle_id in arrived_at_destination:
                     if vehicle_id in self.controlled_vehicles:
-                        #print the raw result out to the terminal
-                        arrived_at_destination = True
                         end_number += 1
+                        arrived_controlled_ids.add(vehicle_id)
                         time_span = step - self.controlled_vehicles[vehicle_id].start_time
+                        completed_travel_times.append(float(time_span))
                         total_time += time_span
                         miss = False
                         if step > self.controlled_vehicles[vehicle_id].deadline:
                             deadlines_missed.append(vehicle_id)
                             miss = True
-                        print("Vehicle {} reaches the destination: {}, timespan: {}, deadline missed: {}"\
-                            .format(vehicle_id, arrived_at_destination, time_span, miss))
-                        #if not arrived_at_destination:
-                            #print("{} - {}".format(self.controlled_vehicles[vehicle_id].local_destination, self.controlled_vehicles[vehicle_id].destination))
-                #  for x  in self.edge_list:
-                        #44884008#2
-                        #traci.getLastStepVehicleNumber(x)
+                        if verbose:
+                            print("Vehicle {} reaches the destination: {}, timespan: {}, deadline missed: {}"                                .format(vehicle_id, True, time_span, miss))
                 traci.simulationStep()
                 step += 1
 
                 if step > MAX_SIMULATION_STEPS:
-                    print('Ending due to timeout.')
+                    step_limit_reached = True
+                    alive_at_step_cap_ids = set()
+                    for vehicle_id in traci.vehicle.getIDList():
+                        if vehicle_id not in self.controlled_vehicles:
+                            continue
+                        try:
+                            current_edge = traci.vehicle.getRoadID(vehicle_id)
+                        except traci.TraCIException:
+                            continue
+                        if current_edge != self.controlled_vehicles[vehicle_id].destination:
+                            alive_at_step_cap_ids.add(vehicle_id)
+                    if verbose:
+                        print('Ending due to timeout.')
                     break
 
         except ValueError as err:
-            print('Exception caught.')
-            print(err)
+            if verbose:
+                print('Exception caught.')
+                print(err)
 
         num_deadlines_missed = len(deadlines_missed)
+        total_controlled = max(len(self.controlled_vehicles), 1)
+        avg_travel_time = (float(total_time) / float(end_number)) if end_number > 0 else float('inf')
+        p50_travel_time = (float(np.percentile(completed_travel_times, 50)) if completed_travel_times else float('inf'))
+        p90_travel_time = (float(np.percentile(completed_travel_times, 90)) if completed_travel_times else float('inf'))
+        stats = {
+            'completion_rate': float(end_number) / float(total_controlled),
+            'avg_travel_time': avg_travel_time,
+            'p50_travel_time': p50_travel_time,
+            'p90_travel_time': p90_travel_time,
+            'deadlines_missed': num_deadlines_missed,
+            'vehicles_reached_destination': int(end_number),
+            'controlled_vehicle_count': int(len(self.controlled_vehicles)),
+            'completed_travel_times': completed_travel_times,
+            'step_limit_reached': bool(step_limit_reached),
+            'alive_at_step_cap': int(len(alive_at_step_cap_ids)),
+            'timeout_rate': float(len(alive_at_step_cap_ids)) / float(total_controlled),
+            'max_step': int(step),
+        }
 
+        if return_stats:
+            return total_time, end_number, num_deadlines_missed, stats
         return total_time, end_number, num_deadlines_missed
 
     def get_edge_vehicle_counts(self):

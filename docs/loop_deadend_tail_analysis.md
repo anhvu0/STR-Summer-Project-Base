@@ -1,110 +1,128 @@
-# Loop / Dead-end Tail Failure Analysis Notes
+# Loop / Dead-end / Tail Failure Analysis Notes
 
-Updated: April 14, 2026
+Updated: April 21, 2026
 
 ## Scope
 
 Use this note when analyzing runs where:
+- completion drops after strong early progress,
+- a small tail of vehicles takes extremely long to finish,
+- loop and dead-end signals stay high,
+- or emergency-brake / teleport signals spike together with pending churn.
 
-- completion drops after early progress,
-- a few vehicles take very long to finish,
-- or `fail_timeout` grows while many decisions are still being opened.
-
-This note is context for training + inference behavior in:
-
+This note applies to:
 - `core/junction_decision_engine.py`
+- `core/shared_decision_policy.py`
 - `core/rl_training_pipeline.py`
 - `controller/QLearningController.py`
 
-## What changed recently
+## What changed
 
-Recent routing-control patches introduced:
+The current mitigation stack is built from several layers rather than one single fix.
 
-1. Lane-change observe/cooldown state flow (observe first, commit later).
-2. Pre-commit loop/trap filter (`prefilter_action_for_loops`).
-3. Ranked fallback selection (`ranked_fallback_actions`) instead of simple first-available fallback.
-4. Additional metrics for observe, fallback, cooldown, and loop/dead-end overrides.
-5. Lane-change attempt/success/fail counters wired in training logs.
+Loop and trap mitigation:
+1. `prefilter_action_for_loops` blocks obviously bad short-cycle, dead-end-reentry, and trap-like actions before they are committed.
+2. `ranked_fallback_actions` replaces first-available fallback behavior with a more stable ranked fallback search.
+3. observe/cooldown flow limits repeated proactive lane-change chasing on the same edge.
+4. active vs passive pending handling stops healthy lane-now queueing from being miscounted as a stale failed decision.
 
-## Important interpretation
+Inference-alignment mitigation:
+1. unified route application keeps training and inference on the same SUMO route-commit semantics.
+2. `QLearningController.should_control_vehicle(...)` now wakes inference on the same structural `forced` and `open` decision cases that training evaluates.
+3. held-out frozen evaluation now measures deployment-style behavior directly during training.
 
-These changes are **mitigations**, not a formal proof that loops/dead-end reentry are solved.
+These changes reduce fallback churn and tail instability, but they are still mitigations rather than a proof that loops are impossible.
 
-- If `loop_events` / `dead_end_reentry_events` remain high, that indicates persistent local-minima behavior.
-- High `override_ratio` with high `fallback_overrides` usually means the policy is repeatedly being corrected away from unsafe or low-quality decisions.
-- Good early completion with bad tail completion usually indicates a small subset of vehicles trapped in recurrent fallback/cooldown patterns.
+## How to read the failure modes
 
-## Minimum metric set to inspect together
+### Pattern A: high loop events plus high fallback churn
 
-Track these per episode and rolling windows:
+Likely cause:
+- the policy is repeatedly entering a locally safe but globally poor continuation under congestion.
 
-- `completion_rate`
-- `avg_travel_time`, `p50_travel_time`, `p90_travel_time`
+Inspect together:
 - `loop_events`
 - `short_cycle_events`
 - `aba_bounce_events`
 - `dead_end_reentry_events`
-- `loop_override_count`
-- `dead_end_reentry_override_count`
 - `fallback_overrides`
 - `fallback_to_lane_feasible_now`
-- `cooldown_replans_blocked`
+- `loop_after_fallback_rate`
+
+### Pattern B: high pending timeout plus low completion
+
+Likely cause:
+- proactive decisions are being opened, deferred, or released too often without enough real progress.
+
+Inspect together:
 - `pending_decision_timeouts`
-- `decision_pending_at_episode_end`
+- `pending_release_route_no_progress_abort`
+- `pending_release_route_stall_timeout`
+- `deferred_lane_change_actions`
+- `cooldown_replans_blocked`
 - `fail_timeout`
-- `teleported_controlled`
 
-## Quick diagnosis patterns
-
-### Pattern A: High overrides + high fallback + high dead_end_reentry
+### Pattern C: emergency-brake spike without matching collision/teleport spike
 
 Likely cause:
+- the controller is still finishing routes, but the local control sequence is creating stress near merges, leader interactions, or commit windows.
 
-- fallback ranking still collapses to locally safe but globally poor continuation under congestion.
+Inspect together:
+- `emergency_brake_events`
+- `emergency_brake_due_to_leader`
+- `emergency_brake_due_to_congestion`
+- `emergency_brake_near_junction`
+- `emergency_brake_after_fallback`
+- `emergency_brake_after_proactive`
+- `emergency_brake_after_lane_now`
 
-Check:
+Important guardrail:
+- treat emergency-brake metrics as stress indicators, not as a direct crash count.
 
-- whether fallback candidate diversity is low,
-- whether same edge repeats dominate recent history for tail vehicles.
+## Training-vs-inference guardrail
 
-### Pattern B: High pending timeout + low lane_change_success
+Do not diagnose deployment quality from `rl_episode_metrics.csv` alone.
+Late training episodes can look better than deployment because training still performs replay updates during the episode.
+Use held-out frozen evaluation instead:
+- `rl_frozen_eval_metrics.csv`
+- best checkpoint `<model-output>.best.h5`
+- best-checkpoint metadata `<model-output>.best.h5.meta.json`
 
-Likely cause:
+If training looks strong but frozen eval is weak, the issue is generalization or rollout mismatch, not that inference should keep learning.
 
-- observe windows are too permissive for low-speed/high-density areas or commit windows are reached too late.
+## Minimum metric set to inspect together
 
-Check:
+- `completion_rate`
+- `avg_travel_time`
+- `p50_travel_time`
+- `p90_travel_time`
+- `timeout_rate`
+- `pending_decision_timeouts`
+- `deferred_lane_change_actions`
+- `loop_events`
+- `dead_end_reentry_events`
+- `fallback_to_lane_feasible_now`
+- `loop_after_fallback_rate`
+- `emergency_brake_events`
+- `fail_timeout`
+- `controlled_teleport_rate`
 
-- `lane_change_observe_abort_no_progress`
-- `lane_change_observe_abort_commit_window`
-- `same_edge_pending_released_no_progress`
-
-### Pattern C: Early completion strong, tail fails at step cap
-
-Likely cause:
-
-- policy works for easy flows but oscillates for hard congestion pockets.
-
-Check:
-
-- episodes with high `cooldown_replans_blocked` and repeated overrides near the end.
-
-## Suggested reporting template
+## Reporting template
 
 When posting run analysis, include:
+1. episode range or evaluation seeds,
+2. whether the numbers come from training rollout or frozen eval,
+3. the minimum metric set above,
+4. one-sentence diagnosis,
+5. the next tuning hypothesis.
 
-1. Episode range and seeds.
-2. Rolling metrics (`completion_rate`, `avg_travel_time`, `fail_timeout`).
-3. Tail-focused safety metrics (loop/dead-end/fallback/cooldown).
-4. One sentence diagnosis:
-   - "policy under-explores",
-   - "fallback churn dominates",
-   - or "lane-change observe too slow/too lenient".
-5. Next tuning hypothesis with expected metric movement.
+## Bottom line
 
-## Reminder for future patches
+The current loop fix is not a single if-statement.
+It is the combination of:
+- safer action prefiltering,
+- better ranked fallbacks,
+- stricter pending lifecycle handling,
+- and closer training/inference control alignment.
 
-- Keep training and inference semantics aligned for observe/fallback/cooldown.
-- Do not report dead-end problem as "fixed" unless both:
-  - dead-end telemetry stabilizes at low values across rolling windows, and
-  - tail timeouts (`fail_timeout`) remain low under varied seeds.
+Judge success on lower travel time and higher completion without worsening the tail, timeout, and emergency-brake stress signals.

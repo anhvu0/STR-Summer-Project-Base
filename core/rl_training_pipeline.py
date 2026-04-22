@@ -13,6 +13,8 @@ from keras.optimizers import Adam
 from collections import defaultdict, deque
 import random
 from controller.RouteController import RouteController
+from controller.QLearningController import QLearningPolicy
+from core.STR_SUMO import StrSumo
 from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision, VehicleSnapshot
 from core.shared_decision_policy import SharedDecisionPolicy
 from core.Util import ConnectionInfo
@@ -407,6 +409,7 @@ class RLTrainingPipeline:
         self,
         sumocfg_path,
         model_output_path,
+        best_model_output_path=None,
         episodes=10,
         spawn_interval=4.0,
         seed_with_episode=True,
@@ -433,11 +436,15 @@ class RLTrainingPipeline:
         route_difficulty_scale_max=1.0,
         decision_debug_csv_path=None,
         fast_training_profile=False,
+        eval_every=0,
+        frozen_eval_seeds=None,
+        eval_spawn_interval=None,
     ):
         """
         Args:
             sumocfg_path: SUMO config file path.
-            model_output_path: Path to save the trained model.
+            model_output_path: Path to save the final trained model.
+            best_model_output_path: Optional path for the best held-out frozen-eval checkpoint.
             episodes: Number of training episodes.
             spawn_interval: Interval between vehicle spawns.
             seed_with_episode: Whether to use the episode number as random seed.
@@ -452,8 +459,15 @@ class RLTrainingPipeline:
         """
         self.sumocfg_path = sumocfg_path
         self.model_output_path = model_output_path
+        self.best_model_output_path = best_model_output_path or self._default_best_model_output_path(model_output_path)
         self.episodes = episodes
-        self.spawn_interval = spawn_interval
+        self.spawn_interval = float(spawn_interval)
+        self.eval_every = max(int(eval_every), 0)
+        default_eval_seeds = self._default_frozen_eval_seeds() if self.eval_every > 0 else []
+        self.frozen_eval_seeds = [int(seed) for seed in (frozen_eval_seeds or default_eval_seeds)]
+        self.eval_spawn_interval = float(eval_spawn_interval) if eval_spawn_interval is not None else float(self.spawn_interval)
+        self._best_frozen_eval_key = None
+        self._best_frozen_eval_summary = None
         self.seed_with_episode = seed_with_episode
         self.destination_reward = destination_reward
         self.teleport_penalty = teleport_penalty
@@ -546,6 +560,9 @@ class RLTrainingPipeline:
         self.state_size = self.shared_policy.compact_state_size
         self.action_size = 6
         self.metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_episode_metrics.csv")
+        self.frozen_eval_metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_frozen_eval_metrics.csv")
+        self.best_model_metadata_path = self.best_model_output_path + ".meta.json"
+        self._frozen_eval_model_path = self._default_best_model_output_path(self.model_output_path).replace(".best", ".frozen_eval_current")
         self._density_vec = np.zeros(len(self.connection_info.edge_list), dtype=np.float32)
         self._density_mean = 0.0
         self._density_std = 0.0
@@ -1594,19 +1611,187 @@ class RLTrainingPipeline:
         )
         return self._clip_reward(reward)
 
-    def generate_episode_vehicles(self, episode_seed=None):
+    def _default_best_model_output_path(self, model_output_path):
+        root, ext = os.path.splitext(model_output_path)
+        if ext:
+            return f"{root}.best{ext}"
+        return model_output_path + ".best"
+
+    def _default_frozen_eval_seeds(self):
+        return [1001, 1002, 1003]
+
+    def _frozen_eval_csv_fields(self):
+        return [
+            "episode",
+            "seed_count",
+            "seed_list",
+            "spawn_interval",
+            "completion_rate_mean",
+            "avg_travel_time_mean",
+            "p50_travel_time_mean",
+            "p90_travel_time_mean",
+            "timeout_rate_mean",
+            "deadlines_missed_mean",
+            "vehicles_reached_destination_mean",
+            "controlled_vehicle_count_mean",
+            "best_checkpoint_updated",
+            "score_key",
+        ]
+
+    def _ensure_frozen_eval_csv_header(self):
+        if self.eval_every <= 0:
+            return
+        with open(self.frozen_eval_metrics_csv_path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=self._frozen_eval_csv_fields()).writeheader()
+
+    def _safe_eval_metric(self, value, default=1.0e9):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not np.isfinite(numeric):
+            return float(default)
+        return numeric
+
+    def _frozen_eval_score_key(self, summary):
+        return (
+            1.0 - float(np.clip(summary.get("completion_rate_mean", 0.0), 0.0, 1.0)),
+            self._safe_eval_metric(summary.get("timeout_rate_mean", 1.0)),
+            self._safe_eval_metric(summary.get("avg_travel_time_mean", float("inf"))),
+            self._safe_eval_metric(summary.get("p90_travel_time_mean", float("inf"))),
+            self._safe_eval_metric(summary.get("deadlines_missed_mean", float("inf"))),
+        )
+
+    def _append_frozen_eval_row(self, row):
+        if self.eval_every <= 0:
+            return
+        fields = self._frozen_eval_csv_fields()
+        serializable_row = {field: row.get(field, "") for field in fields}
+        with open(self.frozen_eval_metrics_csv_path, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=fields).writerow(serializable_row)
+
+    def _save_best_frozen_checkpoint(self, episode, aggregate_summary, per_seed_rows):
+        score_key = self._frozen_eval_score_key(aggregate_summary)
+        improved = self._best_frozen_eval_key is None or score_key < self._best_frozen_eval_key
+        if not improved:
+            return False, score_key
+
+        os.makedirs(os.path.dirname(self.best_model_output_path) or ".", exist_ok=True)
+        self.trainer.model.save(self.best_model_output_path, overwrite=True)
+        metadata = {
+            "episode": int(episode),
+            "score_key": list(score_key),
+            "aggregate": aggregate_summary,
+            "per_seed": per_seed_rows,
+        }
+        with open(self.best_model_metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        self._best_frozen_eval_key = score_key
+        self._best_frozen_eval_summary = metadata
+        return True, score_key
+
+    def _run_frozen_inference_eval(self, episode, sumo_binary):
+        if self.eval_every <= 0:
+            return None
+
+        os.makedirs(os.path.dirname(self._frozen_eval_model_path) or ".", exist_ok=True)
+        self.trainer.model.save(self._frozen_eval_model_path, overwrite=True)
+
+        per_seed_rows = []
+        for eval_seed in self.frozen_eval_seeds:
+            vehicles = self.generate_episode_vehicles(
+                episode_seed=int(eval_seed),
+                spawn_interval_override=self.eval_spawn_interval,
+            )
+            policy = QLearningPolicy(
+                vehicles,
+                self.connection_info,
+                self._frozen_eval_model_path,
+                net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
+            )
+            simulation = StrSumo(policy, self.connection_info, vehicles)
+            try:
+                traci.start([
+                    sumo_binary,
+                    "-c", self.sumocfg_path,
+                    "--quit-on-end",
+                    "--no-step-log",
+                    "--no-warnings",
+                ])
+                _, _, _, stats = simulation.run(verbose=False, return_stats=True)
+            finally:
+                try:
+                    traci.close()
+                except Exception:
+                    pass
+            per_seed_rows.append({
+                "seed": int(eval_seed),
+                "completion_rate": float(stats["completion_rate"]),
+                "avg_travel_time": float(stats["avg_travel_time"]),
+                "p50_travel_time": float(stats["p50_travel_time"]),
+                "p90_travel_time": float(stats["p90_travel_time"]),
+                "timeout_rate": float(stats["timeout_rate"]),
+                "deadlines_missed": float(stats["deadlines_missed"]),
+                "vehicles_reached_destination": float(stats["vehicles_reached_destination"]),
+                "controlled_vehicle_count": float(stats["controlled_vehicle_count"]),
+            })
+
+        def mean_metric(key, default=0.0):
+            values = [float(row[key]) for row in per_seed_rows]
+            if not values:
+                return float(default)
+            return float(np.mean(values))
+
+        aggregate_summary = {
+            "episode": int(episode),
+            "seed_count": int(len(per_seed_rows)),
+            "seed_list": ",".join(str(row["seed"]) for row in per_seed_rows),
+            "spawn_interval": float(self.eval_spawn_interval),
+            "completion_rate_mean": mean_metric("completion_rate", 0.0),
+            "avg_travel_time_mean": mean_metric("avg_travel_time", float("inf")),
+            "p50_travel_time_mean": mean_metric("p50_travel_time", float("inf")),
+            "p90_travel_time_mean": mean_metric("p90_travel_time", float("inf")),
+            "timeout_rate_mean": mean_metric("timeout_rate", 1.0),
+            "deadlines_missed_mean": mean_metric("deadlines_missed", float("inf")),
+            "vehicles_reached_destination_mean": mean_metric("vehicles_reached_destination", 0.0),
+            "controlled_vehicle_count_mean": mean_metric("controlled_vehicle_count", 0.0),
+        }
+        improved, score_key = self._save_best_frozen_checkpoint(
+            episode,
+            aggregate_summary,
+            per_seed_rows,
+        )
+        aggregate_summary["best_checkpoint_updated"] = int(improved)
+        aggregate_summary["score_key"] = "|".join(f"{value:.6f}" for value in score_key)
+        self._append_frozen_eval_row(aggregate_summary)
+        print(
+            "[EP {:03d} FROZEN_EVAL] seeds={} spawn_interval={:.2f} completion={:.3f} avg_tt={:.2f} p90={:.2f} timeout={:.3f} best={}".format(
+                int(episode),
+                aggregate_summary["seed_list"],
+                float(self.eval_spawn_interval),
+                aggregate_summary["completion_rate_mean"],
+                aggregate_summary["avg_travel_time_mean"],
+                aggregate_summary["p90_travel_time_mean"],
+                aggregate_summary["timeout_rate_mean"],
+                "yes" if improved else "no",
+            )
+        )
+        return aggregate_summary
+
+    def generate_episode_vehicles(self, episode_seed=None, spawn_interval_override=None):
         """
         Generate controlled and uncontrolled vehicles for one training episode.
         """
         generator = target_vehicles_generator(os.path.join(self.sumocfg_dir, self.net_file))
         route_path = os.path.join(self.sumocfg_dir, self.route_file)
+        spawn_interval_value = self.spawn_interval if spawn_interval_override is None else float(spawn_interval_override)
         vehicle_list = generator.generate_vehicles(
             num_target_vehicles=100,
             num_random_vehicles=100,
             pattern=self.target_pattern,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
-            spawn_interval=self.spawn_interval,
+            spawn_interval=spawn_interval_value,
             seed=episode_seed,
         )
         if vehicle_list is None:
@@ -1695,6 +1880,7 @@ class RLTrainingPipeline:
         with open(self.metrics_csv_path, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=csv_fields).writeheader()
         self._ensure_decision_debug_csv_header()
+        self._ensure_frozen_eval_csv_header()
 
         # MAX_CACHE_SIZE = 5000
 
@@ -3393,7 +3579,24 @@ class RLTrainingPipeline:
                         raise ValueError("rl_episode_metrics.csv row schema does not match header")
                     writer.writerow(row)
 
+                should_run_frozen_eval = (
+                    self.eval_every > 0
+                    and (
+                        ((episode + 1) % self.eval_every == 0)
+                        or (episode == self.episodes - 1)
+                    )
+                )
+                if should_run_frozen_eval:
+                    self._run_frozen_inference_eval(episode, sumo_binary)
+
         self.trainer.model.save(self.model_output_path)
+        if self._best_frozen_eval_summary is not None:
+            print(
+                "Best frozen-eval checkpoint saved to {} (episode {}).".format(
+                    self.best_model_output_path,
+                    self._best_frozen_eval_summary["episode"],
+                )
+            )
 
     def update_edge_vehicle_counts(self, step, every=10):
         if hasattr(self, "_last_density_step") and (step - self._last_density_step) < every:
