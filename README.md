@@ -72,11 +72,12 @@ What the outputs mean:
 - `rl_episode_metrics.csv`: training-rollout metrics. These runs still include replay updates during the episode, so they are useful for training trends but are not a pure deployment-quality inference measure.
 - `rl_frozen_eval_metrics.csv`: held-out frozen evaluation metrics. These runs use the saved checkpoint with no online learning and average results across held-out seeds.
 - `<model-output>`: the final checkpoint at the end of training.
-- `<model-output>.best.h5`: the best held-out frozen-eval checkpoint, selected by completion rate first, then timeout rate, average travel time, `p90` travel time, and deadline misses.
+- `<model-output>.best.h5`: the best held-out frozen-eval checkpoint, selected by completion rate first, then timeout rate, average travel time, `p90` travel time, tail gap, tail spread ratio, and deadline misses.
 - `<model-output>.best.h5.meta.json`: aggregate and per-seed metadata for the best held-out checkpoint.
 
 This workflow is the recommended way to choose a deployment checkpoint.
 Inference itself does not learn; it only applies the checkpoint you trained.
+`main.py` now prefers the best frozen-eval checkpoint automatically and falls back to the final checkpoint if no best checkpoint exists yet.
 
 ***Recent stability fixes reflected in the codebase***
 

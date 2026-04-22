@@ -190,6 +190,28 @@ class StrSumo:
         avg_travel_time = (float(total_time) / float(end_number)) if end_number > 0 else float('inf')
         p50_travel_time = (float(np.percentile(completed_travel_times, 50)) if completed_travel_times else float('inf'))
         p90_travel_time = (float(np.percentile(completed_travel_times, 90)) if completed_travel_times else float('inf'))
+        if completed_travel_times:
+            tail_travel_times = [tt for tt in completed_travel_times if tt >= p90_travel_time]
+        else:
+            tail_travel_times = []
+        unfinished_count = int(len(alive_at_step_cap_ids))
+        tail_vehicles_over_p90_count = int(len(tail_travel_times) + unfinished_count)
+        tail_reference = (
+            float(np.mean(tail_travel_times))
+            if tail_travel_times else (p90_travel_time if np.isfinite(p90_travel_time) else float(step))
+        )
+        if unfinished_count > 0:
+            # Treat unresolved controlled vehicles as long-tail outcomes when
+            # summarizing frozen inference behavior.
+            tail_reference = (
+                (tail_reference * len(tail_travel_times)) + (float(step) * unfinished_count)
+            ) / max(len(tail_travel_times) + unfinished_count, 1)
+        p50_baseline = p50_travel_time if np.isfinite(p50_travel_time) else 0.0
+        tail_completion_gap_steps = float(max(tail_reference - p50_baseline, 0.0))
+        p95_to_p50_travel_ratio = (
+            float(np.percentile(completed_travel_times, 95) / max(p50_travel_time, 1e-6))
+            if completed_travel_times else float('inf')
+        )
         stats = {
             'completion_rate': float(end_number) / float(total_controlled),
             'avg_travel_time': avg_travel_time,
@@ -202,6 +224,9 @@ class StrSumo:
             'step_limit_reached': bool(step_limit_reached),
             'alive_at_step_cap': int(len(alive_at_step_cap_ids)),
             'timeout_rate': float(len(alive_at_step_cap_ids)) / float(total_controlled),
+            'tail_vehicles_over_p90_count': tail_vehicles_over_p90_count,
+            'tail_completion_gap_steps': tail_completion_gap_steps,
+            'p95_to_p50_travel_ratio': p95_to_p50_travel_ratio,
             'max_step': int(step),
         }
 

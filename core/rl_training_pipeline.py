@@ -300,15 +300,61 @@ class DQNTrainer:
             (state, action, reward, next_state, done, next_valid_actions, metadata)
         )
 
-    def _episode_bucket(self, avg_tt, avg_return, completion_rate, teleported_controlled):
+    def _episode_bucket(
+        self,
+        avg_tt,
+        avg_return,
+        completion_rate,
+        teleported_controlled,
+        timeout_rate=0.0,
+        tail_completion_gap_steps=0.0,
+        p95_to_p50_travel_ratio=0.0,
+    ):
         if avg_tt < 240 and completion_rate >= 0.99 and teleported_controlled <= 2:
-            return "good"
-        if avg_tt < 280 and completion_rate >= 0.97 and teleported_controlled <= 5:
-            return "okay"
-        return "bad"
+            bucket = "good"
+        elif avg_tt < 280 and completion_rate >= 0.97 and teleported_controlled <= 5:
+            bucket = "okay"
+        else:
+            bucket = "bad"
 
-    def flush_staged_episode(self, avg_tt, avg_return, completion_rate, teleported_controlled):
-        bucket = self._episode_bucket(avg_tt, avg_return, completion_rate, teleported_controlled)
+        # Keep replay curation aligned with the travel-time objective while
+        # filtering episodes with clearly unstable long tails.
+        timeout_rate = float(timeout_rate)
+        tail_completion_gap_steps = float(tail_completion_gap_steps)
+        p95_to_p50_travel_ratio = float(p95_to_p50_travel_ratio)
+        if timeout_rate > 0.0:
+            return "bad"
+        if bucket == "good" and (
+            tail_completion_gap_steps > 360.0
+            or p95_to_p50_travel_ratio > 2.8
+        ):
+            return "okay"
+        if bucket in {"good", "okay"} and (
+            tail_completion_gap_steps > 460.0
+            or p95_to_p50_travel_ratio > 3.2
+        ):
+            return "bad"
+        return bucket
+
+    def flush_staged_episode(
+        self,
+        avg_tt,
+        avg_return,
+        completion_rate,
+        teleported_controlled,
+        timeout_rate=0.0,
+        tail_completion_gap_steps=0.0,
+        p95_to_p50_travel_ratio=0.0,
+    ):
+        bucket = self._episode_bucket(
+            avg_tt,
+            avg_return,
+            completion_rate,
+            teleported_controlled,
+            timeout_rate=timeout_rate,
+            tail_completion_gap_steps=tail_completion_gap_steps,
+            p95_to_p50_travel_ratio=p95_to_p50_travel_ratio,
+        )
         for state, action, reward, next_state, done, next_valid_actions, metadata in self.staged_episode_transitions:
             metadata = dict(metadata) if isinstance(metadata, dict) else {}
             metadata["episode_bucket"] = bucket
@@ -1631,6 +1677,8 @@ class RLTrainingPipeline:
             "p50_travel_time_mean",
             "p90_travel_time_mean",
             "timeout_rate_mean",
+            "tail_completion_gap_steps_mean",
+            "p95_to_p50_travel_ratio_mean",
             "deadlines_missed_mean",
             "vehicles_reached_destination_mean",
             "controlled_vehicle_count_mean",
@@ -1659,6 +1707,8 @@ class RLTrainingPipeline:
             self._safe_eval_metric(summary.get("timeout_rate_mean", 1.0)),
             self._safe_eval_metric(summary.get("avg_travel_time_mean", float("inf"))),
             self._safe_eval_metric(summary.get("p90_travel_time_mean", float("inf"))),
+            self._safe_eval_metric(summary.get("tail_completion_gap_steps_mean", float("inf"))),
+            self._safe_eval_metric(summary.get("p95_to_p50_travel_ratio_mean", float("inf"))),
             self._safe_eval_metric(summary.get("deadlines_missed_mean", float("inf"))),
         )
 
@@ -1731,6 +1781,8 @@ class RLTrainingPipeline:
                 "p50_travel_time": float(stats["p50_travel_time"]),
                 "p90_travel_time": float(stats["p90_travel_time"]),
                 "timeout_rate": float(stats["timeout_rate"]),
+                "tail_completion_gap_steps": float(stats["tail_completion_gap_steps"]),
+                "p95_to_p50_travel_ratio": float(stats["p95_to_p50_travel_ratio"]),
                 "deadlines_missed": float(stats["deadlines_missed"]),
                 "vehicles_reached_destination": float(stats["vehicles_reached_destination"]),
                 "controlled_vehicle_count": float(stats["controlled_vehicle_count"]),
@@ -1752,6 +1804,8 @@ class RLTrainingPipeline:
             "p50_travel_time_mean": mean_metric("p50_travel_time", float("inf")),
             "p90_travel_time_mean": mean_metric("p90_travel_time", float("inf")),
             "timeout_rate_mean": mean_metric("timeout_rate", 1.0),
+            "tail_completion_gap_steps_mean": mean_metric("tail_completion_gap_steps", float("inf")),
+            "p95_to_p50_travel_ratio_mean": mean_metric("p95_to_p50_travel_ratio", float("inf")),
             "deadlines_missed_mean": mean_metric("deadlines_missed", float("inf")),
             "vehicles_reached_destination_mean": mean_metric("vehicles_reached_destination", 0.0),
             "controlled_vehicle_count_mean": mean_metric("controlled_vehicle_count", 0.0),
@@ -3244,6 +3298,9 @@ class RLTrainingPipeline:
                     avg_return=avg_return_per_vehicle,
                     completion_rate=completion_rate,
                     teleported_controlled=len(teleported_controlled_ids),
+                    timeout_rate=timeout_rate,
+                    tail_completion_gap_steps=tail_completion_gap_steps,
+                    p95_to_p50_travel_ratio=p95_to_p50_travel_ratio,
                 )
                 self.trainer.epsilon = max(
                     self.trainer.epsilon_min,

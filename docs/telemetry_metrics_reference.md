@@ -120,6 +120,8 @@ Current fields:
 - `p50_travel_time_mean`
 - `p90_travel_time_mean`
 - `timeout_rate_mean`
+- `tail_completion_gap_steps_mean`
+- `p95_to_p50_travel_ratio_mean`
 - `deadlines_missed_mean`
 - `vehicles_reached_destination_mean`
 - `controlled_vehicle_count_mean`
@@ -131,7 +133,9 @@ Checkpoint ranking priority:
 2. lower timeout rate,
 3. lower average travel time,
 4. lower `p90` travel time,
-5. lower deadline misses.
+5. lower tail completion gap,
+6. lower `p95`/`p50` travel ratio,
+7. lower deadline misses.
 
 This ranking is intentionally deployment-oriented.
 

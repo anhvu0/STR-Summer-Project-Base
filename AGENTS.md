@@ -59,7 +59,9 @@
   2. timeout rate,
   3. average travel time,
   4. `p90` travel time,
-  5. deadline misses.
+  5. tail completion gap,
+  6. `p95`/`p50` travel ratio,
+  7. deadline misses.
 
 ## Hard-brake interpretation context
 
