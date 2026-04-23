@@ -160,7 +160,7 @@ def run_simulation(scheduler, vehicles, fast_mode=False):
 if __name__ == "__main__":
     args = build_parser().parse_args()
     model_path = resolve_model_path(args.model_path)
-    sumo_binary = checkBinary('sumo')
+    sumo_binary = checkBinary('sumo-gui')
     # sumo_binary = checkBinary('sumo')#use this line if you do not want the UI of SUMO
 
     # parse config file for map file name
