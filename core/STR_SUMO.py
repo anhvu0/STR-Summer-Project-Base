@@ -67,11 +67,23 @@ class StrSumo:
 
         step = 0
         vehicles_to_direct = [] #  the batch of controlled vehicles passed to make_decisions()
-        vehicle_IDs_in_simulation = []
+        vehicle_IDs_in_simulation = set()
+        controlled_vehicle_ids = set(self.controlled_vehicles.keys())
+
+        simulation_get_min_expected = traci.simulation.getMinExpectedNumber
+        simulation_get_arrived_ids = traci.simulation.getArrivedIDList
+        simulation_step = traci.simulationStep
+        vehicle_get_ids = traci.vehicle.getIDList
+        vehicle_get_road = traci.vehicle.getRoadID
+        vehicle_get_speed = traci.vehicle.getSpeed
+        vehicle_set_color = traci.vehicle.setColor
+        vehicle_set_route = traci.vehicle.setRoute
+        vehicle_set_via = traci.vehicle.setVia
+        vehicle_change_target = traci.vehicle.changeTarget
 
         try:
-            while traci.simulation.getMinExpectedNumber() > 0:
-                vehicle_ids = set(traci.vehicle.getIDList())
+            while simulation_get_min_expected() > 0:
+                vehicle_ids = set(vehicle_get_ids())
 
                 # store edge vehicle counts in connection_info.edge_vehicle_count
                 self.get_edge_vehicle_counts()
@@ -86,13 +98,13 @@ class StrSumo:
                     #self.connection_info.edge_vehicle_count[traci.vehicle.getRoadID(vehicle_id)] += 1
 
                     # handle newly arrived controlled vehicles
-                    if vehicle_id not in vehicle_IDs_in_simulation and vehicle_id in self.controlled_vehicles:
-                        vehicle_IDs_in_simulation.append(vehicle_id)
-                        traci.vehicle.setColor(vehicle_id, (255, 0, 0)) # set color so we can visually track controlled vehicles
+                    if vehicle_id not in vehicle_IDs_in_simulation and vehicle_id in controlled_vehicle_ids:
+                        vehicle_IDs_in_simulation.add(vehicle_id)
+                        vehicle_set_color(vehicle_id, (255, 0, 0)) # set color so we can visually track controlled vehicles
                         self.controlled_vehicles[vehicle_id].start_time = float(step)#Use the detected release time as start time
 
-                    if vehicle_id in self.controlled_vehicles.keys():
-                        current_edge = traci.vehicle.getRoadID(vehicle_id)
+                    if vehicle_id in controlled_vehicle_ids:
+                        current_edge = vehicle_get_road(vehicle_id)
 
                         if current_edge not in self.connection_info.edge_index_dict.keys():
                             continue
@@ -118,27 +130,28 @@ class StrSumo:
                             self.controlled_vehicles[vehicle_id].current_edge = current_edge
 
                         if (edge_changed or should_force_control) and vehicle_id not in queued_ids:
-                            self.controlled_vehicles[vehicle_id].current_speed = traci.vehicle.getSpeed(vehicle_id)
+                            self.controlled_vehicles[vehicle_id].current_speed = vehicle_get_speed(vehicle_id)
                             vehicles_to_direct.append(self.controlled_vehicles[vehicle_id])
                             queued_ids.add(vehicle_id)
                 #print(len(vehicles_to_direct))
                 vehicle_decisions_by_id = self.route_controller.make_decisions(vehicles_to_direct, self.connection_info)
+                live_vehicle_ids = vehicle_ids
                 for vehicle_id, route_decision in vehicle_decisions_by_id.items():
-                    if vehicle_id in traci.vehicle.getIDList():
+                    if vehicle_id in live_vehicle_ids:
                         try:
                             if isinstance(route_decision, (list, tuple)) and len(route_decision) >= 2:
                                 # Preferred path: apply one contiguous explicit route.
-                                traci.vehicle.setRoute(vehicle_id, list(route_decision))
+                                vehicle_set_route(vehicle_id, list(route_decision))
                                 self.controlled_vehicles[vehicle_id].local_destination = route_decision[-1]
                             else:
                                 # Backward-compatible fallback for legacy controllers.
                                 destination = self.controlled_vehicles[vehicle_id].destination
                                 local_target_edge = route_decision
                                 if local_target_edge != destination:
-                                    traci.vehicle.setVia(vehicle_id, [local_target_edge])
+                                    vehicle_set_via(vehicle_id, [local_target_edge])
                                 else:
-                                    traci.vehicle.setVia(vehicle_id, [])
-                                traci.vehicle.changeTarget(vehicle_id, destination)
+                                    vehicle_set_via(vehicle_id, [])
+                                vehicle_change_target(vehicle_id, destination)
                                 self.controlled_vehicles[vehicle_id].local_destination = local_target_edge
                         except traci.exceptions.TraCIException:
                             # If SUMO cannot build a route to this local target from
@@ -146,7 +159,7 @@ class StrSumo:
                             # retry on the next control step.
                             continue
 
-                arrived_at_destination = traci.simulation.getArrivedIDList()
+                arrived_at_destination = simulation_get_arrived_ids()
 
                 for vehicle_id in arrived_at_destination:
                     if vehicle_id in self.controlled_vehicles:
@@ -161,17 +174,17 @@ class StrSumo:
                             miss = True
                         if verbose:
                             print("Vehicle {} reaches the destination: {}, timespan: {}, deadline missed: {}"                                .format(vehicle_id, True, time_span, miss))
-                traci.simulationStep()
+                simulation_step()
                 step += 1
 
                 if step > MAX_SIMULATION_STEPS:
                     step_limit_reached = True
                     alive_at_step_cap_ids = set()
-                    for vehicle_id in traci.vehicle.getIDList():
-                        if vehicle_id not in self.controlled_vehicles:
+                    for vehicle_id in vehicle_get_ids():
+                        if vehicle_id not in controlled_vehicle_ids:
                             continue
                         try:
-                            current_edge = traci.vehicle.getRoadID(vehicle_id)
+                            current_edge = vehicle_get_road(vehicle_id)
                         except traci.TraCIException:
                             continue
                         if current_edge != self.controlled_vehicles[vehicle_id].destination:

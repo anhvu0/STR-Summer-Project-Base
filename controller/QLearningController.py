@@ -105,7 +105,19 @@ class QLearningPolicy(RouteController):
         self.legacy_state_size = self.shared_policy.legacy_state_size(len(self.connection_info.edge_list))
         self.use_compact_state = (self.model_state_size == self.compact_state_size)
         self.density_scale_m = 100.0
-        self._density_vec = np.zeros(len(self.connection_info.edge_list), dtype=np.float32)
+        self._edge_list = tuple(self.connection_info.edge_list)
+        self._lane_length_cache = {}
+        self._edge_lane_meters_cache = {
+            edge_id: max(float(self.connection_info.edge_length_dict.get(edge_id, 5.0)), 5.0)
+            * float(max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1))
+            for edge_id in self._edge_list
+        }
+        self._edge_lane_meters_vec = np.array(
+            [self._edge_lane_meters_cache[edge_id] for edge_id in self._edge_list],
+            dtype=np.float32,
+        )
+        self._edge_vehicle_count_cache = {}
+        self._density_vec = np.zeros(len(self._edge_list), dtype=np.float32)
         self._density_mean = 0.0
         self._density_std = 0.0
         self._density_p95 = 0.0
@@ -134,12 +146,25 @@ class QLearningPolicy(RouteController):
         return max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1)
 
     def _edge_lane_meters(self, edge_id):
+        cached = self._edge_lane_meters_cache.get(edge_id)
+        if cached is not None:
+            return float(cached)
         edge_len = max(float(self.connection_info.edge_length_dict.get(edge_id, 5.0)), 5.0)
         return edge_len * float(self._edge_lane_count(edge_id))
 
+    def _lane_length(self, lane_id):
+        cached = self._lane_length_cache.get(lane_id)
+        if cached is not None:
+            return float(cached)
+        lane_len = float(traci.lane.getLength(lane_id))
+        self._lane_length_cache[lane_id] = lane_len
+        return lane_len
+
     def _edge_density(self, edge_id):
-        count = traci.edge.getLastStepVehicleNumber(edge_id)
-        return (float(count) * float(self.density_scale_m)) / max(self._edge_lane_meters(edge_id), 5.0)
+        cached_count = self._edge_vehicle_count_cache.get(edge_id)
+        if cached_count is None:
+            cached_count = traci.edge.getLastStepVehicleNumber(edge_id)
+        return (float(cached_count) * float(self.density_scale_m)) / max(self._edge_lane_meters(edge_id), 5.0)
 
     def _occupied_density_p95(self, density_vec):
         occupied = density_vec[density_vec > 0.0]
@@ -151,12 +176,15 @@ class QLearningPolicy(RouteController):
         if hasattr(self, "_last_density_step") and (int(step) - int(self._last_density_step)) < int(every):
             return
 
-        edge_list = list(self.connection_info.edge_list)
-        lane_meters_vec = np.array([self._edge_lane_meters(edge_id) for edge_id in edge_list], dtype=np.float32)
-        self._density_vec = np.array([self._edge_density(edge_id) for edge_id in edge_list], dtype=np.float32)
+        edge_list = self._edge_list
+        lane_meters_vec = self._edge_lane_meters_vec
+        edge_get_last_step_vehicle_number = traci.edge.getLastStepVehicleNumber
+        counts = np.array([float(edge_get_last_step_vehicle_number(edge_id)) for edge_id in edge_list], dtype=np.float32)
+        self._edge_vehicle_count_cache = {edge_id: int(count) for edge_id, count in zip(edge_list, counts)}
+        self._density_vec = (counts * float(self.density_scale_m)) / np.maximum(lane_meters_vec, 5.0)
 
         if len(self._density_vec) > 0 and len(lane_meters_vec) > 0:
-            total_vehicles = float(np.sum([traci.edge.getLastStepVehicleNumber(edge_id) for edge_id in edge_list]))
+            total_vehicles = float(np.sum(counts))
             total_lane_meters = float(np.sum(lane_meters_vec))
             self._density_mean = (total_vehicles * float(self.density_scale_m)) / max(total_lane_meters, 1.0)
             density_diff_sq = (self._density_vec - self._density_mean) ** 2
@@ -259,7 +287,7 @@ class QLearningPolicy(RouteController):
             lane_id = traci.vehicle.getLaneID(vid)
             lane_index = int(traci.vehicle.getLaneIndex(vid))
             lane_position = float(traci.vehicle.getLanePosition(vid))
-            lane_length = float(traci.lane.getLength(lane_id))
+            lane_length = self._lane_length(lane_id)
             lane_count = max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1)
             speed = max(float(traci.vehicle.getSpeed(vid)), 0.0)
             dist_to_end = max(lane_length - lane_position, 0.0)

@@ -461,7 +461,7 @@ class RLTrainingPipeline:
         seed_with_episode=True,
         destination_reward=50.0,
         teleport_penalty=-40.0,
-        epsilon_decay=0.99,
+        epsilon_decay=0.995,
         epsilon_min=0.01,
         gamma=0.97,
         replay_capacity=100000,
@@ -579,6 +579,16 @@ class RLTrainingPipeline:
         self.net = sumolib.net.readNet(os.path.join(self.sumocfg_dir, self.net_file))
 
         self.connection_info = ConnectionInfo(os.path.join(self.sumocfg_dir, self.net_file))
+        self._edge_list = tuple(self.connection_info.edge_list)
+        self._edge_lane_meters_cache = {
+            edge_id: max(float(self.connection_info.edge_length_dict.get(edge_id, 5.0)), 5.0)
+            * float(max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1))
+            for edge_id in self._edge_list
+        }
+        self._edge_lane_meters_vec = np.array(
+            [self._edge_lane_meters_cache[edge_id] for edge_id in self._edge_list],
+            dtype=np.float32,
+        )
         self.route_helper = TrainingRouteHelper(self.connection_info)
         self.decision_engine = JunctionDecisionEngine(
             self.connection_info,
@@ -928,6 +938,9 @@ class RLTrainingPipeline:
         return max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1)
 
     def _edge_lane_meters(self, edge_id):
+        cached = self._edge_lane_meters_cache.get(edge_id) if hasattr(self, "_edge_lane_meters_cache") else None
+        if cached is not None:
+            return float(cached)
         edge_len = max(float(self.connection_info.edge_length_dict.get(edge_id, 5.0)), 5.0)
         return edge_len * float(self._edge_lane_count(edge_id))
 
@@ -1110,16 +1123,22 @@ class RLTrainingPipeline:
 
     def collect_vehicle_snapshots(self, vehicle_ids, step):
         snapshots = {}
+        vehicle_get_road = traci.vehicle.getRoadID
+        vehicle_get_lane = traci.vehicle.getLaneID
+        vehicle_get_lane_index = traci.vehicle.getLaneIndex
+        vehicle_get_lane_position = traci.vehicle.getLanePosition
+        vehicle_get_speed = traci.vehicle.getSpeed
+        edge_lane_ids = self.connection_info.edge_lane_ids
         for vehicle_id in vehicle_ids:
-            edge_id = traci.vehicle.getRoadID(vehicle_id)
+            edge_id = vehicle_get_road(vehicle_id)
             if edge_id not in self._passenger_edge_set:
                 continue
-            lane_id = traci.vehicle.getLaneID(vehicle_id)
-            lane_index = int(traci.vehicle.getLaneIndex(vehicle_id))
-            lane_position = float(traci.vehicle.getLanePosition(vehicle_id))
+            lane_id = vehicle_get_lane(vehicle_id)
+            lane_index = int(vehicle_get_lane_index(vehicle_id))
+            lane_position = float(vehicle_get_lane_position(vehicle_id))
             lane_length = self._lane_length(lane_id)
-            lane_count = max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1)
-            speed = max(float(traci.vehicle.getSpeed(vehicle_id)), 0.0)
+            lane_count = max(len(edge_lane_ids.get(edge_id, [])), 1)
+            speed = max(float(vehicle_get_speed(vehicle_id)), 0.0)
             dist_to_end = max(lane_length - lane_position, 0.0)
             snapshots[vehicle_id] = VehicleSnapshot(
                 vehicle_id=vehicle_id,
@@ -3660,12 +3679,13 @@ class RLTrainingPipeline:
             return  # reuse cached self._density_vec
 
         counts = self.connection_info.edge_vehicle_count
-        edge_list = self.connection_info.edge_list
+        edge_list = self._edge_list
 
+        edge_get_last_step_vehicle_number = traci.edge.getLastStepVehicleNumber
         for edge in edge_list:
-            counts[edge] = traci.edge.getLastStepVehicleNumber(edge)
+            counts[edge] = edge_get_last_step_vehicle_number(edge)
 
-        lane_meters_vec = np.array([self._edge_lane_meters(e) for e in edge_list], dtype=np.float32)
+        lane_meters_vec = self._edge_lane_meters_vec
         self._density_vec = np.array([self._edge_density(e, counts[e]) for e in edge_list], dtype=np.float32)
 
         if len(self._density_vec) > 0 and len(lane_meters_vec) > 0:
