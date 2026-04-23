@@ -518,7 +518,8 @@ class SharedDecisionPolicy:
         extra_metadata: Optional[Dict[str, object]] = None,
     ) -> PendingDecision:
         resolution_mode = "lane_now" if action_idx in context.lane_feasible_now_actions else "proactive"
-        metadata = {
+        metadata = dict(extra_metadata or {})
+        metadata.update({
             "phase": "route_pending",
             "action_source": action_source,
             "decision_id": decision_id,
@@ -533,8 +534,7 @@ class SharedDecisionPolicy:
             "lane_now_count": int(len(context.lane_feasible_now_actions)),
             "forced_action": bool(context.forced_action is not None),
             "decision_finalized": False,
-        }
-        metadata.update(dict(extra_metadata or {}))
+        })
         return PendingDecision(
             state=state,
             intended_action=int(action_idx),
@@ -677,4 +677,3 @@ class SharedDecisionPolicy:
             stall_age=stall_age,
             total_age=total_age,
         )
-

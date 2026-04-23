@@ -1,6 +1,7 @@
 import os
 import sys
 import optparse
+import xml.etree.ElementTree as ET
 from xml.dom.minidom import parse, parseString
 from core.Util import *
 from core.target_vehicles_generation_protocols import *
@@ -30,6 +31,20 @@ RIGHT = "r"
 SLIGHT_LEFT = "L"
 SLIGHT_RIGHT = "R"
 
+
+def build_runtime_sumocfg(sumocfg_path, fast_mode=False):
+    resolved_path = os.path.abspath(sumocfg_path)
+    if not fast_mode:
+        return resolved_path
+
+    runtime_path = os.path.splitext(resolved_path)[0] + ".fast.sumocfg"
+    tree = ET.parse(resolved_path)
+    root = tree.getroot()
+    for output_node in list(root.findall("output")):
+        root.remove(output_node)
+    tree.write(runtime_path, encoding="utf-8", xml_declaration=False)
+    return runtime_path
+
 class StrSumo:
     def __init__(self, route_controller, connection_info, controlled_vehicles):
         """
@@ -43,7 +58,7 @@ class StrSumo:
         self.controlled_vehicles =  controlled_vehicles # dictionary of Vehicles by id
         #print(self.controlled_vehicles)
 
-    def run(self, verbose=True, return_stats=False):
+    def run(self, verbose=True, return_stats=False, print_runtime_summary=True):
         """
         Runs the SUMO simulation.
 
@@ -52,6 +67,7 @@ class StrSumo:
         Args:
             verbose: If False, suppress per-vehicle arrival and timeout prints.
             return_stats: If True, append a stats dictionary to the return tuple.
+            print_runtime_summary: If True, print controller runtime summaries when available.
 
         Returns:
             By default: (total_time, number_reached_destination, deadlines_missed_count)
@@ -242,6 +258,19 @@ class StrSumo:
             'p95_to_p50_travel_ratio': p95_to_p50_travel_ratio,
             'max_step': int(step),
         }
+
+        if hasattr(self.route_controller, 'get_runtime_metrics'):
+            try:
+                stats['controller_runtime_metrics'] = self.route_controller.get_runtime_metrics()
+            except Exception:
+                pass
+
+        if print_runtime_summary and hasattr(self.route_controller, 'format_runtime_metrics_summary'):
+            try:
+                for line in self.route_controller.format_runtime_metrics_summary():
+                    print(line)
+            except Exception:
+                pass
 
         if return_stats:
             return total_time, end_number, num_deadlines_missed, stats

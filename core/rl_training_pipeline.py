@@ -14,7 +14,7 @@ from collections import defaultdict, deque
 import random
 from controller.RouteController import RouteController
 from controller.QLearningController import QLearningPolicy
-from core.STR_SUMO import StrSumo
+from core.STR_SUMO import StrSumo, build_runtime_sumocfg
 from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision, VehicleSnapshot
 from core.shared_decision_policy import SharedDecisionPolicy
 from core.Util import ConnectionInfo
@@ -97,7 +97,7 @@ class DQNTrainer:
         learning_rate=0.001,
         gamma=0.95,
         epsilon=1.0,
-        epsilon_decay=0.99,
+        epsilon_decay=0.993,
         epsilon_min=0.01,
         replay_capacity=100000,
         elite_replay_capacity=None,
@@ -461,7 +461,7 @@ class RLTrainingPipeline:
         seed_with_episode=True,
         destination_reward=50.0,
         teleport_penalty=-40.0,
-        epsilon_decay=0.995,
+        epsilon_decay=0.993,
         epsilon_min=0.01,
         gamma=0.97,
         replay_capacity=100000,
@@ -535,6 +535,7 @@ class RLTrainingPipeline:
             self.decision_debug_csv_path = None
         if self.fast_training_profile:
             self.density_refresh_every = max(self.density_refresh_every, 4)
+        self.runtime_sumocfg_path = build_runtime_sumocfg(self.sumocfg_path, fast_mode=self.fast_training_profile)
         self._distance_cache = {}
         self._cache_metrics = defaultdict(float)
         self.progress_reward_scale = 1.00
@@ -1782,12 +1783,12 @@ class RLTrainingPipeline:
             try:
                 traci.start([
                     sumo_binary,
-                    "-c", self.sumocfg_path,
+                    "-c", self.runtime_sumocfg_path,
                     "--quit-on-end",
                     "--no-step-log",
                     "--no-warnings",
                 ])
-                _, _, _, stats = simulation.run(verbose=False, return_stats=True)
+                _, _, _, stats = simulation.run(verbose=False, return_stats=True, print_runtime_summary=False)
             finally:
                 try:
                     traci.close()
@@ -1968,12 +1969,18 @@ class RLTrainingPipeline:
 
             vehicles = self.generate_episode_vehicles(episode_seed=episode_seed)
 
-            traci.start([
+            traci_command = [
                 sumo_binary,
-                "-c", self.sumocfg_path,
-                "--tripinfo-output", os.path.join(self.sumocfg_dir, "trips.trips.xml"),
+                "-c", self.runtime_sumocfg_path,
                 "--quit-on-end",
-            ])
+            ]
+            if self.fast_training_profile:
+                traci_command.extend(["--no-step-log", "--no-warnings"])
+            else:
+                traci_command.extend([
+                    "--tripinfo-output", os.path.join(self.sumocfg_dir, "trips.trips.xml"),
+                ])
+            traci.start(traci_command)
             simulation_get_min_expected = traci.simulation.getMinExpectedNumber
             simulation_step = traci.simulationStep
             simulation_get_arrived_ids = traci.simulation.getArrivedIDList
@@ -3701,6 +3708,3 @@ class RLTrainingPipeline:
             self._density_std = 0.0
             self._density_p95 = 0.0
         self._last_density_step = step
-
-
-

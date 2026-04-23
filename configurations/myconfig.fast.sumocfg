@@ -1,0 +1,12 @@
+<configuration>
+
+<input>
+<net-file value="./maps/map.net.xml" />
+<route-files value="./rou/str_sumo_map.rou.xml" />
+</input>
+<time>
+<begin value="0" />
+<end value="200000" />
+</time>
+
+</configuration>

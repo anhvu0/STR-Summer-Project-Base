@@ -41,7 +41,7 @@ def build_parser():
     parser.add_argument(
         "--episodes",
         type=int,
-        default=1000,
+        default=710,
         help="Number of training episodes.",
     )
     parser.add_argument(
@@ -67,6 +67,19 @@ def build_parser():
         default=2.0,
         help="Optional spawn interval override for held-out frozen inference evaluation.",
     )
+    parser.add_argument(
+        "--fast-mode",
+        dest="fast_mode",
+        action="store_true",
+        help="Enable the stripped runtime SUMO config and skip heavy output files for faster iteration.",
+    )
+    parser.add_argument(
+        "--no-fast-mode",
+        dest="fast_mode",
+        action="store_false",
+        help="Disable fast mode and keep the heavier debug outputs.",
+    )
+    parser.set_defaults(fast_mode=True)
     return parser
 
 
@@ -87,6 +100,7 @@ def main():
         eval_every=args.eval_every,
         frozen_eval_seeds=parse_eval_seeds(args.eval_seeds),
         eval_spawn_interval=args.eval_spawn_interval,
+        fast_training_profile=args.fast_mode,
     )
     pipeline.run()
 

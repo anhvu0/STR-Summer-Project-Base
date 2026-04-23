@@ -11,6 +11,7 @@ from xml.dom.minidom import parse
 import os
 from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision, VehicleSnapshot
 from core.shared_decision_policy import SharedDecisionPolicy
+from core.route_loop_safety import transition_signal
 
 def parse_sumocfg(sumocfg_path):
     dom = parse(sumocfg_path)
@@ -31,6 +32,7 @@ class QLearningPolicy(RouteController):
         self._best_dist = {}
         self._recent_edges = {}
         self._pending_decisions = {}
+        self._distance_cache = {}
         self._lane_change_cooldown = {}
         self.step_control_extra_buffer_m = 35.0
         self._last_observed_edge = {}
@@ -70,6 +72,17 @@ class QLearningPolicy(RouteController):
             "cooldown_replans_blocked": 0,
             "loop_override_count": 0,
             "dead_end_reentry_override_count": 0,
+            "loop_events": 0,
+            "short_cycle_events": 0,
+            "aba_bounce_events": 0,
+            "dead_end_reentry_events": 0,
+            "long_horizon_loop_events": 0,
+            "revisit_without_progress_events": 0,
+            "small_set_loop_events": 0,
+            "small_set_loop_unique3_or_less_events": 0,
+            "small_set_loop_unique4_events": 0,
+            "committed_cyclic_revisit_events": 0,
+            "committed_cyclic_revisit_after_fallback_events": 0,
             "policy_candidates_with_broader_available": 0,
             "policy_candidates_collapsed_to_lane_now_only": 0,
             "pending_commit_window_grace_kept": 0,
@@ -198,14 +211,20 @@ class QLearningPolicy(RouteController):
 
     #-----------------------DEBUGGING-------------------------------------
     def _dist_to_dest(self, edge_id, dest_id):
+        key = (edge_id, dest_id)
+        if key in self._distance_cache:
+            return self._distance_cache[key]
         try:
             from_edge = self.net.getEdge(edge_id)
             to_edge = self.net.getEdge(dest_id)
             path_edges, path_cost = self.net.getShortestPath(from_edge, to_edge, vClass="passenger")
             if path_edges is None:
-                return float("inf")
-            return path_cost
+                self._distance_cache[key] = float("inf")
+            else:
+                self._distance_cache[key] = path_cost
+            return self._distance_cache[key]
         except Exception:
+            self._distance_cache[key] = float("inf")
             return float("inf")
 
     def _estimate_eta(self, edge_id, dest_id):
@@ -213,6 +232,160 @@ class QLearningPolicy(RouteController):
         if not np.isfinite(dist):
             return float("inf")
         return float(dist) / 8.0
+
+    def _edge_out_degree_map(self, edges):
+        return {
+            edge: len(self.connection_info.outgoing_edges_dict.get(edge, {}))
+            for edge in set(edges)
+        }
+
+    def _record_runtime_loop_signals(self, current_edge, destination, recent_history):
+        signal_edges = set(recent_history) | {current_edge}
+        edge_distance_lookup = {
+            edge: self._dist_to_dest(edge, destination)
+            for edge in signal_edges
+        }
+        loop_signals = transition_signal(
+            deque(recent_history, maxlen=self.loop_window),
+            current_edge,
+            edge_out_degree=self._edge_out_degree_map(list(recent_history) + [current_edge]),
+            edge_distance_lookup=edge_distance_lookup,
+            progress_slack=self.decision_engine.loop_distance_slack,
+        )
+        if loop_signals.get("aba_bounce"):
+            self._metrics["aba_bounce_events"] += 1
+        if loop_signals.get("short_cycle"):
+            self._metrics["short_cycle_events"] += 1
+        if loop_signals.get("dead_end_reentry"):
+            self._metrics["dead_end_reentry_events"] += 1
+        if loop_signals.get("long_horizon_loop"):
+            self._metrics["long_horizon_loop_events"] += 1
+        if loop_signals.get("revisit_without_progress"):
+            self._metrics["revisit_without_progress_events"] += 1
+
+        if (
+            loop_signals.get("aba_bounce")
+            or loop_signals.get("short_cycle")
+            or loop_signals.get("dead_end_reentry")
+            or loop_signals.get("long_horizon_loop")
+            or loop_signals.get("revisit_without_progress")
+        ):
+            self._metrics["loop_events"] += 1
+
+        probe = list(recent_history) + [current_edge]
+        recent_probe = probe[-8:]
+        repeated_current = current_edge in recent_history
+        if repeated_current and len(recent_probe) >= 4:
+            unique_edges = len(set(recent_probe))
+            if unique_edges <= 4:
+                self._metrics["small_set_loop_events"] += 1
+                if unique_edges <= 3:
+                    self._metrics["small_set_loop_unique3_or_less_events"] += 1
+                else:
+                    self._metrics["small_set_loop_unique4_events"] += 1
+
+    def _record_committed_cyclic_revisit(self, pending, actual_edge, destination, recent_history):
+        if pending is None or actual_edge == pending.decision_edge:
+            return
+        if not self.decision_engine.route_matches_expected(pending, actual_edge):
+            return
+
+        repeated_recent_edges = sum(1 for edge in recent_history if edge == actual_edge)
+        signal_edges = set(recent_history) | {actual_edge}
+        edge_distance_lookup = {
+            edge: self._dist_to_dest(edge, destination)
+            for edge in signal_edges
+        }
+        loop_signals = transition_signal(
+            deque(recent_history, maxlen=self.loop_window),
+            actual_edge,
+            edge_out_degree=self._edge_out_degree_map(list(recent_history) + [actual_edge]),
+            edge_distance_lookup=edge_distance_lookup,
+            progress_slack=self.decision_engine.loop_distance_slack,
+        )
+        committed_cyclic = bool(
+            repeated_recent_edges > 1
+            or loop_signals.get("short_cycle")
+            or loop_signals.get("aba_bounce")
+            or loop_signals.get("dead_end_reentry")
+            or loop_signals.get("long_horizon_loop")
+            or loop_signals.get("revisit_without_progress")
+        )
+        if not committed_cyclic:
+            return
+
+        self._metrics["committed_cyclic_revisit_events"] += 1
+        action_source = str((pending.metadata or {}).get("action_source", ""))
+        if "fallback" in action_source:
+            self._metrics["committed_cyclic_revisit_after_fallback_events"] += 1
+
+    def get_runtime_metrics(self):
+        metrics = dict(self._metrics)
+        decisions = float(max(metrics.get("decisions", 0), 1))
+        fallback_total = float(max(metrics.get("fallback_selected_total", 0), 1))
+        committed_total = float(max(metrics.get("committed_cyclic_revisit_events", 0), 1))
+        metrics["override_ratio"] = float(metrics.get("overrides", 0)) / decisions
+        metrics["fallback_lane_now_ratio"] = (
+            float(metrics.get("fallback_selected_lane_now", 0)) / fallback_total
+        )
+        metrics["committed_cyclic_revisit_after_fallback_ratio"] = (
+            float(metrics.get("committed_cyclic_revisit_after_fallback_events", 0)) / committed_total
+        )
+        return metrics
+
+    def format_runtime_metrics_summary(self):
+        metrics = self.get_runtime_metrics()
+        return [
+            (
+                "[RL-INFER] decisions={} overrides={} override_ratio={:.1%} "
+                "fallbacks(total/lane_now)={}/{}"
+            ).format(
+                int(metrics["decisions"]),
+                int(metrics["overrides"]),
+                float(metrics["override_ratio"]),
+                int(metrics["fallback_selected_total"]),
+                int(metrics["fallback_selected_lane_now"]),
+            ),
+            (
+                "[RL-INFER] loops total={} short={} aba={} dead_end={} long={} revisit_no_progress={}"
+            ).format(
+                int(metrics["loop_events"]),
+                int(metrics["short_cycle_events"]),
+                int(metrics["aba_bounce_events"]),
+                int(metrics["dead_end_reentry_events"]),
+                int(metrics["long_horizon_loop_events"]),
+                int(metrics["revisit_without_progress_events"]),
+            ),
+            (
+                "[RL-INFER] small_set_loops total={} unique<=3={} unique=4={} "
+                "committed_cyclic={} after_fallback={}"
+            ).format(
+                int(metrics["small_set_loop_events"]),
+                int(metrics["small_set_loop_unique3_or_less_events"]),
+                int(metrics["small_set_loop_unique4_events"]),
+                int(metrics["committed_cyclic_revisit_events"]),
+                int(metrics["committed_cyclic_revisit_after_fallback_events"]),
+            ),
+            (
+                "[RL-INFER] pending_timeouts={} release(no_prog/stall/hard)={}/{}/{}"
+            ).format(
+                int(metrics["pending_decision_timeouts"]),
+                int(metrics["pending_release_route_no_progress_abort"]),
+                int(metrics["pending_release_route_stall_timeout"]),
+                int(metrics["pending_release_route_hard_timeout"]),
+            ),
+            (
+                "[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)={}/{}/{}/{}/{} "
+                "cooldown_blocked={}"
+            ).format(
+                int(metrics["lane_change_observe_started"]),
+                int(metrics["lane_change_observe_success"]),
+                int(metrics["lane_change_observe_abort_no_progress"]),
+                int(metrics["lane_change_observe_abort_low_speed"]),
+                int(metrics["lane_change_observe_abort_commit_window"]),
+                int(metrics["cooldown_replans_blocked"]),
+            ),
+        ]
 
     def _finalize_commitment(self, vehicle):
         vid = vehicle.vehicle_id
@@ -393,6 +566,15 @@ class QLearningPolicy(RouteController):
             self._best_dist.setdefault(vid, float("inf"))
 
             if prev_seen_edge is None or edge_changed_runtime:
+                pending_before_transition = self._pending_decisions.get(vid)
+                if pending_before_transition is not None:
+                    self._record_committed_cyclic_revisit(
+                        pending_before_transition,
+                        start_edge,
+                        vehicle.destination,
+                        recent,
+                    )
+                self._record_runtime_loop_signals(start_edge, vehicle.destination, recent)
                 self._recent_edges[vid].append(start_edge)
                 self._visit_count[vid][start_edge] = self._visit_count[vid].get(start_edge, 0) + 1
                 self._best_dist[vid] = min(self._best_dist[vid], self._dist_to_dest(start_edge, vehicle.destination))
@@ -670,7 +852,7 @@ class QLearningPolicy(RouteController):
 
     # this function reacheds the Neural Network trained before and let it make a decision for the situation now
     def act(self, state, available_actions=None):
-        act_values = self.model.predict(state, verbose=0)[0]
+        act_values = self.model(state, training=False).numpy()[0]
         if available_actions is None:
             mask_start = self.direction_mask_start + 18 if self.use_compact_state else self.direction_mask_start
             available = [i for i, v in enumerate(state[0][mask_start:mask_start + 6]) if v > 0.5]
@@ -725,8 +907,3 @@ class QLearningPolicy(RouteController):
             legacy_aux_features=deadline_features,
             legacy_density_values=[self._edge_density(edge_id) for edge_id in self.connection_info.edge_list] if not self.use_compact_state else None,
         )
-
-
-
-
-

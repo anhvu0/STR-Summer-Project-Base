@@ -454,6 +454,8 @@ class JunctionDecisionEngine:
                 score += 8.0
             if details.get("distance_worsen"):
                 score += 5.0
+            if details.get("recent_revisit_low_progress"):
+                score += 16.0
             next_edge = self.get_next_edge(context.edge_id, action)
             if distance_fn is not None and next_edge is not None:
                 current_dist = distance_fn(context.edge_id, destination)
@@ -480,7 +482,7 @@ class JunctionDecisionEngine:
                 )
                 score += 1.5 * float(trap_score)
                 if next_edge in set(recent_history[-6:]):
-                    score += 8.0
+                    score += 12.0
                 out_degree = len(self.connection_info.outgoing_edges_dict.get(next_edge, {}))
                 if out_degree == 1 and math.isfinite(current_dist) and math.isfinite(next_dist):
                     if next_dist >= (current_dist - max(6.0, 0.25 * self.loop_distance_slack)):
@@ -523,14 +525,24 @@ class JunctionDecisionEngine:
             and history_deque[-1] == context.edge_id
         )
         dist_worsen = False
+        recent_revisit_low_progress = False
         if distance_fn is not None:
             current_distance = distance_fn(context.edge_id, destination)
             next_distance = distance_fn(next_edge, destination)
+            revisit_slack = self.loop_distance_slack if distance_slack is None else float(distance_slack)
             dist_worsen = would_worsen_distance(
                 current_distance,
                 next_distance,
-                slack=self.loop_distance_slack if distance_slack is None else float(distance_slack),
+                slack=revisit_slack,
             )
+            recent_window = list(history_deque)[-6:]
+            if next_edge in recent_window:
+                if not (math.isfinite(current_distance) and math.isfinite(next_distance)):
+                    recent_revisit_low_progress = True
+                else:
+                    recent_revisit_low_progress = (
+                        next_distance >= (current_distance - max(8.0, 0.30 * revisit_slack))
+                    )
         blocked = bool(
             signals.get("short_cycle")
             or signals.get("aba_bounce")
@@ -539,10 +551,12 @@ class JunctionDecisionEngine:
             or signals.get("revisit_without_progress")
             or trap_like
             or dist_worsen
+            or recent_revisit_low_progress
         )
         details = dict(signals)
         details["trap_like_reversal"] = trap_like
         details["distance_worsen"] = dist_worsen
+        details["recent_revisit_low_progress"] = recent_revisit_low_progress
         return (not blocked), details
 
     def try_request_lane_change(self, context: DecisionContext, action_idx: int, duration: int = 70) -> Tuple[bool, bool]:
@@ -671,5 +685,3 @@ class JunctionDecisionEngine:
         reach_mask = [1.0 if i in context.reachable_with_lane_change_actions else 0.0 for i in range(len(self.direction_choices))]
         avail_mask = [1.0 if i in context.available_actions else 0.0 for i in range(len(self.direction_choices))]
         return edge_mask, lane_mask, reach_mask, avail_mask
-
-
