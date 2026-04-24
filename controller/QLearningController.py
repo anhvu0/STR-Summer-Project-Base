@@ -415,6 +415,8 @@ class QLearningPolicy(RouteController):
                 context=context,
                 step=step,
                 lane_position_now=float(snapshot.lane_position),
+                edge_density_fn=self._edge_density,
+                distance_fn=self._dist_to_dest,
             )
             if release_eval.should_release:
                 self._pending_decisions.pop(vid, None)

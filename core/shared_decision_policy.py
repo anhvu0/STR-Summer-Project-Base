@@ -63,6 +63,11 @@ class SharedDecisionPolicy:
         self.proactive_brake_risk_high_density_threshold = 0.45
         self.lane_now_congestion_density_threshold = 0.34
         self.lane_now_congestion_relief_threshold = 0.18
+        self.lane_now_near_junction_density_tighten = 0.10
+        self.lane_now_near_junction_relief_tighten = 0.12
+        self.lane_now_near_junction_distance_keep_extra = 12.0
+        self.lane_now_replan_min_age_steps = 10
+        self.lane_now_replan_low_speed_mps = 1.25
 
         self.compact_state_size = (
             (2 * self.edge_embedding_dim)
@@ -411,11 +416,14 @@ class SharedDecisionPolicy:
             return actions
 
         best_density, best_density_distance, _ = min(scored, key=lambda item: (item[0], item[1], item[2]))
-        distance_keep_slack = max(15.0, 0.5 * float(distance_slack if distance_slack is not None else 30.0))
+        density_threshold, relief_threshold, distance_keep_slack = self._lane_now_congestion_thresholds(
+            context=context,
+            distance_slack=distance_slack,
+        )
         kept = []
         for density, distance, action in scored:
-            high_pressure = density >= self.lane_now_congestion_density_threshold
-            relief_available = (density - best_density) >= self.lane_now_congestion_relief_threshold
+            high_pressure = density >= density_threshold
+            relief_available = (density - best_density) >= relief_threshold
             meaningfully_shorter = math.isfinite(distance) and math.isfinite(best_density_distance) and (
                 distance <= best_density_distance - distance_keep_slack
             )
@@ -428,6 +436,55 @@ class SharedDecisionPolicy:
             kept.append(action)
 
         return sorted(set(kept)) or actions
+
+    def _lane_now_congestion_thresholds(
+        self,
+        *,
+        context: DecisionContext,
+        distance_slack: Optional[float],
+    ) -> Tuple[float, float, float]:
+        base_distance_keep_slack = max(15.0, 0.5 * float(distance_slack if distance_slack is not None else 30.0))
+        commit_distance = max(
+            float(self.decision_engine.commit_min_distance),
+            float(context.speed) * float(self.decision_engine.commit_time_s),
+        )
+        reaction_time_s = float(getattr(self.decision_engine, "reaction_time_s", self.decision_engine.commit_time_s))
+        reaction_distance = max(
+            float(getattr(self.decision_engine, "base_reaction_distance", commit_distance)),
+            float(context.speed) * reaction_time_s,
+        )
+        junction_guard_distance = max(
+            reaction_distance + (0.5 * float(self.decision_engine.lane_change_margin_m)),
+            commit_distance
+            + float(self.decision_engine.lane_change_margin_m)
+            + float(self.decision_engine.proactive_extra_buffer_m)
+            + float(self.decision_engine.proactive_safety_margin_m),
+            base_distance_keep_slack,
+        )
+        junction_proximity = 0.0
+        if junction_guard_distance > 1e-6:
+            junction_proximity = max(
+                0.0,
+                min((junction_guard_distance - float(context.dist_to_end)) / junction_guard_distance, 1.0),
+            )
+        if context.commit_window:
+            junction_proximity = max(junction_proximity, 0.75)
+
+        density_threshold = max(
+            0.22,
+            self.lane_now_congestion_density_threshold
+            - (self.lane_now_near_junction_density_tighten * junction_proximity),
+        )
+        relief_threshold = max(
+            0.06,
+            self.lane_now_congestion_relief_threshold
+            - (self.lane_now_near_junction_relief_tighten * junction_proximity),
+        )
+        distance_keep_slack = (
+            base_distance_keep_slack
+            + (self.lane_now_near_junction_distance_keep_extra * junction_proximity)
+        )
+        return float(density_threshold), float(relief_threshold), float(distance_keep_slack)
 
 
     def _proactive_brake_risk_score(
@@ -670,6 +727,8 @@ class SharedDecisionPolicy:
         context: DecisionContext,
         step: int,
         lane_position_now: float,
+        edge_density_fn: Optional[Callable[[str], float]] = None,
+        distance_fn: Optional[Callable[[str, str], float]] = None,
     ) -> PendingReleaseEvaluation:
         metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
         metadata["lane_position_now"] = float(max(lane_position_now, 0.0))
@@ -713,6 +772,13 @@ class SharedDecisionPolicy:
             and same_edge
             and total_age >= int(self.decision_engine.route_pending_hard_timeout_steps)
         )
+        lane_now_replan = self._should_replan_stalled_lane_now_pending(
+            pending,
+            context=context,
+            total_age=total_age,
+            edge_density_fn=edge_density_fn,
+            distance_fn=distance_fn,
+        )
 
         release_reason = None
         release_as_timeout = False
@@ -723,8 +789,9 @@ class SharedDecisionPolicy:
             release_reason = "route_stall_timeout"
             release_as_timeout = True
         elif no_progress_stall:
-            # Passive lane-now pendings already have a committed route and should
-            # not be reopened just because congestion keeps them on the same edge.
+            release_reason = "route_no_progress_abort"
+        elif lane_now_replan:
+            # Reopen only when a stalled lane-now route has a cleaner comparable branch.
             release_reason = "route_no_progress_abort"
         elif wrong_lane_commit:
             release_reason = "wrong_lane_commit"
@@ -738,3 +805,58 @@ class SharedDecisionPolicy:
             stall_age=stall_age,
             total_age=total_age,
         )
+
+    def _should_replan_stalled_lane_now_pending(
+        self,
+        pending: PendingDecision,
+        *,
+        context: DecisionContext,
+        total_age: int,
+        edge_density_fn: Optional[Callable[[str], float]],
+        distance_fn: Optional[Callable[[str, str], float]],
+    ) -> bool:
+        if edge_density_fn is None or distance_fn is None:
+            return False
+        if self.pending_resolution_mode(pending) != "lane_now":
+            return False
+        if context.edge_id != pending.decision_edge:
+            return False
+        if total_age < int(self.lane_now_replan_min_age_steps):
+            return False
+        if float(context.speed) > float(self.lane_now_replan_low_speed_mps):
+            return False
+
+        current_next_edge = pending.intended_next_edge
+        if not current_next_edge:
+            return False
+        current_density = max(float(edge_density_fn(current_next_edge)), 0.0)
+        current_distance = distance_fn(current_next_edge, pending.destination)
+        if not math.isfinite(current_distance):
+            current_distance = float("inf")
+
+        density_threshold, relief_threshold, distance_slack = self._lane_now_congestion_thresholds(
+            context=context,
+            distance_slack=None,
+        )
+        if current_density < density_threshold:
+            return False
+
+        alternatives = []
+        for action in sorted(set(context.lane_feasible_now_actions)):
+            if int(action) == int(pending.intended_action):
+                continue
+            next_edge = self.decision_engine.get_next_edge(context.edge_id, int(action))
+            if next_edge is None or next_edge == current_next_edge:
+                continue
+            alt_distance = distance_fn(next_edge, pending.destination)
+            if not math.isfinite(alt_distance):
+                continue
+            alt_density = max(float(edge_density_fn(next_edge)), 0.0)
+            alternatives.append((alt_density, float(alt_distance), int(action)))
+        if not alternatives:
+            return False
+
+        best_alt_density, best_alt_distance, _ = min(alternatives, key=lambda item: (item[0], item[1], item[2]))
+        enough_relief = (current_density - best_alt_density) >= relief_threshold
+        not_much_longer = best_alt_distance <= (current_distance + distance_slack)
+        return bool(enough_relief and not_much_longer)
