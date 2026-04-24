@@ -182,7 +182,7 @@ if __name__ == "__main__":
         100,
         100,
         pattern=3,
-        spawn_interval=args.spawn_interval,
+        spawn_interval=2.0,
         seed=args.seed,
     )
     #print the controlled vehicles generated

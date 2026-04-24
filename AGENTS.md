@@ -1,5 +1,11 @@
 # Project Agent Notes
 
+## Expectations:
+Reading files with PowerShell commands like Get-Content and Select-String.
+Editing files with direct PowerShell file replacement instead of apply_patch when the UNC path caused trouble.
+Using the WSL path for git commands, for example:
+wsl git -C /home/anhvu01212001/anhvu/STR_Project/STR-Summer-Project-Base diff ...
+
 ## RL objective context (updated April 2026)
 
 - The RL training objective in `core/rl_training_pipeline.py` is average travel-time minimization, not deadline-feasibility maximization.
