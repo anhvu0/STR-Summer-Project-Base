@@ -703,13 +703,6 @@ class SharedDecisionPolicy:
             and stall_age >= max(no_progress_window, 1)
             and not bool(progress_view["made_progress"])
         )
-        passive_lane_now_stall = (
-            not active_same_edge_monitoring
-            and same_edge
-            and stall_age >= max(no_progress_window, 1)
-            and not bool(progress_view["made_progress"])
-            and float(context.speed) < float(self.decision_engine.observe_low_speed_mps)
-        )
         stalled_timeout = (
             active_same_edge_monitoring
             and same_edge
@@ -729,7 +722,9 @@ class SharedDecisionPolicy:
         elif stalled_timeout:
             release_reason = "route_stall_timeout"
             release_as_timeout = True
-        elif no_progress_stall or passive_lane_now_stall:
+        elif no_progress_stall:
+            # Passive lane-now pendings already have a committed route and should
+            # not be reopened just because congestion keeps them on the same edge.
             release_reason = "route_no_progress_abort"
         elif wrong_lane_commit:
             release_reason = "wrong_lane_commit"

@@ -192,7 +192,29 @@ class SharedDecisionPolicyPendingReleaseTests(unittest.TestCase):
             skip_reason='forced_single_path',
         )
 
-    def test_lane_now_pending_does_not_treat_static_feasibility_as_progress(self):
+    def _proactive_context(self, *, step=0, speed=6.0, lane_position=0.0, dist_to_end=100.0):
+        return DecisionContext(
+            vehicle_id='veh0',
+            edge_id='edgeA',
+            destination='destX',
+            step=step,
+            speed=speed,
+            lane_id='edgeA_0',
+            lane_index=0,
+            lane_count=2,
+            dist_to_end=dist_to_end,
+            edge_valid_actions=[0, 1],
+            lane_feasible_now_actions=[0],
+            reachable_with_lane_change_actions=[0, 1],
+            available_actions=[0, 1],
+            required_lane_shift={0: 0, 1: 1},
+            commit_window=False,
+            forced_action=None,
+            branch_with_choice=True,
+            skip_reason=None,
+        )
+
+    def test_stalled_lane_now_pending_is_kept(self):
         context = self._lane_now_context(step=0)
         pending = self.policy.build_route_pending(
             state=None,
@@ -217,9 +239,9 @@ class SharedDecisionPolicyPendingReleaseTests(unittest.TestCase):
             lane_position_now=0.0,
         )
 
-        self.assertTrue(release.should_release)
-        self.assertEqual(release.release_reason, 'route_no_progress_abort')
-        self.assertFalse(release.release_as_timeout)
+        self.assertFalse(release.should_release)
+        self.assertEqual(release.release_reason, None)
+        self.assertFalse(release.progress_view['made_progress'])
 
     def test_moving_lane_now_pending_is_kept(self):
         context = self._lane_now_context(step=0)
@@ -248,6 +270,35 @@ class SharedDecisionPolicyPendingReleaseTests(unittest.TestCase):
 
         self.assertFalse(release.should_release)
         self.assertTrue(release.progress_view['made_progress'])
+
+    def test_stalled_proactive_pending_still_aborts(self):
+        context = self._proactive_context(step=0, speed=8.0)
+        pending = self.policy.build_route_pending(
+            state=None,
+            action_idx=1,
+            committed_next_edge='edgeC',
+            decision_edge='edgeA',
+            step=0,
+            destination='destX',
+            context=context,
+            lane_change_requested=True,
+            decision_id='d1',
+            origin_mode='proactive',
+            action_source='policy',
+            full_route=['edgeA', 'edgeC'],
+            decision_open_recorded=True,
+        )
+
+        release = self.policy.evaluate_route_pending_release(
+            pending,
+            context=self._proactive_context(step=5, speed=0.0),
+            step=5,
+            lane_position_now=0.0,
+        )
+
+        self.assertTrue(release.should_release)
+        self.assertEqual(release.release_reason, 'route_no_progress_abort')
+        self.assertFalse(release.release_as_timeout)
 
 
 if __name__ == '__main__':
