@@ -291,7 +291,7 @@ class JunctionDecisionEngine:
             made_progress = bool(dist_progress or lane_now_progress)
         else:
             shift_progress = current_shift < prior_shift
-            lane_now_progress = pending.intended_action in context.lane_feasible_now_actions
+            lane_now_progress = pending.intended_action in context.lane_feasible_now_actions and prior_shift > 0
             dist_progress = context.dist_to_end <= (best_dist - progress_eps)
             lane_pos_progress = lane_position >= (best_lane_pos + lane_progress_eps)
             made_progress = bool(dist_progress or shift_progress or lane_now_progress or lane_pos_progress)

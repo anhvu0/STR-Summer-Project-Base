@@ -793,9 +793,6 @@ class QLearningPolicy(RouteController):
 
             next_edge = committed_next_edge
             if next_edge:
-                self._recent_edges[vid].append(next_edge)
-                self._visit_count[vid][next_edge] = self._visit_count[vid].get(next_edge, 0) + 1
-                self._best_dist[vid] = min(self._best_dist[vid], self._dist_to_dest(next_edge, vehicle.destination))
                 decision_id = self._next_decision_id()
                 origin_mode = ("lane_now" if action_idx in context.lane_feasible_now_actions else "proactive")
                 self._pending_decisions[vid] = self.shared_policy.build_route_pending(

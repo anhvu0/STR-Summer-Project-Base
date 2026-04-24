@@ -61,6 +61,8 @@ class SharedDecisionPolicy:
         self.proactive_brake_risk_speed_floor = 4.5
         self.proactive_brake_risk_density_threshold = 0.30
         self.proactive_brake_risk_high_density_threshold = 0.45
+        self.lane_now_congestion_density_threshold = 0.34
+        self.lane_now_congestion_relief_threshold = 0.18
 
         self.compact_state_size = (
             (2 * self.edge_embedding_dim)
@@ -351,6 +353,15 @@ class SharedDecisionPolicy:
 
             proactive_actions.append(action)
 
+        safe_lane_now_actions = self._filter_lane_now_congestion_traps(
+            context=context,
+            lane_now_actions=safe_lane_now_actions,
+            destination=destination,
+            distance_fn=distance_fn,
+            edge_density_fn=edge_density_fn,
+            metrics=metrics,
+            distance_slack=distance_slack,
+        )
         policy_actions = sorted(set(safe_lane_now_actions) | set(proactive_actions))
         if not policy_actions and proactive_risk_scored:
             proactive_risk_scored.sort(key=lambda item: (item[0], item[1]))
@@ -369,6 +380,54 @@ class SharedDecisionPolicy:
             if policy_set == lane_now_set and len(policy_set) < len(broader_available_set):
                 self._increment_metric(metrics, 'policy_candidates_collapsed_to_lane_now_only')
         return policy_actions
+
+    def _filter_lane_now_congestion_traps(
+        self,
+        *,
+        context: DecisionContext,
+        lane_now_actions: Sequence[int],
+        destination: str,
+        distance_fn: Callable[[str, str], float],
+        edge_density_fn: Optional[Callable[[str], float]],
+        metrics: Optional[Dict[str, float]],
+        distance_slack: Optional[float],
+    ) -> List[int]:
+        actions = sorted(set(int(action) for action in lane_now_actions))
+        if edge_density_fn is None or len(actions) <= 1:
+            return actions
+
+        scored = []
+        for action in actions:
+            next_edge = self.decision_engine.get_next_edge(context.edge_id, action)
+            if next_edge is None:
+                continue
+            density = max(float(edge_density_fn(next_edge)), 0.0)
+            distance = distance_fn(next_edge, destination)
+            if not math.isfinite(distance):
+                distance = float("inf")
+            scored.append((density, float(distance), action))
+
+        if len(scored) <= 1:
+            return actions
+
+        best_density, best_density_distance, _ = min(scored, key=lambda item: (item[0], item[1], item[2]))
+        distance_keep_slack = max(15.0, 0.5 * float(distance_slack if distance_slack is not None else 30.0))
+        kept = []
+        for density, distance, action in scored:
+            high_pressure = density >= self.lane_now_congestion_density_threshold
+            relief_available = (density - best_density) >= self.lane_now_congestion_relief_threshold
+            meaningfully_shorter = math.isfinite(distance) and math.isfinite(best_density_distance) and (
+                distance <= best_density_distance - distance_keep_slack
+            )
+            if high_pressure and relief_available and not meaningfully_shorter:
+                self._increment_metric(metrics, "lane_now_congestion_candidates_seen")
+                self._increment_metric(metrics, "lane_now_congestion_candidates_rejected")
+                continue
+            if high_pressure and relief_available:
+                self._increment_metric(metrics, "lane_now_congestion_candidates_seen")
+            kept.append(action)
+
+        return sorted(set(kept)) or actions
 
 
     def _proactive_brake_risk_score(
@@ -644,6 +703,13 @@ class SharedDecisionPolicy:
             and stall_age >= max(no_progress_window, 1)
             and not bool(progress_view["made_progress"])
         )
+        passive_lane_now_stall = (
+            not active_same_edge_monitoring
+            and same_edge
+            and stall_age >= max(no_progress_window, 1)
+            and not bool(progress_view["made_progress"])
+            and float(context.speed) < float(self.decision_engine.observe_low_speed_mps)
+        )
         stalled_timeout = (
             active_same_edge_monitoring
             and same_edge
@@ -663,7 +729,7 @@ class SharedDecisionPolicy:
         elif stalled_timeout:
             release_reason = "route_stall_timeout"
             release_as_timeout = True
-        elif no_progress_stall:
+        elif no_progress_stall or passive_lane_now_stall:
             release_reason = "route_no_progress_abort"
         elif wrong_lane_commit:
             release_reason = "wrong_lane_commit"
