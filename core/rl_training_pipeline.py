@@ -97,9 +97,9 @@ class DQNTrainer:
         learning_rate=0.001,
         gamma=0.95,
         epsilon=1.0,
-        epsilon_decay=0.99,
-        epsilon_min=0.05,
-        replay_capacity=100000,
+        epsilon_decay=0.993,
+        epsilon_min=0.01,
+        replay_capacity=200000,
         elite_replay_capacity=None,
         elite_fraction=0.25,
         batch_size=128,
@@ -1036,6 +1036,7 @@ class RLTrainingPipeline:
             destination=destination,
             recent_history=recent_history,
             distance_fn=self.get_distance_to_destination,
+            edge_density_fn=self._edge_density,
             lane_now_only=lane_now_only,
         )
 

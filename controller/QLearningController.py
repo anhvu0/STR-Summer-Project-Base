@@ -640,6 +640,7 @@ class QLearningPolicy(RouteController):
                         destination=vehicle.destination,
                         recent_history=recent,
                         distance_fn=self._dist_to_dest,
+                        edge_density_fn=self._edge_density,
                         lane_now_only=True,
                     )
                     if action_idx is None:
@@ -727,6 +728,7 @@ class QLearningPolicy(RouteController):
                     destination=vehicle.destination,
                     recent_history=recent,
                     distance_fn=self._dist_to_dest,
+                    edge_density_fn=self._edge_density,
                 )
                 if fallback_action is None:
                     continue
@@ -751,6 +753,7 @@ class QLearningPolicy(RouteController):
                         destination=vehicle.destination,
                         recent_history=recent,
                         distance_fn=self._dist_to_dest,
+                        edge_density_fn=self._edge_density,
                         lane_now_only=True,
                     )
                     if action_idx is None:

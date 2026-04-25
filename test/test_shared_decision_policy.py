@@ -330,6 +330,60 @@ class SharedDecisionPolicyPendingReleaseTests(unittest.TestCase):
         self.assertFalse(release.should_release)
         self.assertTrue(release.progress_view['made_progress'])
 
+    def test_fallback_filters_congested_lane_now_branch_when_cleaner_branch_is_comparable(self):
+        context = self._lane_now_context(
+            step=12,
+            speed=12.0,
+            dist_to_end=12.0,
+            lane_now=[0, 1],
+            available=[0, 1, 2],
+            shifts={0: 0, 1: 0, 2: 1},
+            forced_action=None,
+            branch_with_choice=True,
+            skip_reason=None,
+        )
+        density = {'edgeB': 0.31, 'edgeC': 0.18}
+        distance = {'edgeB': 88.0, 'edgeC': 100.0, 'edgeD': 140.0}
+
+        action = self.policy.select_fallback_action(
+            context,
+            blocked_action=2,
+            destination='destX',
+            recent_history=['edgeZ'],
+            distance_fn=lambda edge, dest: distance.get(edge, float('inf')),
+            edge_density_fn=lambda edge: density.get(edge, 0.0),
+            lane_now_only=True,
+        )
+
+        self.assertEqual(action, 1)
+
+    def test_fallback_keeps_congested_lane_now_branch_when_it_is_much_shorter(self):
+        context = self._lane_now_context(
+            step=12,
+            speed=12.0,
+            dist_to_end=12.0,
+            lane_now=[0, 1],
+            available=[0, 1, 2],
+            shifts={0: 0, 1: 0, 2: 1},
+            forced_action=None,
+            branch_with_choice=True,
+            skip_reason=None,
+        )
+        density = {'edgeB': 0.31, 'edgeC': 0.18}
+        distance = {'edgeB': 60.0, 'edgeC': 100.0, 'edgeD': 140.0}
+
+        action = self.policy.select_fallback_action(
+            context,
+            blocked_action=2,
+            destination='destX',
+            recent_history=['edgeZ'],
+            distance_fn=lambda edge, dest: distance.get(edge, float('inf')),
+            edge_density_fn=lambda edge: density.get(edge, 0.0),
+            lane_now_only=True,
+        )
+
+        self.assertEqual(action, 0)
+
     def test_stalled_proactive_pending_still_aborts(self):
         context = self._proactive_context(step=0, speed=8.0)
         pending = self.policy.build_route_pending(

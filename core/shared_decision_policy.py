@@ -540,20 +540,46 @@ class SharedDecisionPolicy:
         destination: str,
         recent_history: Sequence[str],
         distance_fn: Callable[[str, str], float],
+        edge_density_fn: Optional[Callable[[str], float]] = None,
         lane_now_only: bool = False,
     ) -> Optional[int]:
-        if lane_now_only:
-            lane_now_candidates = self.decision_engine.lane_feasible_fallback_actions(
-                context,
-                blocked_action=blocked_action,
+        lane_now_candidates = self.decision_engine.lane_feasible_fallback_actions(
+            context,
+            blocked_action=blocked_action,
+        )
+        candidate_actions = None
+        if edge_density_fn is not None and lane_now_candidates:
+            filtered_lane_now = self._filter_lane_now_congestion_traps(
+                context=context,
+                lane_now_actions=lane_now_candidates,
+                destination=destination,
+                distance_fn=distance_fn,
+                edge_density_fn=edge_density_fn,
+                metrics=None,
+                distance_slack=None,
             )
+            if filtered_lane_now:
+                if lane_now_only:
+                    candidate_actions = filtered_lane_now
+                else:
+                    safe_connected = self.decision_engine.safe_connected_fallback_actions(
+                        context,
+                        blocked_action=blocked_action,
+                    )
+                    lane_now_set = set(lane_now_candidates)
+                    candidate_actions = sorted(
+                        set(filtered_lane_now)
+                        | {action for action in safe_connected if action not in lane_now_set}
+                    )
+
+        if lane_now_only:
             ranked = self.decision_engine.ranked_fallback_actions(
                 context=context,
                 destination=destination,
                 recent_history=list(recent_history or []),
                 blocked_action=blocked_action,
                 distance_fn=distance_fn,
-                candidate_actions=lane_now_candidates,
+                candidate_actions=candidate_actions if candidate_actions is not None else lane_now_candidates,
             )
         else:
             ranked = self.decision_engine.ranked_fallback_actions(
@@ -562,6 +588,7 @@ class SharedDecisionPolicy:
                 recent_history=list(recent_history or []),
                 blocked_action=blocked_action,
                 distance_fn=distance_fn,
+                candidate_actions=candidate_actions,
             )
         if ranked:
             return int(ranked[0])
