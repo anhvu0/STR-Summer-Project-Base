@@ -175,23 +175,27 @@ class StrSumo:
                             # retry on the next control step.
                             continue
 
+                simulation_step()
+                step += 1
+
                 arrived_at_destination = simulation_get_arrived_ids()
 
                 for vehicle_id in arrived_at_destination:
-                    if vehicle_id in self.controlled_vehicles:
-                        end_number += 1
-                        arrived_controlled_ids.add(vehicle_id)
-                        time_span = step - self.controlled_vehicles[vehicle_id].start_time
-                        completed_travel_times.append(float(time_span))
-                        total_time += time_span
-                        miss = False
-                        if step > self.controlled_vehicles[vehicle_id].deadline:
-                            deadlines_missed.append(vehicle_id)
-                            miss = True
-                        if verbose:
-                            print("Vehicle {} reaches the destination: {}, timespan: {}, deadline missed: {}"                                .format(vehicle_id, True, time_span, miss))
-                simulation_step()
-                step += 1
+                    if vehicle_id not in controlled_vehicle_ids:
+                        continue
+                    if vehicle_id in arrived_controlled_ids:
+                        continue
+                    end_number += 1
+                    arrived_controlled_ids.add(vehicle_id)
+                    time_span = step - self.controlled_vehicles[vehicle_id].start_time
+                    completed_travel_times.append(float(time_span))
+                    total_time += time_span
+                    miss = False
+                    if step > self.controlled_vehicles[vehicle_id].deadline:
+                        deadlines_missed.append(vehicle_id)
+                        miss = True
+                    if verbose:
+                        print("Vehicle {} reaches the destination: {}, timespan: {}, deadline missed: {}"                                .format(vehicle_id, True, time_span, miss))
 
                 if step > MAX_SIMULATION_STEPS:
                     step_limit_reached = True
