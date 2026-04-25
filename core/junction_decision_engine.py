@@ -86,6 +86,9 @@ class JunctionDecisionEngine:
         self.connection_info = connection_info
         self.net = net
         self.direction_choices = direction_choices
+        self._direction_to_index = {
+            direction: idx for idx, direction in enumerate(self.direction_choices)
+        }
 
         self.base_reaction_distance = 25.0
         self.reaction_time_s = 1.3
@@ -112,6 +115,59 @@ class JunctionDecisionEngine:
         self.proactive_safety_margin_m = 8.0
         self.cooldown_after_abort_extra_steps = 2
         self.cooldown_after_timeout_extra_steps = 4
+        self._edge_allows_passenger_cache = {}
+        self._shortest_path_suffix_cache = {}
+        self._edge_valid_actions_by_edge = {}
+        self._lane_now_actions_by_lane = {}
+        self._required_lane_shift_by_lane = {}
+        self._reachable_actions_by_lane = {}
+        self._precompute_static_lane_action_metadata()
+
+    def _precompute_static_lane_action_metadata(self):
+        outgoing_lookup = self.connection_info.outgoing_edges_dict
+        lane_outgoing_lookup = self.connection_info.lane_outgoing_edges_dict
+        edge_lane_ids = self.connection_info.edge_lane_ids
+
+        for edge_id, outgoing in outgoing_lookup.items():
+            edge_valid = tuple(
+                sorted(
+                    self._direction_to_index[direction]
+                    for direction in outgoing.keys()
+                    if direction in self._direction_to_index
+                )
+            )
+            self._edge_valid_actions_by_edge[edge_id] = edge_valid
+
+            lane_ids = edge_lane_ids.get(edge_id, [])
+            direction_candidate_lane_indices = {}
+            for target_lane_idx, lane_candidate in enumerate(lane_ids):
+                lane_candidate_map = lane_outgoing_lookup.get(lane_candidate, {})
+                for direction in lane_candidate_map.keys():
+                    action_idx = self._direction_to_index.get(direction)
+                    if action_idx is None or direction not in outgoing:
+                        continue
+                    direction_candidate_lane_indices.setdefault(action_idx, []).append(target_lane_idx)
+
+            for lane_idx, lane_id in enumerate(lane_ids):
+                lane_map = lane_outgoing_lookup.get(lane_id, {})
+                lane_now = tuple(
+                    sorted(
+                        self._direction_to_index[direction]
+                        for direction in lane_map.keys()
+                        if direction in outgoing and direction in self._direction_to_index
+                    )
+                )
+                required_shift = {}
+                for action_idx in edge_valid:
+                    candidate_indices = direction_candidate_lane_indices.get(action_idx, [])
+                    if not candidate_indices:
+                        continue
+                    required_shift[action_idx] = int(
+                        min(abs(target_lane_idx - lane_idx) for target_lane_idx in candidate_indices)
+                    )
+                self._lane_now_actions_by_lane[lane_id] = lane_now
+                self._required_lane_shift_by_lane[lane_id] = required_shift
+                self._reachable_actions_by_lane[lane_id] = tuple(sorted(required_shift.keys()))
 
     def _lane_data(self, vehicle_id: str, edge_id: str, snapshot: Optional[VehicleSnapshot] = None):
         if snapshot is not None:
@@ -132,10 +188,15 @@ class JunctionDecisionEngine:
         return lane_id, lane_idx, lane_count, dist_to_end, speed
 
     def _edge_allows_passenger(self, edge_id: str) -> bool:
+        cached = self._edge_allows_passenger_cache.get(edge_id)
+        if cached is not None:
+            return bool(cached)
         try:
-            return self.net.getEdge(edge_id).allows("passenger")
+            allows = bool(self.net.getEdge(edge_id).allows("passenger"))
         except Exception:
-            return False
+            allows = False
+        self._edge_allows_passenger_cache[edge_id] = allows
+        return allows
 
     def build_context(
         self,
@@ -148,24 +209,29 @@ class JunctionDecisionEngine:
         lane_id, lane_idx, lane_count, dist_to_end, speed = self._lane_data(vehicle_id, edge_id, snapshot=snapshot)
 
         outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
-        edge_valid = [i for i, d in enumerate(self.direction_choices) if d in outgoing]
-        lane_map = self.connection_info.lane_outgoing_edges_dict.get(lane_id, {})
-        lane_now = [i for i, d in enumerate(self.direction_choices) if d in lane_map and d in outgoing]
+        edge_valid = list(self._edge_valid_actions_by_edge.get(edge_id, ()))
+        lane_now = list(self._lane_now_actions_by_lane.get(lane_id, ()))
+        required_shift = dict(self._required_lane_shift_by_lane.get(lane_id, {}))
+        reachable = list(self._reachable_actions_by_lane.get(lane_id, ()))
 
-        lane_ids = self.connection_info.edge_lane_ids.get(edge_id, [])
-        reachable = []
-        required_shift = {}
-        for idx in edge_valid:
-            direction = self.direction_choices[idx]
-            min_shift = None
-            for target_lane_idx, lane_candidate in enumerate(lane_ids):
-                lane_candidate_map = self.connection_info.lane_outgoing_edges_dict.get(lane_candidate, {})
-                if direction in lane_candidate_map:
-                    shift = abs(target_lane_idx - lane_idx)
-                    min_shift = shift if min_shift is None else min(min_shift, shift)
-            if min_shift is not None:
-                required_shift[idx] = int(min_shift)
-                reachable.append(idx)
+        if not edge_valid:
+            edge_valid = [i for i, d in enumerate(self.direction_choices) if d in outgoing]
+        if not lane_now:
+            lane_map = self.connection_info.lane_outgoing_edges_dict.get(lane_id, {})
+            lane_now = [i for i, d in enumerate(self.direction_choices) if d in lane_map and d in outgoing]
+        if not required_shift and edge_valid:
+            lane_ids = self.connection_info.edge_lane_ids.get(edge_id, [])
+            for idx in edge_valid:
+                direction = self.direction_choices[idx]
+                min_shift = None
+                for target_lane_idx, lane_candidate in enumerate(lane_ids):
+                    lane_candidate_map = self.connection_info.lane_outgoing_edges_dict.get(lane_candidate, {})
+                    if direction in lane_candidate_map:
+                        shift = abs(target_lane_idx - lane_idx)
+                        min_shift = shift if min_shift is None else min(min_shift, shift)
+                if min_shift is not None:
+                    required_shift[idx] = int(min_shift)
+            reachable = sorted(required_shift.keys())
 
         reaction_distance = max(self.base_reaction_distance, speed * self.reaction_time_s)
         commit_distance = max(self.commit_min_distance, speed * self.commit_time_s)
@@ -586,6 +652,26 @@ class JunctionDecisionEngine:
         direction = self.direction_choices[action_idx]
         return outgoing.get(direction)
 
+    def _shortest_path_suffix(self, from_edge_id: str, destination: str) -> Optional[Tuple[str, ...]]:
+        key = (from_edge_id, destination)
+        if key in self._shortest_path_suffix_cache:
+            return self._shortest_path_suffix_cache[key]
+
+        try:
+            from_edge = self.net.getEdge(from_edge_id)
+            to_edge = self.net.getEdge(destination)
+            path_edges, _ = self.net.getShortestPath(from_edge, to_edge, vClass="passenger")
+        except Exception:
+            path_edges = None
+
+        if not path_edges:
+            path_ids = (from_edge_id,) if from_edge_id == destination else None
+        else:
+            path_ids = tuple(edge.getID() for edge in path_edges)
+
+        self._shortest_path_suffix_cache[key] = path_ids
+        return path_ids
+
     def build_route_fragment(self, edge_id: str, action_idx: int, destination: str, horizon_m: Optional[float] = None):
         horizon = self.default_fragment_horizon_m if horizon_m is None else float(horizon_m)
         immediate = self.get_next_edge(edge_id, action_idx)
@@ -597,19 +683,10 @@ class JunctionDecisionEngine:
         if immediate != destination and len(immediate_outgoing) == 1 and edge_id in immediate_outgoing.values():
             return [], None, "trap_like_reversal"
 
-        try:
-            from_edge = self.net.getEdge(immediate)
-            to_edge = self.net.getEdge(destination)
-            path_edges, _ = self.net.getShortestPath(from_edge, to_edge, vClass="passenger")
-        except Exception:
-            path_edges = None
-
-        if not path_edges:
-            if immediate == destination:
-                return [immediate], immediate, None
+        path_ids = self._shortest_path_suffix(immediate, destination)
+        if not path_ids:
             return [], None, "unreachable_destination"
 
-        path_ids = [edge.getID() for edge in path_edges]
         fragment = []
         cumulative = 0.0
         for edge in path_ids:
@@ -637,24 +714,14 @@ class JunctionDecisionEngine:
         if not self._edge_allows_passenger(immediate):
             return [], None, "non_passenger_edge"
 
-        try:
-            from_edge = self.net.getEdge(immediate)
-            to_edge = self.net.getEdge(destination)
-            path_edges, _ = self.net.getShortestPath(from_edge, to_edge, vClass="passenger")
-        except Exception:
-            path_edges = None
-
-        if not path_edges:
-            if immediate == destination:
-                return [edge_id, immediate], immediate, None
+        suffix = self._shortest_path_suffix(immediate, destination)
+        if not suffix:
             return [], None, "unreachable_destination"
-
-        suffix = [edge.getID() for edge in path_edges]
         for edge in suffix:
             if not self._edge_allows_passenger(edge):
                 return [], None, "non_passenger_edge"
 
-        full_route = [edge_id] + suffix
+        full_route = [edge_id] + list(suffix)
         return full_route, immediate, None
 
     def apply_route_decision(self, vehicle_id: str, edge_id: str, action_idx: int, destination: str):

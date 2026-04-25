@@ -3,6 +3,7 @@ from core.Util import ConnectionInfo, Vehicle
 from keras.models import load_model
 import numpy as np
 import traci
+from traci import constants as tc
 import sumolib
 import math
 from collections import deque
@@ -135,6 +136,18 @@ class QLearningPolicy(RouteController):
         self._density_std = 0.0
         self._density_p95 = 0.0
         self._last_density_step = -10**9
+        self._vehicle_subscription_vars = (
+            tc.VAR_ROAD_ID,
+            tc.VAR_LANE_ID,
+            tc.VAR_LANE_INDEX,
+            tc.VAR_LANEPOSITION,
+            tc.VAR_SPEED,
+        )
+        self._active_vehicle_subscriptions = set()
+        self._step_cache_step = None
+        self._step_vehicle_results = {}
+        self._step_snapshot_cache = {}
+        self._step_context_cache = {}
         self.direction_mask_start = (2 * self.edge_embedding_dim) if self.use_compact_state else 2
         self._init_edge_embeddings(seed=1337)
 
@@ -191,8 +204,10 @@ class QLearningPolicy(RouteController):
 
         edge_list = self._edge_list
         lane_meters_vec = self._edge_lane_meters_vec
-        edge_get_last_step_vehicle_number = traci.edge.getLastStepVehicleNumber
-        counts = np.array([float(edge_get_last_step_vehicle_number(edge_id)) for edge_id in edge_list], dtype=np.float32)
+        counts = np.array(
+            [float(self.connection_info.edge_vehicle_count.get(edge_id, 0)) for edge_id in edge_list],
+            dtype=np.float32,
+        )
         self._edge_vehicle_count_cache = {edge_id: int(count) for edge_id, count in zip(edge_list, counts)}
         self._density_vec = (counts * float(self.density_scale_m)) / np.maximum(lane_meters_vec, 5.0)
 
@@ -208,6 +223,28 @@ class QLearningPolicy(RouteController):
             self._density_std = 0.0
             self._density_p95 = 0.0
         self._last_density_step = int(step)
+
+    def _prepare_step_cache(self, step):
+        step = int(step)
+        if self._step_cache_step == step:
+            return
+        self._step_cache_step = step
+        self._step_snapshot_cache = {}
+        self._step_context_cache = {}
+        try:
+            self._step_vehicle_results = traci.vehicle.getAllSubscriptionResults() or {}
+        except Exception:
+            self._step_vehicle_results = {}
+
+    def _ensure_vehicle_subscription(self, vehicle_id):
+        vehicle_id = str(vehicle_id)
+        if vehicle_id in self._active_vehicle_subscriptions:
+            return
+        try:
+            traci.vehicle.subscribe(vehicle_id, self._vehicle_subscription_vars)
+            self._active_vehicle_subscriptions.add(vehicle_id)
+        except traci.TraCIException:
+            return
 
     #-----------------------DEBUGGING-------------------------------------
     def _dist_to_dest(self, edge_id, dest_id):
@@ -396,12 +433,13 @@ class QLearningPolicy(RouteController):
         if phase != "route_pending":
             return
         step = int(traci.simulation.getTime())
+        self._prepare_step_cache(step)
         snapshot = self._snapshot_vehicle(vid, vehicle.current_edge, step)
         if vehicle.current_edge == pending.decision_edge:
             if snapshot is None:
                 return
             active_pending = self.shared_policy.pending_requires_active_same_edge_monitoring(pending)
-            context = self.decision_engine.build_context(str(vid), vehicle.current_edge, vehicle.destination, step, snapshot=snapshot)
+            context = self._get_step_context(str(vid), vehicle.current_edge, vehicle.destination, step, snapshot=snapshot)
             if active_pending and self.decision_engine.should_timeout_pending(pending, step):
                 self._pending_decisions.pop(vid, None)
                 self._record_pending_release("route_stall_timeout")
@@ -458,31 +496,74 @@ class QLearningPolicy(RouteController):
             self._metrics["pending_release_abort_events_total"] += 1
 
     def _snapshot_vehicle(self, vid, edge_id, step):
+        step = int(step)
+        vid = str(vid)
+        self._prepare_step_cache(step)
+        cached = self._step_snapshot_cache.get(vid)
+        if cached is not None and cached.edge_id == edge_id:
+            return cached
+
+        result = self._step_vehicle_results.get(vid) or {}
         try:
-            lane_id = traci.vehicle.getLaneID(vid)
-            lane_index = int(traci.vehicle.getLaneIndex(vid))
-            lane_position = float(traci.vehicle.getLanePosition(vid))
+            lane_id = result.get(tc.VAR_LANE_ID)
+            if lane_id is None:
+                lane_id = traci.vehicle.getLaneID(vid)
+            lane_index = result.get(tc.VAR_LANE_INDEX)
+            if lane_index is None:
+                lane_index = traci.vehicle.getLaneIndex(vid)
+            lane_position = result.get(tc.VAR_LANEPOSITION)
+            if lane_position is None:
+                lane_position = traci.vehicle.getLanePosition(vid)
+            speed = result.get(tc.VAR_SPEED)
+            if speed is None:
+                speed = traci.vehicle.getSpeed(vid)
+            lane_index = int(lane_index)
+            lane_position = float(lane_position)
+            speed = max(float(speed), 0.0)
             lane_length = self._lane_length(lane_id)
             lane_count = max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1)
-            speed = max(float(traci.vehicle.getSpeed(vid)), 0.0)
             dist_to_end = max(lane_length - lane_position, 0.0)
-            return VehicleSnapshot(
+            snapshot = VehicleSnapshot(
                 vehicle_id=str(vid), step=int(step), edge_id=edge_id, lane_id=lane_id,
                 lane_index=lane_index, lane_count=lane_count, lane_position=lane_position,
                 lane_length=lane_length, dist_to_end=dist_to_end, speed=speed,
             )
+            self._step_snapshot_cache[vid] = snapshot
+            return snapshot
         except traci.TraCIException:
             return None
 
+    def _get_step_context(self, vid, edge_id, destination, step, snapshot=None):
+        step = int(step)
+        key = (str(vid), edge_id, destination, step)
+        cached = self._step_context_cache.get(key)
+        if cached is not None:
+            return cached
+        context = self.decision_engine.build_context(
+            str(vid),
+            edge_id,
+            destination,
+            step,
+            snapshot=snapshot,
+        )
+        self._step_context_cache[key] = context
+        return context
+
     def should_control_vehicle(self, vehicle_id, vehicle, step):
         vid = str(vehicle_id)
+        step = int(step)
+        self._prepare_step_cache(step)
+        self._ensure_vehicle_subscription(vid)
 
         # Avoid duplicate same-step work
-        if self._last_control_step.get(vid) == int(step):
+        if self._last_control_step.get(vid) == step:
             return False
 
+        result = self._step_vehicle_results.get(vid) or {}
         try:
-            current_edge = traci.vehicle.getRoadID(vid)
+            current_edge = result.get(tc.VAR_ROAD_ID)
+            if current_edge is None:
+                current_edge = traci.vehicle.getRoadID(vid)
         except traci.TraCIException:
             return False
 
@@ -500,15 +581,9 @@ class QLearningPolicy(RouteController):
             if current_edge != pending.decision_edge:
                 self._metrics["step_control_pending"] += 1
                 return True
-            snapshot = self._snapshot_vehicle(vid, current_edge, int(step))
+            snapshot = self._snapshot_vehicle(vid, current_edge, step)
             if snapshot is not None:
-                context = self.decision_engine.build_context(
-                    vid,
-                    current_edge,
-                    vehicle.destination,
-                    int(step),
-                    snapshot=snapshot,
-                )
+                context = self._get_step_context(vid, current_edge, vehicle.destination, step, snapshot=snapshot)
                 if context.commit_window and pending.intended_action not in context.lane_feasible_now_actions:
                     self._metrics["step_control_pending"] += 1
                     return True
@@ -518,17 +593,11 @@ class QLearningPolicy(RouteController):
             self._metrics["step_control_edge_change"] += 1
             return True
 
-        snapshot = self._snapshot_vehicle(vid, current_edge, int(step))
+        snapshot = self._snapshot_vehicle(vid, current_edge, step)
         if snapshot is None:
             return False
 
-        context = self.decision_engine.build_context(
-            vid,
-            current_edge,
-            vehicle.destination,
-            int(step),
-            snapshot=snapshot,
-        )
+        context = self._get_step_context(vid, current_edge, vehicle.destination, step, snapshot=snapshot)
 
         # Match training more closely:
         # - forced decisions are always evaluated
@@ -543,7 +612,127 @@ class QLearningPolicy(RouteController):
 
     def make_decisions(self, vehicles, connection_info: ConnectionInfo):
         local_targets = {}
-        self._refresh_density_stats(int(traci.simulation.getTime()))
+        step = int(traci.simulation.getTime())
+        self._prepare_step_cache(step)
+        self._refresh_density_stats(step)
+        open_decision_batch = []
+
+        def process_selected_action(vid, vehicle, start_edge, context, recent, action_idx):
+            if action_idx not in context.available_actions:
+                self._metrics["overrides"] += 1
+                self._metrics["impossible_action_overrides"] += 1
+                return
+            safe_ok, signal = self.decision_engine.prefilter_action_for_loops(
+                context=context,
+                action_idx=action_idx,
+                destination=vehicle.destination,
+                recent_history=recent,
+                distance_fn=self._dist_to_dest,
+                distance_slack=self.score_slack,
+            )
+            if not safe_ok:
+                self._metrics["overrides"] += 1
+                self._metrics["loop_overrides"] += 1
+                self._metrics["loop_override_count"] += 1
+                if signal.get("dead_end_reentry"):
+                    self._metrics["deadend_overrides"] += 1
+                    self._metrics["dead_end_reentry_override_count"] += 1
+                if signal.get("distance_worsen"):
+                    self._metrics["distance_overrides"] += 1
+                fallback_action = self.shared_policy.select_fallback_action(
+                    context,
+                    blocked_action=action_idx,
+                    destination=vehicle.destination,
+                    recent_history=recent,
+                    distance_fn=self._dist_to_dest,
+                    edge_density_fn=self._edge_density,
+                )
+                if fallback_action is None:
+                    return
+                action_idx = fallback_action
+                self._metrics["fallback_selected_total"] += 1
+                if action_idx in context.lane_feasible_now_actions:
+                    self._metrics["fallback_selected_lane_now"] += 1
+
+            selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
+            if selected_next_edge is None:
+                return
+
+            lane_change_requested = False
+            if action_idx not in context.lane_feasible_now_actions:
+                cooldown_until = self._lane_change_cooldown.get((vid, start_edge), -1)
+                if step < cooldown_until:
+                    self._metrics["overrides"] += 1
+                    self._metrics["cooldown_replans_blocked"] += 1
+                    action_idx = self.shared_policy.select_fallback_action(
+                        context,
+                        blocked_action=action_idx,
+                        destination=vehicle.destination,
+                        recent_history=recent,
+                        distance_fn=self._dist_to_dest,
+                        edge_density_fn=self._edge_density,
+                        lane_now_only=True,
+                    )
+                    if action_idx is None:
+                        return
+                    self._metrics["fallback_selected_total"] += 1
+                    if action_idx in context.lane_feasible_now_actions:
+                        self._metrics["fallback_selected_lane_now"] += 1
+                else:
+                    lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action_idx)
+                    observe_meta = self.decision_engine.start_lane_change_observe(context, action_idx, step, lane_change_requested, lane_change_ok)
+                    decision_id = self._next_decision_id()
+                    origin_mode = ("lane_now" if action_idx in context.lane_feasible_now_actions else "proactive")
+                    self._pending_decisions[vid] = self.shared_policy.build_observe_pending(
+                        state=None,
+                        action_idx=action_idx,
+                        intended_next_edge=selected_next_edge,
+                        decision_edge=start_edge,
+                        step=step,
+                        destination=vehicle.destination,
+                        context=context,
+                        lane_change_requested=lane_change_requested,
+                        decision_id=decision_id,
+                        origin_mode=origin_mode,
+                        action_source="policy",
+                        observe_metadata=observe_meta,
+                        decision_open_recorded=True,
+                    )
+                    self._metrics["lane_change_observe_started"] += 1
+                    self._metrics["deferred_lane_change_actions"] += 1
+                    return
+
+            full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
+                str(vid),
+                start_edge,
+                action_idx,
+                vehicle.destination,
+            )
+            if apply_error:
+                self._metrics["overrides"] += 1
+                self._metrics["distance_overrides"] += 1
+                return
+
+            next_edge = committed_next_edge
+            if next_edge:
+                decision_id = self._next_decision_id()
+                origin_mode = ("lane_now" if action_idx in context.lane_feasible_now_actions else "proactive")
+                self._pending_decisions[vid] = self.shared_policy.build_route_pending(
+                    state=None,
+                    action_idx=action_idx,
+                    committed_next_edge=next_edge,
+                    decision_edge=start_edge,
+                    step=step,
+                    destination=vehicle.destination,
+                    context=context,
+                    lane_change_requested=lane_change_requested,
+                    decision_id=decision_id,
+                    origin_mode=origin_mode,
+                    action_source="policy",
+                    full_route=full_route,
+                    decision_open_recorded=True,
+                )
+            # Route already committed directly via shared apply_route_decision.
 
         if not hasattr(self, "_debug_net_checked"):
             self._debug_net_checked = True
@@ -556,7 +745,6 @@ class QLearningPolicy(RouteController):
                 continue
 
             vid = vehicle.vehicle_id
-            step = int(traci.simulation.getTime())
             self._last_control_step[vid] = step
             if vid not in self._recent_edges:
                 self._recent_edges[vid] = deque(maxlen=self.loop_window)
@@ -591,7 +779,7 @@ class QLearningPolicy(RouteController):
                     obs_snapshot = self._snapshot_vehicle(vid, start_edge, step)
                     if obs_snapshot is None:
                         continue
-                    obs_context = self.decision_engine.build_context(str(vid), start_edge, vehicle.destination, step, snapshot=obs_snapshot)
+                    obs_context = self._get_step_context(str(vid), start_edge, vehicle.destination, step, snapshot=obs_snapshot)
                     status, reason = self.decision_engine.evaluate_lane_change_observation(
                         pending.metadata, obs_context, pending.intended_action
                     )
@@ -677,11 +865,11 @@ class QLearningPolicy(RouteController):
             snapshot = self._snapshot_vehicle(vid, start_edge, step)
             if snapshot is None:
                 continue
-            context = self.decision_engine.build_context(str(vid), start_edge, vehicle.destination, step, snapshot=snapshot)
-
+            context = self._get_step_context(str(vid), start_edge, vehicle.destination, step, snapshot=snapshot)
             decision_mode = self.shared_policy.classify_decision(context)
             if decision_mode.mode == "forced":
-                action_idx = int(decision_mode.action)
+                process_selected_action(vid, vehicle, start_edge, context, recent, int(decision_mode.action))
+                continue
             elif decision_mode.mode != "open":
                 continue
             else:
@@ -698,124 +886,33 @@ class QLearningPolicy(RouteController):
                     metrics=self._metrics,
                     distance_slack=self.score_slack,
                 )
-                action_idx = self.act(state, available_actions=policy_actions)
                 self._metrics["decisions"] += 1
-
-            if action_idx not in context.available_actions:
-                self._metrics["overrides"] += 1
-                self._metrics["impossible_action_overrides"] += 1
-                continue
-            safe_ok, signal = self.decision_engine.prefilter_action_for_loops(
-                context=context,
-                action_idx=action_idx,
-                destination=vehicle.destination,
-                recent_history=recent,
-                distance_fn=self._dist_to_dest,
-                distance_slack=self.score_slack,
-            )
-            if not safe_ok:
-                self._metrics["overrides"] += 1
-                self._metrics["loop_overrides"] += 1
-                self._metrics["loop_override_count"] += 1
-                if signal.get("dead_end_reentry"):
-                    self._metrics["deadend_overrides"] += 1
-                    self._metrics["dead_end_reentry_override_count"] += 1
-                if signal.get("distance_worsen"):
-                    self._metrics["distance_overrides"] += 1
-                fallback_action = self.shared_policy.select_fallback_action(
-                    context,
-                    blocked_action=action_idx,
-                    destination=vehicle.destination,
-                    recent_history=recent,
-                    distance_fn=self._dist_to_dest,
-                    edge_density_fn=self._edge_density,
+                open_decision_batch.append(
+                    {
+                        "vid": vid,
+                        "vehicle": vehicle,
+                        "start_edge": start_edge,
+                        "context": context,
+                        "recent": recent,
+                        "state": state,
+                        "policy_actions": policy_actions,
+                    }
                 )
-                if fallback_action is None:
-                    continue
-                action_idx = self.act(state, available_actions=[fallback_action]) if context.forced_action is None else fallback_action
-                self._metrics["fallback_selected_total"] += 1
-                if action_idx in context.lane_feasible_now_actions:
-                    self._metrics["fallback_selected_lane_now"] += 1
 
-            selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
-            if selected_next_edge is None:
-                continue
-
-            lane_change_requested = False
-            if action_idx not in context.lane_feasible_now_actions:
-                cooldown_until = self._lane_change_cooldown.get((vid, start_edge), -1)
-                if step < cooldown_until:
-                    self._metrics["overrides"] += 1
-                    self._metrics["cooldown_replans_blocked"] += 1
-                    action_idx = self.shared_policy.select_fallback_action(
-                        context,
-                        blocked_action=action_idx,
-                        destination=vehicle.destination,
-                        recent_history=recent,
-                        distance_fn=self._dist_to_dest,
-                        edge_density_fn=self._edge_density,
-                        lane_now_only=True,
-                    )
-                    if action_idx is None:
-                        continue
-                    self._metrics["fallback_selected_total"] += 1
-                    if action_idx in context.lane_feasible_now_actions:
-                        self._metrics["fallback_selected_lane_now"] += 1
-                else:
-                    lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action_idx)
-                    observe_meta = self.decision_engine.start_lane_change_observe(context, action_idx, step, lane_change_requested, lane_change_ok)
-                    decision_id = self._next_decision_id()
-                    origin_mode = ("lane_now" if action_idx in context.lane_feasible_now_actions else "proactive")
-                    self._pending_decisions[vid] = self.shared_policy.build_observe_pending(
-                        state=None,
-                        action_idx=action_idx,
-                        intended_next_edge=selected_next_edge,
-                        decision_edge=start_edge,
-                        step=step,
-                        destination=vehicle.destination,
-                        context=context,
-                        lane_change_requested=lane_change_requested,
-                        decision_id=decision_id,
-                        origin_mode=origin_mode,
-                        action_source="policy",
-                        observe_metadata=observe_meta,
-                        decision_open_recorded=True,
-                    )
-                    self._metrics["lane_change_observe_started"] += 1
-                    self._metrics["deferred_lane_change_actions"] += 1
-                    continue
-
-            full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
-                str(vid),
-                start_edge,
-                action_idx,
-                vehicle.destination,
+        if open_decision_batch:
+            action_indices = self.act_batch(
+                [entry["state"] for entry in open_decision_batch],
+                [entry["policy_actions"] for entry in open_decision_batch],
             )
-            if apply_error:
-                self._metrics["overrides"] += 1
-                self._metrics["distance_overrides"] += 1
-                continue
-
-            next_edge = committed_next_edge
-            if next_edge:
-                decision_id = self._next_decision_id()
-                origin_mode = ("lane_now" if action_idx in context.lane_feasible_now_actions else "proactive")
-                self._pending_decisions[vid] = self.shared_policy.build_route_pending(
-                    state=None,
-                    action_idx=action_idx,
-                    committed_next_edge=next_edge,
-                    decision_edge=start_edge,
-                    step=step,
-                    destination=vehicle.destination,
-                    context=context,
-                    lane_change_requested=lane_change_requested,
-                    decision_id=decision_id,
-                    origin_mode=origin_mode,
-                    action_source="policy",
-                    full_route=full_route,
-                    decision_open_recorded=True,
+            for entry, action_idx in zip(open_decision_batch, action_indices):
+                process_selected_action(
+                    entry["vid"],
+                    entry["vehicle"],
+                    entry["start_edge"],
+                    entry["context"],
+                    entry["recent"],
+                    action_idx,
                 )
-            # Route already committed directly via shared apply_route_decision.
 
         if self._metrics["decisions"] > 0:
             snapshot = (
@@ -866,16 +963,36 @@ class QLearningPolicy(RouteController):
         masked[available] = act_values[available]
         return int(np.argmax(masked))
 
+    def act_batch(self, states, available_actions_batch):
+        if not states:
+            return []
+        state_batch = np.array([state[0] for state in states], dtype=np.float32)
+        q_batch = self.model(state_batch, training=False).numpy()
+        results = []
+        for q_values, available_actions in zip(q_batch, available_actions_batch):
+            available = list(available_actions) if available_actions is not None else []
+            if not available:
+                results.append(int(np.argmax(q_values)))
+                continue
+            masked = np.full_like(q_values, -1e9)
+            valid_idx = np.asarray(available, dtype=np.intp)
+            masked[valid_idx] = q_values[valid_idx]
+            results.append(int(np.argmax(masked)))
+        return results
     # this function gives the current state of the vehicle based on the state size
     def getState(self, vehicle_id, edge_now, destination_edge, context=None):
         en = edge_now
+        current_step = int(context.step) if context is not None else int(
+            self._step_cache_step if self._step_cache_step is not None else traci.simulation.getTime()
+        )
         if context is None:
-            context = self.decision_engine.build_context(str(vehicle_id), en, destination_edge, int(traci.simulation.getTime()))
+            self._prepare_step_cache(current_step)
+            context = self._get_step_context(str(vehicle_id), en, destination_edge, current_step)
 
         vehicle_obj = self.vehicles.get(str(vehicle_id))
         deadline_features = [0.0, 0.0, 0.0]
         if vehicle_obj is not None:
-            now = traci.simulation.getTime()
+            now = float(current_step)
             deadline_window = max(float(vehicle_obj.deadline) - float(vehicle_obj.start_time), 1.0)
             time_left = max(float(vehicle_obj.deadline) - float(now), 0.0)
             elapsed = max(float(now) - float(vehicle_obj.start_time), 0.0)
@@ -886,26 +1003,58 @@ class QLearningPolicy(RouteController):
                 urgency,
             ]
 
+        density_cache = {}
+        eta_cache = {}
+
+        def cached_edge_density(edge_id):
+            if edge_id is None:
+                return float("inf")
+            cached = density_cache.get(edge_id)
+            if cached is not None:
+                return cached
+            cached = float(self._edge_density(edge_id))
+            density_cache[edge_id] = cached
+            return cached
+
+        def cached_eta(edge_id, destination):
+            if edge_id is None:
+                return float("inf")
+            key = (edge_id, destination)
+            cached = eta_cache.get(key)
+            if cached is not None:
+                return cached
+            cached = float(self._estimate_eta(edge_id, destination))
+            eta_cache[key] = cached
+            return cached
+
+        social_cost_cache = {}
+        for action_idx in context.edge_valid_actions:
+            next_edge = self.decision_engine.get_next_edge(en, action_idx)
+            if next_edge is None:
+                social_cost_cache[action_idx] = float("inf")
+                continue
+            eta_value = cached_eta(next_edge, destination_edge)
+            if not np.isfinite(eta_value):
+                eta_value = 20.0
+            social_cost_cache[action_idx] = (
+                (1.25 * cached_edge_density(next_edge))
+                + (0.01 * float(eta_value))
+            )
+
         return self.shared_policy.encode_state(
             edge_id=en,
             destination_edge=destination_edge,
             context=context,
             use_compact_state=self.use_compact_state,
             edge_embedding_fn=self._get_edge_embedding,
-            edge_density_fn=self._edge_density,
-            eta_fn=self._estimate_eta,
-            social_cost_fn=lambda current_edge, action_idx, destination: (
-                (1.25 * float(self._edge_density(self.decision_engine.get_next_edge(current_edge, action_idx))))
-                + (0.01 * float(self._estimate_eta(self.decision_engine.get_next_edge(current_edge, action_idx), destination))
-                   if self.decision_engine.get_next_edge(current_edge, action_idx) is not None and np.isfinite(self._estimate_eta(self.decision_engine.get_next_edge(current_edge, action_idx), destination))
-                   else 20.0)
-                if self.decision_engine.get_next_edge(current_edge, action_idx) is not None else float("inf")
-            ),
+            edge_density_fn=cached_edge_density,
+            eta_fn=cached_eta,
+            social_cost_fn=lambda current_edge, action_idx, destination: social_cost_cache.get(action_idx, float("inf")),
             global_density_stats=(float(self._density_mean), float(self._density_std)) if self.use_compact_state else None,
             edge_lane_meters_fn=self._edge_lane_meters,
-            step=int(traci.simulation.getTime()),
+            step=current_step,
             vehicle_start_time=(float(vehicle_obj.start_time) if vehicle_obj is not None else None),
             edge_index_lookup=self.connection_info.edge_index_dict,
             legacy_aux_features=deadline_features,
-            legacy_density_values=[self._edge_density(edge_id) for edge_id in self.connection_info.edge_list] if not self.use_compact_state else None,
+            legacy_density_values=[cached_edge_density(edge_id) for edge_id in self.connection_info.edge_list] if not self.use_compact_state else None,
         )

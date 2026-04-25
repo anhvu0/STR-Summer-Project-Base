@@ -13,6 +13,7 @@ else:
     sys.exit("No environment variable SUMO_HOME!")
 
 import traci
+from traci import constants as tc
 import sumolib
 import numpy as np
 from controller.RouteController import *
@@ -56,7 +57,27 @@ class StrSumo:
         self.connection_info = connection_info
         self.route_controller = route_controller
         self.controlled_vehicles =  controlled_vehicles # dictionary of Vehicles by id
+        self._vehicle_subscription_vars = (
+            tc.VAR_ROAD_ID,
+            tc.VAR_SPEED,
+        )
+        self._edge_subscription_vars = (tc.LAST_STEP_VEHICLE_NUMBER,)
+        self._active_vehicle_subscriptions = set()
         #print(self.controlled_vehicles)
+
+    def _initialize_edge_subscriptions(self):
+        for edge_id in self.connection_info.edge_list:
+            traci.edge.subscribe(edge_id, self._edge_subscription_vars)
+
+    def _ensure_vehicle_subscriptions(self, vehicle_ids):
+        for vehicle_id in vehicle_ids:
+            if vehicle_id in self._active_vehicle_subscriptions:
+                continue
+            try:
+                traci.vehicle.subscribe(vehicle_id, self._vehicle_subscription_vars)
+                self._active_vehicle_subscriptions.add(vehicle_id)
+            except traci.TraCIException:
+                continue
 
     def run(self, verbose=True, return_stats=False, print_runtime_summary=True):
         """
@@ -96,13 +117,20 @@ class StrSumo:
         vehicle_set_route = traci.vehicle.setRoute
         vehicle_set_via = traci.vehicle.setVia
         vehicle_change_target = traci.vehicle.changeTarget
+        vehicle_get_all_subscription_results = traci.vehicle.getAllSubscriptionResults
+        edge_get_all_subscription_results = traci.edge.getAllSubscriptionResults
+        self._active_vehicle_subscriptions = set()
+        self._initialize_edge_subscriptions()
 
         try:
             while simulation_get_min_expected() > 0:
                 vehicle_ids = set(vehicle_get_ids())
+                self._ensure_vehicle_subscriptions(vehicle_ids & controlled_vehicle_ids)
+                vehicle_results = vehicle_get_all_subscription_results() or {}
+                edge_results = edge_get_all_subscription_results() or {}
 
                 # store edge vehicle counts in connection_info.edge_vehicle_count
-                self.get_edge_vehicle_counts()
+                self.get_edge_vehicle_counts(edge_results=edge_results)
                 #initialize vehicles to be directed
                 vehicles_to_direct = []
                 queued_ids = set()
@@ -120,7 +148,13 @@ class StrSumo:
                         self.controlled_vehicles[vehicle_id].start_time = float(step)#Use the detected release time as start time
 
                     if vehicle_id in controlled_vehicle_ids:
-                        current_edge = vehicle_get_road(vehicle_id)
+                        result = vehicle_results.get(vehicle_id) or {}
+                        try:
+                            current_edge = result.get(tc.VAR_ROAD_ID)
+                            if current_edge is None:
+                                current_edge = vehicle_get_road(vehicle_id)
+                        except traci.TraCIException:
+                            continue
 
                         if current_edge not in self.connection_info.edge_index_dict.keys():
                             continue
@@ -146,7 +180,13 @@ class StrSumo:
                             self.controlled_vehicles[vehicle_id].current_edge = current_edge
 
                         if (edge_changed or should_force_control) and vehicle_id not in queued_ids:
-                            self.controlled_vehicles[vehicle_id].current_speed = vehicle_get_speed(vehicle_id)
+                            try:
+                                current_speed = result.get(tc.VAR_SPEED)
+                                if current_speed is None:
+                                    current_speed = vehicle_get_speed(vehicle_id)
+                            except traci.TraCIException:
+                                continue
+                            self.controlled_vehicles[vehicle_id].current_speed = float(current_speed)
                             vehicles_to_direct.append(self.controlled_vehicles[vehicle_id])
                             queued_ids.add(vehicle_id)
                 #print(len(vehicles_to_direct))
@@ -280,6 +320,11 @@ class StrSumo:
             return total_time, end_number, num_deadlines_missed, stats
         return total_time, end_number, num_deadlines_missed
 
-    def get_edge_vehicle_counts(self):
+    def get_edge_vehicle_counts(self, edge_results=None):
+        edge_results = edge_results or {}
         for edge in self.connection_info.edge_list:
-            self.connection_info.edge_vehicle_count[edge] = traci.edge.getLastStepVehicleNumber(edge)
+            result = edge_results.get(edge) or {}
+            count = result.get(tc.LAST_STEP_VEHICLE_NUMBER)
+            if count is None:
+                count = traci.edge.getLastStepVehicleNumber(edge)
+            self.connection_info.edge_vehicle_count[edge] = int(count)
