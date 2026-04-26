@@ -356,6 +356,75 @@ class QLearningPolicy(RouteController):
         if "fallback" in action_source:
             self._metrics["committed_cyclic_revisit_after_fallback_events"] += 1
 
+    def _format_pending_descriptor(self, descriptor):
+        if not descriptor:
+            return "none"
+        return (
+            f"{descriptor['vehicle_id']}@{descriptor['edge']}:"
+            f"age={descriptor['age']},stall={descriptor['stall_age']},"
+            f"phase={descriptor['phase']},mode={descriptor['resolution_mode']},"
+            f"shift={descriptor['current_shift']}"
+        )
+
+    def _runtime_pending_snapshot(self):
+        summary = {
+            "total_open": 0,
+            "observe_open": 0,
+            "route_open": 0,
+            "lane_now_open": 0,
+            "proactive_open": 0,
+            "active_monitoring_open": 0,
+            "oldest_descriptor": None,
+        }
+        if not self._pending_decisions:
+            return summary
+
+        try:
+            step = int(traci.simulation.getTime())
+        except Exception:
+            step = 0
+
+        oldest_descriptor = None
+        for vehicle_id, pending in self._pending_decisions.items():
+            metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
+            phase = self.shared_policy.pending_phase(pending)
+            resolution_mode = self.shared_policy.pending_resolution_mode(pending)
+            active_monitoring = self.shared_policy.pending_requires_active_same_edge_monitoring(pending)
+            age = max(step - int(pending.decision_step), 0)
+            last_progress_step = int(metadata.get("last_progress_step", pending.decision_step))
+            stall_age = max(step - last_progress_step, 0)
+            current_shift = int(metadata.get("last_required_shift", metadata.get("observe_last_required_shift", 99)))
+            descriptor = {
+                "vehicle_id": str(vehicle_id),
+                "edge": str(pending.decision_edge),
+                "age": int(age),
+                "stall_age": int(stall_age),
+                "phase": str(phase),
+                "resolution_mode": str(resolution_mode),
+                "current_shift": int(current_shift),
+            }
+            if oldest_descriptor is None or (descriptor["age"], descriptor["stall_age"], descriptor["vehicle_id"]) > (
+                oldest_descriptor["age"],
+                oldest_descriptor["stall_age"],
+                oldest_descriptor["vehicle_id"],
+            ):
+                oldest_descriptor = descriptor
+
+            summary["total_open"] += 1
+            if phase == "observe_lane_change":
+                summary["observe_open"] += 1
+            else:
+                summary["route_open"] += 1
+            if resolution_mode == "lane_now":
+                summary["lane_now_open"] += 1
+            else:
+                summary["proactive_open"] += 1
+            if active_monitoring:
+                summary["active_monitoring_open"] += 1
+
+        summary["oldest_descriptor"] = oldest_descriptor
+        return summary
+
     def get_runtime_metrics(self):
         metrics = dict(self._metrics)
         decisions = float(max(metrics.get("decisions", 0), 1))
@@ -372,6 +441,7 @@ class QLearningPolicy(RouteController):
 
     def format_runtime_metrics_summary(self):
         metrics = self.get_runtime_metrics()
+        pending_snapshot = self._runtime_pending_snapshot()
         return [
             (
                 "[RL-INFER] decisions={} overrides={} override_ratio={:.1%} "
@@ -421,6 +491,18 @@ class QLearningPolicy(RouteController):
                 int(metrics["lane_change_observe_abort_low_speed"]),
                 int(metrics["lane_change_observe_abort_commit_window"]),
                 int(metrics["cooldown_replans_blocked"]),
+            ),
+            (
+                "[RL-INFER] pending_end total={} observe/route={}/{} "
+                "lane_now/proactive={}/{} active_monitor={} oldest={}"
+            ).format(
+                int(pending_snapshot["total_open"]),
+                int(pending_snapshot["observe_open"]),
+                int(pending_snapshot["route_open"]),
+                int(pending_snapshot["lane_now_open"]),
+                int(pending_snapshot["proactive_open"]),
+                int(pending_snapshot["active_monitoring_open"]),
+                self._format_pending_descriptor(pending_snapshot["oldest_descriptor"]),
             ),
         ]
 

@@ -10,7 +10,7 @@ from keras.layers import Dense
 from keras.models import Sequential, clone_model
 from keras.losses import Huber
 from keras.optimizers import Adam
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 import random
 from controller.RouteController import RouteController
 from controller.QLearningController import QLearningPolicy
@@ -690,6 +690,124 @@ class RLTrainingPipeline:
         with open(self.decision_debug_csv_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=self._decision_debug_fields)
             writer.writerows(rows)
+
+    def _format_top_counts(self, counts, limit=3):
+        if not counts:
+            return ""
+        items = []
+        for key, value in counts.items():
+            try:
+                numeric_value = float(value)
+            except Exception:
+                continue
+            if numeric_value <= 0.0:
+                continue
+            items.append((str(key), numeric_value))
+        if not items:
+            return ""
+        items.sort(key=lambda item: (-item[1], item[0]))
+        formatted = []
+        for key, numeric_value in items[:max(int(limit), 1)]:
+            if abs(numeric_value - round(numeric_value)) <= 1e-9:
+                value_str = str(int(round(numeric_value)))
+            else:
+                value_str = f"{numeric_value:.2f}"
+            formatted.append(f"{key}:{value_str}")
+        return "|".join(formatted)
+
+    def _format_pending_descriptor(self, descriptor):
+        if not descriptor:
+            return ""
+        return (
+            f"{descriptor['vehicle_id']}@{descriptor['edge']}:"
+            f"age={descriptor['age']},stall={descriptor['stall_age']},"
+            f"phase={descriptor['phase']},mode={descriptor['resolution_mode']},"
+            f"shift={descriptor['current_shift']}"
+        )
+
+    def _summarize_pending_backlog(self, pending_decisions, step):
+        step = max(int(step), 0)
+        summary = {
+            "total_open": 0,
+            "observe_open": 0,
+            "route_open": 0,
+            "lane_now_open": 0,
+            "proactive_open": 0,
+            "active_monitoring_open": 0,
+            "mean_age_all": 0.0,
+            "max_age_all": 0.0,
+            "mean_age_active": 0.0,
+            "max_age_active": 0.0,
+            "mean_age_lane_now": 0.0,
+            "max_age_lane_now": 0.0,
+            "mean_stall_age": 0.0,
+            "max_stall_age": 0.0,
+            "oldest_descriptor": None,
+            "hot_edges": "",
+        }
+        if not pending_decisions:
+            return summary
+
+        age_all = []
+        age_active = []
+        age_lane_now = []
+        stall_ages = []
+        hot_edges = Counter()
+        oldest_descriptor = None
+
+        for vehicle_id, pending in pending_decisions.items():
+            metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
+            phase = self.shared_policy.pending_phase(pending)
+            resolution_mode = self.shared_policy.pending_resolution_mode(pending)
+            active_monitoring = self.shared_policy.pending_requires_active_same_edge_monitoring(pending)
+            age = max(step - int(pending.decision_step), 0)
+            last_progress_step = int(metadata.get("last_progress_step", pending.decision_step))
+            stall_age = max(step - last_progress_step, 0)
+            current_shift = int(metadata.get("last_required_shift", metadata.get("observe_last_required_shift", 99)))
+            descriptor = {
+                "vehicle_id": str(vehicle_id),
+                "edge": str(pending.decision_edge),
+                "age": int(age),
+                "stall_age": int(stall_age),
+                "phase": str(phase),
+                "resolution_mode": str(resolution_mode),
+                "current_shift": int(current_shift),
+            }
+            if oldest_descriptor is None or (descriptor["age"], descriptor["stall_age"], descriptor["vehicle_id"]) > (
+                oldest_descriptor["age"],
+                oldest_descriptor["stall_age"],
+                oldest_descriptor["vehicle_id"],
+            ):
+                oldest_descriptor = descriptor
+
+            summary["total_open"] += 1
+            hot_edges[str(pending.decision_edge)] += 1
+            age_all.append(float(age))
+            stall_ages.append(float(stall_age))
+            if phase == "observe_lane_change":
+                summary["observe_open"] += 1
+            else:
+                summary["route_open"] += 1
+            if active_monitoring:
+                summary["active_monitoring_open"] += 1
+                age_active.append(float(age))
+            if resolution_mode == "lane_now":
+                summary["lane_now_open"] += 1
+                age_lane_now.append(float(age))
+            else:
+                summary["proactive_open"] += 1
+
+        summary["mean_age_all"] = float(np.mean(age_all)) if age_all else 0.0
+        summary["max_age_all"] = float(max(age_all)) if age_all else 0.0
+        summary["mean_age_active"] = float(np.mean(age_active)) if age_active else 0.0
+        summary["max_age_active"] = float(max(age_active)) if age_active else 0.0
+        summary["mean_age_lane_now"] = float(np.mean(age_lane_now)) if age_lane_now else 0.0
+        summary["max_age_lane_now"] = float(max(age_lane_now)) if age_lane_now else 0.0
+        summary["mean_stall_age"] = float(np.mean(stall_ages)) if stall_ages else 0.0
+        summary["max_stall_age"] = float(max(stall_ages)) if stall_ages else 0.0
+        summary["oldest_descriptor"] = oldest_descriptor
+        summary["hot_edges"] = self._format_top_counts(hot_edges)
+        return summary
 
     def _build_decision_debug_row(
         self,
@@ -2005,18 +2123,36 @@ class RLTrainingPipeline:
             "route_mismatch", "loop_events",
             "short_cycle_events", "aba_bounce_events", "dead_end_reentry_events",
             "long_horizon_loop_events", "revisit_without_progress_events",
-            "safety_overrides", "fragment_build_failures", "fallback_overrides", "fallback_selected_lane_now",
+            "loop_signal_events_total", "loop_repeat_only_events",
+            "safety_overrides", "loop_prefilter_overrides", "fragment_build_failures",
+            "fallback_overrides", "fallback_selected_total", "fallback_selected_lane_now",
             "pending_decision_timeouts", "deferred_lane_change_actions",
-            "lane_change_observe_started", "lane_change_observe_success", "cooldown_replans_blocked",
+            "lane_change_observe_started", "lane_change_observe_success",
+            "lane_change_observe_abort_no_progress", "lane_change_observe_abort_low_speed",
+            "lane_change_observe_abort_commit_window",
+            "pending_release_events_total", "pending_release_abort_events_total",
+            "pending_release_timeout_events_total",
+            "cooldown_replans_blocked",
             "pending_release_observe_abort_no_progress", "pending_release_observe_abort_commit_window",
             "pending_release_observe_abort_low_speed", "pending_release_wrong_lane_commit",
             "pending_release_route_no_progress_abort", "pending_release_route_stall_timeout", "pending_release_route_hard_timeout",
             "loop_override_count", "dead_end_reentry_override_count",
             "snapshot_cache_hits", "shortest_path_cache_hits",
             "exploration_actions", "policy_actions", "override_ratio", "override_events_total",
+            "override_event_loop_prefilter", "override_event_cooldown_fallback",
+            "override_event_observe_abort_fallback", "override_event_route_apply_fail",
+            "override_event_invalid_action",
             "policy_masked_actions_removed", "override_learning_transitions",
-            "override_learning_negative", "override_learning_imitation",
+            "cooldown_fallback_overrides", "observe_abort_fallback_overrides",
+            "route_apply_fail_overrides", "override_learning_negative", "override_learning_imitation",
             "alive_at_step_cap", "decision_pending_at_episode_end", "mean_pending_age", "mean_decision_latency_steps",
+            "pending_open_observe_end", "pending_open_route_end", "pending_open_lane_now_end",
+            "pending_open_proactive_end", "pending_open_active_monitoring_end",
+            "mean_pending_age_end_all", "max_pending_age_end_all",
+            "mean_pending_age_end_active", "max_pending_age_end_active",
+            "mean_pending_age_end_lane_now", "max_pending_age_end_lane_now",
+            "mean_pending_stall_age_end", "max_pending_stall_age_end",
+            "top_pending_end_edges", "oldest_pending_summary",
             "mean_reward_per_finalized_decision", "mean_route_difficulty_eta", "p50_route_difficulty_eta",
             "p90_route_difficulty_eta", "fail_teleport", "fail_timeout", "fail_removed_non_destination",
             "fail_unreachable_transition", "fail_dead_end_no_outgoing",
@@ -2025,18 +2161,27 @@ class RLTrainingPipeline:
             "emergency_brake_near_junction", "emergency_brake_other_reason",
             "emergency_brake_after_fallback", "emergency_brake_after_proactive",
             "emergency_brake_after_lane_now", "emergency_brake_without_recent_decision",
+            "emergency_brake_rate_per_100_decisions", "emergency_brake_rate_per_100_arrivals",
+            "emergency_brake_leader_share", "emergency_brake_congestion_share",
+            "emergency_brake_junction_share", "emergency_brake_other_share",
+            "emergency_brake_after_fallback_share", "emergency_brake_after_proactive_share",
+            "emergency_brake_after_lane_now_share", "emergency_brake_without_recent_decision_share",
+            "top_emergency_brake_edges", "top_emergency_brake_vehicles",
             "teleport_inferred_jam", "teleport_inferred_yield_or_deadlock",
             "lane_change_request_accepted_rate", "lane_change_observe_resolution_rate",
             "lane_change_observe_success_overcount",
             "tail_vehicles_over_p90_count", "tail_completion_gap_steps",
             "loop_reason_short_cycle", "loop_reason_aba_bounce", "loop_reason_dead_end_reentry",
             "loop_reason_long_horizon", "loop_reason_revisit_without_progress", "dominant_loop_reason",
+            "top_loop_signal_edges", "top_loop_repeat_only_edges",
             "aggregate_actionable_skip_to_finalized_ratio",
             "social_regret_mean", "social_regret_p90", "social_best_action_chosen_rate",
             "actionable_skip_ratio", "structural_skip_ratio",
             "pending_resolution_success_rate", "pending_timeout_rate", "pending_abort_rate", "delay_fairness_gini",
             "loop_after_fallback_rate", "p95_to_p50_travel_ratio", "timeout_rate",
             "fallback_rate_per_opened_decision", "controlled_teleport_rate",
+            "skip_reason_forced_by_lane_commit", "skip_reason_too_late_or_unreachable",
+            "skip_reason_forced_single_path", "skip_reason_no_branch",
             "reachable_lane_change_nonempty", "reachable_lane_change_excluded_any",
             "reachable_lane_change_excluded_all", "policy_candidates_with_broader_available",
             "policy_candidates_collapsed_to_lane_now_only",
@@ -2139,6 +2284,10 @@ class RLTrainingPipeline:
             hard_brake_counts_by_vehicle = defaultdict(int)
             last_observed_brake_step_by_vehicle = {}
             decision_attribution_by_vehicle = {}
+            emergency_brake_events_by_edge = Counter()
+            emergency_brake_events_by_vehicle = Counter()
+            loop_signal_events_by_edge = Counter()
+            loop_repeat_only_events_by_edge = Counter()
             mean_density_samples = []
             p95_density_samples = []
             congestion_high_pressure_steps = 0
@@ -2554,6 +2703,8 @@ class RLTrainingPipeline:
                             if hard_brake and not was_hard_brake_active:
                                 decision_metrics["emergency_brake_events"] += 1
                                 hard_brake_counts_by_vehicle[vehicle_id] += 1
+                                emergency_brake_events_by_edge[str(snapshot.edge_id)] += 1
+                                emergency_brake_events_by_vehicle[str(vehicle_id)] += 1
                                 emergency_reason = "other"
                                 try:
                                     leader_info = traci.vehicle.getLeader(vehicle_id)
@@ -2638,6 +2789,16 @@ class RLTrainingPipeline:
                                 decision_metrics["long_horizon_loop_events"] += 1
                             if loop_signals.get("revisit_without_progress"):
                                 decision_metrics["revisit_without_progress_events"] += 1
+                            explicit_loop_signal = bool(
+                                loop_signals["aba_bounce"]
+                                or loop_signals["short_cycle"]
+                                or loop_signals["dead_end_reentry"]
+                                or loop_signals.get("long_horizon_loop")
+                                or loop_signals.get("revisit_without_progress")
+                            )
+                            if explicit_loop_signal:
+                                decision_metrics["loop_signal_events_total"] += 1
+                                loop_signal_events_by_edge[str(current_edge)] += 1
                             ext_pen = max(self._edge_density(current_edge), 0.0)
                             prev_distance = self.get_distance_to_destination(pending.decision_edge, vehicle.destination)
                             curr_distance = self.get_distance_to_destination(current_edge, vehicle.destination)
@@ -2692,7 +2853,10 @@ class RLTrainingPipeline:
                             decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
                             finalized_decision_rewards.append(float(reward))
                             episode_return_total += reward
-                            if repeated_recent_edges > 1:
+                            if repeated_recent_edges > 1 and not explicit_loop_signal:
+                                decision_metrics["loop_repeat_only_events"] += 1
+                                loop_repeat_only_events_by_edge[str(current_edge)] += 1
+                            if repeated_recent_edges > 1 or explicit_loop_signal:
                                 decision_metrics["loop_events"] += 1
                                 if "fallback" in action_source:
                                     decision_metrics["loop_after_fallback_events"] += 1
@@ -3497,6 +3661,50 @@ class RLTrainingPipeline:
                     / float(max(decision_metrics["lane_now_decisions_opened"], 1.0))
                 )
                 controlled_teleport_rate = float(len(teleported_controlled_ids)) / float(max(total_controlled, 1))
+                pending_end_summary = self._summarize_pending_backlog(
+                    pending_decisions,
+                    last_step_executed,
+                )
+                oldest_pending_summary = self._format_pending_descriptor(
+                    pending_end_summary.get("oldest_descriptor")
+                )
+                emergency_brake_total = float(max(decision_metrics["emergency_brake_events"], 1.0))
+                emergency_brake_rate_per_100_decisions = (
+                    100.0 * float(decision_metrics["emergency_brake_events"])
+                    / float(max(decision_metrics["decisions_opened"], 1.0))
+                )
+                emergency_brake_rate_per_100_arrivals = (
+                    100.0 * float(decision_metrics["emergency_brake_events"])
+                    / float(max(global_arrival_count, 1.0))
+                )
+                emergency_brake_leader_share = (
+                    float(decision_metrics["emergency_brake_due_to_leader"]) / emergency_brake_total
+                )
+                emergency_brake_congestion_share = (
+                    float(decision_metrics["emergency_brake_due_to_congestion"]) / emergency_brake_total
+                )
+                emergency_brake_junction_share = (
+                    float(decision_metrics["emergency_brake_near_junction"]) / emergency_brake_total
+                )
+                emergency_brake_other_share = (
+                    float(decision_metrics["emergency_brake_other_reason"]) / emergency_brake_total
+                )
+                emergency_brake_after_fallback_share = (
+                    float(decision_metrics["emergency_brake_after_fallback"]) / emergency_brake_total
+                )
+                emergency_brake_after_proactive_share = (
+                    float(decision_metrics["emergency_brake_after_proactive"]) / emergency_brake_total
+                )
+                emergency_brake_after_lane_now_share = (
+                    float(decision_metrics["emergency_brake_after_lane_now"]) / emergency_brake_total
+                )
+                emergency_brake_without_recent_decision_share = (
+                    float(decision_metrics["emergency_brake_without_recent_decision"]) / emergency_brake_total
+                )
+                top_emergency_brake_edges = self._format_top_counts(emergency_brake_events_by_edge)
+                top_emergency_brake_vehicles = self._format_top_counts(emergency_brake_events_by_vehicle)
+                top_loop_signal_edges = self._format_top_counts(loop_signal_events_by_edge)
+                top_loop_repeat_only_edges = self._format_top_counts(loop_repeat_only_events_by_edge)
                 reachable_lane_change_excluded_any_rate = (
                     float(decision_metrics["reachable_lane_change_excluded_any"])
                     / float(max(decision_metrics["reachable_lane_change_nonempty"], 1.0))
@@ -3563,12 +3771,18 @@ class RLTrainingPipeline:
                     )
                 )
                 print(
-                    "  pending: timeout={:.0f} open_end={} mean_age={:.1f} "
+                    "  pending: timeout={:.0f} open_end={} observe/route={:.0f}/{:.0f} "
+                    "lane_now/proactive={:.0f}/{:.0f} active_monitor={:.0f} mean_active_age={:.1f} "
                     "resolve(success/timeout/abort)={:.1%}/{:.1%}/{:.1%} "
                     "observe(start/success/abort)={:.0f}/{:.0f}/{:.0f} "
                     "release(no_prog/wrong_lane/stall/hard)={:.0f}/{:.0f}/{:.0f}/{:.0f}".format(
                         decision_metrics["pending_decision_timeouts"],
-                        len(pending_decisions),
+                        pending_end_summary["total_open"],
+                        pending_end_summary["observe_open"],
+                        pending_end_summary["route_open"],
+                        pending_end_summary["lane_now_open"],
+                        pending_end_summary["proactive_open"],
+                        pending_end_summary["active_monitoring_open"],
                         mean_pending_age,
                         pending_resolution_success_rate,
                         pending_timeout_rate,
@@ -3583,15 +3797,57 @@ class RLTrainingPipeline:
                     )
                 )
                 print(
-                    "  loops: total={:.0f} short={:.0f} aba={:.0f} dead_end={:.0f} long_horizon={:.0f} "
+                    "  pending_end: mean_age(all/active/lane_now)={:.1f}/{:.1f}/{:.1f} "
+                    "max_age={:.0f} stall_mean/max={:.1f}/{:.0f} oldest={}".format(
+                        pending_end_summary["mean_age_all"],
+                        pending_end_summary["mean_age_active"],
+                        pending_end_summary["mean_age_lane_now"],
+                        pending_end_summary["max_age_all"],
+                        pending_end_summary["mean_stall_age"],
+                        pending_end_summary["max_stall_age"],
+                        oldest_pending_summary or "none",
+                    )
+                )
+                print(
+                    "  loops: total={:.0f} signal_events={:.0f} repeat_only={:.0f} "
+                    "short={:.0f} aba={:.0f} dead_end={:.0f} long_horizon={:.0f} revisit_no_progress={:.0f} "
                     "dominant={} loop_after_fallback={:.1%}".format(
                         decision_metrics["loop_events"],
+                        decision_metrics["loop_signal_events_total"],
+                        decision_metrics["loop_repeat_only_events"],
                         decision_metrics["short_cycle_events"],
                         decision_metrics["aba_bounce_events"],
                         decision_metrics["dead_end_reentry_events"],
                         decision_metrics["long_horizon_loop_events"],
+                        decision_metrics["revisit_without_progress_events"],
                         dominant_loop_reason,
                         loop_after_fallback_rate,
+                    )
+                )
+                print(
+                    "  brakes: total={:.0f} leader/congestion/junction/other={:.0f}/{:.0f}/{:.0f}/{:.0f} "
+                    "source(fallback/proactive/lane_now/no_recent)={:.0f}/{:.0f}/{:.0f}/{:.0f} "
+                    "rate/100_open={:.1f} rate/100_arrived={:.1f}".format(
+                        decision_metrics["emergency_brake_events"],
+                        decision_metrics["emergency_brake_due_to_leader"],
+                        decision_metrics["emergency_brake_due_to_congestion"],
+                        decision_metrics["emergency_brake_near_junction"],
+                        decision_metrics["emergency_brake_other_reason"],
+                        decision_metrics["emergency_brake_after_fallback"],
+                        decision_metrics["emergency_brake_after_proactive"],
+                        decision_metrics["emergency_brake_after_lane_now"],
+                        decision_metrics["emergency_brake_without_recent_decision"],
+                        emergency_brake_rate_per_100_decisions,
+                        emergency_brake_rate_per_100_arrivals,
+                    )
+                )
+                print(
+                    "  hotspots: brake_edges={} brake_vehicles={} pending_edges={} loop_signal_edges={} loop_repeat_only_edges={}".format(
+                        top_emergency_brake_edges or "none",
+                        top_emergency_brake_vehicles or "none",
+                        pending_end_summary["hot_edges"] or "none",
+                        top_loop_signal_edges or "none",
+                        top_loop_repeat_only_edges or "none",
                     )
                 )
                 print(
@@ -3730,6 +3986,8 @@ class RLTrainingPipeline:
                         "dead_end_reentry_events": decision_metrics["dead_end_reentry_events"],
                         "long_horizon_loop_events": decision_metrics["long_horizon_loop_events"],
                         "revisit_without_progress_events": decision_metrics["revisit_without_progress_events"],
+                        "loop_signal_events_total": decision_metrics["loop_signal_events_total"],
+                        "loop_repeat_only_events": decision_metrics["loop_repeat_only_events"],
                         "safety_overrides": decision_metrics["safety_overrides"],
                         "loop_prefilter_overrides": decision_metrics["loop_prefilter_overrides"],
                         "fragment_build_failures": decision_metrics["fragment_build_failures"],
@@ -3778,6 +4036,21 @@ class RLTrainingPipeline:
                         "alive_at_step_cap": alive_at_step_cap_count,
                         "decision_pending_at_episode_end": len(pending_decisions),
                         "mean_pending_age": mean_pending_age,
+                        "pending_open_observe_end": pending_end_summary["observe_open"],
+                        "pending_open_route_end": pending_end_summary["route_open"],
+                        "pending_open_lane_now_end": pending_end_summary["lane_now_open"],
+                        "pending_open_proactive_end": pending_end_summary["proactive_open"],
+                        "pending_open_active_monitoring_end": pending_end_summary["active_monitoring_open"],
+                        "mean_pending_age_end_all": pending_end_summary["mean_age_all"],
+                        "max_pending_age_end_all": pending_end_summary["max_age_all"],
+                        "mean_pending_age_end_active": pending_end_summary["mean_age_active"],
+                        "max_pending_age_end_active": pending_end_summary["max_age_active"],
+                        "mean_pending_age_end_lane_now": pending_end_summary["mean_age_lane_now"],
+                        "max_pending_age_end_lane_now": pending_end_summary["max_age_lane_now"],
+                        "mean_pending_stall_age_end": pending_end_summary["mean_stall_age"],
+                        "max_pending_stall_age_end": pending_end_summary["max_stall_age"],
+                        "top_pending_end_edges": pending_end_summary["hot_edges"],
+                        "oldest_pending_summary": oldest_pending_summary,
                         "mean_decision_latency_steps": mean_decision_latency_steps,
                         "mean_reward_per_finalized_decision": mean_reward_per_finalized_decision,
                         "mean_route_difficulty_eta": mean_route_difficulty_eta,
@@ -3800,6 +4073,18 @@ class RLTrainingPipeline:
                         "emergency_brake_after_proactive": decision_metrics["emergency_brake_after_proactive"],
                         "emergency_brake_after_lane_now": decision_metrics["emergency_brake_after_lane_now"],
                         "emergency_brake_without_recent_decision": decision_metrics["emergency_brake_without_recent_decision"],
+                        "emergency_brake_rate_per_100_decisions": emergency_brake_rate_per_100_decisions,
+                        "emergency_brake_rate_per_100_arrivals": emergency_brake_rate_per_100_arrivals,
+                        "emergency_brake_leader_share": emergency_brake_leader_share,
+                        "emergency_brake_congestion_share": emergency_brake_congestion_share,
+                        "emergency_brake_junction_share": emergency_brake_junction_share,
+                        "emergency_brake_other_share": emergency_brake_other_share,
+                        "emergency_brake_after_fallback_share": emergency_brake_after_fallback_share,
+                        "emergency_brake_after_proactive_share": emergency_brake_after_proactive_share,
+                        "emergency_brake_after_lane_now_share": emergency_brake_after_lane_now_share,
+                        "emergency_brake_without_recent_decision_share": emergency_brake_without_recent_decision_share,
+                        "top_emergency_brake_edges": top_emergency_brake_edges,
+                        "top_emergency_brake_vehicles": top_emergency_brake_vehicles,
                         "teleport_inferred_jam": decision_metrics["teleport_inferred_jam"],
                         "teleport_inferred_yield_or_deadlock": decision_metrics["teleport_inferred_yield_or_deadlock"],
                         "lane_change_request_accepted_rate": lane_change_request_accepted_rate,
@@ -3813,6 +4098,8 @@ class RLTrainingPipeline:
                         "loop_reason_long_horizon": decision_metrics["long_horizon_loop_events"],
                         "loop_reason_revisit_without_progress": decision_metrics["revisit_without_progress_events"],
                         "dominant_loop_reason": dominant_loop_reason,
+                        "top_loop_signal_edges": top_loop_signal_edges,
+                        "top_loop_repeat_only_edges": top_loop_repeat_only_edges,
                         "aggregate_actionable_skip_to_finalized_ratio": aggregate_actionable_skip_to_finalized_ratio,
                         "social_regret_mean": social_regret_mean,
                         "social_regret_p90": social_regret_p90,
