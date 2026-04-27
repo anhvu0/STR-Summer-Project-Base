@@ -35,7 +35,7 @@ def build_parser():
     )
     parser.add_argument(
         "--best-model-output",
-        default="./configurations/model/rl_model_map.best.h5",
+        default="./configurations/model/rl_model_map2.best.h5",
         help="Optional path for the best held-out frozen-eval checkpoint. Defaults to <model-output>.best.h5.",
     )
     parser.add_argument(

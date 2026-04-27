@@ -107,7 +107,7 @@ class DQNTrainer:
         replay_warmup=2000,
         target_update_every=400,
         target_soft_tau=1.0,
-        use_double_dqn=True,
+        use_double_dqn=False,
     ):
         """
         :param learning_rate: Can be adjusted for further optimization
@@ -472,7 +472,7 @@ class RLTrainingPipeline:
         train_every=6,
         grad_steps=1,
         rolling_window=100,
-        use_double_dqn=True,
+        use_double_dqn=False,
         target_pattern=3,
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
@@ -618,8 +618,8 @@ class RLTrainingPipeline:
         self._init_edge_embeddings(seed=1337)
         self.state_size = self.shared_policy.compact_state_size
         self.action_size = 6
-        self.metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_episode_metrics.csv")
-        self.frozen_eval_metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_frozen_eval_metrics.csv")
+        self.metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_episode_metrics2.csv")
+        self.frozen_eval_metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_frozen_eval_metrics2.csv")
         self.best_model_metadata_path = self.best_model_output_path + ".meta.json"
         self._frozen_eval_model_path = self._default_best_model_output_path(self.model_output_path).replace(".best", ".frozen_eval_current")
         self._density_vec = np.zeros(len(self.connection_info.edge_list), dtype=np.float32)
