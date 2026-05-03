@@ -35,7 +35,7 @@ def build_parser():
     )
     parser.add_argument(
         "--best-model-output",
-        default="./configurations/model/rl_model_map2.best.h5",
+        default="./configurations/model/rl_model_map.best.h5",
         help="Optional path for the best held-out frozen-eval checkpoint. Defaults to <model-output>.best.h5.",
     )
     parser.add_argument(
@@ -58,7 +58,7 @@ def build_parser():
     )
     parser.add_argument(
         "--eval-seeds",
-        default="5000,5001,5002",
+        default="5000,5001,5002,5003,5004",
         help="Comma-separated held-out seeds for frozen inference evaluation.",
     )
     parser.add_argument(
@@ -79,7 +79,19 @@ def build_parser():
         action="store_false",
         help="Disable fast mode and keep the heavier debug outputs.",
     )
-    parser.set_defaults(fast_mode=True)
+    parser.add_argument(
+        "--double-dqn",
+        dest="use_double_dqn",
+        action="store_true",
+        help="Use online argmax plus target-network evaluation for replay bootstrapping.",
+    )
+    parser.add_argument(
+        "--no-double-dqn",
+        dest="use_double_dqn",
+        action="store_false",
+        help="Use the target network for both replay action selection and evaluation.",
+    )
+    parser.set_defaults(fast_mode=True, use_double_dqn=True)
     return parser
 
 
@@ -101,6 +113,7 @@ def main():
         frozen_eval_seeds=parse_eval_seeds(args.eval_seeds),
         eval_spawn_interval=args.eval_spawn_interval,
         fast_training_profile=args.fast_mode,
+        use_double_dqn=args.use_double_dqn,
     )
     pipeline.run()
 

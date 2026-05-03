@@ -63,9 +63,12 @@ def resolve_model_path(raw_model_path=None):
     if raw_model_path:
         return raw_model_path
     best_model_path = "./configurations/model/rl_model_map.best.h5"
+    # legacy_best_model_path = "./configurations/model/rl_model_map.best.h5"
     final_model_path = "./configurations/model/rl_model_map.h5"
     if os.path.exists(best_model_path):
         return best_model_path
+    # if os.path.exists(legacy_best_model_path):
+    #     return legacy_best_model_path
     return final_model_path
 
 
@@ -160,7 +163,7 @@ def run_simulation(scheduler, vehicles, fast_mode=False):
 if __name__ == "__main__":
     args = build_parser().parse_args()
     model_path = resolve_model_path(args.model_path)
-    sumo_binary = checkBinary('sumo-gui')
+    sumo_binary = checkBinary('sumo')
     # sumo_binary = checkBinary('sumo')#use this line if you do not want the UI of SUMO
 
     # parse config file for map file name
@@ -176,20 +179,21 @@ if __name__ == "__main__":
     route_file_attr = route_file_node[0].attributes
     route_file = "./configurations/"+route_file_attr['value'].nodeValue
     # Pattern 2: multiple origins with one shared destination.
-    vehicles = get_controlled_vehicles(
-        route_file,
-        init_connection_info,
-        100,
-        100,
-        pattern=3,
-        spawn_interval=2.0,
-        seed=args.seed,
-    )
-    #print the controlled vehicles generated
-    if not args.fast_mode:
-        for vid, v in vehicles.items():
-            print("id: {}, destination: {}, start time:{}, deadline: {};".format(vid, \
-                v.destination, v.start_time, v.deadline))
-    test_dijkstra_policy(copy.deepcopy(vehicles), fast_mode=args.fast_mode)
-    print("Using RL checkpoint:", model_path)
-    test_q_learning(copy.deepcopy(vehicles), model_path, fast_mode=args.fast_mode)
+    for i in range(1, 10):
+        vehicles = get_controlled_vehicles(
+            route_file,
+            init_connection_info,
+            100,
+            100,
+            pattern=3,
+            spawn_interval=2.0,
+            seed=5000+i,
+        )
+        #print the controlled vehicles generated
+        if not args.fast_mode:
+            for vid, v in vehicles.items():
+                print("id: {}, destination: {}, start time:{}, deadline: {};".format(vid, \
+                    v.destination, v.start_time, v.deadline))
+        test_dijkstra_policy(copy.deepcopy(vehicles), fast_mode=args.fast_mode)
+        print("Using RL checkpoint:", model_path)
+        test_q_learning(copy.deepcopy(vehicles), model_path, fast_mode=args.fast_mode)

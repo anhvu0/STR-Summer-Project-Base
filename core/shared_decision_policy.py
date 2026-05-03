@@ -68,6 +68,10 @@ class SharedDecisionPolicy:
         self.lane_now_near_junction_distance_keep_extra = 12.0
         self.lane_now_replan_min_age_steps = 10
         self.lane_now_replan_low_speed_mps = 1.25
+        self.lane_now_stale_timeout_min_stall_steps = max(
+            int(self.decision_engine.route_pending_hard_timeout_steps),
+            int(self.decision_engine.pending_progress_timeout_steps) * 2,
+        )
 
         self.compact_state_size = (
             (2 * self.edge_embedding_dim)
@@ -783,6 +787,7 @@ class SharedDecisionPolicy:
         stall_age = max(int(step) - last_progress_step, 0)
         total_age = max(int(step) - int(pending.decision_step), 0)
         no_progress_window = int(self.decision_engine.route_pending_no_progress_window_steps)
+        lane_now_pending = self.pending_resolution_mode(pending) == "lane_now"
         no_progress_stall = (
             active_same_edge_monitoring
             and same_edge
@@ -803,8 +808,16 @@ class SharedDecisionPolicy:
             pending,
             context=context,
             total_age=total_age,
+            stall_age=stall_age,
             edge_density_fn=edge_density_fn,
             distance_fn=distance_fn,
+        )
+        lane_now_stale_timeout = (
+            lane_now_pending
+            and same_edge
+            and total_age >= int(self.decision_engine.route_pending_hard_timeout_steps)
+            and stall_age >= int(self.lane_now_stale_timeout_min_stall_steps)
+            and float(context.speed) <= float(self.lane_now_replan_low_speed_mps)
         )
 
         release_reason = None
@@ -820,6 +833,11 @@ class SharedDecisionPolicy:
         elif lane_now_replan:
             # Reopen only when a stalled lane-now route has a cleaner comparable branch.
             release_reason = "route_no_progress_abort"
+        elif lane_now_stale_timeout:
+            # Passive lane-now pendings should survive normal queues, but not
+            # hundreds of no-progress steps with no viable relief branch.
+            release_reason = "route_hard_timeout"
+            release_as_timeout = True
         elif wrong_lane_commit:
             release_reason = "wrong_lane_commit"
 
@@ -839,6 +857,7 @@ class SharedDecisionPolicy:
         *,
         context: DecisionContext,
         total_age: int,
+        stall_age: int,
         edge_density_fn: Optional[Callable[[str], float]],
         distance_fn: Optional[Callable[[str, str], float]],
     ) -> bool:
@@ -851,6 +870,8 @@ class SharedDecisionPolicy:
         if total_age < int(self.lane_now_replan_min_age_steps):
             return False
         if float(context.speed) > float(self.lane_now_replan_low_speed_mps):
+            return False
+        if stall_age < int(self.decision_engine.route_pending_stall_steps):
             return False
 
         current_next_edge = pending.intended_next_edge
@@ -886,4 +907,6 @@ class SharedDecisionPolicy:
         best_alt_density, best_alt_distance, _ = min(alternatives, key=lambda item: (item[0], item[1], item[2]))
         enough_relief = (current_density - best_alt_density) >= relief_threshold
         not_much_longer = best_alt_distance <= (current_distance + distance_slack)
-        return bool(enough_relief and not_much_longer)
+        clearly_shorter = best_alt_distance <= (current_distance - max(8.0, 0.35 * distance_slack))
+        severe_stall = stall_age >= int(self.decision_engine.pending_progress_timeout_steps)
+        return bool((enough_relief and not_much_longer) or (severe_stall and clearly_shorter))

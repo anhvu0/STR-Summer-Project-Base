@@ -236,6 +236,11 @@ class StrSumo:
                         miss = True
                     if verbose:
                         print("Vehicle {} reaches the destination: {}, timespan: {}, deadline missed: {}"                                .format(vehicle_id, True, time_span, miss))
+                    if hasattr(self.route_controller, "cleanup_vehicle_state"):
+                        try:
+                            self.route_controller.cleanup_vehicle_state(vehicle_id)
+                        except Exception:
+                            pass
 
                 if step > MAX_SIMULATION_STEPS:
                     step_limit_reached = True

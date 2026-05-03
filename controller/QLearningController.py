@@ -246,6 +246,23 @@ class QLearningPolicy(RouteController):
         except traci.TraCIException:
             return
 
+    def cleanup_vehicle_state(self, vehicle_id):
+        """
+        Clear per-vehicle inference state once SUMO reports a terminal outcome.
+        """
+        vid = str(vehicle_id)
+        self._pending_decisions.pop(vid, None)
+        self._visit_count.pop(vid, None)
+        self._best_dist.pop(vid, None)
+        self._recent_edges.pop(vid, None)
+        self._last_observed_edge.pop(vid, None)
+        self._last_control_step.pop(vid, None)
+        self._step_snapshot_cache.pop(vid, None)
+        self._active_vehicle_subscriptions.discard(vid)
+        stale_cooldowns = [key for key in self._lane_change_cooldown if key and key[0] == vid]
+        for key in stale_cooldowns:
+            self._lane_change_cooldown.pop(key, None)
+
     #-----------------------DEBUGGING-------------------------------------
     def _dist_to_dest(self, edge_id, dest_id):
         key = (edge_id, dest_id)

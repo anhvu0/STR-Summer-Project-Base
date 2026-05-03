@@ -36,7 +36,7 @@ import sumolib
 In this file, we build a DQN network
 """
 
-MAX_SIMULATION_STEPS = 2000 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
+MAX_SIMULATION_STEPS = 3500 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
 
 # Compact metric glossary used by training CSV + logs.
 # type ∈ {event_count, gauge, per_episode_aggregate, cumulative_counter, ratio}
@@ -107,7 +107,7 @@ class DQNTrainer:
         replay_warmup=2000,
         target_update_every=400,
         target_soft_tau=1.0,
-        use_double_dqn=False,
+        use_double_dqn=True,
     ):
         """
         :param learning_rate: Can be adjusted for further optimization
@@ -255,6 +255,42 @@ class DQNTrainer:
             and float(reward) >= -2.0
         )
 
+    def _should_store_interim_pending_transition(self, metadata):
+        """
+        Keep a thin, age-aware sample of same-edge pending wait costs.
+
+        Storing every pending step would let long queues dominate replay, but
+        dropping all of them hides the exact travel-time cost that makes stale
+        lane-change and route decisions bad.
+        """
+        if not metadata.get("decision_open", False):
+            return False
+        if int(metadata.get("available_count", 0)) < 2:
+            return False
+        if metadata.get("forced_action", False):
+            return False
+
+        age = max(int(metadata.get("pending_age", 0)), 0)
+        if age < 4:
+            return False
+
+        resolution_mode = str(metadata.get("pending_resolution_mode", "lane_now"))
+        if age < 16:
+            interval = 8
+            keep_prob = 0.35
+        elif age < 64:
+            interval = 10
+            keep_prob = 0.45
+        else:
+            interval = 16
+            keep_prob = 0.55
+
+        if resolution_mode != "lane_now":
+            keep_prob = min(keep_prob + 0.10, 0.75)
+        if age % interval != 0:
+            return False
+        return random.random() < keep_prob
+
     def _should_store_main_transition(self, reward, done, metadata):
         metadata = metadata or {}
         if metadata.get("override_learning", False):
@@ -269,7 +305,7 @@ class DQNTrainer:
             return True
 
         if metadata.get("interim_pending_credit", False):
-            return False
+            return self._should_store_interim_pending_transition(metadata)
 
         if not metadata.get("decision_open", False):
             return False
@@ -281,6 +317,7 @@ class DQNTrainer:
         is_finalized = bool(metadata.get("decision_finalized", False))
         is_timeout_or_observe = bool(
             metadata.get("pending_timeout_replan", False)
+            or metadata.get("route_pending_replan", False)
             or metadata.get("observe_no_progress", False)
             or metadata.get("observe_low_speed", False)
             or metadata.get("observe_commit_window_miss", False)
@@ -463,8 +500,8 @@ class RLTrainingPipeline:
         seed_with_episode=True,
         destination_reward=50.0,
         teleport_penalty=-40.0,
-        epsilon_decay=0.99,
-        epsilon_min=0.05,
+        epsilon_decay=0.993,
+        epsilon_min=0.01,
         gamma=0.97,
         replay_capacity=100000,
         batch_size=128,
@@ -522,6 +559,7 @@ class RLTrainingPipeline:
         self.train_every = train_every
         self.grad_steps = grad_steps
         self.rolling_window = rolling_window
+        self.use_double_dqn = bool(use_double_dqn)
         self.target_pattern = target_pattern
         self.debug_exit_diagnostics = debug_exit_diagnostics
         self.debug_exit_diagnostics_limit = max(int(debug_exit_diagnostics_limit), 0)
@@ -618,8 +656,8 @@ class RLTrainingPipeline:
         self._init_edge_embeddings(seed=1337)
         self.state_size = self.shared_policy.compact_state_size
         self.action_size = 6
-        self.metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_episode_metrics2.csv")
-        self.frozen_eval_metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_frozen_eval_metrics2.csv")
+        self.metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_episode_metrics.csv")
+        self.frozen_eval_metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_frozen_eval_metrics.csv")
         self.best_model_metadata_path = self.best_model_output_path + ".meta.json"
         self._frozen_eval_model_path = self._default_best_model_output_path(self.model_output_path).replace(".best", ".frozen_eval_current")
         self._density_vec = np.zeros(len(self.connection_info.edge_list), dtype=np.float32)
@@ -657,7 +695,7 @@ class RLTrainingPipeline:
             replay_warmup=replay_warmup,
             target_update_every=400,
             target_soft_tau=1.0,
-            use_double_dqn=use_double_dqn,
+            use_double_dqn=True,
         )
         self._decision_debug_fields = [
             "episode", "step", "vehicle_id", "decision_edge", "action", "action_source", "available_actions",
@@ -1662,6 +1700,7 @@ class RLTrainingPipeline:
             next_valid_actions=[],
             metadata=final_metadata,
         )
+        pending_decisions.pop(vehicle_id, None)
         self._register_decision_finalized(decision_metrics, pending)
         decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
         finalized_decision_rewards.append(float(reward))
@@ -1912,6 +1951,7 @@ class RLTrainingPipeline:
             "seed_count",
             "seed_list",
             "spawn_interval",
+            "use_double_dqn",
             "completion_rate_mean",
             "avg_travel_time_mean",
             "p50_travel_time_mean",
@@ -2039,6 +2079,7 @@ class RLTrainingPipeline:
             "seed_count": int(len(per_seed_rows)),
             "seed_list": ",".join(str(row["seed"]) for row in per_seed_rows),
             "spawn_interval": float(self.eval_spawn_interval),
+            "use_double_dqn": int(self.use_double_dqn),
             "completion_rate_mean": mean_metric("completion_rate", 0.0),
             "avg_travel_time_mean": mean_metric("avg_travel_time", float("inf")),
             "p50_travel_time_mean": mean_metric("p50_travel_time", float("inf")),
@@ -2080,8 +2121,8 @@ class RLTrainingPipeline:
         route_path = os.path.join(self.sumocfg_dir, self.route_file)
         spawn_interval_value = self.spawn_interval if spawn_interval_override is None else float(spawn_interval_override)
         vehicle_list = generator.generate_vehicles(
-            num_target_vehicles=100,
-            num_random_vehicles=100,
+            num_target_vehicles=200,
+            num_random_vehicles=200,
             pattern=self.target_pattern,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
@@ -2104,7 +2145,7 @@ class RLTrainingPipeline:
         rolling_avg_travel_time = deque(maxlen=self.rolling_window)
         rolling_mismatch = deque(maxlen=self.rolling_window)
         csv_fields = [
-            "episode", "epsilon", "replay",
+            "episode", "epsilon", "replay", "use_double_dqn",
             "train_steps_cumulative", "train_steps_episode", "episode_mean_loss", "last_batch_loss",
             "episode_return_total", "avg_return_per_vehicle",
             "elite_buffer_size", "elite_transitions_added_episode", "elite_transitions_added_cumulative",
@@ -3151,6 +3192,12 @@ class RLTrainingPipeline:
                                     metadata={
                                         **(pending.metadata if isinstance(pending.metadata, dict) else {}),
                                         "interim_pending_credit": True,
+                                        "pending_age": int(pending_age),
+                                        "pending_elapsed_steps": int(elapsed_pending),
+                                        "pending_resolution_mode": self.shared_policy.pending_resolution_mode(pending),
+                                        "pending_stall_age": int(
+                                            max(step - int((pending.metadata or {}).get("last_progress_step", pending.decision_step)), 0)
+                                        ),
                                         "decision_finalized": False,
                                     },
                                 )
@@ -3227,6 +3274,44 @@ class RLTrainingPipeline:
                                 decision_metrics["pending_commit_window_grace_kept"] += 1
                             if release_eval.should_release:
                                 self._record_pending_release(decision_metrics, release_eval.release_reason)
+                                release_state = self._get_or_encode_step_state(
+                                    step_state_cache,
+                                    step_context_cache,
+                                    vehicle_id,
+                                    vehicle,
+                                    step,
+                                    snapshot,
+                                    context=pending_ctx,
+                                )
+                                if release_eval.release_as_timeout:
+                                    release_penalty = self.pending_timeout_penalty
+                                elif release_eval.release_reason == "wrong_lane_commit":
+                                    release_penalty = self.pending_replan_penalty + self.observe_commit_window_miss_penalty
+                                elif release_eval.release_reason == "route_no_progress_abort":
+                                    release_penalty = self.pending_replan_penalty + self.observe_no_progress_penalty
+                                else:
+                                    release_penalty = self.pending_replan_penalty
+                                release_penalty = self._clip_reward(release_penalty)
+                                self.trainer.stage_transition(
+                                    pending.state,
+                                    pending.intended_action,
+                                    release_penalty,
+                                    release_state,
+                                    False,
+                                    next_valid_actions=pending_ctx.available_actions,
+                                    metadata={
+                                        **(pending.metadata if isinstance(pending.metadata, dict) else {}),
+                                        "pending_timeout_replan": bool(release_eval.release_as_timeout),
+                                        "route_pending_replan": not bool(release_eval.release_as_timeout),
+                                        "route_release_reason": release_eval.release_reason,
+                                        "pending_age": int(pending_age),
+                                        "pending_stall_age": int(release_eval.stall_age),
+                                        "pending_elapsed_steps": int(max(step - pending.last_credit_step, 0)),
+                                        "pending_resolution_mode": self.shared_policy.pending_resolution_mode(pending),
+                                        "decision_finalized": False,
+                                    },
+                                )
+                                episode_return_total += release_penalty
 
                                 if release_eval.release_as_timeout:
                                     decision_metrics["pending_decision_timeouts"] += 1
@@ -3246,6 +3331,9 @@ class RLTrainingPipeline:
                                     "step": int(step),
                                     "reason": "timeout" if release_eval.release_as_timeout else "abort",
                                 }
+                                if release_eval.release_as_timeout:
+                                    prev_edge_by_vehicle[vehicle_id] = current_edge
+                                    continue
 
                         context = self._get_or_build_step_context(
                             step_context_cache,
@@ -3938,6 +4026,7 @@ class RLTrainingPipeline:
                         "episode": episode,
                         "epsilon": self.trainer.epsilon,
                         "replay": len(self.trainer.memory),
+                        "use_double_dqn": int(self.use_double_dqn),
                         "train_steps_cumulative": self.trainer.train_steps,
                         "train_steps_episode": int(self.trainer.train_steps - trainer_counter_start["train_steps"]),
                         "episode_mean_loss": (float(np.mean(self.trainer.episode_loss_values)) if self.trainer.episode_loss_values else ""),
