@@ -72,6 +72,10 @@ class SharedDecisionPolicy:
             int(self.decision_engine.route_pending_hard_timeout_steps),
             int(self.decision_engine.pending_progress_timeout_steps) * 2,
         )
+        self.lane_now_stale_timeout_max_age_steps = max(
+            int(self.decision_engine.route_pending_hard_timeout_steps) * 3,
+            int(self.decision_engine.pending_progress_timeout_steps) * 5,
+        )
 
         self.compact_state_size = (
             (2 * self.edge_embedding_dim)
@@ -817,7 +821,11 @@ class SharedDecisionPolicy:
             and same_edge
             and total_age >= int(self.decision_engine.route_pending_hard_timeout_steps)
             and stall_age >= int(self.lane_now_stale_timeout_min_stall_steps)
-            and float(context.speed) <= float(self.lane_now_replan_low_speed_mps)
+            and (
+                float(context.speed) <= float(self.lane_now_replan_low_speed_mps)
+                or total_age >= int(self.lane_now_stale_timeout_max_age_steps)
+                or current_shift >= 90
+            )
         )
 
         release_reason = None

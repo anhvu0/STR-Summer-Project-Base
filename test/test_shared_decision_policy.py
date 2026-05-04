@@ -17,6 +17,13 @@ class DummyConnectionInfo:
     outgoing_edges_dict = {
         'edgeA': {'L': 'edgeB', 'S': 'edgeC', 'R': 'edgeD'},
     }
+    lane_outgoing_edges_dict = {
+        'edgeA_0': {'L': 'edgeB', 'S': 'edgeC', 'R': 'edgeD'},
+        'edgeA_1': {'S': 'edgeC', 'R': 'edgeD'},
+    }
+    edge_lane_ids = {
+        'edgeA': ['edgeA_0', 'edgeA_1'],
+    }
 
 
 class DummyDecisionEngine:
@@ -25,6 +32,8 @@ class DummyDecisionEngine:
     proactive_extra_buffer_m = 6.0
     lane_change_margin_m = 10.0
     proactive_safety_margin_m = 8.0
+    route_pending_hard_timeout_steps = 60
+    pending_progress_timeout_steps = 32
 
     def __init__(self):
         self.next_edges = {
@@ -509,6 +518,107 @@ class SharedDecisionPolicyPendingReleaseTests(unittest.TestCase):
 
         self.assertFalse(release.should_release)
         self.assertEqual(release.release_reason, None)
+
+    def test_old_moving_lane_now_pending_is_kept_before_stale_max_age(self):
+        context = self._lane_now_context()
+        pending = self.policy.build_route_pending(
+            state=None,
+            action_idx=0,
+            committed_next_edge='edgeB',
+            decision_edge='edgeA',
+            step=0,
+            destination='destX',
+            context=context,
+            lane_change_requested=False,
+            decision_id='d0',
+            origin_mode='lane_now',
+            action_source='policy',
+            full_route=['edgeA', 'edgeB'],
+            decision_open_recorded=True,
+        )
+        old_step = int(self.policy.lane_now_stale_timeout_max_age_steps) - 1
+
+        release = self.policy.evaluate_route_pending_release(
+            pending,
+            context=self._lane_now_context(step=old_step, speed=6.0),
+            step=old_step,
+            lane_position_now=0.0,
+            edge_density_fn=lambda edge: 0.0,
+            distance_fn=lambda edge, dest: 100.0,
+        )
+
+        self.assertFalse(release.should_release)
+        self.assertEqual(release.release_reason, None)
+
+    def test_very_old_lane_now_pending_times_out_without_relief_branch(self):
+        context = self._lane_now_context()
+        pending = self.policy.build_route_pending(
+            state=None,
+            action_idx=0,
+            committed_next_edge='edgeB',
+            decision_edge='edgeA',
+            step=0,
+            destination='destX',
+            context=context,
+            lane_change_requested=False,
+            decision_id='d0',
+            origin_mode='lane_now',
+            action_source='policy',
+            full_route=['edgeA', 'edgeB'],
+            decision_open_recorded=True,
+        )
+        old_step = int(self.policy.lane_now_stale_timeout_max_age_steps) + 1
+
+        release = self.policy.evaluate_route_pending_release(
+            pending,
+            context=self._lane_now_context(step=old_step, speed=6.0),
+            step=old_step,
+            lane_position_now=0.0,
+            edge_density_fn=lambda edge: 0.0,
+            distance_fn=lambda edge, dest: 100.0,
+        )
+
+        self.assertTrue(release.should_release)
+        self.assertEqual(release.release_reason, 'route_hard_timeout')
+        self.assertTrue(release.release_as_timeout)
+
+    def test_invalid_lane_now_shift_times_out_after_stall_threshold(self):
+        context = self._lane_now_context(shifts={0: 0})
+        pending = self.policy.build_route_pending(
+            state=None,
+            action_idx=0,
+            committed_next_edge='edgeB',
+            decision_edge='edgeA',
+            step=0,
+            destination='destX',
+            context=context,
+            lane_change_requested=False,
+            decision_id='d0',
+            origin_mode='lane_now',
+            action_source='policy',
+            full_route=['edgeA', 'edgeB'],
+            decision_open_recorded=True,
+        )
+        stale_step = int(self.policy.lane_now_stale_timeout_min_stall_steps)
+
+        release = self.policy.evaluate_route_pending_release(
+            pending,
+            context=self._lane_now_context(
+                step=stale_step,
+                speed=6.0,
+                lane_now=[],
+                available=[],
+                shifts={},
+            ),
+            step=stale_step,
+            lane_position_now=0.0,
+            edge_density_fn=lambda edge: 0.0,
+            distance_fn=lambda edge, dest: 100.0,
+        )
+
+        self.assertTrue(release.should_release)
+        self.assertEqual(release.release_reason, 'route_hard_timeout')
+        self.assertTrue(release.release_as_timeout)
 
 
 if __name__ == '__main__':

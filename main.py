@@ -24,6 +24,16 @@ from sumolib import checkBinary
 import traci
 
 
+DEFAULT_EVAL_SEEDS = "5000,5001,5002,5003,5004"
+
+
+def parse_seed_list(raw_value):
+    raw_value = (raw_value or "").strip()
+    if not raw_value:
+        return []
+    return [int(token.strip()) for token in raw_value.split(",") if token.strip()]
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Run inference-time routing controllers in SUMO.")
     parser.add_argument(
@@ -34,14 +44,43 @@ def build_parser():
     parser.add_argument(
         "--spawn-interval",
         type=float,
-        default=None,
-        help="Optional release spacing for generated controlled vehicles.",
+        default=2.0,
+        help="Release spacing for generated controlled vehicles. Defaults to frozen-eval training value.",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=None,
-        help="Optional random seed for reproducible inference vehicle generation.",
+        help="Optional single seed for reproducible inference vehicle generation. Overrides --seeds.",
+    )
+    parser.add_argument(
+        "--seeds",
+        default=DEFAULT_EVAL_SEEDS,
+        help="Comma-separated seeds for repeated Dijkstra/RL comparison runs.",
+    )
+    parser.add_argument(
+        "--controlled-vehicles",
+        type=int,
+        default=100,
+        help="Number of controlled vehicles. Defaults to the frozen-eval training value.",
+    )
+    parser.add_argument(
+        "--uncontrolled-vehicles",
+        type=int,
+        default=100,
+        help="Number of uncontrolled background vehicles. Defaults to the frozen-eval training value.",
+    )
+    parser.add_argument(
+        "--pattern",
+        type=int,
+        default=3,
+        help="Vehicle generation pattern. Defaults to the training/frozen-eval pattern.",
+    )
+    parser.add_argument(
+        "--traci-port",
+        type=int,
+        default=8873,
+        help="TraCI port for SUMO inference runs. Use a different value if the port is busy.",
     )
     parser.add_argument(
         "--fast-mode",
@@ -70,6 +109,15 @@ def resolve_model_path(raw_model_path=None):
     # if os.path.exists(legacy_best_model_path):
     #     return legacy_best_model_path
     return final_model_path
+
+
+def resolve_run_seeds(single_seed=None, seed_list_raw=None):
+    if single_seed is not None:
+        return [int(single_seed)]
+    seeds = parse_seed_list(seed_list_raw)
+    if seeds:
+        return seeds
+    return parse_seed_list(DEFAULT_EVAL_SEEDS)
 
 
 # use vehicle generation protocols to generate vehicle list
@@ -111,19 +159,19 @@ def get_controlled_vehicles(route_filename, connection_info, \
     return vehicle_dict
 
 
-def test_dijkstra_policy(vehicles, fast_mode=False):
+def test_dijkstra_policy(vehicles, fast_mode=False, traci_port=8873):
     print("Testing Dijkstra's Algorithm Route Controller")
     scheduler = DijkstraPolicy(init_connection_info)
-    run_simulation(scheduler, vehicles, fast_mode=fast_mode)
+    return run_simulation(scheduler, vehicles, fast_mode=fast_mode, traci_port=traci_port)
 
 
-def test_q_learning(vehicles, model_path, fast_mode=False):
+def test_q_learning(vehicles, model_path, fast_mode=False, traci_port=8873):
     print("Testing Q Learning Route Controller")
     scheduler = QLearningPolicy(vehicles, init_connection_info, model_path)
-    run_simulation(scheduler, vehicles, fast_mode=fast_mode)
+    return run_simulation(scheduler, vehicles, fast_mode=fast_mode, traci_port=traci_port)
 
 
-def run_simulation(scheduler, vehicles, fast_mode=False):
+def run_simulation(scheduler, vehicles, fast_mode=False, traci_port=8873):
 
     simulation = StrSumo(scheduler, init_connection_info, vehicles)
     runtime_sumocfg = build_runtime_sumocfg("./configurations/myconfig.sumocfg", fast_mode=fast_mode)
@@ -141,9 +189,9 @@ def run_simulation(scheduler, vehicles, fast_mode=False):
             "--tripinfo-output", "./main_output/trips.trips.xml",
             "--fcd-output", "./main_output/testTrace.xml",
         ])
-    traci.start(traci_command)
+    traci.start(traci_command, port=int(traci_port))
     try:
-        total_time, end_number, deadlines_missed, _ = simulation.run(
+        total_time, end_number, deadlines_missed, stats = simulation.run(
             verbose=not fast_mode,
             return_stats=True,
             print_runtime_summary=True,
@@ -154,10 +202,46 @@ def run_simulation(scheduler, vehicles, fast_mode=False):
             avg_timespan = "N/A (no vehicles reached destination)"
         print("Average timespan: {}, total vehicle number: {}, total vehicles reached destination: {}".format(avg_timespan,\
             str(len(vehicles)), str(end_number)))
+        if isinstance(stats, dict):
+            print(
+                "Travel summary: completion={:.3f}, p50={:.2f}, p90={:.2f}, tail_gap={:.2f}, p95/p50={:.2f}, timeout_rate={:.3f}".format(
+                    float(stats.get("completion_rate", 0.0)),
+                    float(stats.get("p50_travel_time", 0.0)),
+                    float(stats.get("p90_travel_time", 0.0)),
+                    float(stats.get("tail_completion_gap_steps", 0.0)),
+                    float(stats.get("p95_to_p50_travel_ratio", 0.0)),
+                    float(stats.get("timeout_rate", 0.0)),
+                )
+            )
         print(str(deadlines_missed) + ' deadlines missed.')
+        return stats
     finally:
         if traci.isLoaded():
             traci.close()
+
+
+def summarize_runs(label, rows):
+    rows = [row for row in rows if isinstance(row, dict)]
+    if not rows:
+        return
+
+    def mean_metric(key):
+        values = [float(row.get(key, 0.0)) for row in rows]
+        return sum(values) / float(len(values))
+
+    print(
+        "{} summary over {} run(s): completion={:.3f}, avg={:.2f}, p50={:.2f}, p90={:.2f}, tail_gap={:.2f}, p95/p50={:.2f}, timeout={:.3f}".format(
+            label,
+            len(rows),
+            mean_metric("completion_rate"),
+            mean_metric("avg_travel_time"),
+            mean_metric("p50_travel_time"),
+            mean_metric("p90_travel_time"),
+            mean_metric("tail_completion_gap_steps"),
+            mean_metric("p95_to_p50_travel_ratio"),
+            mean_metric("timeout_rate"),
+        )
+    )
 
 
 if __name__ == "__main__":
@@ -178,22 +262,40 @@ if __name__ == "__main__":
     route_file_node = dom.getElementsByTagName('route-files')
     route_file_attr = route_file_node[0].attributes
     route_file = "./configurations/"+route_file_attr['value'].nodeValue
-    # Pattern 2: multiple origins with one shared destination.
-    for i in range(1, 10):
+    run_seeds = resolve_run_seeds(args.seed, args.seeds)
+    print(
+        "Inference scenario: controlled={}, uncontrolled={}, pattern={}, spawn_interval={}, seeds={}".format(
+            args.controlled_vehicles,
+            args.uncontrolled_vehicles,
+            args.pattern,
+            args.spawn_interval,
+            ",".join(str(seed) for seed in run_seeds),
+        )
+    )
+    dijkstra_results = []
+    rl_results = []
+    for seed in run_seeds:
         vehicles = get_controlled_vehicles(
             route_file,
             init_connection_info,
-            100,
-            100,
-            pattern=3,
-            spawn_interval=2.0,
-            seed=5000+i,
+            args.controlled_vehicles,
+            args.uncontrolled_vehicles,
+            pattern=args.pattern,
+            spawn_interval=args.spawn_interval,
+            seed=seed,
         )
+        print("Scenario seed:", seed)
         #print the controlled vehicles generated
         if not args.fast_mode:
             for vid, v in vehicles.items():
                 print("id: {}, destination: {}, start time:{}, deadline: {};".format(vid, \
                     v.destination, v.start_time, v.deadline))
-        test_dijkstra_policy(copy.deepcopy(vehicles), fast_mode=args.fast_mode)
+        dijkstra_results.append(
+            test_dijkstra_policy(copy.deepcopy(vehicles), fast_mode=args.fast_mode, traci_port=args.traci_port)
+        )
         print("Using RL checkpoint:", model_path)
-        test_q_learning(copy.deepcopy(vehicles), model_path, fast_mode=args.fast_mode)
+        rl_results.append(
+            test_q_learning(copy.deepcopy(vehicles), model_path, fast_mode=args.fast_mode, traci_port=args.traci_port)
+        )
+    summarize_runs("Dijkstra", dijkstra_results)
+    summarize_runs("Q-learning", rl_results)

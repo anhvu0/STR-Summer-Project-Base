@@ -36,7 +36,7 @@ import sumolib
 In this file, we build a DQN network
 """
 
-MAX_SIMULATION_STEPS = 3500 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
+MAX_SIMULATION_STEPS = 2000 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
 
 # Compact metric glossary used by training CSV + logs.
 # type ∈ {event_count, gauge, per_episode_aggregate, cumulative_counter, ratio}
@@ -2121,8 +2121,8 @@ class RLTrainingPipeline:
         route_path = os.path.join(self.sumocfg_dir, self.route_file)
         spawn_interval_value = self.spawn_interval if spawn_interval_override is None else float(spawn_interval_override)
         vehicle_list = generator.generate_vehicles(
-            num_target_vehicles=200,
-            num_random_vehicles=200,
+            num_target_vehicles=100,
+            num_random_vehicles=100,
             pattern=self.target_pattern,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
@@ -2334,6 +2334,13 @@ class RLTrainingPipeline:
             congestion_high_pressure_steps = 0
             social_regret_samples = []
 
+            def decision_recent_history(vehicle_id):
+                try:
+                    history = recent_history_for_decision.get(vehicle_id)
+                except NameError:
+                    history = None
+                return list(history) if history is not None else list(recent_edge_history[vehicle_id])
+
             def process_selected_action(
                 vehicle_id,
                 vehicle,
@@ -2347,7 +2354,7 @@ class RLTrainingPipeline:
             ):
                 nonlocal episode_return_total
 
-                recent_history = list(recent_edge_history[vehicle_id])
+                recent_history = decision_recent_history(vehicle_id)
                 cooldown_until = lane_change_cooldown_until.get((vehicle_id, current_edge), -1)
                 next_edge = self.decision_engine.get_next_edge(current_edge, action)
                 if next_edge is None:
@@ -2711,6 +2718,7 @@ class RLTrainingPipeline:
                     step_context_cache = {}
                     step_state_cache = {}
                     open_decision_batch = []
+                    recent_history_for_decision = {}
                     step_mean_density = float(self._density_mean)
                     step_p95_density = float(self._density_p95)
                     mean_density_samples.append(step_mean_density)
@@ -2779,6 +2787,10 @@ class RLTrainingPipeline:
                             emergency_brake_active_by_vehicle[vehicle_id] = False
 
                         current_edge = snapshot.edge_id
+                        previous_seen_edge = last_seen_edge_by_vehicle.get(vehicle_id)
+                        edge_changed_runtime = previous_seen_edge is None or previous_seen_edge != current_edge
+                        history_before_edge = list(recent_edge_history[vehicle_id])
+                        recent_history_for_decision[vehicle_id] = history_before_edge
                         prev_speed_by_vehicle[vehicle_id] = snapshot.speed
                         last_observed_brake_step_by_vehicle[vehicle_id] = step
 
@@ -2792,30 +2804,26 @@ class RLTrainingPipeline:
                             vehicle._route_difficulty_eta_logged = True
                         last_seen_edge_by_vehicle[vehicle_id] = current_edge
                         last_snapshot_by_vehicle[vehicle_id] = snapshot
-                        recent_edge_history[vehicle_id].append(current_edge)
-
-                        # Do not cleanup pre-step destination reaches yet; terminal transition
-                        # must be written exactly once before any state is removed.
-                        if current_edge == vehicle.destination:
-                            continue
+                        if edge_changed_runtime:
+                            recent_edge_history[vehicle_id].append(current_edge)
 
                         prev_edge = prev_edge_by_vehicle.get(vehicle_id)
                         if vehicle_id in pending_decisions and current_edge != pending_decisions[vehicle_id].decision_edge:
                             pending = pending_decisions.pop(vehicle_id)
                             decision_metrics["pending_resolved_success"] += 1
-                            repeated_recent_edges = sum(1 for e in recent_edge_history[vehicle_id] if e == current_edge)
+                            repeated_recent_edges = sum(1 for e in history_before_edge if e == current_edge)
                             mismatch = not self.decision_engine.route_matches_expected(pending, current_edge)
                             if mismatch:
                                 decision_metrics["route_mismatch"] += 1
-                            signal_edges = set(recent_edge_history[vehicle_id]) | {current_edge}
+                            signal_edges = set(history_before_edge) | {current_edge}
                             edge_distance_lookup = {
                                 edge: self.get_distance_to_destination(edge, vehicle.destination)
                                 for edge in signal_edges
                             }
                             loop_signals = transition_signal(
-                                recent_edge_history[vehicle_id],
+                                deque(history_before_edge, maxlen=self.loop_window),
                                 current_edge,
-                                edge_out_degree=self._edge_out_degree_map(list(recent_edge_history[vehicle_id]) + [current_edge]),
+                                edge_out_degree=self._edge_out_degree_map(history_before_edge + [current_edge]),
                                 edge_distance_lookup=edge_distance_lookup,
                                 progress_slack=self.decision_engine.loop_distance_slack,
                             )
@@ -2894,10 +2902,10 @@ class RLTrainingPipeline:
                             decision_latency_steps.append(float(max(step - pending.decision_step, 0)))
                             finalized_decision_rewards.append(float(reward))
                             episode_return_total += reward
-                            if repeated_recent_edges > 1 and not explicit_loop_signal:
+                            if repeated_recent_edges > 0 and not explicit_loop_signal:
                                 decision_metrics["loop_repeat_only_events"] += 1
                                 loop_repeat_only_events_by_edge[str(current_edge)] += 1
-                            if repeated_recent_edges > 1 or explicit_loop_signal:
+                            if repeated_recent_edges > 0 or explicit_loop_signal:
                                 decision_metrics["loop_events"] += 1
                                 if "fallback" in action_source:
                                     decision_metrics["loop_after_fallback_events"] += 1
@@ -2930,6 +2938,11 @@ class RLTrainingPipeline:
                                 externality_penalty=ext_pen,
                                 marginal_pressure=marginal_pressure,
                             ))
+                        # Do not cleanup pre-step destination reaches yet; terminal transition
+                        # must be written exactly once before any state is removed.
+                        if current_edge == vehicle.destination:
+                            prev_edge_by_vehicle[vehicle_id] = current_edge
+                            continue
                         elif vehicle_id in pending_decisions:
                             pending = pending_decisions[vehicle_id]
                             pending_phase = pending.metadata.get("phase", "route_pending")
@@ -2963,7 +2976,7 @@ class RLTrainingPipeline:
                                         override_penalty = self._clip_reward(-6.0)
                                         obs_policy_actions = self._policy_action_candidates(
                                             context=obs_context,
-                                            recent_history=list(recent_edge_history[vehicle_id]),
+                                            recent_history=decision_recent_history(vehicle_id),
                                             cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
                                             destination=vehicle.destination,
                                             decision_metrics=decision_metrics,
@@ -3067,7 +3080,7 @@ class RLTrainingPipeline:
                                     obs_context,
                                     blocked_action=pending.intended_action,
                                     destination=vehicle.destination,
-                                    recent_history=list(recent_edge_history[vehicle_id]),
+                                    recent_history=decision_recent_history(vehicle_id),
                                     lane_now_only=True,
                                 )
                                 if fallback_action is None:
@@ -3120,7 +3133,7 @@ class RLTrainingPipeline:
                                 decision_metrics["fallback_after_observe_abort_count"] += 1
                                 observe_policy_actions = self._policy_action_candidates(
                                     context=obs_context,
-                                    recent_history=list(recent_edge_history[vehicle_id]),
+                                    recent_history=decision_recent_history(vehicle_id),
                                     cooldown_active=True,
                                     destination=vehicle.destination,
                                     decision_metrics=decision_metrics,
@@ -3163,7 +3176,10 @@ class RLTrainingPipeline:
                                     lane_change_deferrals=pending.metadata.get("lane_change_deferrals", 0),
                                     hard_brake_events=self._consume_hard_brake_events(hard_brake_counts_by_vehicle, vehicle_id),
                                 )
-                                age_scale = 1.0 / (1.0 + 0.10 * max(pending_age - 8, 0))
+                                age_scale = max(
+                                    0.20,
+                                    1.0 / (1.0 + 0.10 * max(pending_age - 8, 0)),
+                                )
                                 pending_reward *= age_scale
                                 next_ctx = self._get_or_build_step_context(
                                     step_context_cache,
@@ -3411,7 +3427,7 @@ class RLTrainingPipeline:
                             cooldown_active = step < cooldown_until
                             policy_actions = self._policy_action_candidates(
                                 context=context,
-                                recent_history=list(recent_edge_history[vehicle_id]),
+                                recent_history=decision_recent_history(vehicle_id),
                                 cooldown_active=cooldown_active,
                                 destination=vehicle.destination,
                                 decision_metrics=decision_metrics,
