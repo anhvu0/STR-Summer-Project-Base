@@ -23,6 +23,8 @@ class PendingReleaseEvaluation:
     progress_view: Dict[str, object]
     stall_age: int
     total_age: int
+    avoid_reopen_action: Optional[int] = None
+    preferred_replan_action: Optional[int] = None
 
 
 class SharedDecisionPolicy:
@@ -68,6 +70,11 @@ class SharedDecisionPolicy:
         self.lane_now_near_junction_distance_keep_extra = 12.0
         self.lane_now_replan_min_age_steps = 10
         self.lane_now_replan_low_speed_mps = 1.25
+        route_pending_stall_steps = int(getattr(self.decision_engine, "route_pending_stall_steps", 8))
+        self.lane_now_replan_deadlock_min_age_steps = max(
+            int(self.decision_engine.pending_progress_timeout_steps),
+            route_pending_stall_steps * 3,
+        )
         self.lane_now_stale_timeout_min_stall_steps = max(
             int(self.decision_engine.route_pending_hard_timeout_steps),
             int(self.decision_engine.pending_progress_timeout_steps) * 2,
@@ -808,7 +815,7 @@ class SharedDecisionPolicy:
             and same_edge
             and total_age >= int(self.decision_engine.route_pending_hard_timeout_steps)
         )
-        lane_now_replan = self._should_replan_stalled_lane_now_pending(
+        lane_now_replan_action = self._stalled_lane_now_replan_action(
             pending,
             context=context,
             total_age=total_age,
@@ -816,6 +823,7 @@ class SharedDecisionPolicy:
             edge_density_fn=edge_density_fn,
             distance_fn=distance_fn,
         )
+        lane_now_replan = lane_now_replan_action is not None
         lane_now_stale_timeout = (
             lane_now_pending
             and same_edge
@@ -857,9 +865,11 @@ class SharedDecisionPolicy:
             progress_view=progress_view,
             stall_age=stall_age,
             total_age=total_age,
+            avoid_reopen_action=int(pending.intended_action) if lane_now_replan else None,
+            preferred_replan_action=int(lane_now_replan_action) if lane_now_replan_action is not None else None,
         )
 
-    def _should_replan_stalled_lane_now_pending(
+    def _stalled_lane_now_replan_action(
         self,
         pending: PendingDecision,
         *,
@@ -868,23 +878,24 @@ class SharedDecisionPolicy:
         stall_age: int,
         edge_density_fn: Optional[Callable[[str], float]],
         distance_fn: Optional[Callable[[str, str], float]],
-    ) -> bool:
+    ) -> Optional[int]:
         if edge_density_fn is None or distance_fn is None:
-            return False
+            return None
         if self.pending_resolution_mode(pending) != "lane_now":
-            return False
+            return None
         if context.edge_id != pending.decision_edge:
-            return False
+            return None
         if total_age < int(self.lane_now_replan_min_age_steps):
-            return False
+            return None
         if float(context.speed) > float(self.lane_now_replan_low_speed_mps):
-            return False
-        if stall_age < int(self.decision_engine.route_pending_stall_steps):
-            return False
+            return None
+        route_pending_stall_steps = int(getattr(self.decision_engine, "route_pending_stall_steps", 8))
+        if stall_age < route_pending_stall_steps:
+            return None
 
         current_next_edge = pending.intended_next_edge
         if not current_next_edge:
-            return False
+            return None
         current_density = max(float(edge_density_fn(current_next_edge)), 0.0)
         current_distance = distance_fn(current_next_edge, pending.destination)
         if not math.isfinite(current_distance):
@@ -894,8 +905,6 @@ class SharedDecisionPolicy:
             context=context,
             distance_slack=None,
         )
-        if current_density < density_threshold:
-            return False
 
         alternatives = []
         for action in sorted(set(context.lane_feasible_now_actions)):
@@ -910,11 +919,37 @@ class SharedDecisionPolicy:
             alt_density = max(float(edge_density_fn(next_edge)), 0.0)
             alternatives.append((alt_density, float(alt_distance), int(action)))
         if not alternatives:
-            return False
+            return None
 
-        best_alt_density, best_alt_distance, _ = min(alternatives, key=lambda item: (item[0], item[1], item[2]))
-        enough_relief = (current_density - best_alt_density) >= relief_threshold
-        not_much_longer = best_alt_distance <= (current_distance + distance_slack)
-        clearly_shorter = best_alt_distance <= (current_distance - max(8.0, 0.35 * distance_slack))
         severe_stall = stall_age >= int(self.decision_engine.pending_progress_timeout_steps)
-        return bool((enough_relief and not_much_longer) or (severe_stall and clearly_shorter))
+        deadlock_stall = (
+            total_age >= int(self.lane_now_replan_deadlock_min_age_steps)
+            and stall_age >= route_pending_stall_steps
+        )
+
+        relief_candidates = []
+        shorter_candidates = []
+        deadlock_candidates = []
+        for alt_density, alt_distance, action in alternatives:
+            enough_relief = (current_density - alt_density) >= relief_threshold
+            not_much_longer = alt_distance <= (current_distance + distance_slack)
+            clearly_shorter = alt_distance <= (current_distance - max(8.0, 0.35 * distance_slack))
+            density_not_worse = alt_density <= (current_density + max(0.08, 0.5 * relief_threshold))
+            comparable_or_better = alt_distance <= (current_distance + max(distance_slack, 20.0))
+            if current_density >= density_threshold and enough_relief and not_much_longer:
+                relief_candidates.append((alt_density, alt_distance, action))
+            if severe_stall and clearly_shorter:
+                shorter_candidates.append((alt_distance, alt_density, action))
+            if deadlock_stall and comparable_or_better and density_not_worse:
+                deadlock_candidates.append((alt_distance, alt_density, action))
+
+        # Congested lane-now choices still need relief. Low-density yield/deadlock
+        # cases often do not cross the congestion threshold, so let sustained
+        # low-speed stalls escape to a comparable non-worse branch.
+        if relief_candidates:
+            return int(min(relief_candidates, key=lambda item: (item[0], item[1], item[2]))[2])
+        if shorter_candidates:
+            return int(min(shorter_candidates, key=lambda item: (item[0], item[1], item[2]))[2])
+        if deadlock_candidates:
+            return int(min(deadlock_candidates, key=lambda item: (item[0], item[1], item[2]))[2])
+        return None

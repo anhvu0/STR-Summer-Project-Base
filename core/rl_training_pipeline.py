@@ -2235,6 +2235,8 @@ class RLTrainingPipeline:
             "proactive_decisions_opened", "proactive_decisions_finalized",
             "lane_now_decisions_opened", "lane_now_decisions_finalized",
             "proactive_pending_abort_count", "proactive_pending_timeout_count",
+            "lane_now_replan_releases", "lane_now_replan_forced_alternative",
+            "lane_now_replan_blocked_reopen_actions",
             "fallback_after_observe_abort_count", "fallback_after_timeout_count",
             "same_edge_reopen_after_abort_count", "synthetic_terminal_finalizations",
             "finalized_opened_proactive_ratio", "finalized_opened_lane_now_ratio",
@@ -2280,6 +2282,7 @@ class RLTrainingPipeline:
             lane_change_deferrals = defaultdict(int)
             lane_change_cooldown_until = {}
             pending_release_info = {}
+            stale_lane_now_replan_targets = {}
             recent_edge_history = defaultdict(lambda: deque(maxlen=self.loop_window))
             prev_edge_by_vehicle = {}
             decision_metrics = defaultdict(float)
@@ -2340,6 +2343,28 @@ class RLTrainingPipeline:
                 except NameError:
                     history = None
                 return list(history) if history is not None else list(recent_edge_history[vehicle_id])
+
+            def force_stale_lane_now_replan_if_available(vehicle_id, current_edge, step, context, policy_actions):
+                key = (vehicle_id, current_edge)
+                target_info = stale_lane_now_replan_targets.get(key)
+                if not target_info:
+                    return policy_actions
+                if int(step) > int(target_info.get("until", step)):
+                    stale_lane_now_replan_targets.pop(key, None)
+                    return policy_actions
+
+                blocked_action = int(target_info.get("blocked_action", -1))
+                preferred_action = int(target_info.get("preferred_action", -1))
+                available = set(int(action) for action in context.available_actions)
+                if preferred_action in available:
+                    decision_metrics["lane_now_replan_forced_alternative"] += 1
+                    return [preferred_action]
+                if blocked_action in policy_actions and len(policy_actions) > 1:
+                    filtered_actions = [action for action in policy_actions if int(action) != blocked_action]
+                    if filtered_actions:
+                        decision_metrics["lane_now_replan_blocked_reopen_actions"] += 1
+                        return filtered_actions
+                return policy_actions
 
             def process_selected_action(
                 vehicle_id,
@@ -3338,6 +3363,16 @@ class RLTrainingPipeline:
                                     decision_metrics["pending_resolved_abort_no_progress"] += 1
                                     if str((pending.metadata or {}).get("decision_origin_mode", pending.decision_origin_mode)) == "proactive":
                                         decision_metrics["proactive_pending_abort_count"] += 1
+                                    if (
+                                        release_eval.avoid_reopen_action is not None
+                                        and release_eval.preferred_replan_action is not None
+                                    ):
+                                        stale_lane_now_replan_targets[(vehicle_id, current_edge)] = {
+                                            "blocked_action": int(release_eval.avoid_reopen_action),
+                                            "preferred_action": int(release_eval.preferred_replan_action),
+                                            "until": int(step + self.decision_engine.cooldown_after_pending_release(timeout=False)),
+                                        }
+                                        decision_metrics["lane_now_replan_releases"] += 1
                                 pending_decisions.pop(vehicle_id, None)
                                 lane_change_cooldown_until[(vehicle_id, current_edge)] = (
                                     step + self.decision_engine.cooldown_after_pending_release(timeout=release_eval.release_as_timeout)
@@ -3431,6 +3466,13 @@ class RLTrainingPipeline:
                                 cooldown_active=cooldown_active,
                                 destination=vehicle.destination,
                                 decision_metrics=decision_metrics,
+                            )
+                            policy_actions = force_stale_lane_now_replan_if_available(
+                                vehicle_id,
+                                current_edge,
+                                step,
+                                context,
+                                policy_actions,
                             )
                             removed_actions = max(len(context.available_actions) - len(policy_actions), 0)
                             decision_metrics["policy_masked_actions_removed"] += removed_actions
@@ -4245,6 +4287,9 @@ class RLTrainingPipeline:
                         "lane_now_decisions_finalized": decision_metrics["lane_now_decisions_finalized"],
                         "proactive_pending_abort_count": decision_metrics["proactive_pending_abort_count"],
                         "proactive_pending_timeout_count": decision_metrics["proactive_pending_timeout_count"],
+                        "lane_now_replan_releases": decision_metrics["lane_now_replan_releases"],
+                        "lane_now_replan_forced_alternative": decision_metrics["lane_now_replan_forced_alternative"],
+                        "lane_now_replan_blocked_reopen_actions": decision_metrics["lane_now_replan_blocked_reopen_actions"],
                         "fallback_after_observe_abort_count": decision_metrics["fallback_after_observe_abort_count"],
                         "fallback_after_timeout_count": decision_metrics["fallback_after_timeout_count"],
                         "same_edge_reopen_after_abort_count": decision_metrics["same_edge_reopen_after_abort_count"],

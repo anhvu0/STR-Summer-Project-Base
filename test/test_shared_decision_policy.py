@@ -470,6 +470,108 @@ class SharedDecisionPolicyPendingReleaseTests(unittest.TestCase):
         self.assertTrue(release.should_release)
         self.assertEqual(release.release_reason, 'route_no_progress_abort')
         self.assertFalse(release.release_as_timeout)
+        self.assertEqual(release.avoid_reopen_action, 0)
+        self.assertEqual(release.preferred_replan_action, 1)
+
+    def test_low_density_deadlock_lane_now_pending_replans_to_comparable_branch(self):
+        context = self._lane_now_context(
+            lane_now=[0, 1],
+            available=[0, 1],
+            shifts={0: 0, 1: 0},
+            forced_action=None,
+            branch_with_choice=True,
+            skip_reason=None,
+        )
+        pending = self.policy.build_route_pending(
+            state=None,
+            action_idx=0,
+            committed_next_edge='edgeB',
+            decision_edge='edgeA',
+            step=0,
+            destination='destX',
+            context=context,
+            lane_change_requested=False,
+            decision_id='d0',
+            origin_mode='lane_now',
+            action_source='policy',
+            full_route=['edgeA', 'edgeB'],
+            decision_open_recorded=True,
+        )
+        density = {'edgeB': 0.04, 'edgeC': 0.05}
+        distance = {'edgeB': 100.0, 'edgeC': 108.0}
+
+        release = self.policy.evaluate_route_pending_release(
+            pending,
+            context=self._lane_now_context(
+                step=int(self.policy.lane_now_replan_deadlock_min_age_steps),
+                speed=0.2,
+                lane_now=[0, 1],
+                available=[0, 1],
+                shifts={0: 0, 1: 0},
+                forced_action=None,
+                branch_with_choice=True,
+                skip_reason=None,
+            ),
+            step=int(self.policy.lane_now_replan_deadlock_min_age_steps),
+            lane_position_now=0.0,
+            edge_density_fn=lambda edge: density.get(edge, 0.0),
+            distance_fn=lambda edge, dest: distance.get(edge, float('inf')),
+        )
+
+        self.assertTrue(release.should_release)
+        self.assertEqual(release.release_reason, 'route_no_progress_abort')
+        self.assertFalse(release.release_as_timeout)
+        self.assertEqual(release.avoid_reopen_action, 0)
+        self.assertEqual(release.preferred_replan_action, 1)
+
+    def test_deadlock_replan_skips_too_long_clean_branch_for_viable_branch(self):
+        context = self._lane_now_context(
+            lane_now=[0, 1, 2],
+            available=[0, 1, 2],
+            shifts={0: 0, 1: 0, 2: 0},
+            forced_action=None,
+            branch_with_choice=True,
+            skip_reason=None,
+        )
+        pending = self.policy.build_route_pending(
+            state=None,
+            action_idx=0,
+            committed_next_edge='edgeB',
+            decision_edge='edgeA',
+            step=0,
+            destination='destX',
+            context=context,
+            lane_change_requested=False,
+            decision_id='d0',
+            origin_mode='lane_now',
+            action_source='policy',
+            full_route=['edgeA', 'edgeB'],
+            decision_open_recorded=True,
+        )
+        density = {'edgeB': 0.04, 'edgeC': 0.01, 'edgeD': 0.05}
+        distance = {'edgeB': 100.0, 'edgeC': 180.0, 'edgeD': 106.0}
+
+        release = self.policy.evaluate_route_pending_release(
+            pending,
+            context=self._lane_now_context(
+                step=int(self.policy.lane_now_replan_deadlock_min_age_steps),
+                speed=0.2,
+                lane_now=[0, 1, 2],
+                available=[0, 1, 2],
+                shifts={0: 0, 1: 0, 2: 0},
+                forced_action=None,
+                branch_with_choice=True,
+                skip_reason=None,
+            ),
+            step=int(self.policy.lane_now_replan_deadlock_min_age_steps),
+            lane_position_now=0.0,
+            edge_density_fn=lambda edge: density.get(edge, 0.0),
+            distance_fn=lambda edge, dest: distance.get(edge, float('inf')),
+        )
+
+        self.assertTrue(release.should_release)
+        self.assertEqual(release.release_reason, 'route_no_progress_abort')
+        self.assertEqual(release.preferred_replan_action, 2)
 
     def test_stalled_lane_now_pending_kept_when_cleaner_branch_is_much_longer(self):
         context = self._lane_now_context(

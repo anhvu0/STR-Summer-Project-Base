@@ -35,6 +35,7 @@ class QLearningPolicy(RouteController):
         self._pending_decisions = {}
         self._distance_cache = {}
         self._lane_change_cooldown = {}
+        self._stale_lane_now_replan_targets = {}
         self.step_control_extra_buffer_m = 35.0
         self._last_observed_edge = {}
         self._last_control_step = {}
@@ -92,6 +93,9 @@ class QLearningPolicy(RouteController):
             "proactive_brake_risk_candidates_seen": 0,
             "proactive_brake_risk_candidates_rejected": 0,
             "proactive_brake_risk_fallback_kept": 0,
+            "lane_now_replan_releases": 0,
+            "lane_now_replan_forced_alternative": 0,
+            "lane_now_replan_blocked_reopen_actions": 0,
             "commit_window_candidates_rejected": 0,
             "commit_window_non_lane_candidates_seen": 0,
             "step_control_edge_change": 0,
@@ -262,6 +266,9 @@ class QLearningPolicy(RouteController):
         stale_cooldowns = [key for key in self._lane_change_cooldown if key and key[0] == vid]
         for key in stale_cooldowns:
             self._lane_change_cooldown.pop(key, None)
+        stale_replans = [key for key in self._stale_lane_now_replan_targets if key and key[0] == vid]
+        for key in stale_replans:
+            self._stale_lane_now_replan_targets.pop(key, None)
 
     #-----------------------DEBUGGING-------------------------------------
     def _dist_to_dest(self, edge_id, dest_id):
@@ -491,12 +498,16 @@ class QLearningPolicy(RouteController):
                 int(metrics["committed_cyclic_revisit_after_fallback_events"]),
             ),
             (
-                "[RL-INFER] pending_timeouts={} release(no_prog/stall/hard)={}/{}/{}"
+                "[RL-INFER] pending_timeouts={} release(no_prog/stall/hard)={}/{}/{} "
+                "lane_now_rescue(release/forced/blocked)={}/{}/{}"
             ).format(
                 int(metrics["pending_decision_timeouts"]),
                 int(metrics["pending_release_route_no_progress_abort"]),
                 int(metrics["pending_release_route_stall_timeout"]),
                 int(metrics["pending_release_route_hard_timeout"]),
+                int(metrics["lane_now_replan_releases"]),
+                int(metrics["lane_now_replan_forced_alternative"]),
+                int(metrics["lane_now_replan_blocked_reopen_actions"]),
             ),
             (
                 "[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)={}/{}/{}/{}/{} "
@@ -560,6 +571,16 @@ class QLearningPolicy(RouteController):
                 self._record_pending_release(release_eval.release_reason)
                 if release_eval.release_as_timeout:
                     self._metrics["pending_decision_timeouts"] += 1
+                elif (
+                    release_eval.avoid_reopen_action is not None
+                    and release_eval.preferred_replan_action is not None
+                ):
+                    self._stale_lane_now_replan_targets[(vid, vehicle.current_edge)] = {
+                        "blocked_action": int(release_eval.avoid_reopen_action),
+                        "preferred_action": int(release_eval.preferred_replan_action),
+                        "until": int(step + self.decision_engine.cooldown_after_pending_release(timeout=False)),
+                    }
+                    self._metrics["lane_now_replan_releases"] += 1
                 self._lane_change_cooldown[(vid, vehicle.current_edge)] = (
                     step + self.decision_engine.cooldown_after_pending_release(timeout=release_eval.release_as_timeout)
                 )
@@ -574,6 +595,28 @@ class QLearningPolicy(RouteController):
                 self._metrics["decision_committed_skips"] += 1
             return
         self._pending_decisions.pop(vid, None)
+
+    def _force_stale_lane_now_replan_if_available(self, vid, current_edge, step, context, policy_actions):
+        key = (vid, current_edge)
+        target_info = self._stale_lane_now_replan_targets.get(key)
+        if not target_info:
+            return policy_actions
+        if int(step) > int(target_info.get("until", step)):
+            self._stale_lane_now_replan_targets.pop(key, None)
+            return policy_actions
+
+        blocked_action = int(target_info.get("blocked_action", -1))
+        preferred_action = int(target_info.get("preferred_action", -1))
+        available = set(int(action) for action in context.available_actions)
+        if preferred_action in available:
+            self._metrics["lane_now_replan_forced_alternative"] += 1
+            return [preferred_action]
+        if blocked_action in policy_actions and len(policy_actions) > 1:
+            filtered_actions = [action for action in policy_actions if int(action) != blocked_action]
+            if filtered_actions:
+                self._metrics["lane_now_replan_blocked_reopen_actions"] += 1
+                return filtered_actions
+        return policy_actions
 
     def _record_pending_release(self, reason):
         key_map = {
@@ -684,6 +727,21 @@ class QLearningPolicy(RouteController):
             if snapshot is not None:
                 context = self._get_step_context(vid, current_edge, vehicle.destination, step, snapshot=snapshot)
                 if context.commit_window and pending.intended_action not in context.lane_feasible_now_actions:
+                    self._metrics["step_control_pending"] += 1
+                    return True
+                pending_age = self.decision_engine.pending_age_steps(pending, step)
+                lane_now_pending = self.shared_policy.pending_resolution_mode(pending) == "lane_now"
+                low_speed = float(snapshot.speed) <= float(self.shared_policy.lane_now_replan_low_speed_mps)
+                stale_lane_now_age = (
+                    pending_age >= int(self.decision_engine.route_pending_hard_timeout_steps)
+                    and low_speed
+                )
+                very_old_lane_now_age = pending_age >= int(self.shared_policy.lane_now_stale_timeout_max_age_steps)
+                low_speed_lane_now = (
+                    pending_age >= int(self.shared_policy.lane_now_replan_min_age_steps)
+                    and low_speed
+                )
+                if lane_now_pending and (stale_lane_now_age or very_old_lane_now_age or low_speed_lane_now):
                     self._metrics["step_control_pending"] += 1
                     return True
 
@@ -984,6 +1042,13 @@ class QLearningPolicy(RouteController):
                     edge_density_fn=self._edge_density,
                     metrics=self._metrics,
                     distance_slack=self.score_slack,
+                )
+                policy_actions = self._force_stale_lane_now_replan_if_available(
+                    vid,
+                    start_edge,
+                    step,
+                    context,
+                    policy_actions,
                 )
                 self._metrics["decisions"] += 1
                 open_decision_batch.append(
