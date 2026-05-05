@@ -27,6 +27,21 @@ class PendingReleaseEvaluation:
     preferred_replan_action: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class ActionCorridorStats:
+    next_edge: Optional[str]
+    edges: Tuple[str, ...]
+    mean_density: float
+    max_density: float
+    congested_edges: int
+    eta: float
+    next_distance: float
+    best_distance: float
+    trap_score: float
+    revisit_hits: int
+    score: float
+
+
 class SharedDecisionPolicy:
     """
     Shared owner for policy-facing decision logic that wraps the junction executor.
@@ -83,6 +98,12 @@ class SharedDecisionPolicy:
             int(self.decision_engine.route_pending_hard_timeout_steps) * 3,
             int(self.decision_engine.pending_progress_timeout_steps) * 5,
         )
+        self.corridor_horizon_m = max(
+            float(getattr(self.decision_engine, "default_fragment_horizon_m", 180.0)),
+            120.0,
+        )
+        self.corridor_congestion_density_threshold = 0.32
+        self.corridor_recent_revisit_window = 8
 
         self.compact_state_size = (
             (2 * self.edge_embedding_dim)
@@ -151,6 +172,141 @@ class SharedDecisionPolicy:
             dtype=np.float32,
         )
 
+    def _action_corridor_edges(
+        self,
+        *,
+        edge_id: str,
+        action_idx: int,
+        destination: str,
+    ) -> Tuple[Optional[str], Tuple[str, ...]]:
+        next_edge = self.decision_engine.get_next_edge(edge_id, action_idx)
+        if next_edge is None:
+            return None, ()
+
+        build_route_fragment = getattr(self.decision_engine, "build_route_fragment", None)
+        if callable(build_route_fragment):
+            try:
+                fragment, _, error = build_route_fragment(
+                    edge_id,
+                    action_idx,
+                    destination,
+                    horizon_m=self.corridor_horizon_m,
+                )
+            except TypeError:
+                fragment, _, error = build_route_fragment(edge_id, action_idx, destination)
+            except Exception:
+                fragment, error = None, "fragment_error"
+            if fragment and not error:
+                return next_edge, tuple(str(edge) for edge in fragment if edge)
+
+        return next_edge, (str(next_edge),)
+
+    def action_corridor_stats(
+        self,
+        *,
+        edge_id: str,
+        action_idx: int,
+        destination: str,
+        edge_density_fn: Callable[[str], float],
+        distance_fn: Optional[Callable[[str, str], float]] = None,
+        eta_fn: Optional[Callable[[str, str], float]] = None,
+        recent_history: Optional[Sequence[str]] = None,
+    ) -> Optional[ActionCorridorStats]:
+        next_edge, corridor_edges = self._action_corridor_edges(
+            edge_id=edge_id,
+            action_idx=action_idx,
+            destination=destination,
+        )
+        if next_edge is None:
+            return None
+
+        if not corridor_edges:
+            corridor_edges = (str(next_edge),)
+
+        edge_length_lookup = getattr(self.connection_info, "edge_length_dict", {}) or {}
+        outgoing_lookup = getattr(self.connection_info, "outgoing_edges_dict", {}) or {}
+
+        densities = []
+        weights = []
+        finite_distances = []
+        for edge in corridor_edges:
+            densities.append(max(float(edge_density_fn(edge)), 0.0))
+            weights.append(max(float(edge_length_lookup.get(edge, 40.0)), 5.0))
+            if distance_fn is not None:
+                distance = float(distance_fn(edge, destination))
+                if math.isfinite(distance):
+                    finite_distances.append(distance)
+
+        if not densities:
+            return None
+
+        mean_density = float(
+            np.average(
+                np.array(densities, dtype=np.float32),
+                weights=np.array(weights, dtype=np.float32),
+            )
+        )
+        max_density = float(np.max(densities))
+        congested_edges = int(
+            sum(1 for density in densities if density >= self.corridor_congestion_density_threshold)
+        )
+
+        next_distance = float("inf")
+        if distance_fn is not None:
+            next_distance = float(distance_fn(next_edge, destination))
+
+        eta = float("inf")
+        if eta_fn is not None:
+            eta = float(eta_fn(next_edge, destination))
+        if not math.isfinite(eta):
+            eta = (next_distance / 8.0) if math.isfinite(next_distance) else float("inf")
+
+        best_distance = min(finite_distances) if finite_distances else next_distance
+
+        recent_window = tuple(
+            str(edge)
+            for edge in list(recent_history or [])[-self.corridor_recent_revisit_window:]
+        )
+        recent_set = set(recent_window)
+        revisit_hits = int(sum(1 for edge in corridor_edges[:3] if edge in recent_set))
+
+        trap_score = 0.0
+        for depth, edge in enumerate(corridor_edges[:3], start=1):
+            out_degree = len(outgoing_lookup.get(edge, {}) or {})
+            if edge != destination and out_degree == 0:
+                trap_score += 6.0 / float(depth)
+                break
+            if edge != destination and out_degree == 1:
+                trap_score += 1.4 / float(depth)
+            if edge in recent_set:
+                trap_score += 1.6 / float(depth)
+
+        score = (
+            0.95 * mean_density
+            + 0.75 * max_density
+            + 0.18 * float(congested_edges)
+            + 0.22 * trap_score
+            + 0.12 * float(revisit_hits)
+        )
+        if math.isfinite(eta):
+            score += 0.01 * float(eta)
+        else:
+            score += 25.0
+
+        return ActionCorridorStats(
+            next_edge=str(next_edge),
+            edges=tuple(corridor_edges),
+            mean_density=mean_density,
+            max_density=max_density,
+            congested_edges=congested_edges,
+            eta=eta,
+            next_distance=next_distance,
+            best_distance=best_distance,
+            trap_score=float(trap_score),
+            revisit_hits=revisit_hits,
+            score=float(score),
+        )
+
     def per_action_branch_features(
         self,
         context: DecisionContext,
@@ -166,13 +322,19 @@ class SharedDecisionPolicy:
             base = action_idx * 5
             if action_idx not in context.edge_valid_actions:
                 continue
-            next_edge = self.decision_engine.get_next_edge(context.edge_id, action_idx)
-            if next_edge is None:
+            stats = self.action_corridor_stats(
+                edge_id=context.edge_id,
+                action_idx=action_idx,
+                destination=destination,
+                edge_density_fn=edge_density_fn,
+                eta_fn=eta_fn,
+            )
+            if stats is None or stats.next_edge is None:
                 continue
             features[base + 0] = float(context.required_lane_shift.get(action_idx, 0)) / 3.0
             features[base + 1] = 1.0 if action_idx in lane_now else 0.0
-            features[base + 2] = float(edge_density_fn(next_edge))
-            eta = eta_fn(next_edge, destination)
+            features[base + 2] = float(stats.mean_density)
+            eta = float(stats.eta)
             features[base + 3] = (
                 min(float(eta) / float(self.max_simulation_steps), 1.0)
                 if math.isfinite(eta) else 1.0
@@ -381,6 +543,7 @@ class SharedDecisionPolicy:
             edge_density_fn=edge_density_fn,
             metrics=metrics,
             distance_slack=distance_slack,
+            recent_history=recent_history,
         )
         policy_actions = sorted(set(safe_lane_now_actions) | set(proactive_actions))
         if not policy_actions and proactive_risk_scored:
@@ -409,6 +572,7 @@ class SharedDecisionPolicy:
         destination: str,
         distance_fn: Callable[[str, str], float],
         edge_density_fn: Optional[Callable[[str], float]],
+        recent_history: Optional[Sequence[str]] = None,
     ) -> List[int]:
         """
         Return policy candidates in best-first heuristic order.
@@ -421,36 +585,60 @@ class SharedDecisionPolicy:
         if len(unique_actions) <= 1:
             return unique_actions
 
+        density_lookup = edge_density_fn if edge_density_fn is not None else (lambda edge_id: 0.0)
         current_distance = distance_fn(context.edge_id, destination)
-        scored = []
+        current_density = max(float(density_lookup(context.edge_id)), 0.0)
         lane_now = set(context.lane_feasible_now_actions)
+        action_stats = []
         for action in unique_actions:
-            next_edge = self.decision_engine.get_next_edge(context.edge_id, action)
-            if next_edge is None:
+            stats = self.action_corridor_stats(
+                edge_id=context.edge_id,
+                action_idx=action,
+                destination=destination,
+                edge_density_fn=density_lookup,
+                distance_fn=distance_fn,
+                recent_history=recent_history,
+            )
+            if stats is None or stats.next_edge is None:
                 continue
-            next_distance = distance_fn(next_edge, destination)
-            eta_proxy = (float(next_distance) / 8.0) if math.isfinite(next_distance) else float("inf")
-            density = max(float(edge_density_fn(next_edge)), 0.0) if edge_density_fn is not None else 0.0
-            current_density = max(float(edge_density_fn(context.edge_id)), 0.0) if edge_density_fn is not None else 0.0
+            action_stats.append((action, stats))
+
+        if not action_stats:
+            return unique_actions
+
+        finite_next_distances = [
+            float(stats.next_distance)
+            for _, stats in action_stats
+            if math.isfinite(stats.next_distance)
+        ]
+        best_next_distance = (
+            min(finite_next_distances)
+            if finite_next_distances else float("inf")
+        )
+
+        scored = []
+        for action, stats in action_stats:
             required_shift = int(context.required_lane_shift.get(action, 0))
 
-            score = 0.0
-            if math.isfinite(eta_proxy):
-                score += 0.010 * eta_proxy
-            else:
-                score += 25.0
-            score += 1.15 * density
+            score = float(stats.score)
+            score += 0.28 * max(stats.max_density - stats.mean_density, 0.0)
             score += 0.08 * float(max(required_shift, 0))
             if action not in lane_now:
                 score += 0.18 * float(max(required_shift, 1))
-            if math.isfinite(current_distance) and math.isfinite(next_distance):
-                if next_distance >= (current_distance - 1.0):
+            if math.isfinite(best_next_distance) and math.isfinite(stats.next_distance):
+                score += min(max(stats.next_distance - best_next_distance, 0.0) * 0.006, 0.45)
+            if math.isfinite(current_distance) and math.isfinite(stats.next_distance):
+                if stats.next_distance >= (current_distance - 1.0):
                     score += 0.45
                 loop_distance_slack = float(getattr(self.decision_engine, "loop_distance_slack", 30.0))
-                if next_distance <= (current_distance - max(8.0, 0.25 * loop_distance_slack)):
-                    score -= 0.15
-            if density <= max(current_density - 0.12, 0.0):
-                score -= 0.25
+                if stats.best_distance <= (current_distance - max(8.0, 0.25 * loop_distance_slack)):
+                    score -= 0.10
+            if stats.mean_density <= max(current_density - 0.10, 0.0):
+                score -= 0.18
+            if stats.max_density <= max(current_density - 0.14, 0.0):
+                score -= 0.10
+            if recent_history and stats.next_edge in set(recent_history[-4:]):
+                score += 0.80
             if action in lane_now:
                 score -= 0.05
             scored.append((float(score), action))
@@ -470,6 +658,7 @@ class SharedDecisionPolicy:
         edge_density_fn: Optional[Callable[[str], float]],
         metrics: Optional[Dict[str, float]],
         distance_slack: Optional[float],
+        recent_history: Optional[Sequence[str]] = None,
     ) -> List[int]:
         actions = sorted(set(int(action) for action in lane_now_actions))
         if edge_density_fn is None or len(actions) <= 1:
@@ -477,29 +666,48 @@ class SharedDecisionPolicy:
 
         scored = []
         for action in actions:
-            next_edge = self.decision_engine.get_next_edge(context.edge_id, action)
-            if next_edge is None:
+            stats = self.action_corridor_stats(
+                edge_id=context.edge_id,
+                action_idx=action,
+                destination=destination,
+                edge_density_fn=edge_density_fn,
+                distance_fn=distance_fn,
+                recent_history=recent_history,
+            )
+            if stats is None:
                 continue
-            density = max(float(edge_density_fn(next_edge)), 0.0)
-            distance = distance_fn(next_edge, destination)
-            if not math.isfinite(distance):
-                distance = float("inf")
-            scored.append((density, float(distance), action))
+            scored.append((
+                float(stats.score),
+                float(stats.max_density),
+                float(stats.mean_density),
+                float(stats.next_distance),
+                action,
+            ))
 
         if len(scored) <= 1:
             return actions
 
-        best_density, best_density_distance, _ = min(scored, key=lambda item: (item[0], item[1], item[2]))
+        best_score, best_max_density, best_mean_density, best_distance, _ = min(
+            scored,
+            key=lambda item: (item[0], item[3], item[4]),
+        )
         density_threshold, relief_threshold, distance_keep_slack = self._lane_now_congestion_thresholds(
             context=context,
             distance_slack=distance_slack,
         )
         kept = []
-        for density, distance, action in scored:
-            high_pressure = density >= density_threshold
-            relief_available = (density - best_density) >= relief_threshold
-            meaningfully_shorter = math.isfinite(distance) and math.isfinite(best_density_distance) and (
-                distance <= best_density_distance - distance_keep_slack
+        for score, max_density, mean_density, distance, action in scored:
+            high_pressure = (
+                max_density >= density_threshold
+                or mean_density >= max(density_threshold - 0.06, 0.20)
+            )
+            relief_available = (
+                (score - best_score) >= 0.22
+                or (max_density - best_max_density) >= relief_threshold
+                or (mean_density - best_mean_density) >= max(0.08, 0.5 * relief_threshold)
+            )
+            meaningfully_shorter = math.isfinite(distance) and math.isfinite(best_distance) and (
+                distance <= best_distance - distance_keep_slack
             )
             if high_pressure and relief_available and not meaningfully_shorter:
                 self._increment_metric(metrics, "lane_now_congestion_candidates_seen")
@@ -631,6 +839,7 @@ class SharedDecisionPolicy:
                 edge_density_fn=edge_density_fn,
                 metrics=None,
                 distance_slack=None,
+                recent_history=recent_history,
             )
             if filtered_lane_now:
                 if lane_now_only:
@@ -664,9 +873,19 @@ class SharedDecisionPolicy:
                 distance_fn=distance_fn,
                 candidate_actions=candidate_actions,
             )
+        if ranked and edge_density_fn is not None:
+            ranked = self.rank_policy_actions(
+                context=context,
+                actions=ranked,
+                destination=destination,
+                distance_fn=distance_fn,
+                edge_density_fn=edge_density_fn,
+                recent_history=recent_history,
+            )
         if ranked:
             return int(ranked[0])
         return None
+
     def build_observe_pending(
         self,
         *,
@@ -961,10 +1180,23 @@ class SharedDecisionPolicy:
         current_next_edge = pending.intended_next_edge
         if not current_next_edge:
             return None
-        current_density = max(float(edge_density_fn(current_next_edge)), 0.0)
-        current_distance = distance_fn(current_next_edge, pending.destination)
-        if not math.isfinite(current_distance):
-            current_distance = float("inf")
+        current_stats = self.action_corridor_stats(
+            edge_id=context.edge_id,
+            action_idx=int(pending.intended_action),
+            destination=pending.destination,
+            edge_density_fn=edge_density_fn,
+            distance_fn=distance_fn,
+        )
+        if current_stats is None:
+            return None
+        current_distance = (
+            float(current_stats.next_distance)
+            if math.isfinite(current_stats.next_distance) else float("inf")
+        )
+        current_pressure = max(
+            float(current_stats.score),
+            (0.75 * float(current_stats.max_density)) + (0.45 * float(current_stats.mean_density)),
+        )
 
         density_threshold, relief_threshold, distance_slack = self._lane_now_congestion_thresholds(
             context=context,
@@ -975,14 +1207,23 @@ class SharedDecisionPolicy:
         for action in sorted(set(context.lane_feasible_now_actions)):
             if int(action) == int(pending.intended_action):
                 continue
-            next_edge = self.decision_engine.get_next_edge(context.edge_id, int(action))
-            if next_edge is None or next_edge == current_next_edge:
+            stats = self.action_corridor_stats(
+                edge_id=context.edge_id,
+                action_idx=int(action),
+                destination=pending.destination,
+                edge_density_fn=edge_density_fn,
+                distance_fn=distance_fn,
+            )
+            if stats is None or stats.next_edge is None or stats.next_edge == current_next_edge:
                 continue
-            alt_distance = distance_fn(next_edge, pending.destination)
+            alt_distance = float(stats.next_distance)
             if not math.isfinite(alt_distance):
                 continue
-            alt_density = max(float(edge_density_fn(next_edge)), 0.0)
-            alternatives.append((alt_density, float(alt_distance), int(action)))
+            alt_pressure = max(
+                float(stats.score),
+                (0.75 * float(stats.max_density)) + (0.45 * float(stats.mean_density)),
+            )
+            alternatives.append((float(alt_pressure), stats, float(alt_distance), int(action)))
         if not alternatives:
             return None
 
@@ -995,18 +1236,29 @@ class SharedDecisionPolicy:
         relief_candidates = []
         shorter_candidates = []
         deadlock_candidates = []
-        for alt_density, alt_distance, action in alternatives:
-            enough_relief = (current_density - alt_density) >= relief_threshold
+        for alt_pressure, alt_stats, alt_distance, action in alternatives:
+            enough_relief = (
+                (current_pressure - alt_pressure) >= 0.22
+                or (current_stats.max_density - alt_stats.max_density) >= relief_threshold
+                or (current_stats.mean_density - alt_stats.mean_density) >= max(0.08, 0.5 * relief_threshold)
+            )
             not_much_longer = alt_distance <= (current_distance + distance_slack)
             clearly_shorter = alt_distance <= (current_distance - max(8.0, 0.35 * distance_slack))
-            density_not_worse = alt_density <= (current_density + max(0.08, 0.5 * relief_threshold))
+            pressure_not_worse = (
+                alt_pressure <= (current_pressure + 0.15)
+                and alt_stats.max_density <= (current_stats.max_density + max(0.08, 0.5 * relief_threshold))
+            )
             comparable_or_better = alt_distance <= (current_distance + max(distance_slack, 20.0))
-            if current_density >= density_threshold and enough_relief and not_much_longer:
-                relief_candidates.append((alt_density, alt_distance, action))
+            if (
+                max(current_stats.max_density, current_stats.mean_density) >= density_threshold
+                and enough_relief
+                and not_much_longer
+            ):
+                relief_candidates.append((alt_pressure, alt_distance, action))
             if severe_stall and clearly_shorter:
-                shorter_candidates.append((alt_distance, alt_density, action))
-            if deadlock_stall and comparable_or_better and density_not_worse:
-                deadlock_candidates.append((alt_distance, alt_density, action))
+                shorter_candidates.append((alt_distance, alt_pressure, action))
+            if deadlock_stall and comparable_or_better and pressure_not_worse:
+                deadlock_candidates.append((alt_pressure, alt_distance, action))
 
         # Congested lane-now choices still need relief. Low-density yield/deadlock
         # cases often do not cross the congestion threshold, so let sustained

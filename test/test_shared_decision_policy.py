@@ -16,6 +16,12 @@ class DummyConnectionInfo:
     edge_list = []
     outgoing_edges_dict = {
         'edgeA': {'L': 'edgeB', 'S': 'edgeC', 'R': 'edgeD'},
+        'edgeB': {'S': 'edgeJam'},
+        'edgeC': {'S': 'edgeFree'},
+        'edgeD': {'S': 'edgeD1'},
+        'edgeJam': {'S': 'destX'},
+        'edgeFree': {'S': 'destX'},
+        'edgeD1': {'S': 'destX'},
     }
     lane_outgoing_edges_dict = {
         'edgeA_0': {'L': 'edgeB', 'S': 'edgeC', 'R': 'edgeD'},
@@ -23,6 +29,16 @@ class DummyConnectionInfo:
     }
     edge_lane_ids = {
         'edgeA': ['edgeA_0', 'edgeA_1'],
+    }
+    edge_length_dict = {
+        'edgeA': 40.0,
+        'edgeB': 40.0,
+        'edgeC': 40.0,
+        'edgeD': 40.0,
+        'edgeJam': 80.0,
+        'edgeFree': 80.0,
+        'edgeD1': 60.0,
+        'destX': 40.0,
     }
 
 
@@ -34,6 +50,9 @@ class DummyDecisionEngine:
     proactive_safety_margin_m = 8.0
     route_pending_hard_timeout_steps = 60
     pending_progress_timeout_steps = 32
+    route_pending_stall_steps = 8
+    default_fragment_horizon_m = 180.0
+    loop_distance_slack = 30.0
 
     def __init__(self):
         self.next_edges = {
@@ -41,12 +60,26 @@ class DummyDecisionEngine:
             ('edgeA', 1): 'edgeC',
             ('edgeA', 2): 'edgeD',
         }
+        self.route_fragments = {
+            ('edgeA', 0, 'destX'): ['edgeB', 'edgeJam', 'destX'],
+            ('edgeA', 1, 'destX'): ['edgeC', 'edgeFree', 'destX'],
+            ('edgeA', 2, 'destX'): ['edgeD', 'edgeD1', 'destX'],
+        }
 
     def prefilter_action_for_loops(self, context, action_idx, destination, recent_history, distance_fn=None, distance_slack=None):
         return True, {}
 
     def get_next_edge(self, edge_id, action_idx):
         return self.next_edges.get((edge_id, action_idx))
+
+    def build_route_fragment(self, edge_id, action_idx, destination, horizon_m=None):
+        fragment = self.route_fragments.get((edge_id, action_idx, destination))
+        if fragment:
+            return list(fragment), destination, None
+        next_edge = self.get_next_edge(edge_id, action_idx)
+        if next_edge is None:
+            return [], None, "invalid_action"
+        return [next_edge], destination, None
 
     def is_decision_open(self, context):
         return len(context.available_actions) > 1
@@ -215,6 +248,39 @@ class SharedDecisionPolicyBrakeRiskTests(unittest.TestCase):
         self.assertEqual(actions, [0, 1])
         self.assertEqual(metrics['lane_now_congestion_candidates_seen'], 0.0)
         self.assertEqual(metrics['lane_now_congestion_candidates_rejected'], 0.0)
+
+    def test_rank_policy_actions_looks_beyond_next_edge(self):
+        context = self._context(lane_now=[0, 1], available=[0, 1], shifts={0: 0, 1: 0}, dist_to_end=40.0, speed=10.0)
+        density = {'edgeB': 0.05, 'edgeJam': 0.72, 'edgeC': 0.12, 'edgeFree': 0.05}
+        distance = {'edgeA': 120.0, 'edgeB': 90.0, 'edgeJam': 45.0, 'edgeC': 100.0, 'edgeFree': 40.0}
+
+        ranked = self.policy.rank_policy_actions(
+            context=context,
+            actions=[0, 1],
+            destination='destX',
+            distance_fn=lambda edge, dest: distance.get(edge, 100.0),
+            edge_density_fn=lambda edge: density.get(edge, 0.0),
+            recent_history=['edgeY'],
+        )
+
+        self.assertEqual(ranked, [1, 0])
+
+    def test_per_action_branch_features_use_corridor_density(self):
+        context = self._context(lane_now=[0, 1], available=[0, 1], shifts={0: 0, 1: 0})
+        density = {'edgeB': 0.05, 'edgeJam': 0.72, 'destX': 0.0, 'edgeC': 0.12, 'edgeFree': 0.05}
+
+        features = self.policy.per_action_branch_features(
+            context,
+            'destX',
+            edge_density_fn=lambda edge: density.get(edge, 0.0),
+            eta_fn=lambda edge, dest: 80.0 if edge == 'edgeB' else 90.0,
+            social_cost_fn=lambda current_edge, action_idx, destination: float(action_idx),
+        )
+
+        action0_density = features[2]
+        action1_density = features[7]
+        self.assertGreater(action0_density, density['edgeB'])
+        self.assertLess(action1_density, action0_density)
 
 
 class SharedDecisionPolicyPendingReleaseTests(unittest.TestCase):

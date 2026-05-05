@@ -10,6 +10,7 @@ from collections import deque
 
 from xml.dom.minidom import parse
 import os
+from core.dueling_q_layers import DuelingQCombine  # noqa: F401
 from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision, VehicleSnapshot
 from core.shared_decision_policy import SharedDecisionPolicy
 from core.route_loop_safety import transition_signal
@@ -1049,6 +1050,7 @@ class QLearningPolicy(RouteController):
                     destination=vehicle.destination,
                     distance_fn=self._dist_to_dest,
                     edge_density_fn=self._edge_density,
+                    recent_history=recent,
                 )
                 policy_actions = self._force_stale_lane_now_replan_if_available(
                     vid,
@@ -1200,17 +1202,26 @@ class QLearningPolicy(RouteController):
 
         social_cost_cache = {}
         for action_idx in context.edge_valid_actions:
-            next_edge = self.decision_engine.get_next_edge(en, action_idx)
-            if next_edge is None:
+            stats = self.shared_policy.action_corridor_stats(
+                edge_id=en,
+                action_idx=action_idx,
+                destination=destination_edge,
+                edge_density_fn=cached_edge_density,
+                distance_fn=self._dist_to_dest,
+                eta_fn=cached_eta,
+            )
+            if stats is None:
                 social_cost_cache[action_idx] = float("inf")
                 continue
-            eta_value = cached_eta(next_edge, destination_edge)
-            if not np.isfinite(eta_value):
-                eta_value = 20.0
-            social_cost_cache[action_idx] = (
-                (1.25 * cached_edge_density(next_edge))
-                + (0.01 * float(eta_value))
-            )
+            current_distance = self._dist_to_dest(en, destination_edge)
+            social_cost = float(stats.score)
+            if np.isfinite(current_distance) and np.isfinite(stats.next_distance):
+                if stats.next_distance >= (current_distance - 1.0):
+                    social_cost += 0.45
+                loop_distance_slack = float(getattr(self.decision_engine, "loop_distance_slack", 30.0))
+                if stats.best_distance <= (current_distance - max(8.0, 0.25 * loop_distance_slack)):
+                    social_cost -= 0.10
+            social_cost_cache[action_idx] = float(max(social_cost, 0.0))
 
         return self.shared_policy.encode_state(
             edge_id=en,

@@ -24,7 +24,7 @@ from sumolib import checkBinary
 import traci
 
 
-DEFAULT_EVAL_SEEDS = "5000,5001,5002,5003,5004"
+DEFAULT_EVAL_SEEDS = "6000,6001,6002,6003,6004,6005"
 
 
 def parse_seed_list(raw_value):

@@ -6,8 +6,8 @@ import csv
 import json
 
 from xml.dom.minidom import parse
-from keras.layers import Dense
-from keras.models import Sequential, clone_model
+from keras.layers import Dense, Input
+from keras.models import Model, clone_model
 from keras.losses import Huber
 from keras.optimizers import Adam
 from collections import Counter, defaultdict, deque
@@ -15,6 +15,7 @@ import random
 from controller.RouteController import RouteController
 from controller.QLearningController import QLearningPolicy
 from core.STR_SUMO import StrSumo, build_runtime_sumocfg
+from core.dueling_q_layers import DuelingQCombine
 from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision, VehicleSnapshot
 from core.shared_decision_policy import SharedDecisionPolicy
 from core.Util import ConnectionInfo
@@ -108,7 +109,7 @@ class DQNTrainer:
         target_update_every=400,
         target_soft_tau=1.0,
         use_double_dqn=True,
-        guided_exploration_best_prob=0.65,
+        guided_exploration_best_prob=0.75,
     ):
         """
         :param learning_rate: Can be adjusted for further optimization
@@ -178,10 +179,19 @@ class DQNTrainer:
         self.target_model.set_weights(mixed_weights)
 
     def build_model(self, learning_rate):
-        model = Sequential()
-        model.add(Dense(128, input_dim=self.state_size, activation='relu'))      #May increase Dense for bigger network
-        model.add(Dense(64, activation='relu'))
-        model.add(Dense(self.action_size, activation='linear'))
+        inputs = Input(shape=(self.state_size,), name="state")
+        trunk = Dense(192, activation='relu', name='trunk_dense_0')(inputs)
+        trunk = Dense(128, activation='relu', name='trunk_dense_1')(trunk)
+        trunk = Dense(64, activation='relu', name='trunk_dense_2')(trunk)
+
+        value = Dense(64, activation='relu', name='value_dense')(trunk)
+        value = Dense(1, activation='linear', name='state_value')(value)
+
+        advantage = Dense(64, activation='relu', name='advantage_dense')(trunk)
+        advantage = Dense(self.action_size, activation='linear', name='action_advantage')(advantage)
+
+        q_values = DuelingQCombine(name='q_values')([value, advantage])
+        model = Model(inputs=inputs, outputs=q_values, name='dueling_dqn')
         model.compile(loss=Huber(delta=1.0), optimizer=Adam(learning_rate=learning_rate, clipnorm=10.0))
         return model
 
@@ -297,22 +307,29 @@ class DQNTrainer:
             return False
 
         age = max(int(metadata.get("pending_age", 0)), 0)
-        if age < 4:
+        stall_age = max(int(metadata.get("pending_stall_age", 0)), 0)
+        if age < 2:
             return False
 
         resolution_mode = str(metadata.get("pending_resolution_mode", "lane_now"))
-        if age < 16:
-            interval = 8
-            keep_prob = 0.35
-        elif age < 64:
-            interval = 10
+        if age < 10:
+            interval = 4
             keep_prob = 0.45
+        elif age < 24:
+            interval = 6
+            keep_prob = 0.60
+        elif age < 64:
+            interval = 8
+            keep_prob = 0.75
         else:
-            interval = 16
-            keep_prob = 0.55
+            interval = 10
+            keep_prob = 0.85
 
         if resolution_mode != "lane_now":
-            keep_prob = min(keep_prob + 0.10, 0.75)
+            keep_prob = min(keep_prob + 0.05, 0.90)
+        if stall_age >= 8:
+            interval = max(2, interval - 2)
+            keep_prob = min(keep_prob + 0.10, 0.95)
         if age % interval != 0:
             return False
         return random.random() < keep_prob
@@ -1140,16 +1157,27 @@ class RLTrainingPipeline:
     def _action_social_cost_proxy(self, current_edge, action_idx, destination):
         """
         Lower is better for "selfless" local decisions.
-        Proxy combines downstream edge pressure + residual distance.
+        Proxy combines short-horizon corridor pressure + residual distance.
         """
-        next_edge = self.decision_engine.get_next_edge(current_edge, action_idx)
-        if next_edge is None:
+        stats = self.shared_policy.action_corridor_stats(
+            edge_id=current_edge,
+            action_idx=action_idx,
+            destination=destination,
+            edge_density_fn=self._edge_density,
+            distance_fn=self.get_distance_to_destination,
+            eta_fn=self._estimate_remaining_eta,
+        )
+        if stats is None:
             return float("inf")
-        density = self._edge_density(next_edge)
-        eta_proxy = self._estimate_remaining_eta(next_edge, destination)
-        if not math.isfinite(eta_proxy):
-            eta_proxy = float(MAX_SIMULATION_STEPS)
-        return (1.25 * float(density)) + (0.01 * float(eta_proxy))
+        current_distance = self.get_distance_to_destination(current_edge, destination)
+        cost = float(stats.score)
+        if math.isfinite(current_distance) and math.isfinite(stats.next_distance):
+            if stats.next_distance >= (current_distance - 1.0):
+                cost += 0.45
+            loop_distance_slack = float(getattr(self.decision_engine, "loop_distance_slack", 30.0))
+            if stats.best_distance <= (current_distance - max(8.0, 0.25 * loop_distance_slack)):
+                cost -= 0.10
+        return float(max(cost, 0.0))
 
     def _edge_lane_count(self, edge_id):
         return max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1)
@@ -1250,6 +1278,7 @@ class RLTrainingPipeline:
             destination=destination,
             distance_fn=self.get_distance_to_destination,
             edge_density_fn=self._edge_density,
+            recent_history=recent_history,
         )
 
     def _select_fallback_action(self, context, blocked_action, destination, recent_history, lane_now_only=False):
@@ -3290,11 +3319,6 @@ class RLTrainingPipeline:
                                     lane_change_deferrals=pending.metadata.get("lane_change_deferrals", 0),
                                     hard_brake_events=self._consume_hard_brake_events(hard_brake_counts_by_vehicle, vehicle_id),
                                 )
-                                age_scale = max(
-                                    0.20,
-                                    1.0 / (1.0 + 0.10 * max(pending_age - 8, 0)),
-                                )
-                                pending_reward *= age_scale
                                 next_ctx = self._get_or_build_step_context(
                                     step_context_cache,
                                     vehicle_id,
