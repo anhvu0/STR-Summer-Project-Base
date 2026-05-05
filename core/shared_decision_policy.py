@@ -98,6 +98,12 @@ class SharedDecisionPolicy:
             int(self.decision_engine.route_pending_hard_timeout_steps) * 3,
             int(self.decision_engine.pending_progress_timeout_steps) * 5,
         )
+        self.policy_detour_base_slack_m = 12.0
+        self.policy_detour_relief_slack_m = 24.0
+        self.policy_detour_score_relief = 0.28
+        self.policy_detour_density_relief = 0.12
+        self.lane_now_replan_distance_slack_m = 14.0
+        self.lane_now_deadlock_distance_slack_m = 10.0
         self.corridor_horizon_m = max(
             float(getattr(self.decision_engine, "default_fragment_horizon_m", 180.0)),
             120.0,
@@ -555,6 +561,15 @@ class SharedDecisionPolicy:
         if not policy_actions:
             return available_actions
 
+        policy_actions = self._filter_policy_detour_actions(
+            context=context,
+            actions=policy_actions,
+            destination=destination,
+            distance_fn=distance_fn,
+            edge_density_fn=edge_density_fn,
+            recent_history=recent_history,
+        )
+
         broader_available_set = set(filtered_available_actions)
         lane_now_set = set(safe_lane_now_actions)
         policy_set = set(policy_actions)
@@ -647,6 +662,136 @@ class SharedDecisionPolicy:
             return unique_actions
         scored.sort(key=lambda item: (item[0], item[1]))
         return [action for _, action in scored]
+
+    def _distance_detour_slack(self, current_distance: float, *, base: float, cap: float, fraction: float) -> float:
+        if math.isfinite(current_distance):
+            return float(max(base, min(cap, fraction * max(float(current_distance), 0.0))))
+        return float(base)
+
+    def _filter_policy_detour_actions(
+        self,
+        *,
+        context: DecisionContext,
+        actions: Sequence[int],
+        destination: str,
+        distance_fn: Callable[[str, str], float],
+        edge_density_fn: Optional[Callable[[str], float]],
+        recent_history: Optional[Sequence[str]] = None,
+    ) -> List[int]:
+        """
+        Keep the model's action mask aligned with the travel-time objective.
+
+        The network can still choose among viable branches, but materially
+        longer congestion-relief detours must be route-safe and clearly useful.
+        This is a mask rather than a ranking tweak because greedy inference
+        ignores candidate order.
+        """
+        unique_actions = sorted(set(int(action) for action in actions))
+        if len(unique_actions) <= 1:
+            return unique_actions
+
+        density_lookup = edge_density_fn if edge_density_fn is not None else (lambda edge_id: 0.0)
+        action_stats = []
+        for action in unique_actions:
+            stats = self.action_corridor_stats(
+                edge_id=context.edge_id,
+                action_idx=action,
+                destination=destination,
+                edge_density_fn=density_lookup,
+                distance_fn=distance_fn,
+                recent_history=recent_history,
+            )
+            if stats is None or stats.next_edge is None:
+                continue
+            action_stats.append((int(action), stats))
+
+        finite_stats = [
+            (action, stats)
+            for action, stats in action_stats
+            if math.isfinite(float(stats.next_distance))
+        ]
+        if len(finite_stats) <= 1:
+            return unique_actions
+
+        best_action, best_stats = min(
+            finite_stats,
+            key=lambda item: (float(item[1].next_distance), float(item[1].score), item[0]),
+        )
+        best_next_distance = float(best_stats.next_distance)
+        best_pressure = max(
+            float(best_stats.score),
+            (0.75 * float(best_stats.max_density)) + (0.45 * float(best_stats.mean_density)),
+        )
+        current_distance = float(distance_fn(context.edge_id, destination))
+        close_slack = self._distance_detour_slack(
+            current_distance,
+            base=float(self.policy_detour_base_slack_m),
+            cap=22.0,
+            fraction=0.06,
+        )
+        relief_slack = self._distance_detour_slack(
+            current_distance,
+            base=max(float(self.policy_detour_relief_slack_m), close_slack),
+            cap=34.0,
+            fraction=0.11,
+        )
+        density_threshold, relief_threshold, _ = self._lane_now_congestion_thresholds(
+            context=context,
+            distance_slack=close_slack,
+        )
+
+        kept = {int(best_action)}
+        for action, stats in finite_stats:
+            action = int(action)
+            if action == int(best_action):
+                continue
+
+            next_distance = float(stats.next_distance)
+            detour = next_distance - best_next_distance
+            corridor_revisit = int(stats.revisit_hits) > 0
+            corridor_trap = float(stats.trap_score) >= 5.0
+            route_safe = not corridor_revisit and not corridor_trap
+            action_pressure = max(
+                float(stats.score),
+                (0.75 * float(stats.max_density)) + (0.45 * float(stats.mean_density)),
+            )
+            high_best_pressure = (
+                float(best_stats.max_density) >= density_threshold
+                or float(best_stats.mean_density) >= max(density_threshold - 0.06, 0.20)
+            )
+            strong_relief = (
+                high_best_pressure
+                and (
+                    (best_pressure - action_pressure) >= float(self.policy_detour_score_relief)
+                    or (float(best_stats.max_density) - float(stats.max_density)) >= max(
+                        float(self.policy_detour_density_relief),
+                        relief_threshold,
+                    )
+                    or (float(best_stats.mean_density) - float(stats.mean_density)) >= max(
+                        0.08,
+                        0.5 * relief_threshold,
+                    )
+                )
+            )
+            corridor_recovers = (
+                math.isfinite(float(stats.best_distance))
+                and math.isfinite(current_distance)
+                and float(stats.best_distance) <= (
+                    current_distance - max(8.0, 0.25 * float(self.decision_engine.loop_distance_slack))
+                )
+                and float(stats.best_distance) <= (best_next_distance + close_slack)
+            )
+
+            if detour <= close_slack and (route_safe or corridor_recovers):
+                kept.add(action)
+                continue
+            if strong_relief and route_safe and detour <= relief_slack:
+                kept.add(action)
+                continue
+            if corridor_recovers and detour <= relief_slack:
+                kept.add(action)
+
+        return sorted(action for action in unique_actions if int(action) in kept) or [int(best_action)]
 
     def _filter_lane_now_congestion_traps(
         self,
@@ -1049,6 +1194,7 @@ class SharedDecisionPolicy:
         lane_position_now: float,
         edge_density_fn: Optional[Callable[[str], float]] = None,
         distance_fn: Optional[Callable[[str, str], float]] = None,
+        recent_history: Optional[Sequence[str]] = None,
     ) -> PendingReleaseEvaluation:
         metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
         metadata["lane_position_now"] = float(max(lane_position_now, 0.0))
@@ -1104,6 +1250,7 @@ class SharedDecisionPolicy:
             stall_age=stall_age,
             edge_density_fn=edge_density_fn,
             distance_fn=distance_fn,
+            recent_history=recent_history,
         )
         lane_now_replan = lane_now_replan_action is not None
         lane_now_stale_timeout = (
@@ -1162,6 +1309,7 @@ class SharedDecisionPolicy:
         stall_age: int,
         edge_density_fn: Optional[Callable[[str], float]],
         distance_fn: Optional[Callable[[str, str], float]],
+        recent_history: Optional[Sequence[str]] = None,
     ) -> Optional[int]:
         if edge_density_fn is None or distance_fn is None:
             return None
@@ -1186,6 +1334,7 @@ class SharedDecisionPolicy:
             destination=pending.destination,
             edge_density_fn=edge_density_fn,
             distance_fn=distance_fn,
+            recent_history=recent_history,
         )
         if current_stats is None:
             return None
@@ -1202,6 +1351,18 @@ class SharedDecisionPolicy:
             context=context,
             distance_slack=None,
         )
+        route_slack = self._distance_detour_slack(
+            current_distance,
+            base=float(self.lane_now_replan_distance_slack_m),
+            cap=max(float(distance_slack), float(self.lane_now_replan_distance_slack_m)),
+            fraction=0.06,
+        )
+        deadlock_slack = self._distance_detour_slack(
+            current_distance,
+            base=float(self.lane_now_deadlock_distance_slack_m),
+            cap=18.0,
+            fraction=0.04,
+        )
 
         alternatives = []
         for action in sorted(set(context.lane_feasible_now_actions)):
@@ -1213,6 +1374,7 @@ class SharedDecisionPolicy:
                 destination=pending.destination,
                 edge_density_fn=edge_density_fn,
                 distance_fn=distance_fn,
+                recent_history=recent_history,
             )
             if stats is None or stats.next_edge is None or stats.next_edge == current_next_edge:
                 continue
@@ -1237,27 +1399,31 @@ class SharedDecisionPolicy:
         shorter_candidates = []
         deadlock_candidates = []
         for alt_pressure, alt_stats, alt_distance, action in alternatives:
+            route_revisit = int(alt_stats.revisit_hits) > 0
+            route_trap = float(alt_stats.trap_score) >= 5.0
+            route_safe = not route_revisit and not route_trap
             enough_relief = (
                 (current_pressure - alt_pressure) >= 0.22
                 or (current_stats.max_density - alt_stats.max_density) >= relief_threshold
                 or (current_stats.mean_density - alt_stats.mean_density) >= max(0.08, 0.5 * relief_threshold)
             )
-            not_much_longer = alt_distance <= (current_distance + distance_slack)
+            not_much_longer = alt_distance <= (current_distance + route_slack)
             clearly_shorter = alt_distance <= (current_distance - max(8.0, 0.35 * distance_slack))
             pressure_not_worse = (
                 alt_pressure <= (current_pressure + 0.15)
                 and alt_stats.max_density <= (current_stats.max_density + max(0.08, 0.5 * relief_threshold))
             )
-            comparable_or_better = alt_distance <= (current_distance + max(distance_slack, 20.0))
+            comparable_or_better = alt_distance <= (current_distance + deadlock_slack)
             if (
-                max(current_stats.max_density, current_stats.mean_density) >= density_threshold
+                route_safe
+                and max(current_stats.max_density, current_stats.mean_density) >= density_threshold
                 and enough_relief
                 and not_much_longer
             ):
                 relief_candidates.append((alt_pressure, alt_distance, action))
-            if severe_stall and clearly_shorter:
+            if severe_stall and clearly_shorter and (route_safe or alt_distance < current_distance):
                 shorter_candidates.append((alt_distance, alt_pressure, action))
-            if deadlock_stall and comparable_or_better and pressure_not_worse:
+            if deadlock_stall and route_safe and comparable_or_better and pressure_not_worse:
                 deadlock_candidates.append((alt_pressure, alt_distance, action))
 
         # Congested lane-now choices still need relief. Low-density yield/deadlock

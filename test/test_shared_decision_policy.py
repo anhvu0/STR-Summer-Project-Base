@@ -205,9 +205,34 @@ class SharedDecisionPolicyBrakeRiskTests(unittest.TestCase):
             metrics=metrics,
         )
 
-        self.assertEqual(actions, [0, 1])
+        self.assertEqual(actions, [0])
         self.assertEqual(metrics['lane_now_congestion_candidates_seen'], 1.0)
         self.assertEqual(metrics['lane_now_congestion_candidates_rejected'], 0.0)
+
+    def test_prunes_comparable_branch_when_corridor_revisits_recent_edge(self):
+        context = self._context(lane_now=[0, 1], available=[0, 1], shifts={0: 0, 1: 0}, dist_to_end=48.0, speed=10.0)
+        metrics = defaultdict(float)
+        density = {'edgeB': 0.08, 'edgeC': 0.07, 'edgeFree': 0.05}
+        distance = {
+            'edgeA': 105.0,
+            'edgeB': 100.0,
+            'edgeJam': 100.0,
+            'edgeC': 108.0,
+            'edgeFree': 108.0,
+            'destX': 108.0,
+        }
+
+        actions = self.policy.policy_action_candidates(
+            context,
+            recent_history=['edgeFree'],
+            cooldown_active=False,
+            destination='destX',
+            distance_fn=lambda edge, dest: distance.get(edge, 108.0),
+            edge_density_fn=lambda edge: density.get(edge, 0.0),
+            metrics=metrics,
+        )
+
+        self.assertEqual(actions, [0])
 
     def test_prunes_moderately_congested_lane_now_branch_when_close_to_junction(self):
         context = self._context(lane_now=[0, 1], available=[0, 1], shifts={0: 0, 1: 0}, dist_to_end=12.0, speed=12.0)
@@ -638,6 +663,55 @@ class SharedDecisionPolicyPendingReleaseTests(unittest.TestCase):
         self.assertTrue(release.should_release)
         self.assertEqual(release.release_reason, 'route_no_progress_abort')
         self.assertEqual(release.preferred_replan_action, 2)
+
+    def test_stalled_lane_now_pending_keeps_route_when_relief_branch_revisits_recent_edge(self):
+        context = self._lane_now_context(
+            lane_now=[0, 1],
+            available=[0, 1],
+            shifts={0: 0, 1: 0},
+            forced_action=None,
+            branch_with_choice=True,
+            skip_reason=None,
+        )
+        pending = self.policy.build_route_pending(
+            state=None,
+            action_idx=0,
+            committed_next_edge='edgeB',
+            decision_edge='edgeA',
+            step=0,
+            destination='destX',
+            context=context,
+            lane_change_requested=False,
+            decision_id='d0',
+            origin_mode='lane_now',
+            action_source='policy',
+            full_route=['edgeA', 'edgeB'],
+            decision_open_recorded=True,
+        )
+        density = {'edgeB': 0.44, 'edgeC': 0.18, 'edgeFree': 0.05}
+        distance = {'edgeB': 100.0, 'edgeC': 108.0, 'edgeFree': 108.0, 'destX': 108.0}
+
+        release = self.policy.evaluate_route_pending_release(
+            pending,
+            context=self._lane_now_context(
+                step=12,
+                speed=0.4,
+                lane_now=[0, 1],
+                available=[0, 1],
+                shifts={0: 0, 1: 0},
+                forced_action=None,
+                branch_with_choice=True,
+                skip_reason=None,
+            ),
+            step=12,
+            lane_position_now=0.0,
+            edge_density_fn=lambda edge: density.get(edge, 0.0),
+            distance_fn=lambda edge, dest: distance.get(edge, 108.0),
+            recent_history=['edgeC'],
+        )
+
+        self.assertFalse(release.should_release)
+        self.assertEqual(release.release_reason, None)
 
     def test_stalled_lane_now_pending_kept_when_cleaner_branch_is_much_longer(self):
         context = self._lane_now_context(

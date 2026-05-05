@@ -3426,6 +3426,7 @@ class RLTrainingPipeline:
                                 lane_position_now=float(snapshot.lane_position),
                                 edge_density_fn=self._edge_density,
                                 distance_fn=self.get_distance_to_destination,
+                                recent_history=decision_recent_history(vehicle_id),
                             )
                             if (
                                 pending_ctx.commit_window
