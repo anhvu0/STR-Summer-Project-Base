@@ -108,6 +108,7 @@ class DQNTrainer:
         target_update_every=400,
         target_soft_tau=1.0,
         use_double_dqn=True,
+        guided_exploration_best_prob=0.65,
     ):
         """
         :param learning_rate: Can be adjusted for further optimization
@@ -128,6 +129,7 @@ class DQNTrainer:
         self.target_update_every = max(int(target_update_every), 1)
         self.target_soft_tau = float(np.clip(target_soft_tau, 0.0, 1.0))
         self.use_double_dqn = bool(use_double_dqn)
+        self.guided_exploration_best_prob = float(np.clip(guided_exploration_best_prob, 0.0, 1.0))
         self.memory = ReplayBuffer(replay_capacity)
         self.elite_fraction = float(np.clip(elite_fraction, 0.0, 0.5))
         elite_capacity = elite_replay_capacity if elite_replay_capacity is not None else max(replay_capacity // 4, batch_size * 4)
@@ -138,6 +140,7 @@ class DQNTrainer:
         self.replay_main_kept_finalized = 0
         self.replay_main_kept_pending_timeout = 0
         self.replay_main_kept_terminal = 0
+        self.replay_main_kept_override = 0
         self.replay_main_kept_other = 0
         self.replay_main_dropped = 0
         self.staged_episode_transitions = []
@@ -179,8 +182,31 @@ class DQNTrainer:
         model.add(Dense(128, input_dim=self.state_size, activation='relu'))      #May increase Dense for bigger network
         model.add(Dense(64, activation='relu'))
         model.add(Dense(self.action_size, activation='linear'))
-        model.compile(loss=Huber(delta=1.0), optimizer=Adam(learning_rate = learning_rate))
+        model.compile(loss=Huber(delta=1.0), optimizer=Adam(learning_rate=learning_rate, clipnorm=10.0))
         return model
+
+    def _ranked_exploration_choice(self, valid_actions):
+        """
+        Exploration receives policy candidates in best-first order. Keep a real
+        exploration tail, but make destructive uniform wandering much rarer.
+        """
+        ranked_actions = []
+        seen = set()
+        for action in valid_actions:
+            action = int(action)
+            if action in seen:
+                continue
+            seen.add(action)
+            ranked_actions.append(action)
+        if not ranked_actions:
+            return None
+        if len(ranked_actions) == 1:
+            return ranked_actions[0]
+        if random.random() < self.guided_exploration_best_prob:
+            return ranked_actions[0]
+        weights = np.array([1.0 / float(idx + 1) for idx in range(len(ranked_actions))], dtype=np.float64)
+        weights /= np.sum(weights)
+        return int(np.random.choice(ranked_actions, p=weights))
     
     def select_action(self, state, valid_actions, return_source=False):
         """
@@ -190,7 +216,7 @@ class DQNTrainer:
         if not valid_actions:
             return (None, "none") if return_source else None
         if np.random.rand() <= self.epsilon: # Random to see if the agent should choose a new path
-            action = random.choice(valid_actions)
+            action = self._ranked_exploration_choice(valid_actions)
             return (action, "explore") if return_source else action
         q_values = self.model(state, training=False).numpy()[0]
         masked_values = np.full_like(q_values, -1e9)    #Make all q-values -1e9, then valid actions will update their according value, invalid actions will not be updated and stay negative
@@ -212,7 +238,7 @@ class DQNTrainer:
             if not valid_actions:
                 continue
             if np.random.rand() <= self.epsilon:
-                results[idx] = (random.choice(valid_actions), "explore")
+                results[idx] = (self._ranked_exploration_choice(valid_actions), "explore")
             else:
                 policy_indices.append(idx)
                 policy_states.append(state[0])
@@ -291,12 +317,33 @@ class DQNTrainer:
             return False
         return random.random() < keep_prob
 
-    def _should_store_main_transition(self, reward, done, metadata):
-        metadata = metadata or {}
-        if metadata.get("override_learning", False):
-            return False
+    def _should_store_override_transition(self, reward, metadata):
+        """
+        Safety overrides are the model's most actionable negative examples.
+        Earlier versions staged them but filtered them out of replay, so the
+        guardrails kept correcting the same policy mistakes without teaching
+        the Q-network to avoid them.
+        """
         if metadata.get("imitation_credit", False):
             return False
+        if float(reward) >= 0.0:
+            return False
+        override_type = str(metadata.get("override_type", ""))
+        if override_type in {
+            "loop_prefilter_fallback",
+            "route_apply_failure",
+            "cooldown_fallback",
+            "observe_abort_fallback",
+        }:
+            return True
+        return bool(metadata.get("override_cause"))
+
+    def _should_store_main_transition(self, reward, done, metadata):
+        metadata = metadata or {}
+        if metadata.get("imitation_credit", False):
+            return False
+        if metadata.get("override_learning", False):
+            return self._should_store_override_transition(reward, metadata)
         if metadata.get("synthetic_terminal_no_pending", False):
             return False
 
@@ -406,6 +453,8 @@ class DQNTrainer:
                     self.replay_main_kept_finalized += 1
                 elif metadata.get("pending_timeout_replan", False):
                     self.replay_main_kept_pending_timeout += 1
+                elif metadata.get("override_learning", False):
+                    self.replay_main_kept_override += 1
                 else:
                     self.replay_main_kept_other += 1
             else:
@@ -695,7 +744,7 @@ class RLTrainingPipeline:
             replay_warmup=replay_warmup,
             target_update_every=400,
             target_soft_tau=1.0,
-            use_double_dqn=True,
+            use_double_dqn=self.use_double_dqn,
         )
         self._decision_debug_fields = [
             "episode", "step", "vehicle_id", "decision_edge", "action", "action_source", "available_actions",
@@ -1185,7 +1234,7 @@ class RLTrainingPipeline:
         return context.available_actions
 
     def _policy_action_candidates(self, context, recent_history, cooldown_active, destination, decision_metrics=None):
-        return self.shared_policy.policy_action_candidates(
+        actions = self.shared_policy.policy_action_candidates(
             context,
             recent_history=recent_history,
             cooldown_active=cooldown_active,
@@ -1194,6 +1243,13 @@ class RLTrainingPipeline:
             edge_density_fn=self._edge_density,
             metrics=decision_metrics,
             distance_slack=self.score_slack,
+        )
+        return self.shared_policy.rank_policy_actions(
+            context=context,
+            actions=actions,
+            destination=destination,
+            distance_fn=self.get_distance_to_destination,
+            edge_density_fn=self._edge_density,
         )
 
     def _select_fallback_action(self, context, blocked_action, destination, recent_history, lane_now_only=False):
@@ -2153,6 +2209,8 @@ class RLTrainingPipeline:
             "replay_main_finalized_episode", "replay_main_finalized_cumulative",
             "replay_main_pending_timeout_episode", "replay_main_pending_timeout_cumulative",
             "replay_main_terminal_episode", "replay_main_terminal_cumulative",
+            "replay_main_override_episode", "replay_main_override_cumulative",
+            "replay_main_other_episode", "replay_main_other_cumulative",
             "replay_main_dropped_episode", "replay_main_dropped_cumulative",
             "completion_rate", "avg_travel_time", "p50_travel_time", "p90_travel_time", "teleports", "teleported_controlled",
             "controlled_ever_teleported", "arrived_after_teleport", "clean_arrivals_without_teleport",
@@ -2296,6 +2354,7 @@ class RLTrainingPipeline:
                 "replay_main_kept_finalized": self.trainer.replay_main_kept_finalized,
                 "replay_main_kept_pending_timeout": self.trainer.replay_main_kept_pending_timeout,
                 "replay_main_kept_terminal": self.trainer.replay_main_kept_terminal,
+                "replay_main_kept_override": self.trainer.replay_main_kept_override,
                 "replay_main_dropped": self.trainer.replay_main_dropped,
                 "replay_main_kept_other": self.trainer.replay_main_kept_other,
             }
@@ -2365,6 +2424,23 @@ class RLTrainingPipeline:
                         decision_metrics["lane_now_replan_blocked_reopen_actions"] += 1
                         return filtered_actions
                 return policy_actions
+
+            def policy_actions_for_bootstrap(vehicle_id, vehicle, step, context, recent_history=None, cooldown_active=None):
+                decision_mode = self.shared_policy.classify_decision(context)
+                if decision_mode.mode == "forced":
+                    return [int(decision_mode.action)] if decision_mode.action is not None else []
+                if decision_mode.mode != "open":
+                    return []
+                if cooldown_active is None:
+                    cooldown_until = lane_change_cooldown_until.get((vehicle_id, context.edge_id), -1)
+                    cooldown_active = int(step) < int(cooldown_until)
+                return self._policy_action_candidates(
+                    context=context,
+                    recent_history=(recent_history if recent_history is not None else decision_recent_history(vehicle_id)),
+                    cooldown_active=bool(cooldown_active),
+                    destination=vehicle.destination,
+                    decision_metrics=None,
+                )
 
             def process_selected_action(
                 vehicle_id,
@@ -2912,7 +2988,13 @@ class RLTrainingPipeline:
                                 reward,
                                 next_state,
                                 done,
-                                next_valid_actions=next_ctx.available_actions,
+                                next_valid_actions=policy_actions_for_bootstrap(
+                                    vehicle_id,
+                                    vehicle,
+                                    step,
+                                    next_ctx,
+                                    recent_history=list(recent_edge_history[vehicle_id]),
+                                ),
                                 metadata={
                                     **(pending.metadata if isinstance(pending.metadata, dict) else {}),
                                     "forced_action": pending.context.forced_action is not None,
@@ -3069,7 +3151,14 @@ class RLTrainingPipeline:
                                         context=obs_context,
                                     ),
                                     False,
-                                    next_valid_actions=obs_context.available_actions,
+                                    next_valid_actions=policy_actions_for_bootstrap(
+                                        vehicle_id,
+                                        vehicle,
+                                        step,
+                                        obs_context,
+                                        recent_history=decision_recent_history(vehicle_id),
+                                        cooldown_active=True,
+                                    ),
                                     metadata={
                                         **(pending.metadata if isinstance(pending.metadata, dict) else {}),
                                         "override_learning": True,
@@ -3229,7 +3318,7 @@ class RLTrainingPipeline:
                                     pending_reward,
                                     next_state,
                                     False,
-                                    next_valid_actions=next_ctx.available_actions,
+                                    next_valid_actions=[int(pending.intended_action)],
                                     metadata={
                                         **(pending.metadata if isinstance(pending.metadata, dict) else {}),
                                         "interim_pending_credit": True,
@@ -3271,7 +3360,14 @@ class RLTrainingPipeline:
                                     timeout_penalty,
                                     timeout_state,
                                     False,
-                                    next_valid_actions=timeout_ctx.available_actions,
+                                    next_valid_actions=policy_actions_for_bootstrap(
+                                        vehicle_id,
+                                        vehicle,
+                                        step,
+                                        timeout_ctx,
+                                        recent_history=decision_recent_history(vehicle_id),
+                                        cooldown_active=True,
+                                    ),
                                     metadata={
                                         **(pending.metadata if isinstance(pending.metadata, dict) else {}),
                                         "pending_timeout_replan": True,
@@ -3339,7 +3435,14 @@ class RLTrainingPipeline:
                                     release_penalty,
                                     release_state,
                                     False,
-                                    next_valid_actions=pending_ctx.available_actions,
+                                    next_valid_actions=policy_actions_for_bootstrap(
+                                        vehicle_id,
+                                        vehicle,
+                                        step,
+                                        pending_ctx,
+                                        recent_history=decision_recent_history(vehicle_id),
+                                        cooldown_active=True,
+                                    ),
                                     metadata={
                                         **(pending.metadata if isinstance(pending.metadata, dict) else {}),
                                         "pending_timeout_replan": bool(release_eval.release_as_timeout),
@@ -4102,6 +4205,10 @@ class RLTrainingPipeline:
                         "replay_main_pending_timeout_cumulative": self.trainer.replay_main_kept_pending_timeout,
                         "replay_main_terminal_episode": int(self.trainer.replay_main_kept_terminal - trainer_counter_start["replay_main_kept_terminal"]),
                         "replay_main_terminal_cumulative": self.trainer.replay_main_kept_terminal,
+                        "replay_main_override_episode": int(self.trainer.replay_main_kept_override - trainer_counter_start["replay_main_kept_override"]),
+                        "replay_main_override_cumulative": self.trainer.replay_main_kept_override,
+                        "replay_main_other_episode": int(self.trainer.replay_main_kept_other - trainer_counter_start["replay_main_kept_other"]),
+                        "replay_main_other_cumulative": self.trainer.replay_main_kept_other,
                         "replay_main_dropped_episode": int(self.trainer.replay_main_dropped - trainer_counter_start["replay_main_dropped"]),
                         "replay_main_dropped_cumulative": self.trainer.replay_main_dropped,
                         "completion_rate": completion_rate,

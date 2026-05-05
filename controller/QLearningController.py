@@ -1043,6 +1043,13 @@ class QLearningPolicy(RouteController):
                     metrics=self._metrics,
                     distance_slack=self.score_slack,
                 )
+                policy_actions = self.shared_policy.rank_policy_actions(
+                    context=context,
+                    actions=policy_actions,
+                    destination=vehicle.destination,
+                    distance_fn=self._dist_to_dest,
+                    edge_density_fn=self._edge_density,
+                )
                 policy_actions = self._force_stale_lane_now_replan_if_available(
                     vid,
                     start_edge,

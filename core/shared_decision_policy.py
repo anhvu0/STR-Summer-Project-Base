@@ -401,6 +401,65 @@ class SharedDecisionPolicy:
                 self._increment_metric(metrics, 'policy_candidates_collapsed_to_lane_now_only')
         return policy_actions
 
+    def rank_policy_actions(
+        self,
+        *,
+        context: DecisionContext,
+        actions: Sequence[int],
+        destination: str,
+        distance_fn: Callable[[str, str], float],
+        edge_density_fn: Optional[Callable[[str], float]],
+    ) -> List[int]:
+        """
+        Return policy candidates in best-first heuristic order.
+
+        The network still decides greedily from Q-values, but epsilon exploration
+        uses this order to stay close to Dijkstra in light traffic and to prefer
+        lower-pressure alternatives when congestion makes the shortest branch bad.
+        """
+        unique_actions = sorted(set(int(action) for action in actions))
+        if len(unique_actions) <= 1:
+            return unique_actions
+
+        current_distance = distance_fn(context.edge_id, destination)
+        scored = []
+        lane_now = set(context.lane_feasible_now_actions)
+        for action in unique_actions:
+            next_edge = self.decision_engine.get_next_edge(context.edge_id, action)
+            if next_edge is None:
+                continue
+            next_distance = distance_fn(next_edge, destination)
+            eta_proxy = (float(next_distance) / 8.0) if math.isfinite(next_distance) else float("inf")
+            density = max(float(edge_density_fn(next_edge)), 0.0) if edge_density_fn is not None else 0.0
+            current_density = max(float(edge_density_fn(context.edge_id)), 0.0) if edge_density_fn is not None else 0.0
+            required_shift = int(context.required_lane_shift.get(action, 0))
+
+            score = 0.0
+            if math.isfinite(eta_proxy):
+                score += 0.010 * eta_proxy
+            else:
+                score += 25.0
+            score += 1.15 * density
+            score += 0.08 * float(max(required_shift, 0))
+            if action not in lane_now:
+                score += 0.18 * float(max(required_shift, 1))
+            if math.isfinite(current_distance) and math.isfinite(next_distance):
+                if next_distance >= (current_distance - 1.0):
+                    score += 0.45
+                loop_distance_slack = float(getattr(self.decision_engine, "loop_distance_slack", 30.0))
+                if next_distance <= (current_distance - max(8.0, 0.25 * loop_distance_slack)):
+                    score -= 0.15
+            if density <= max(current_density - 0.12, 0.0):
+                score -= 0.25
+            if action in lane_now:
+                score -= 0.05
+            scored.append((float(score), action))
+
+        if not scored:
+            return unique_actions
+        scored.sort(key=lambda item: (item[0], item[1]))
+        return [action for _, action in scored]
+
     def _filter_lane_now_congestion_traps(
         self,
         *,
@@ -805,10 +864,14 @@ class SharedDecisionPolicy:
             and stall_age >= max(no_progress_window, 1)
             and not bool(progress_view["made_progress"])
         )
-        stalled_timeout = (
+        replan_stall = (
             active_same_edge_monitoring
             and same_edge
             and stall_age >= int(self.decision_engine.route_pending_stall_steps)
+        )
+        stalled_timeout = (
+            replan_stall
+            and total_age >= int(self.decision_engine.pending_progress_timeout_steps)
         )
         hard_timeout = (
             active_same_edge_monitoring
@@ -844,6 +907,8 @@ class SharedDecisionPolicy:
         elif stalled_timeout:
             release_reason = "route_stall_timeout"
             release_as_timeout = True
+        elif replan_stall:
+            release_reason = "route_no_progress_abort"
         elif no_progress_stall:
             release_reason = "route_no_progress_abort"
         elif lane_now_replan:
