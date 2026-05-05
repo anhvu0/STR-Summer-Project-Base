@@ -92,16 +92,27 @@ class DQNTrainer:
     Deep Q-Network trainer for routing decisions
     """
 
+    EPISODE_COUNTER_EXPORT_SPECS = (
+        ("elite_transitions_added", "elite_transitions_added"),
+        ("elite_samples_drawn", "elite_samples_drawn"),
+        ("replay_main_kept_finalized", "replay_main_finalized"),
+        ("replay_main_kept_pending_timeout", "replay_main_pending_timeout"),
+        ("replay_main_kept_terminal", "replay_main_terminal"),
+        ("replay_main_kept_override", "replay_main_override"),
+        ("replay_main_kept_other", "replay_main_other"),
+        ("replay_main_dropped", "replay_main_dropped"),
+    )
+
     def __init__(
         self,
         state_size,
         action_size,
-        learning_rate=0.001,
-        gamma=0.95,
+        learning_rate=0.0005,
+        gamma=0.97,
         epsilon=1.0,
-        epsilon_decay=0.993,
-        epsilon_min=0.01,
-        replay_capacity=200000,
+        epsilon_decay=0.995,
+        epsilon_min=0.03,
+        replay_capacity=150000,
         elite_replay_capacity=None,
         elite_fraction=0.25,
         batch_size=128,
@@ -150,6 +161,47 @@ class DQNTrainer:
         self.train_steps = 0
         self.last_loss = None
         self.episode_loss_values = []
+
+    @classmethod
+    def episode_metric_fields(cls):
+        fields = [
+            "epsilon",
+            "replay",
+            "train_steps_cumulative",
+            "train_steps_episode",
+            "episode_mean_loss",
+            "last_batch_loss",
+            "elite_buffer_size",
+        ]
+        for _, field_stem in cls.EPISODE_COUNTER_EXPORT_SPECS:
+            fields.extend([f"{field_stem}_episode", f"{field_stem}_cumulative"])
+        return tuple(fields)
+
+    def reset_episode_tracking(self):
+        self.episode_loss_values = []
+        self.last_loss = None
+
+    def capture_episode_metric_snapshot(self):
+        snapshot = {"train_steps": int(self.train_steps)}
+        for attr_name, _ in self.EPISODE_COUNTER_EXPORT_SPECS:
+            snapshot[attr_name] = int(getattr(self, attr_name))
+        return snapshot
+
+    def episode_metric_row(self, counter_start):
+        row = {
+            "epsilon": self.epsilon,
+            "replay": len(self.memory),
+            "train_steps_cumulative": self.train_steps,
+            "train_steps_episode": int(self.train_steps - int(counter_start.get("train_steps", 0))),
+            "episode_mean_loss": (float(np.mean(self.episode_loss_values)) if self.episode_loss_values else ""),
+            "last_batch_loss": self.last_loss if self.last_loss is not None else "",
+            "elite_buffer_size": len(self.elite_memory),
+        }
+        for attr_name, field_stem in self.EPISODE_COUNTER_EXPORT_SPECS:
+            cumulative_value = int(getattr(self, attr_name))
+            row[f"{field_stem}_episode"] = cumulative_value - int(counter_start.get(attr_name, 0))
+            row[f"{field_stem}_cumulative"] = cumulative_value
+        return row
 
     def _build_target_model(self):
         target_model = clone_model(self.model)
@@ -566,16 +618,16 @@ class RLTrainingPipeline:
         seed_with_episode=True,
         destination_reward=50.0,
         teleport_penalty=-40.0,
-        epsilon_decay=0.993,
-        epsilon_min=0.01,
+        epsilon_decay=0.995,
+        epsilon_min=0.03,
         gamma=0.97,
-        replay_capacity=100000,
+        replay_capacity=150000,
         batch_size=128,
         replay_warmup=2000,
         train_every=6,
         grad_steps=1,
         rolling_window=100,
-        use_double_dqn=False,
+        use_double_dqn=True,
         target_pattern=3,
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
@@ -2229,18 +2281,12 @@ class RLTrainingPipeline:
         rolling_avg_return = deque(maxlen=self.rolling_window)
         rolling_avg_travel_time = deque(maxlen=self.rolling_window)
         rolling_mismatch = deque(maxlen=self.rolling_window)
+        trainer_csv_fields = list(self.trainer.episode_metric_fields())
         csv_fields = [
-            "episode", "epsilon", "replay", "use_double_dqn",
-            "train_steps_cumulative", "train_steps_episode", "episode_mean_loss", "last_batch_loss",
+            "episode", *trainer_csv_fields[:2], "use_double_dqn",
+            *trainer_csv_fields[2:6],
             "episode_return_total", "avg_return_per_vehicle",
-            "elite_buffer_size", "elite_transitions_added_episode", "elite_transitions_added_cumulative",
-            "elite_samples_drawn_episode", "elite_samples_drawn_cumulative",
-            "replay_main_finalized_episode", "replay_main_finalized_cumulative",
-            "replay_main_pending_timeout_episode", "replay_main_pending_timeout_cumulative",
-            "replay_main_terminal_episode", "replay_main_terminal_cumulative",
-            "replay_main_override_episode", "replay_main_override_cumulative",
-            "replay_main_other_episode", "replay_main_other_cumulative",
-            "replay_main_dropped_episode", "replay_main_dropped_cumulative",
+            *trainer_csv_fields[6:],
             "completion_rate", "avg_travel_time", "p50_travel_time", "p90_travel_time", "teleports", "teleported_controlled",
             "controlled_ever_teleported", "arrived_after_teleport", "clean_arrivals_without_teleport",
             "forced_actions", "decisions_considered", "decisions_opened", "decisions_finalized", "decisions_skipped",
@@ -2375,18 +2421,8 @@ class RLTrainingPipeline:
             decision_metrics = defaultdict(float)
             decision_metrics["fallback_selected_total"] = 0.0
             decision_metrics["fallback_selected_lane_now"] = 0.0
-            self.trainer.episode_loss_values = []
-            trainer_counter_start = {
-                "train_steps": self.trainer.train_steps,
-                "elite_transitions_added": self.trainer.elite_transitions_added,
-                "elite_samples_drawn": self.trainer.elite_samples_drawn,
-                "replay_main_kept_finalized": self.trainer.replay_main_kept_finalized,
-                "replay_main_kept_pending_timeout": self.trainer.replay_main_kept_pending_timeout,
-                "replay_main_kept_terminal": self.trainer.replay_main_kept_terminal,
-                "replay_main_kept_override": self.trainer.replay_main_kept_override,
-                "replay_main_dropped": self.trainer.replay_main_dropped,
-                "replay_main_kept_other": self.trainer.replay_main_kept_other,
-            }
+            self.trainer.reset_episode_tracking()
+            trainer_counter_start = self.trainer.capture_episode_metric_snapshot()
 
             episode_return_total = 0.0
             episode_teleport_events = 0
@@ -4206,36 +4242,15 @@ class RLTrainingPipeline:
                     ))
                 self._append_decision_debug_rows(decision_debug_rows)
                 traci.close()
+                trainer_row = self.trainer.episode_metric_row(trainer_counter_start)
                 with open(self.metrics_csv_path, "a", newline="") as f:
                     writer = csv.DictWriter(f, fieldnames=csv_fields)
                     row = {
                         "episode": episode,
-                        "epsilon": self.trainer.epsilon,
-                        "replay": len(self.trainer.memory),
+                        **trainer_row,
                         "use_double_dqn": int(self.use_double_dqn),
-                        "train_steps_cumulative": self.trainer.train_steps,
-                        "train_steps_episode": int(self.trainer.train_steps - trainer_counter_start["train_steps"]),
-                        "episode_mean_loss": (float(np.mean(self.trainer.episode_loss_values)) if self.trainer.episode_loss_values else ""),
-                        "last_batch_loss": self.trainer.last_loss if self.trainer.last_loss is not None else "",
                         "episode_return_total": episode_return_total,
                         "avg_return_per_vehicle": avg_return_per_vehicle,
-                        "elite_buffer_size": len(self.trainer.elite_memory),
-                        "elite_transitions_added_episode": int(self.trainer.elite_transitions_added - trainer_counter_start["elite_transitions_added"]),
-                        "elite_transitions_added_cumulative": self.trainer.elite_transitions_added,
-                        "elite_samples_drawn_episode": int(self.trainer.elite_samples_drawn - trainer_counter_start["elite_samples_drawn"]),
-                        "elite_samples_drawn_cumulative": self.trainer.elite_samples_drawn,
-                        "replay_main_finalized_episode": int(self.trainer.replay_main_kept_finalized - trainer_counter_start["replay_main_kept_finalized"]),
-                        "replay_main_finalized_cumulative": self.trainer.replay_main_kept_finalized,
-                        "replay_main_pending_timeout_episode": int(self.trainer.replay_main_kept_pending_timeout - trainer_counter_start["replay_main_kept_pending_timeout"]),
-                        "replay_main_pending_timeout_cumulative": self.trainer.replay_main_kept_pending_timeout,
-                        "replay_main_terminal_episode": int(self.trainer.replay_main_kept_terminal - trainer_counter_start["replay_main_kept_terminal"]),
-                        "replay_main_terminal_cumulative": self.trainer.replay_main_kept_terminal,
-                        "replay_main_override_episode": int(self.trainer.replay_main_kept_override - trainer_counter_start["replay_main_kept_override"]),
-                        "replay_main_override_cumulative": self.trainer.replay_main_kept_override,
-                        "replay_main_other_episode": int(self.trainer.replay_main_kept_other - trainer_counter_start["replay_main_kept_other"]),
-                        "replay_main_other_cumulative": self.trainer.replay_main_kept_other,
-                        "replay_main_dropped_episode": int(self.trainer.replay_main_dropped - trainer_counter_start["replay_main_dropped"]),
-                        "replay_main_dropped_cumulative": self.trainer.replay_main_dropped,
                         "completion_rate": completion_rate,
                         "avg_travel_time": avg_travel_time,
                         "p50_travel_time": p50_travel_time,
@@ -4306,7 +4321,6 @@ class RLTrainingPipeline:
                         "override_event_invalid_action": decision_metrics["override_event_invalid_action"],
                         "policy_masked_actions_removed": decision_metrics["policy_masked_actions_removed"],
                         "override_learning_transitions": decision_metrics["override_learning_transitions"],
-                        "loop_prefilter_overrides": decision_metrics["loop_prefilter_overrides"],
                         "cooldown_fallback_overrides": decision_metrics["cooldown_fallback_overrides"],
                         "observe_abort_fallback_overrides": decision_metrics["observe_abort_fallback_overrides"],
                         "route_apply_fail_overrides": decision_metrics["route_apply_fail_overrides"],
