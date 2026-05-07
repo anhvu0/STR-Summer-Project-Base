@@ -58,7 +58,7 @@ def build_parser():
     )
     parser.add_argument(
         "--eval-seeds",
-        default="5000,5001,5002,5003,5004",
+        default="5000,5001,5002,5003,5004,5005,5006,5007,5008,5009",
         help="Comma-separated held-out seeds for frozen inference evaluation.",
     )
     parser.add_argument(
