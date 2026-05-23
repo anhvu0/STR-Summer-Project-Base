@@ -101,13 +101,10 @@ def build_parser():
 def resolve_model_path(raw_model_path=None):
     if raw_model_path:
         return raw_model_path
-    best_model_path = "./configurations/model/rl_model_map.best.h5"
-    # legacy_best_model_path = "./configurations/model/rl_model_map.best.h5"
-    final_model_path = "./configurations/model/rl_model_map.h5"
+    best_model_path = "./configurations/model/rl_model_map.best.pt"
+    final_model_path = "./configurations/model/rl_model_map.pt"
     if os.path.exists(best_model_path):
         return best_model_path
-    # if os.path.exists(legacy_best_model_path):
-    #     return legacy_best_model_path
     return final_model_path
 
 

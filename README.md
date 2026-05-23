@@ -65,15 +65,15 @@ python3 train_rl.py
 Useful options:
 
 ```bash
-python3 train_rl.py   --sumocfg ./configurations/myconfig.sumocfg   --model-output ./configurations/model/rl_model_map.h5   --episodes 500   --spawn-interval 2.0   --eval-every 25   --eval-seeds 1001,1002,1003   --eval-spawn-interval 2.0
+python3 train_rl.py   --sumocfg ./configurations/myconfig.sumocfg   --model-output ./configurations/model/rl_model_map.pt   --episodes 500   --spawn-interval 2.0   --eval-every 25   --eval-seeds 1001,1002,1003   --eval-spawn-interval 2.0
 ```
 
 What the outputs mean:
 - `rl_episode_metrics.csv`: training-rollout metrics. These runs still include replay updates during the episode, so they are useful for training trends but are not a pure deployment-quality inference measure.
 - `rl_frozen_eval_metrics.csv`: held-out frozen evaluation metrics. These runs use the saved checkpoint with no online learning and average results across held-out seeds.
 - `<model-output>`: the final checkpoint at the end of training.
-- `<model-output>.best.h5`: the best held-out frozen-eval checkpoint, selected by completion rate first, then timeout rate, average travel time, `p90` travel time, tail gap, tail spread ratio, and deadline misses.
-- `<model-output>.best.h5.meta.json`: aggregate and per-seed metadata for the best held-out checkpoint.
+- `<model-output>.best.pt`: the best held-out frozen-eval checkpoint, selected by completion rate first, then timeout rate, average travel time, `p90` travel time, tail gap, tail spread ratio, and deadline misses.
+- `<model-output>.best.pt.meta.json`: aggregate and per-seed metadata for the best held-out checkpoint.
 
 This workflow is the recommended way to choose a deployment checkpoint.
 Inference itself does not learn; it only applies the checkpoint you trained.

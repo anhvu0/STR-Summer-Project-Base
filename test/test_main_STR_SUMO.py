@@ -54,7 +54,7 @@ def test_random_policy():
 
 def test_q_learning():
     print("Testing Q Learning Route Controller")
-    scheduler = QLearningPolicy(init_connection_info, './rl_model.h5')
+    scheduler = QLearningPolicy(init_connection_info, './rl_model.pt')
     run_simulation(scheduler)
     print("TEST PASSED!")
     print("************")

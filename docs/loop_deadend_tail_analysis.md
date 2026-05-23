@@ -85,8 +85,8 @@ Do not diagnose deployment quality from `rl_episode_metrics.csv` alone.
 Late training episodes can look better than deployment because training still performs replay updates during the episode.
 Use held-out frozen evaluation instead:
 - `rl_frozen_eval_metrics.csv`
-- best checkpoint `<model-output>.best.h5`
-- best-checkpoint metadata `<model-output>.best.h5.meta.json`
+- best checkpoint `<model-output>.best.pt`
+- best-checkpoint metadata `<model-output>.best.pt.meta.json`
 
 If training looks strong but frozen eval is weak, the issue is generalization or rollout mismatch, not that inference should keep learning.
 

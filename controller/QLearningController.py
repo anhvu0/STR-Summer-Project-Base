@@ -1,7 +1,7 @@
 ﻿from controller.RouteController import RouteController
 from core.Util import ConnectionInfo, Vehicle
-from keras.models import load_model
 import numpy as np
+import torch
 import traci
 from traci import constants as tc
 import sumolib
@@ -10,7 +10,7 @@ from collections import deque
 
 from xml.dom.minidom import parse
 import os
-from core.dueling_q_layers import DuelingQCombine  # noqa: F401
+from core.dueling_q_layers import load_torch_checkpoint
 from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision, VehicleSnapshot
 from core.shared_decision_policy import SharedDecisionPolicy
 from core.route_loop_safety import transition_signal
@@ -25,8 +25,9 @@ net_path = parse_sumocfg("./configurations/myconfig.sumocfg")
 class QLearningPolicy(RouteController):
     def __init__(self, vehicles, connection_info, model_file, net_xml_file = net_path):
         super().__init__(connection_info)
-        self.model = load_model(model_file)
-        self.model_state_size = int(self.model.input_shape[-1])
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model, self.model_checkpoint = load_torch_checkpoint(model_file, device=self.device)
+        self.model_state_size = int(self.model.state_size)
         self.vehicles = vehicles
         self.net = sumolib.net.readNet(net_xml_file)
         self.decision_engine = JunctionDecisionEngine(connection_info, self.net, self.direction_choices)
@@ -155,6 +156,13 @@ class QLearningPolicy(RouteController):
         self._step_context_cache = {}
         self.direction_mask_start = (2 * self.edge_embedding_dim) if self.use_compact_state else 2
         self._init_edge_embeddings(seed=1337)
+
+    def _predict_q_values(self, states):
+        self.model.eval()
+        state_array = np.asarray(states, dtype=np.float32)
+        with torch.no_grad():
+            state_tensor = torch.as_tensor(state_array, dtype=torch.float32, device=self.device)
+            return self.model(state_tensor).detach().cpu().numpy()
 
     def _next_decision_id(self):
         self._decision_seq += 1
@@ -1125,7 +1133,7 @@ class QLearningPolicy(RouteController):
 
     # this function reacheds the Neural Network trained before and let it make a decision for the situation now
     def act(self, state, available_actions=None):
-        act_values = self.model(state, training=False).numpy()[0]
+        act_values = self._predict_q_values(state)[0]
         if available_actions is None:
             mask_start = self.direction_mask_start + 18 if self.use_compact_state else self.direction_mask_start
             available = [i for i, v in enumerate(state[0][mask_start:mask_start + 6]) if v > 0.5]
@@ -1141,7 +1149,7 @@ class QLearningPolicy(RouteController):
         if not states:
             return []
         state_batch = np.array([state[0] for state in states], dtype=np.float32)
-        q_batch = self.model(state_batch, training=False).numpy()
+        q_batch = self._predict_q_values(state_batch)
         results = []
         for q_values, available_actions in zip(q_batch, available_actions_batch):
             available = list(available_actions) if available_actions is not None else []

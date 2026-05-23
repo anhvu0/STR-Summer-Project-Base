@@ -52,8 +52,8 @@ This reduces training-vs-inference decision-cadence mismatch.
 `core/rl_training_pipeline.py`
 - added configurable held-out frozen evaluation (`eval_every`, `eval_seeds`, `eval_spawn_interval`),
 - added `rl_frozen_eval_metrics.csv`,
-- added best-checkpoint saving to `<model-output>.best.h5`,
-- added metadata export to `<model-output>.best.h5.meta.json`.
+- added best-checkpoint saving to `<model-output>.best.pt`,
+- added metadata export to `<model-output>.best.pt.meta.json`.
 
 Frozen evaluation runs the current checkpoint without online learning and scores it on held-out seeds using the real inference controller.
 
@@ -62,7 +62,7 @@ Frozen evaluation runs the current checkpoint without online learning and scores
 Use these outputs for different questions:
 - `rl_episode_metrics.csv`: "Is training improving?"
 - `rl_frozen_eval_metrics.csv`: "How good is the saved checkpoint when deployed?"
-- `<model-output>.best.h5`: "Which checkpoint should I actually use for inference?"
+- `<model-output>.best.pt`: "Which checkpoint should I actually use for inference?"
 
 ## Recommended workflow
 

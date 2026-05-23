@@ -53,10 +53,19 @@ class FakeVehicleAPI:
     def changeTarget(self, vehicle_id, destination):
         return None
 
+    def getAllSubscriptionResults(self):
+        return {}
+
 
 class FakeEdgeAPI:
     def getLastStepVehicleNumber(self, edge_id):
         return 0
+
+    def subscribe(self, edge_id, variables):
+        return None
+
+    def getAllSubscriptionResults(self):
+        return {}
 
 
 class DummyScheduler:
@@ -69,8 +78,16 @@ class StrSumoArrivalAccountingTests(unittest.TestCase):
         sys.modules.pop("core.STR_SUMO", None)
         fake_sumolib = types.ModuleType("sumolib")
         fake_sumolib.net = SimpleNamespace()
+        fake_constants = types.ModuleType("traci.constants")
+        fake_constants.VAR_ROAD_ID = 80
+        fake_constants.VAR_SPEED = 64
+        fake_constants.LAST_STEP_VEHICLE_NUMBER = 16
+        fake_traci_module = types.ModuleType("traci")
+        fake_traci_module.__dict__.update(vars(fake_traci))
+        fake_traci_module.constants = fake_constants
         fake_modules = {
-            "traci": fake_traci,
+            "traci": fake_traci_module,
+            "traci.constants": fake_constants,
             "sumolib": fake_sumolib,
             "core.Util": types.ModuleType("core.Util"),
             "core.target_vehicles_generation_protocols": types.ModuleType("core.target_vehicles_generation_protocols"),

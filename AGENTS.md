@@ -69,8 +69,8 @@ wsl git -C /home/anhvu01212001/anhvu/STR_Project/STR-Summer-Project-Base diff ..
   - `best_model_output_path`
 - Deployment-quality outputs are:
   - `rl_frozen_eval_metrics.csv`
-  - `<model-output>.best.h5`
-  - `<model-output>.best.h5.meta.json`
+- `<model-output>.best.pt`
+- `<model-output>.best.pt.meta.json`
 - Best-checkpoint ranking priority is:
   1. completion rate,
   2. timeout rate,

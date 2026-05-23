@@ -6,16 +6,14 @@ import csv
 import json
 
 from xml.dom.minidom import parse
-from keras.layers import Dense, Input
-from keras.models import Model, clone_model
-from keras.losses import Huber
-from keras.optimizers import Adam
+import torch
+from torch import nn
 from collections import Counter, defaultdict, deque
 import random
 from controller.RouteController import RouteController
 from controller.QLearningController import QLearningPolicy
 from core.STR_SUMO import StrSumo, build_runtime_sumocfg
-from core.dueling_q_layers import DuelingQCombine
+from core.dueling_q_layers import build_dueling_dqn, save_torch_checkpoint
 from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision, VehicleSnapshot
 from core.shared_decision_policy import SharedDecisionPolicy
 from core.Util import ConnectionInfo
@@ -45,7 +43,7 @@ METRIC_DOCS = {
     "episode_return_total": {"description": "Sum of all rewards in the episode.", "type": "per_episode_aggregate"},
     "avg_return_per_vehicle": {"description": "episode_return_total / controlled_vehicle_count.", "type": "ratio", "numerator": "episode_return_total", "denominator": "total_controlled"},
     "episode_mean_loss": {"description": "Mean of replay batch losses observed in this episode.", "type": "per_episode_aggregate"},
-    "last_batch_loss": {"description": "Loss from the latest replay train_on_batch call this episode.", "type": "gauge"},
+    "last_batch_loss": {"description": "Loss from the latest replay optimizer step this episode.", "type": "gauge"},
     "decisions_opened": {"description": "Unique strategic decisions opened (one count per decision_id).", "type": "event_count", "mutually_exclusive_with_siblings": False},
     "decisions_finalized": {"description": "Strategic decisions that resolved/finalized; excludes synthetic terminal finalizations.", "type": "event_count"},
     "synthetic_terminal_finalizations": {"description": "Terminal transitions emitted when no pending strategic decision exists.", "type": "event_count"},
@@ -156,7 +154,10 @@ class DQNTrainer:
         self.replay_main_kept_other = 0
         self.replay_main_dropped = 0
         self.staged_episode_transitions = []
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = self.build_model(learning_rate)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.loss_fn = nn.SmoothL1Loss()
         self.target_model = self._build_target_model()
         self.train_steps = 0
         self.last_loss = None
@@ -204,8 +205,9 @@ class DQNTrainer:
         return row
 
     def _build_target_model(self):
-        target_model = clone_model(self.model)
-        target_model.set_weights(self.model.get_weights())
+        target_model = build_dueling_dqn(self.state_size, self.action_size, device=self.device)
+        target_model.load_state_dict(self.model.state_dict())
+        target_model.eval()
         return target_model
 
     def update_target_network(self, force=False):
@@ -217,35 +219,36 @@ class DQNTrainer:
         if not force and (self.train_steps % self.target_update_every != 0):
             return
 
-        online_weights = self.model.get_weights()
         if self.target_soft_tau >= 1.0:
-            self.target_model.set_weights(online_weights)
+            self.target_model.load_state_dict(self.model.state_dict())
             return
 
-        target_weights = self.target_model.get_weights()
         tau = self.target_soft_tau
-        mixed_weights = [
-            tau * online_w + (1.0 - tau) * target_w
-            for online_w, target_w in zip(online_weights, target_weights)
-        ]
-        self.target_model.set_weights(mixed_weights)
+        with torch.no_grad():
+            for target_param, online_param in zip(self.target_model.parameters(), self.model.parameters()):
+                target_param.data.mul_(1.0 - tau).add_(online_param.data, alpha=tau)
 
     def build_model(self, learning_rate):
-        inputs = Input(shape=(self.state_size,), name="state")
-        trunk = Dense(192, activation='relu', name='trunk_dense_0')(inputs)
-        trunk = Dense(128, activation='relu', name='trunk_dense_1')(trunk)
-        trunk = Dense(64, activation='relu', name='trunk_dense_2')(trunk)
+        del learning_rate
+        return build_dueling_dqn(self.state_size, self.action_size, device=self.device)
 
-        value = Dense(64, activation='relu', name='value_dense')(trunk)
-        value = Dense(1, activation='linear', name='state_value')(value)
+    def predict_q_values(self, states, target=False):
+        model = self.target_model if target else self.model
+        model.eval()
+        state_array = np.asarray(states, dtype=np.float32)
+        with torch.no_grad():
+            state_tensor = torch.as_tensor(state_array, dtype=torch.float32, device=self.device)
+            return model(state_tensor).detach().cpu().numpy()
 
-        advantage = Dense(64, activation='relu', name='advantage_dense')(trunk)
-        advantage = Dense(self.action_size, activation='linear', name='action_advantage')(advantage)
-
-        q_values = DuelingQCombine(name='q_values')([value, advantage])
-        model = Model(inputs=inputs, outputs=q_values, name='dueling_dqn')
-        model.compile(loss=Huber(delta=1.0), optimizer=Adam(learning_rate=learning_rate, clipnorm=10.0))
-        return model
+    def save_checkpoint(self, path):
+        save_torch_checkpoint(
+            path,
+            self.model,
+            optimizer=self.optimizer,
+            train_steps=int(self.train_steps),
+            epsilon=float(self.epsilon),
+            use_double_dqn=bool(self.use_double_dqn),
+        )
 
     def _ranked_exploration_choice(self, valid_actions):
         """
@@ -280,7 +283,7 @@ class DQNTrainer:
         if np.random.rand() <= self.epsilon: # Random to see if the agent should choose a new path
             action = self._ranked_exploration_choice(valid_actions)
             return (action, "explore") if return_source else action
-        q_values = self.model(state, training=False).numpy()[0]
+        q_values = self.predict_q_values(state)[0]
         masked_values = np.full_like(q_values, -1e9)    #Make all q-values -1e9, then valid actions will update their according value, invalid actions will not be updated and stay negative
         valid_idx = np.asarray(valid_actions, dtype=np.intp)
         masked_values[valid_idx] = q_values[valid_idx]
@@ -305,7 +308,7 @@ class DQNTrainer:
                 policy_indices.append(idx)
                 policy_states.append(state[0])
         if policy_states:
-            q_batch = self.model(np.array(policy_states, dtype=np.float32), training=False).numpy()
+            q_batch = self.predict_q_values(np.array(policy_states, dtype=np.float32))
             for local_idx, global_idx in enumerate(policy_indices):
                 valid_actions = valid_actions_batch[global_idx]
                 masked_values = np.full_like(q_batch[local_idx], -1e9)
@@ -566,15 +569,15 @@ class DQNTrainer:
         next_valid_actions_batch = [s[5] for s in minibatch]
         batch_len = states.shape[0]
 
-        # Keep keras inference pattern fast:
+        # Keep inference fast:
         # - Fuse ONLINE model calls for q(s) and q_online(s') in one pass.
         # - Use TARGET model only for bootstrap values.
         # This preserves Double-DQN behavior when enabled.
         stacked_states = np.vstack((states, next_states))
-        q_all_online = self.model(stacked_states, training=False).numpy()
+        q_all_online = self.predict_q_values(stacked_states)
         q = q_all_online[:batch_len]
         q_next_online = q_all_online[batch_len:]
-        q_next_target = self.target_model(next_states, training=False).numpy()
+        q_next_target = self.predict_q_values(next_states, target=True)
 
         valid_action_mask = np.zeros((batch_len, self.action_size), dtype=np.bool_)
         for idx, valid_actions in enumerate(next_valid_actions_batch):
@@ -593,10 +596,18 @@ class DQNTrainer:
             rewards + (1.0 - dones.astype(np.float32)) * self.gamma * bootstrap_values
         )
 
-        loss = self.model.train_on_batch(states, target)
-        self.last_loss = float(loss) if loss is not None else None
-        if self.last_loss is not None:
-            self.episode_loss_values.append(self.last_loss)
+        self.model.train()
+        states_tensor = torch.as_tensor(states, dtype=torch.float32, device=self.device)
+        target_tensor = torch.as_tensor(target, dtype=torch.float32, device=self.device)
+        predicted = self.model(states_tensor)
+        loss = self.loss_fn(predicted, target_tensor)
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+        self.optimizer.step()
+
+        self.last_loss = float(loss.detach().cpu().item())
+        self.episode_loss_values.append(self.last_loss)
         self.train_steps += 1
         self.update_target_network()
 
@@ -2144,7 +2155,7 @@ class RLTrainingPipeline:
             return False, score_key
 
         os.makedirs(os.path.dirname(self.best_model_output_path) or ".", exist_ok=True)
-        self.trainer.model.save(self.best_model_output_path, overwrite=True)
+        self.trainer.save_checkpoint(self.best_model_output_path)
         metadata = {
             "episode": int(episode),
             "score_key": list(score_key),
@@ -2162,7 +2173,7 @@ class RLTrainingPipeline:
             return None
 
         os.makedirs(os.path.dirname(self._frozen_eval_model_path) or ".", exist_ok=True)
-        self.trainer.model.save(self._frozen_eval_model_path, overwrite=True)
+        self.trainer.save_checkpoint(self._frozen_eval_model_path)
 
         per_seed_rows = []
         for eval_seed in self.frozen_eval_seeds:
@@ -4458,7 +4469,7 @@ class RLTrainingPipeline:
                 if should_run_frozen_eval:
                     self._run_frozen_inference_eval(episode, sumo_binary)
 
-        self.trainer.model.save(self.model_output_path)
+        self.trainer.save_checkpoint(self.model_output_path)
         if self._best_frozen_eval_summary is not None:
             print(
                 "Best frozen-eval checkpoint saved to {} (episode {}).".format(

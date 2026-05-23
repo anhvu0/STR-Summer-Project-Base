@@ -30,13 +30,13 @@ def build_parser():
 
     parser.add_argument(
         "--model-output",
-        default="./configurations/model/rl_model_map.h5",
+        default="./configurations/model/rl_model_map.pt",
         help="Path to save the trained model.",
     )
     parser.add_argument(
         "--best-model-output",
-        default="./configurations/model/rl_model_map.best.h5",
-        help="Optional path for the best held-out frozen-eval checkpoint. Defaults to <model-output>.best.h5.",
+        default="./configurations/model/rl_model_map.best.pt",
+        help="Optional path for the best held-out frozen-eval checkpoint. Defaults to <model-output>.best.pt.",
     )
     parser.add_argument(
         "--episodes",
