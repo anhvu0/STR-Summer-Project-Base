@@ -100,6 +100,9 @@ class QLearningPolicy(RouteController):
             "lane_now_replan_blocked_reopen_actions": 0,
             "commit_window_candidates_rejected": 0,
             "commit_window_non_lane_candidates_seen": 0,
+            "coordination_pending_reservations_seeded": 0,
+            "coordination_pressure_candidates_seen": 0,
+            "coordination_pressure_candidates_rejected": 0,
             "step_control_edge_change": 0,
             "step_control_pending": 0,
             "step_control_near_junction": 0,
@@ -123,21 +126,36 @@ class QLearningPolicy(RouteController):
         # Must match RLTrainingPipeline compact state spec; retrained models are required when this changes.
         self.compact_state_size_without_coordination = self.shared_policy.compact_state_size_without_coordination
         self.compact_state_size = self.shared_policy.compact_state_size
+        self.compact_state_size_without_coordination_v1 = self.shared_policy.compact_state_size_without_coordination_v1
+        self.compact_state_size_v1 = self.shared_policy.compact_state_size_v1
         self.legacy_state_size = self.shared_policy.legacy_state_size(len(self.connection_info.edge_list))
+        self.compact_state_version = 2
         self.use_coordination_state = (self.model_state_size == self.compact_state_size)
         if self.model_state_size == self.compact_state_size:
             self.use_compact_state = True
+            self.compact_state_version = 2
         elif self.model_state_size == self.compact_state_size_without_coordination:
             self.use_compact_state = True
+            self.compact_state_version = 2
+        elif self.model_state_size == self.compact_state_size_v1:
+            self.use_compact_state = True
+            self.use_coordination_state = True
+            self.compact_state_version = 1
+        elif self.model_state_size == self.compact_state_size_without_coordination_v1:
+            self.use_compact_state = True
+            self.use_coordination_state = False
+            self.compact_state_version = 1
         elif self.model_state_size == self.legacy_state_size:
             self.use_compact_state = False
         else:
             raise ValueError(
                 "Checkpoint state_size={} is incompatible with current controller specs "
-                "(coordination_compact={}, compact={}, legacy={}).".format(
+                "(coordination_compact_v2={}, compact_v2={}, coordination_compact_v1={}, compact_v1={}, legacy={}).".format(
                     self.model_state_size,
                     self.compact_state_size,
                     self.compact_state_size_without_coordination,
+                    self.compact_state_size_v1,
+                    self.compact_state_size_without_coordination_v1,
                     self.legacy_state_size,
                 )
             )
@@ -165,12 +183,16 @@ class QLearningPolicy(RouteController):
             tc.VAR_LANE_INDEX,
             tc.VAR_LANEPOSITION,
             tc.VAR_SPEED,
+            tc.VAR_WAITING_TIME,
         )
         self._active_vehicle_subscriptions = set()
         self._step_cache_step = None
         self._step_vehicle_results = {}
         self._step_snapshot_cache = {}
         self._step_context_cache = {}
+        self._step_vehicle_wait_cache = {}
+        self._step_lane_occupancy_cache = {}
+        self._step_lane_halting_cache = {}
         self.direction_mask_start = (2 * self.edge_embedding_dim) if self.use_compact_state else 2
         self._init_edge_embeddings(seed=1337)
 
@@ -215,6 +237,49 @@ class QLearningPolicy(RouteController):
         lane_len = float(traci.lane.getLength(lane_id))
         self._lane_length_cache[lane_id] = lane_len
         return lane_len
+
+    def _vehicle_wait_time(self, vehicle_id):
+        vehicle_id = str(vehicle_id)
+        cached = self._step_vehicle_wait_cache.get(vehicle_id)
+        if cached is not None:
+            return float(cached)
+        if vehicle_id == "__terminal__":
+            self._step_vehicle_wait_cache[vehicle_id] = 0.0
+            return 0.0
+        result = self._step_vehicle_results.get(vehicle_id) or {}
+        wait_time = result.get(tc.VAR_WAITING_TIME)
+        if wait_time is None:
+            wait_time = 0.0
+        wait_time = max(float(wait_time), 0.0)
+        self._step_vehicle_wait_cache[vehicle_id] = wait_time
+        return wait_time
+
+    def _lane_occupancy(self, lane_id):
+        cached = self._step_lane_occupancy_cache.get(lane_id)
+        if cached is not None:
+            return float(cached)
+        try:
+            occupancy = float(traci.lane.getLastStepOccupancy(lane_id))
+        except Exception:
+            occupancy = 0.0
+        if occupancy > 1.0:
+            occupancy /= 100.0
+        occupancy = float(np.clip(occupancy, 0.0, 1.0))
+        self._step_lane_occupancy_cache[lane_id] = occupancy
+        return occupancy
+
+    def _lane_halting_density(self, lane_id):
+        cached = self._step_lane_halting_cache.get(lane_id)
+        if cached is not None:
+            return float(cached)
+        try:
+            halting = float(traci.lane.getLastStepHaltingNumber(lane_id))
+        except Exception:
+            halting = 0.0
+        density = (halting * float(self.density_scale_m)) / max(self._lane_length(lane_id), 5.0)
+        density = float(np.clip(density, 0.0, 1.0))
+        self._step_lane_halting_cache[lane_id] = density
+        return density
 
     def _edge_density(self, edge_id):
         cached_count = self._edge_vehicle_count_cache.get(edge_id)
@@ -261,6 +326,9 @@ class QLearningPolicy(RouteController):
         self._step_cache_step = step
         self._step_snapshot_cache = {}
         self._step_context_cache = {}
+        self._step_vehicle_wait_cache = {}
+        self._step_lane_occupancy_cache = {}
+        self._step_lane_halting_cache = {}
         try:
             self._step_vehicle_results = traci.vehicle.getAllSubscriptionResults() or {}
         except Exception:
@@ -558,6 +626,13 @@ class QLearningPolicy(RouteController):
                 int(pending_snapshot["active_monitoring_open"]),
                 self._format_pending_descriptor(pending_snapshot["oldest_descriptor"]),
             ),
+            (
+                "[RL-INFER] coordination pending_seeded={} pressure_filtered={}/{}"
+            ).format(
+                int(metrics["coordination_pending_reservations_seeded"]),
+                int(metrics["coordination_pressure_candidates_rejected"]),
+                int(metrics["coordination_pressure_candidates_seen"]),
+            ),
         ]
 
     def _finalize_commitment(self, vehicle):
@@ -801,6 +876,14 @@ class QLearningPolicy(RouteController):
         self._refresh_density_stats(step)
         open_decision_batch = []
         step_coordination_state = self.shared_policy.empty_coordination_state()
+        self._metrics["coordination_pending_reservations_seeded"] += (
+            self.shared_policy.seed_coordination_from_pending(
+                step_coordination_state,
+                self._pending_decisions,
+                current_step=step,
+                max_age_steps=self.decision_engine.route_pending_hard_timeout_steps,
+            )
+        )
 
         def process_selected_action(vid, vehicle, start_edge, context, recent, action_idx, coordination_state=None):
             if action_idx not in context.available_actions:
@@ -1128,6 +1211,7 @@ class QLearningPolicy(RouteController):
                     edge_density_fn=self._edge_density,
                     metrics=self._metrics,
                     distance_slack=self.score_slack,
+                    coordination_state=step_coordination_state,
                 )
                 policy_actions = self.shared_policy.rank_policy_actions(
                     context=entry["context"],
@@ -1312,9 +1396,13 @@ class QLearningPolicy(RouteController):
             edge_lane_meters_fn=self._edge_lane_meters,
             step=current_step,
             vehicle_start_time=(float(vehicle_obj.start_time) if vehicle_obj is not None else None),
+            vehicle_wait_time_fn=self._vehicle_wait_time,
+            lane_halting_density_fn=self._lane_halting_density,
+            lane_occupancy_fn=self._lane_occupancy,
             edge_index_lookup=self.connection_info.edge_index_dict,
             legacy_aux_features=deadline_features,
             legacy_density_values=[cached_edge_density(edge_id) for edge_id in self.connection_info.edge_list] if not self.use_compact_state else None,
             include_coordination=bool(self.use_compact_state and self.use_coordination_state),
             coordination_state=coordination_state,
+            compact_state_version=self.compact_state_version,
         )

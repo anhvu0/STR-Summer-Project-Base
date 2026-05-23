@@ -4,12 +4,14 @@ import sys
 import math
 import csv
 import json
+import copy
 
 from xml.dom.minidom import parse
 import torch
 from torch import nn
 from collections import Counter, defaultdict, deque
 import random
+from controller.DijkstraController import DijkstraPolicy
 from controller.RouteController import RouteController
 from controller.QLearningController import QLearningPolicy
 from core.STR_SUMO import StrSumo, build_runtime_sumocfg
@@ -109,7 +111,7 @@ class DQNTrainer:
         gamma=0.97,
         epsilon=1.0,
         epsilon_decay=0.995,
-        epsilon_min=0.03,
+        epsilon_min=0.01,
         replay_capacity=150000,
         elite_replay_capacity=None,
         elite_fraction=0.25,
@@ -630,7 +632,7 @@ class RLTrainingPipeline:
         destination_reward=50.0,
         teleport_penalty=-40.0,
         epsilon_decay=0.995,
-        epsilon_min=0.03,
+        epsilon_min=0.01,
         gamma=0.97,
         replay_capacity=150000,
         batch_size=128,
@@ -791,6 +793,7 @@ class RLTrainingPipeline:
         self.frozen_eval_metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_frozen_eval_metrics.csv")
         self.best_model_metadata_path = self.best_model_output_path + ".meta.json"
         self._frozen_eval_model_path = self._default_best_model_output_path(self.model_output_path).replace(".best", ".frozen_eval_current")
+        self._frozen_eval_baseline_cache = {}
         self._density_vec = np.zeros(len(self.connection_info.edge_list), dtype=np.float32)
         self._density_mean = 0.0
         self._density_std = 0.0
@@ -806,9 +809,14 @@ class RLTrainingPipeline:
             tc.VAR_LANE_INDEX,
             tc.VAR_LANEPOSITION,
             tc.VAR_SPEED,
+            tc.VAR_WAITING_TIME,
         )
         self._edge_subscription_vars = (tc.LAST_STEP_VEHICLE_NUMBER,)
         self._active_vehicle_subscriptions = set()
+        self._step_vehicle_results = {}
+        self._step_vehicle_wait_cache = {}
+        self._step_lane_occupancy_cache = {}
+        self._step_lane_halting_cache = {}
         self.congestion_density_threshold = 0.30
         self.congestion_low_speed_threshold = 2.0
         self.emergency_decel_threshold = 4.5
@@ -1320,15 +1328,27 @@ class RLTrainingPipeline:
             global_density_stats=(float(self._density_mean), float(self._density_std)),
             step=step,
             vehicle_start_time=(float(vehicle.start_time) if vehicle is not None else None),
+            vehicle_wait_time_fn=self._vehicle_wait_time,
+            lane_halting_density_fn=self._lane_halting_density,
+            lane_occupancy_fn=self._lane_occupancy,
             include_coordination=True,
             coordination_state=coordination_state,
+            compact_state_version=self.shared_policy.compact_state_version,
         )
     
     def valid_actions_for_vehicle(self, vehicle_id, edge_id, destination_edge, step):
         context = self.decision_engine.build_context(vehicle_id, edge_id, destination_edge, step)
         return context.available_actions
 
-    def _policy_action_candidates(self, context, recent_history, cooldown_active, destination, decision_metrics=None):
+    def _policy_action_candidates(
+        self,
+        context,
+        recent_history,
+        cooldown_active,
+        destination,
+        decision_metrics=None,
+        coordination_state=None,
+    ):
         actions = self.shared_policy.policy_action_candidates(
             context,
             recent_history=recent_history,
@@ -1338,6 +1358,7 @@ class RLTrainingPipeline:
             edge_density_fn=self._edge_density,
             metrics=decision_metrics,
             distance_slack=self.score_slack,
+            coordination_state=coordination_state,
         )
         return self.shared_policy.rank_policy_actions(
             context=context,
@@ -1346,6 +1367,7 @@ class RLTrainingPipeline:
             distance_fn=self.get_distance_to_destination,
             edge_density_fn=self._edge_density,
             recent_history=recent_history,
+            coordination_state=coordination_state,
         )
 
     def _select_fallback_action(self, context, blocked_action, destination, recent_history, lane_now_only=False, coordination_state=None):
@@ -1442,6 +1464,49 @@ class RLTrainingPipeline:
         lane_len = float(traci.lane.getLength(lane_id))
         self._lane_length_cache[lane_id] = lane_len
         return lane_len
+
+    def _vehicle_wait_time(self, vehicle_id):
+        vehicle_id = str(vehicle_id)
+        cached = self._step_vehicle_wait_cache.get(vehicle_id)
+        if cached is not None:
+            return float(cached)
+        if vehicle_id == "__terminal__":
+            self._step_vehicle_wait_cache[vehicle_id] = 0.0
+            return 0.0
+        result = self._step_vehicle_results.get(vehicle_id) or {}
+        wait_time = result.get(tc.VAR_WAITING_TIME)
+        if wait_time is None:
+            wait_time = 0.0
+        wait_time = max(float(wait_time), 0.0)
+        self._step_vehicle_wait_cache[vehicle_id] = wait_time
+        return wait_time
+
+    def _lane_occupancy(self, lane_id):
+        cached = self._step_lane_occupancy_cache.get(lane_id)
+        if cached is not None:
+            return float(cached)
+        try:
+            occupancy = float(traci.lane.getLastStepOccupancy(lane_id))
+        except Exception:
+            occupancy = 0.0
+        if occupancy > 1.0:
+            occupancy /= 100.0
+        occupancy = float(np.clip(occupancy, 0.0, 1.0))
+        self._step_lane_occupancy_cache[lane_id] = occupancy
+        return occupancy
+
+    def _lane_halting_density(self, lane_id):
+        cached = self._step_lane_halting_cache.get(lane_id)
+        if cached is not None:
+            return float(cached)
+        try:
+            halting = float(traci.lane.getLastStepHaltingNumber(lane_id))
+        except Exception:
+            halting = 0.0
+        density = (halting * float(self.density_scale_m)) / max(self._lane_length(lane_id), 5.0)
+        density = float(np.clip(density, 0.0, 1.0))
+        self._step_lane_halting_cache[lane_id] = density
+        return density
 
     def _initialize_edge_subscriptions(self):
         for edge_id in self._edge_list:
@@ -1544,7 +1609,7 @@ class RLTrainingPipeline:
         coord_key = None
         if coordination_state is not None:
             coord_key = (
-                int(coordination_state.reserved_agents),
+                round(float(coordination_state.reserved_agents), 3),
                 tuple(sorted((str(edge), float(load)) for edge, load in coordination_state.next_edge_loads.items())),
                 tuple(sorted((str(edge), float(load)) for edge, load in coordination_state.corridor_edge_loads.items())),
                 tuple(sorted((str(dest), float(load)) for dest, load in coordination_state.destination_loads.items())),
@@ -2111,7 +2176,7 @@ class RLTrainingPipeline:
         return model_output_path + ".best"
 
     def _default_frozen_eval_seeds(self):
-        return [1001, 1002, 1003]
+        return [6000, 6001, 6002, 6003, 6004, 6005]
 
     def _frozen_eval_csv_fields(self):
         return [
@@ -2120,14 +2185,31 @@ class RLTrainingPipeline:
             "seed_list",
             "spawn_interval",
             "use_double_dqn",
+            "baseline_seed_source",
+            "win_count",
+            "win_rate",
             "completion_rate_mean",
+            "baseline_completion_rate_mean",
+            "completion_rate_delta_mean",
             "avg_travel_time_mean",
+            "baseline_avg_travel_time_mean",
+            "avg_travel_time_delta_mean",
             "p50_travel_time_mean",
             "p90_travel_time_mean",
+            "baseline_p90_travel_time_mean",
+            "p90_travel_time_delta_mean",
             "timeout_rate_mean",
+            "baseline_timeout_rate_mean",
+            "timeout_rate_delta_mean",
             "tail_completion_gap_steps_mean",
+            "baseline_tail_completion_gap_steps_mean",
+            "tail_completion_gap_steps_delta_mean",
             "p95_to_p50_travel_ratio_mean",
+            "baseline_p95_to_p50_travel_ratio_mean",
+            "p95_to_p50_travel_ratio_delta_mean",
             "deadlines_missed_mean",
+            "baseline_deadlines_missed_mean",
+            "deadlines_missed_delta_mean",
             "vehicles_reached_destination_mean",
             "controlled_vehicle_count_mean",
             "best_checkpoint_updated",
@@ -2149,15 +2231,27 @@ class RLTrainingPipeline:
             return float(default)
         return numeric
 
+    def _travel_score_tuple(self, stats):
+        return (
+            1.0 - float(np.clip(stats.get("completion_rate", 0.0), 0.0, 1.0)),
+            self._safe_eval_metric(stats.get("timeout_rate", 1.0)),
+            self._safe_eval_metric(stats.get("avg_travel_time", float("inf"))),
+            self._safe_eval_metric(stats.get("p90_travel_time", float("inf"))),
+            self._safe_eval_metric(stats.get("tail_completion_gap_steps", float("inf"))),
+            self._safe_eval_metric(stats.get("p95_to_p50_travel_ratio", float("inf"))),
+            self._safe_eval_metric(stats.get("deadlines_missed", float("inf"))),
+        )
+
     def _frozen_eval_score_key(self, summary):
         return (
-            1.0 - float(np.clip(summary.get("completion_rate_mean", 0.0), 0.0, 1.0)),
-            self._safe_eval_metric(summary.get("timeout_rate_mean", 1.0)),
-            self._safe_eval_metric(summary.get("avg_travel_time_mean", float("inf"))),
-            self._safe_eval_metric(summary.get("p90_travel_time_mean", float("inf"))),
-            self._safe_eval_metric(summary.get("tail_completion_gap_steps_mean", float("inf"))),
-            self._safe_eval_metric(summary.get("p95_to_p50_travel_ratio_mean", float("inf"))),
-            self._safe_eval_metric(summary.get("deadlines_missed_mean", float("inf"))),
+            1.0 - float(np.clip(summary.get("win_rate", 0.0), 0.0, 1.0)),
+            self._safe_eval_metric(summary.get("timeout_rate_delta_mean", 1.0)),
+            self._safe_eval_metric(summary.get("avg_travel_time_delta_mean", float("inf"))),
+            self._safe_eval_metric(summary.get("p90_travel_time_delta_mean", float("inf"))),
+            self._safe_eval_metric(summary.get("tail_completion_gap_steps_delta_mean", float("inf"))),
+            self._safe_eval_metric(summary.get("p95_to_p50_travel_ratio_delta_mean", float("inf"))),
+            self._safe_eval_metric(summary.get("deadlines_missed_delta_mean", float("inf"))),
+            self._safe_eval_metric(-summary.get("completion_rate_delta_mean", 0.0), 0.0),
         )
 
     def _append_frozen_eval_row(self, row):
@@ -2195,19 +2289,8 @@ class RLTrainingPipeline:
         os.makedirs(os.path.dirname(self._frozen_eval_model_path) or ".", exist_ok=True)
         self.trainer.save_checkpoint(self._frozen_eval_model_path)
 
-        per_seed_rows = []
-        for eval_seed in self.frozen_eval_seeds:
-            vehicles = self.generate_episode_vehicles(
-                episode_seed=int(eval_seed),
-                spawn_interval_override=self.eval_spawn_interval,
-            )
-            policy = QLearningPolicy(
-                vehicles,
-                self.connection_info,
-                self._frozen_eval_model_path,
-                net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
-            )
-            simulation = StrSumo(policy, self.connection_info, vehicles)
+        def run_eval_controller(controller, vehicles):
+            simulation = StrSumo(controller, self.connection_info, vehicles)
             try:
                 traci.start([
                     sumo_binary,
@@ -2222,16 +2305,65 @@ class RLTrainingPipeline:
                     traci.close()
                 except Exception:
                     pass
+            return stats
+
+        per_seed_rows = []
+        for eval_seed in self.frozen_eval_seeds:
+            vehicles = self.generate_episode_vehicles(
+                episode_seed=int(eval_seed),
+                spawn_interval_override=self.eval_spawn_interval,
+            )
+            dijkstra_cache_key = (
+                int(eval_seed),
+                float(self.eval_spawn_interval),
+                int(self.target_pattern),
+            )
+            baseline_stats = self._frozen_eval_baseline_cache.get(dijkstra_cache_key)
+            if baseline_stats is None:
+                baseline_policy = DijkstraPolicy(self.connection_info)
+                baseline_vehicles = copy.deepcopy(vehicles)
+                baseline_stats = run_eval_controller(
+                    baseline_policy,
+                    baseline_vehicles,
+                )
+                self._frozen_eval_baseline_cache[dijkstra_cache_key] = dict(baseline_stats)
+
+            rl_vehicles = copy.deepcopy(vehicles)
+            policy = QLearningPolicy(
+                rl_vehicles,
+                self.connection_info,
+                self._frozen_eval_model_path,
+                net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
+            )
+            stats = run_eval_controller(policy, rl_vehicles)
+            rl_score = self._travel_score_tuple(stats)
+            baseline_score = self._travel_score_tuple(baseline_stats)
+            win = int(rl_score < baseline_score)
             per_seed_rows.append({
                 "seed": int(eval_seed),
+                "win_vs_dijkstra": int(win),
                 "completion_rate": float(stats["completion_rate"]),
+                "baseline_completion_rate": float(baseline_stats["completion_rate"]),
+                "completion_rate_delta": float(stats["completion_rate"]) - float(baseline_stats["completion_rate"]),
                 "avg_travel_time": float(stats["avg_travel_time"]),
+                "baseline_avg_travel_time": float(baseline_stats["avg_travel_time"]),
+                "avg_travel_time_delta": float(stats["avg_travel_time"]) - float(baseline_stats["avg_travel_time"]),
                 "p50_travel_time": float(stats["p50_travel_time"]),
                 "p90_travel_time": float(stats["p90_travel_time"]),
+                "baseline_p90_travel_time": float(baseline_stats["p90_travel_time"]),
+                "p90_travel_time_delta": float(stats["p90_travel_time"]) - float(baseline_stats["p90_travel_time"]),
                 "timeout_rate": float(stats["timeout_rate"]),
+                "baseline_timeout_rate": float(baseline_stats["timeout_rate"]),
+                "timeout_rate_delta": float(stats["timeout_rate"]) - float(baseline_stats["timeout_rate"]),
                 "tail_completion_gap_steps": float(stats["tail_completion_gap_steps"]),
+                "baseline_tail_completion_gap_steps": float(baseline_stats["tail_completion_gap_steps"]),
+                "tail_completion_gap_steps_delta": float(stats["tail_completion_gap_steps"]) - float(baseline_stats["tail_completion_gap_steps"]),
                 "p95_to_p50_travel_ratio": float(stats["p95_to_p50_travel_ratio"]),
+                "baseline_p95_to_p50_travel_ratio": float(baseline_stats["p95_to_p50_travel_ratio"]),
+                "p95_to_p50_travel_ratio_delta": float(stats["p95_to_p50_travel_ratio"]) - float(baseline_stats["p95_to_p50_travel_ratio"]),
                 "deadlines_missed": float(stats["deadlines_missed"]),
+                "baseline_deadlines_missed": float(baseline_stats["deadlines_missed"]),
+                "deadlines_missed_delta": float(stats["deadlines_missed"]) - float(baseline_stats["deadlines_missed"]),
                 "vehicles_reached_destination": float(stats["vehicles_reached_destination"]),
                 "controlled_vehicle_count": float(stats["controlled_vehicle_count"]),
             })
@@ -2248,14 +2380,31 @@ class RLTrainingPipeline:
             "seed_list": ",".join(str(row["seed"]) for row in per_seed_rows),
             "spawn_interval": float(self.eval_spawn_interval),
             "use_double_dqn": int(self.use_double_dqn),
+            "baseline_seed_source": ",".join(str(seed) for seed in self.frozen_eval_seeds),
+            "win_count": float(sum(float(row["win_vs_dijkstra"]) for row in per_seed_rows)),
+            "win_rate": mean_metric("win_vs_dijkstra", 0.0),
             "completion_rate_mean": mean_metric("completion_rate", 0.0),
+            "baseline_completion_rate_mean": mean_metric("baseline_completion_rate", 0.0),
+            "completion_rate_delta_mean": mean_metric("completion_rate_delta", 0.0),
             "avg_travel_time_mean": mean_metric("avg_travel_time", float("inf")),
+            "baseline_avg_travel_time_mean": mean_metric("baseline_avg_travel_time", float("inf")),
+            "avg_travel_time_delta_mean": mean_metric("avg_travel_time_delta", float("inf")),
             "p50_travel_time_mean": mean_metric("p50_travel_time", float("inf")),
             "p90_travel_time_mean": mean_metric("p90_travel_time", float("inf")),
+            "baseline_p90_travel_time_mean": mean_metric("baseline_p90_travel_time", float("inf")),
+            "p90_travel_time_delta_mean": mean_metric("p90_travel_time_delta", float("inf")),
             "timeout_rate_mean": mean_metric("timeout_rate", 1.0),
+            "baseline_timeout_rate_mean": mean_metric("baseline_timeout_rate", 1.0),
+            "timeout_rate_delta_mean": mean_metric("timeout_rate_delta", 1.0),
             "tail_completion_gap_steps_mean": mean_metric("tail_completion_gap_steps", float("inf")),
+            "baseline_tail_completion_gap_steps_mean": mean_metric("baseline_tail_completion_gap_steps", float("inf")),
+            "tail_completion_gap_steps_delta_mean": mean_metric("tail_completion_gap_steps_delta", float("inf")),
             "p95_to_p50_travel_ratio_mean": mean_metric("p95_to_p50_travel_ratio", float("inf")),
+            "baseline_p95_to_p50_travel_ratio_mean": mean_metric("baseline_p95_to_p50_travel_ratio", float("inf")),
+            "p95_to_p50_travel_ratio_delta_mean": mean_metric("p95_to_p50_travel_ratio_delta", float("inf")),
             "deadlines_missed_mean": mean_metric("deadlines_missed", float("inf")),
+            "baseline_deadlines_missed_mean": mean_metric("baseline_deadlines_missed", float("inf")),
+            "deadlines_missed_delta_mean": mean_metric("deadlines_missed_delta", float("inf")),
             "vehicles_reached_destination_mean": mean_metric("vehicles_reached_destination", 0.0),
             "controlled_vehicle_count_mean": mean_metric("controlled_vehicle_count", 0.0),
         }
@@ -2268,14 +2417,14 @@ class RLTrainingPipeline:
         aggregate_summary["score_key"] = "|".join(f"{value:.6f}" for value in score_key)
         self._append_frozen_eval_row(aggregate_summary)
         print(
-            "[EP {:03d} FROZEN_EVAL] seeds={} spawn_interval={:.2f} completion={:.3f} avg_tt={:.2f} p90={:.2f} timeout={:.3f} best={}".format(
+            "[EP {:03d} FROZEN_EVAL] seeds={} spawn_interval={:.2f} win_rate={:.3f} avg_delta={:.2f} p90_delta={:.2f} tail_delta={:.2f} best={}".format(
                 int(episode),
                 aggregate_summary["seed_list"],
                 float(self.eval_spawn_interval),
-                aggregate_summary["completion_rate_mean"],
-                aggregate_summary["avg_travel_time_mean"],
-                aggregate_summary["p90_travel_time_mean"],
-                aggregate_summary["timeout_rate_mean"],
+                aggregate_summary["win_rate"],
+                aggregate_summary["avg_travel_time_delta_mean"],
+                aggregate_summary["p90_travel_time_delta_mean"],
+                aggregate_summary["tail_completion_gap_steps_delta_mean"],
                 "yes" if improved else "no",
             )
         )
@@ -2390,6 +2539,8 @@ class RLTrainingPipeline:
             "reachable_lane_change_nonempty", "reachable_lane_change_excluded_any",
             "reachable_lane_change_excluded_all", "policy_candidates_with_broader_available",
             "policy_candidates_collapsed_to_lane_now_only",
+            "coordination_pending_reservations_seeded",
+            "coordination_pressure_candidates_seen", "coordination_pressure_candidates_rejected",
             "lane_now_congestion_candidates_seen", "lane_now_congestion_candidates_rejected",
             "commit_window_non_lane_candidates_seen", "commit_window_candidates_rejected",
             "proactive_shift2_candidates_seen", "proactive_shift2_candidates_rejected",
@@ -2536,6 +2687,7 @@ class RLTrainingPipeline:
                     cooldown_active=bool(cooldown_active),
                     destination=vehicle.destination,
                     decision_metrics=None,
+                    coordination_state=step_coordination_state,
                 )
 
             def process_selected_action(
@@ -2598,6 +2750,7 @@ class RLTrainingPipeline:
                         cooldown_active=step < cooldown_until,
                         destination=vehicle.destination,
                         decision_metrics=decision_metrics,
+                        coordination_state=coordination_state,
                     )
                     self.trainer.stage_transition(
                         state,
@@ -2681,6 +2834,7 @@ class RLTrainingPipeline:
                             cooldown_active=True,
                             destination=vehicle.destination,
                             decision_metrics=decision_metrics,
+                            coordination_state=coordination_state,
                         )
                         self.trainer.stage_transition(
                             state,
@@ -2840,6 +2994,7 @@ class RLTrainingPipeline:
                         cooldown_active=step < cooldown_until,
                         destination=vehicle.destination,
                         decision_metrics=decision_metrics,
+                        coordination_state=coordination_state,
                     )
                     self.trainer.stage_transition(
                         state,
@@ -2926,6 +3081,10 @@ class RLTrainingPipeline:
                     controlled_live_ids = [vid for vid in vehicle_ids if vid in vehicles]
                     self._ensure_vehicle_subscriptions(controlled_live_ids)
                     vehicle_subscription_results = traci.vehicle.getAllSubscriptionResults() or {}
+                    self._step_vehicle_results = vehicle_subscription_results
+                    self._step_vehicle_wait_cache = {}
+                    self._step_lane_occupancy_cache = {}
+                    self._step_lane_halting_cache = {}
                     step_snapshots = self.collect_vehicle_snapshots(
                         controlled_live_ids,
                         step,
@@ -2935,6 +3094,14 @@ class RLTrainingPipeline:
                     step_state_cache = {}
                     open_decision_batch = []
                     step_coordination_state = self.shared_policy.empty_coordination_state()
+                    decision_metrics["coordination_pending_reservations_seeded"] += (
+                        self.shared_policy.seed_coordination_from_pending(
+                            step_coordination_state,
+                            pending_decisions,
+                            current_step=step,
+                            max_age_steps=self.decision_engine.route_pending_hard_timeout_steps,
+                        )
+                    )
                     recent_history_for_decision = {}
                     step_mean_density = float(self._density_mean)
                     step_p95_density = float(self._density_p95)
@@ -3098,6 +3265,7 @@ class RLTrainingPipeline:
                                 step,
                                 snapshot,
                                 context=next_ctx,
+                                coordination_state=step_coordination_state,
                             )
                             self.trainer.stage_transition(
                                 pending.state,
@@ -3204,6 +3372,7 @@ class RLTrainingPipeline:
                                             cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
                                             destination=vehicle.destination,
                                             decision_metrics=decision_metrics,
+                                            coordination_state=step_coordination_state,
                                         )
                                         self.trainer.stage_transition(
                                             pending.state,
@@ -3272,6 +3441,7 @@ class RLTrainingPipeline:
                                         step,
                                         snapshot,
                                         context=obs_context,
+                                        coordination_state=step_coordination_state,
                                     ),
                                     False,
                                     next_valid_actions=policy_actions_for_bootstrap(
@@ -3390,6 +3560,7 @@ class RLTrainingPipeline:
                                     cooldown_active=True,
                                     destination=vehicle.destination,
                                     decision_metrics=decision_metrics,
+                                    coordination_state=step_coordination_state,
                                 )
                                 imitation_reward = self._clip_reward(0.10)
                                 self.trainer.stage_transition(
@@ -3446,6 +3617,7 @@ class RLTrainingPipeline:
                                     step,
                                     snapshot,
                                     context=next_ctx,
+                                    coordination_state=step_coordination_state,
                                 )
                                 self.trainer.stage_transition(
                                     pending.state,
@@ -3487,6 +3659,7 @@ class RLTrainingPipeline:
                                     step,
                                     snapshot,
                                     context=timeout_ctx,
+                                    coordination_state=step_coordination_state,
                                 )
                                 timeout_penalty = self._clip_reward(self.pending_timeout_penalty)
                                 self.trainer.stage_transition(
@@ -3555,6 +3728,7 @@ class RLTrainingPipeline:
                                     step,
                                     snapshot,
                                     context=pending_ctx,
+                                    coordination_state=step_coordination_state,
                                 )
                                 if release_eval.release_as_timeout:
                                     release_penalty = self.pending_timeout_penalty
@@ -3714,6 +3888,7 @@ class RLTrainingPipeline:
                                 cooldown_active=cooldown_active,
                                 destination=vehicle.destination,
                                 decision_metrics=decision_metrics,
+                                coordination_state=step_coordination_state,
                             )
                             removed_actions = max(len(context.available_actions) - len(policy_actions), 0)
                             decision_metrics["policy_masked_actions_removed"] += removed_actions
@@ -4538,6 +4713,9 @@ class RLTrainingPipeline:
                         "reachable_lane_change_excluded_all": decision_metrics["reachable_lane_change_excluded_all"],
                         "policy_candidates_with_broader_available": decision_metrics["policy_candidates_with_broader_available"],
                         "policy_candidates_collapsed_to_lane_now_only": decision_metrics["policy_candidates_collapsed_to_lane_now_only"],
+                        "coordination_pending_reservations_seeded": decision_metrics["coordination_pending_reservations_seeded"],
+                        "coordination_pressure_candidates_seen": decision_metrics["coordination_pressure_candidates_seen"],
+                        "coordination_pressure_candidates_rejected": decision_metrics["coordination_pressure_candidates_rejected"],
                         "lane_now_congestion_candidates_seen": decision_metrics["lane_now_congestion_candidates_seen"],
                         "lane_now_congestion_candidates_rejected": decision_metrics["lane_now_congestion_candidates_rejected"],
                         "commit_window_non_lane_candidates_seen": decision_metrics["commit_window_non_lane_candidates_seen"],

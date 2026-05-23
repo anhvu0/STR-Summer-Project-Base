@@ -44,7 +44,7 @@ class ActionCorridorStats:
 
 @dataclass
 class CoordinationReservationState:
-    reserved_agents: int = 0
+    reserved_agents: float = 0.0
     next_edge_loads: Dict[str, float] = field(default_factory=dict)
     corridor_edge_loads: Dict[str, float] = field(default_factory=dict)
     destination_loads: Dict[str, float] = field(default_factory=dict)
@@ -91,8 +91,8 @@ class SharedDecisionPolicy:
         self.lane_now_near_junction_density_tighten = 0.10
         self.lane_now_near_junction_relief_tighten = 0.12
         self.lane_now_near_junction_distance_keep_extra = 12.0
-        self.lane_now_replan_min_age_steps = 10
-        self.lane_now_replan_low_speed_mps = 1.25
+        self.lane_now_replan_min_age_steps = 8
+        self.lane_now_replan_low_speed_mps = 1.75
         route_pending_stall_steps = int(getattr(self.decision_engine, "route_pending_stall_steps", 8))
         self.lane_now_replan_deadlock_min_age_steps = max(
             int(self.decision_engine.pending_progress_timeout_steps),
@@ -119,21 +119,41 @@ class SharedDecisionPolicy:
         self.coordination_destination_load_cap = 8.0
         self.coordination_reserved_agents_cap = 16.0
         self.coordination_rank_penalty_scale = 0.45
+        self.coordination_filter_pressure_margin = 0.85
+        self.coordination_filter_distance_base_slack_m = 12.0
+        self.coordination_filter_distance_cap_m = 32.0
         self.corridor_horizon_m = max(
             float(getattr(self.decision_engine, "default_fragment_horizon_m", 180.0)),
             120.0,
         )
         self.corridor_congestion_density_threshold = 0.32
         self.corridor_recent_revisit_window = 8
+        self.base_lane_feature_count = 3
+        self.spillback_lane_feature_count = 2
+        self.objective_feature_count = 3
+        self.base_branch_feature_count = 5
+        self.spillback_branch_feature_count = 2
+        self.compact_state_version = 2
+        self.vehicle_wait_time_clip_s = 120.0
 
-        self.compact_state_size_without_coordination = (
+        self.compact_state_size_without_coordination_v1 = (
             (2 * self.edge_embedding_dim)
             + (4 * self.action_count)
             + 1
-            + 3
-            + 3
+            + self.base_lane_feature_count
+            + self.objective_feature_count
             + self.local_congestion_k
-            + (5 * self.action_count)
+            + (self.base_branch_feature_count * self.action_count)
+        )
+        self.compact_state_size_v1 = (
+            self.compact_state_size_without_coordination_v1
+            + self.coordination_global_feature_count
+            + (self.coordination_action_feature_count * self.action_count)
+        )
+        self.compact_state_size_without_coordination = (
+            self.compact_state_size_without_coordination_v1
+            + self.spillback_lane_feature_count
+            + (self.spillback_branch_feature_count * self.action_count)
         )
         self.compact_state_size = (
             self.compact_state_size_without_coordination
@@ -143,6 +163,16 @@ class SharedDecisionPolicy:
 
     def legacy_state_size(self, edge_count: int) -> int:
         return 2 + self.action_count + 3 + 3 + int(edge_count)
+
+    def compact_lane_feature_count(self, version: int = 2) -> int:
+        if int(version) <= 1:
+            return self.base_lane_feature_count
+        return self.base_lane_feature_count + self.spillback_lane_feature_count
+
+    def compact_branch_feature_count(self, version: int = 2) -> int:
+        if int(version) <= 1:
+            return self.base_branch_feature_count
+        return self.base_branch_feature_count + self.spillback_branch_feature_count
 
     def empty_coordination_state(self) -> CoordinationReservationState:
         return CoordinationReservationState()
@@ -280,8 +310,12 @@ class SharedDecisionPolicy:
         context: DecisionContext,
         destination: str,
         action_idx: int,
+        weight: float = 1.0,
     ) -> None:
         if coordination_state is None:
+            return
+        weight = max(float(weight), 0.0)
+        if weight <= 0.0:
             return
         next_edge, corridor_edges = self._action_corridor_edges(
             edge_id=context.edge_id,
@@ -290,17 +324,64 @@ class SharedDecisionPolicy:
         )
         if next_edge is None:
             return
-        coordination_state.reserved_agents += 1
+        coordination_state.reserved_agents += weight
         coordination_state.destination_loads[destination] = (
-            float(coordination_state.destination_loads.get(destination, 0.0)) + 1.0
+            float(coordination_state.destination_loads.get(destination, 0.0)) + weight
         )
         coordination_state.next_edge_loads[next_edge] = (
-            float(coordination_state.next_edge_loads.get(next_edge, 0.0)) + 1.0
+            float(coordination_state.next_edge_loads.get(next_edge, 0.0)) + weight
         )
         for edge_id in corridor_edges:
             coordination_state.corridor_edge_loads[edge_id] = (
-                float(coordination_state.corridor_edge_loads.get(edge_id, 0.0)) + 1.0
+                float(coordination_state.corridor_edge_loads.get(edge_id, 0.0)) + weight
             )
+
+    def seed_coordination_from_pending(
+        self,
+        coordination_state: Optional[CoordinationReservationState],
+        pending_decisions: Dict[str, PendingDecision],
+        *,
+        current_step: Optional[int] = None,
+        max_age_steps: Optional[int] = None,
+    ) -> int:
+        """
+        Carry active cross-step commitments into this step's coordination state.
+
+        Same-step reservations alone miss vehicles that already committed a route
+        fragment in a previous step but have not reached the next strategic edge
+        yet. Seeding these pendings lets the policy see near-future corridor load,
+        not just vehicles already physically counted on an edge.
+        """
+        if coordination_state is None or not pending_decisions:
+            return 0
+
+        seeded = 0
+        for pending in pending_decisions.values():
+            if pending is None or getattr(pending, "context", None) is None:
+                continue
+            metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
+            if bool(metadata.get("decision_finalized", False)):
+                continue
+            if current_step is not None and max_age_steps is not None:
+                age = max(int(current_step) - int(pending.decision_step), 0)
+                if age > int(max_age_steps):
+                    continue
+            phase = self.pending_phase(pending)
+            if phase == "route_pending":
+                weight = 1.0
+            elif phase == "observe_lane_change":
+                weight = 0.5
+            else:
+                continue
+            self.reserve_action(
+                coordination_state,
+                context=pending.context,
+                destination=pending.destination,
+                action_idx=int(pending.intended_action),
+                weight=weight,
+            )
+            seeded += 1
+        return int(seeded)
 
     def classify_decision(self, context: DecisionContext) -> DecisionMode:
         if context.forced_action is not None:
@@ -491,6 +572,56 @@ class SharedDecisionPolicy:
             score=float(score),
         )
 
+    def _normalize_wait_time(self, wait_time_s: float) -> float:
+        return float(
+            np.clip(
+                float(max(wait_time_s, 0.0)) / max(float(self.vehicle_wait_time_clip_s), 1.0),
+                0.0,
+                1.0,
+            )
+        )
+
+    def _normalize_lane_occupancy(self, occupancy_value: float) -> float:
+        occupancy = max(float(occupancy_value), 0.0)
+        if occupancy > 1.0:
+            occupancy /= 100.0
+        return float(np.clip(occupancy, 0.0, 1.0))
+
+    def _normalize_halting_density(self, halting_density: float) -> float:
+        return float(np.clip(max(float(halting_density), 0.0), 0.0, 1.0))
+
+    def _next_edge_spillback_features(
+        self,
+        *,
+        edge_id: str,
+        action_idx: int,
+        lane_occupancy_fn: Optional[Callable[[str], float]],
+        lane_halting_density_fn: Optional[Callable[[str], float]],
+    ) -> Tuple[float, float]:
+        if lane_occupancy_fn is None or lane_halting_density_fn is None:
+            return 0.0, 0.0
+
+        next_edge = self.decision_engine.get_next_edge(edge_id, action_idx)
+        if next_edge is None:
+            return 0.0, 0.0
+
+        lane_ids = self.connection_info.edge_lane_ids.get(next_edge, [])
+        if not lane_ids:
+            return 0.0, 0.0
+
+        occupancy_values = [
+            self._normalize_lane_occupancy(lane_occupancy_fn(lane_id))
+            for lane_id in lane_ids
+        ]
+        halting_values = [
+            self._normalize_halting_density(lane_halting_density_fn(lane_id))
+            for lane_id in lane_ids
+        ]
+        return (
+            float(np.mean(occupancy_values)) if occupancy_values else 0.0,
+            float(np.mean(halting_values)) if halting_values else 0.0,
+        )
+
     def per_action_branch_features(
         self,
         context: DecisionContext,
@@ -499,11 +630,15 @@ class SharedDecisionPolicy:
         edge_density_fn: Callable[[str], float],
         eta_fn: Callable[[str, str], float],
         social_cost_fn: Callable[[str, int, str], float],
+        lane_occupancy_fn: Optional[Callable[[str], float]] = None,
+        lane_halting_density_fn: Optional[Callable[[str], float]] = None,
+        compact_state_version: int = 2,
     ) -> np.ndarray:
-        features = np.zeros(5 * self.action_count, dtype=np.float32)
+        branch_feature_count = self.compact_branch_feature_count(version=compact_state_version)
+        features = np.zeros(branch_feature_count * self.action_count, dtype=np.float32)
         lane_now = set(context.lane_feasible_now_actions)
         for action_idx in range(self.action_count):
-            base = action_idx * 5
+            base = action_idx * branch_feature_count
             if action_idx not in context.edge_valid_actions:
                 continue
             stats = self.action_corridor_stats(
@@ -525,6 +660,15 @@ class SharedDecisionPolicy:
             )
             social = social_cost_fn(context.edge_id, action_idx, destination)
             features[base + 4] = min(float(social), 10.0) if math.isfinite(social) else 10.0
+            if compact_state_version >= 2:
+                next_edge_occupancy, next_edge_halting = self._next_edge_spillback_features(
+                    edge_id=context.edge_id,
+                    action_idx=action_idx,
+                    lane_occupancy_fn=lane_occupancy_fn,
+                    lane_halting_density_fn=lane_halting_density_fn,
+                )
+                features[base + 5] = next_edge_occupancy
+                features[base + 6] = next_edge_halting
         return features
 
     def encode_state(
@@ -542,17 +686,29 @@ class SharedDecisionPolicy:
         edge_lane_meters_fn: Optional[Callable[[str], float]] = None,
         step: Optional[int] = None,
         vehicle_start_time: Optional[float] = None,
+        vehicle_wait_time_fn: Optional[Callable[[str], float]] = None,
+        lane_halting_density_fn: Optional[Callable[[str], float]] = None,
+        lane_occupancy_fn: Optional[Callable[[str], float]] = None,
         edge_index_lookup: Optional[Dict[str, int]] = None,
         legacy_aux_features: Optional[Sequence[float]] = None,
         legacy_density_values: Optional[Sequence[float]] = None,
         include_coordination: bool = False,
         coordination_state: Optional[CoordinationReservationState] = None,
+        compact_state_version: int = 2,
     ) -> np.ndarray:
         if use_compact_state:
-            state_size = (
-                self.compact_state_size
-                if include_coordination else self.compact_state_size_without_coordination
-            )
+            lane_feature_count = self.compact_lane_feature_count(version=compact_state_version)
+            branch_feature_count = self.compact_branch_feature_count(version=compact_state_version)
+            if int(compact_state_version) <= 1:
+                state_size = (
+                    self.compact_state_size_v1
+                    if include_coordination else self.compact_state_size_without_coordination_v1
+                )
+            else:
+                state_size = (
+                    self.compact_state_size
+                    if include_coordination else self.compact_state_size_without_coordination
+                )
             state = np.zeros(state_size, dtype=np.float32)
             state[0:self.edge_embedding_dim] = edge_embedding_fn(edge_id)
             state[self.edge_embedding_dim:(2 * self.edge_embedding_dim)] = edge_embedding_fn(destination_edge)
@@ -569,8 +725,17 @@ class SharedDecisionPolicy:
             state[lane_base + 0] = context.lane_index / max(context.lane_count - 1, 1)
             state[lane_base + 1] = min(context.lane_count, 6) / 6.0
             state[lane_base + 2] = min(max(context.dist_to_end, 0.0), 200.0) / 200.0
+            if compact_state_version >= 2:
+                if vehicle_wait_time_fn is not None:
+                    state[lane_base + 3] = self._normalize_wait_time(
+                        vehicle_wait_time_fn(context.vehicle_id)
+                    )
+                if lane_halting_density_fn is not None:
+                    state[lane_base + 4] = self._normalize_halting_density(
+                        lane_halting_density_fn(context.lane_id)
+                    )
 
-            objective_base = lane_base + 3
+            objective_base = lane_base + lane_feature_count
             current_density = float(edge_density_fn(edge_id))
             if step is not None and vehicle_start_time is not None:
                 elapsed = max(float(step) - float(vehicle_start_time), 0.0)
@@ -601,15 +766,19 @@ class SharedDecisionPolicy:
                 edge_density_fn=edge_density_fn,
                 eta_fn=eta_fn,
                 social_cost_fn=social_cost_fn,
+                lane_occupancy_fn=lane_occupancy_fn,
+                lane_halting_density_fn=lane_halting_density_fn,
+                compact_state_version=compact_state_version,
             )
-            state[branch_base:branch_base + len(branch_features)] = branch_features
+            expected_branch_size = branch_feature_count * self.action_count
+            state[branch_base:branch_base + expected_branch_size] = branch_features
             if include_coordination:
                 global_coord_features, action_coord_features = self.coordination_features(
                     context=context,
                     destination=destination_edge,
                     coordination_state=coordination_state,
                 )
-                coord_base = branch_base + len(branch_features)
+                coord_base = branch_base + expected_branch_size
                 state[coord_base:coord_base + self.coordination_global_feature_count] = global_coord_features
                 state[coord_base + self.coordination_global_feature_count:] = action_coord_features
             return state.reshape(1, -1)
@@ -655,6 +824,7 @@ class SharedDecisionPolicy:
         edge_density_fn: Optional[Callable[[str], float]] = None,
         metrics: Optional[Dict[str, float]] = None,
         distance_slack: Optional[float] = None,
+        coordination_state: Optional[CoordinationReservationState] = None,
     ) -> List[int]:
         available_actions = list(context.available_actions)
         if not available_actions:
@@ -764,6 +934,16 @@ class SharedDecisionPolicy:
             edge_density_fn=edge_density_fn,
             recent_history=recent_history,
         )
+        policy_actions = self._filter_coordination_pressure_actions(
+            context=context,
+            actions=policy_actions,
+            destination=destination,
+            distance_fn=distance_fn,
+            edge_density_fn=edge_density_fn,
+            recent_history=recent_history,
+            coordination_state=coordination_state,
+            metrics=metrics,
+        )
 
         broader_available_set = set(filtered_available_actions)
         lane_now_set = set(safe_lane_now_actions)
@@ -773,6 +953,102 @@ class SharedDecisionPolicy:
             if policy_set == lane_now_set and len(policy_set) < len(broader_available_set):
                 self._increment_metric(metrics, 'policy_candidates_collapsed_to_lane_now_only')
         return policy_actions
+
+    def _filter_coordination_pressure_actions(
+        self,
+        *,
+        context: DecisionContext,
+        actions: Sequence[int],
+        destination: str,
+        distance_fn: Callable[[str, str], float],
+        edge_density_fn: Optional[Callable[[str], float]],
+        recent_history: Optional[Sequence[str]],
+        coordination_state: Optional[CoordinationReservationState],
+        metrics: Optional[Dict[str, float]],
+    ) -> List[int]:
+        unique_actions = sorted(set(int(action) for action in actions))
+        if coordination_state is None or len(unique_actions) <= 1:
+            return unique_actions
+
+        density_lookup = edge_density_fn if edge_density_fn is not None else (lambda edge_id: 0.0)
+        current_distance = float(distance_fn(context.edge_id, destination))
+        distance_slack = self._distance_detour_slack(
+            current_distance,
+            base=float(self.coordination_filter_distance_base_slack_m),
+            cap=float(self.coordination_filter_distance_cap_m),
+            fraction=0.08,
+        )
+
+        scored = []
+        for action in unique_actions:
+            stats = self.action_corridor_stats(
+                edge_id=context.edge_id,
+                action_idx=action,
+                destination=destination,
+                edge_density_fn=density_lookup,
+                distance_fn=distance_fn,
+                recent_history=recent_history,
+            )
+            if stats is None or stats.next_edge is None:
+                continue
+            pressure = self.coordination_pressure_score(
+                context=context,
+                destination=destination,
+                action_idx=action,
+                coordination_state=coordination_state,
+            )
+            scored.append((int(action), stats, float(pressure)))
+
+        if len(scored) <= 1:
+            return unique_actions
+
+        min_pressure = min(pressure for _, _, pressure in scored)
+        best_distance = min(
+            float(stats.next_distance)
+            for _, stats, _ in scored
+            if math.isfinite(float(stats.next_distance))
+        ) if any(math.isfinite(float(stats.next_distance)) for _, stats, _ in scored) else float("inf")
+        kept = []
+        for action, stats, pressure in scored:
+            action_distance = float(stats.next_distance)
+            high_pressure = pressure >= (
+                min_pressure + float(self.coordination_filter_pressure_margin)
+            )
+            if not high_pressure:
+                kept.append(action)
+                continue
+
+            lower_pressure_alternative = False
+            for alt_action, alt_stats, alt_pressure in scored:
+                if alt_action == action:
+                    continue
+                if alt_pressure > pressure - float(self.coordination_filter_pressure_margin):
+                    continue
+                alt_distance = float(alt_stats.next_distance)
+                if not math.isfinite(action_distance) or not math.isfinite(alt_distance):
+                    lower_pressure_alternative = True
+                    break
+                if alt_distance <= action_distance + distance_slack:
+                    lower_pressure_alternative = True
+                    break
+
+            if not lower_pressure_alternative:
+                kept.append(action)
+                continue
+            self._increment_metric(metrics, "coordination_pressure_candidates_seen")
+            if (
+                math.isfinite(action_distance)
+                and math.isfinite(best_distance)
+                and action_distance <= best_distance - distance_slack
+            ):
+                kept.append(action)
+                continue
+
+            self._increment_metric(metrics, "coordination_pressure_candidates_rejected")
+
+        if kept:
+            return sorted(set(kept))
+        return [min(scored, key=lambda item: (item[2], float(item[1].next_distance), item[0]))[0]]
 
     def rank_policy_actions(
         self,

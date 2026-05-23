@@ -61,19 +61,19 @@ def build_parser():
     parser.add_argument(
         "--controlled-vehicles",
         type=int,
-        default=100,
+        default=80,
         help="Number of controlled vehicles. Defaults to the frozen-eval training value.",
     )
     parser.add_argument(
         "--uncontrolled-vehicles",
         type=int,
-        default=100,
+        default=140,
         help="Number of uncontrolled background vehicles. Defaults to the frozen-eval training value.",
     )
     parser.add_argument(
         "--pattern",
         type=int,
-        default=1,
+        default=3,
         help="Vehicle generation pattern. Defaults to the training/frozen-eval pattern.",
     )
     parser.add_argument(
