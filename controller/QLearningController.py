@@ -121,9 +121,26 @@ class QLearningPolicy(RouteController):
             density_scale_m=100.0,
         )
         # Must match RLTrainingPipeline compact state spec; retrained models are required when this changes.
+        self.compact_state_size_without_coordination = self.shared_policy.compact_state_size_without_coordination
         self.compact_state_size = self.shared_policy.compact_state_size
         self.legacy_state_size = self.shared_policy.legacy_state_size(len(self.connection_info.edge_list))
-        self.use_compact_state = (self.model_state_size == self.compact_state_size)
+        self.use_coordination_state = (self.model_state_size == self.compact_state_size)
+        if self.model_state_size == self.compact_state_size:
+            self.use_compact_state = True
+        elif self.model_state_size == self.compact_state_size_without_coordination:
+            self.use_compact_state = True
+        elif self.model_state_size == self.legacy_state_size:
+            self.use_compact_state = False
+        else:
+            raise ValueError(
+                "Checkpoint state_size={} is incompatible with current controller specs "
+                "(coordination_compact={}, compact={}, legacy={}).".format(
+                    self.model_state_size,
+                    self.compact_state_size,
+                    self.compact_state_size_without_coordination,
+                    self.legacy_state_size,
+                )
+            )
         self.density_scale_m = 100.0
         self._edge_list = tuple(self.connection_info.edge_list)
         self._lane_length_cache = {}
@@ -783,12 +800,13 @@ class QLearningPolicy(RouteController):
         self._prepare_step_cache(step)
         self._refresh_density_stats(step)
         open_decision_batch = []
+        step_coordination_state = self.shared_policy.empty_coordination_state()
 
-        def process_selected_action(vid, vehicle, start_edge, context, recent, action_idx):
+        def process_selected_action(vid, vehicle, start_edge, context, recent, action_idx, coordination_state=None):
             if action_idx not in context.available_actions:
                 self._metrics["overrides"] += 1
                 self._metrics["impossible_action_overrides"] += 1
-                return
+                return None
             safe_ok, signal = self.decision_engine.prefilter_action_for_loops(
                 context=context,
                 action_idx=action_idx,
@@ -813,9 +831,10 @@ class QLearningPolicy(RouteController):
                     recent_history=recent,
                     distance_fn=self._dist_to_dest,
                     edge_density_fn=self._edge_density,
+                    coordination_state=coordination_state,
                 )
                 if fallback_action is None:
-                    return
+                    return None
                 action_idx = fallback_action
                 self._metrics["fallback_selected_total"] += 1
                 if action_idx in context.lane_feasible_now_actions:
@@ -823,7 +842,7 @@ class QLearningPolicy(RouteController):
 
             selected_next_edge = self.decision_engine.get_next_edge(start_edge, action_idx)
             if selected_next_edge is None:
-                return
+                return None
 
             lane_change_requested = False
             if action_idx not in context.lane_feasible_now_actions:
@@ -839,9 +858,10 @@ class QLearningPolicy(RouteController):
                         distance_fn=self._dist_to_dest,
                         edge_density_fn=self._edge_density,
                         lane_now_only=True,
+                        coordination_state=coordination_state,
                     )
                     if action_idx is None:
-                        return
+                        return None
                     self._metrics["fallback_selected_total"] += 1
                     if action_idx in context.lane_feasible_now_actions:
                         self._metrics["fallback_selected_lane_now"] += 1
@@ -867,7 +887,7 @@ class QLearningPolicy(RouteController):
                     )
                     self._metrics["lane_change_observe_started"] += 1
                     self._metrics["deferred_lane_change_actions"] += 1
-                    return
+                    return int(action_idx)
 
             full_route, committed_next_edge, apply_error = self.decision_engine.apply_route_decision(
                 str(vid),
@@ -878,7 +898,7 @@ class QLearningPolicy(RouteController):
             if apply_error:
                 self._metrics["overrides"] += 1
                 self._metrics["distance_overrides"] += 1
-                return
+                return None
 
             next_edge = committed_next_edge
             if next_edge:
@@ -900,6 +920,7 @@ class QLearningPolicy(RouteController):
                     decision_open_recorded=True,
                 )
             # Route already committed directly via shared apply_route_decision.
+            return int(action_idx)
 
         if not hasattr(self, "_debug_net_checked"):
             self._debug_net_checked = True
@@ -975,6 +996,12 @@ class QLearningPolicy(RouteController):
                             full_route=full_route,
                             state=None,
                         )
+                        self.shared_policy.reserve_action(
+                            step_coordination_state,
+                            context=context,
+                            destination=vehicle.destination,
+                            action_idx=int(action_idx),
+                        )
                         continue
                     if reason == "commit_window":
                         self._metrics["lane_change_observe_abort_commit_window"] += 1
@@ -997,6 +1024,7 @@ class QLearningPolicy(RouteController):
                         distance_fn=self._dist_to_dest,
                         edge_density_fn=self._edge_density,
                         lane_now_only=True,
+                        coordination_state=step_coordination_state,
                     )
                     if action_idx is None:
                         continue
@@ -1026,6 +1054,12 @@ class QLearningPolicy(RouteController):
                         full_route=full_route,
                         decision_open_recorded=True,
                     )
+                    self.shared_policy.reserve_action(
+                        step_coordination_state,
+                        context=obs_context,
+                        destination=vehicle.destination,
+                        action_idx=int(action_idx),
+                    )
                     continue
                 continue
 
@@ -1035,39 +1069,26 @@ class QLearningPolicy(RouteController):
             context = self._get_step_context(str(vid), start_edge, vehicle.destination, step, snapshot=snapshot)
             decision_mode = self.shared_policy.classify_decision(context)
             if decision_mode.mode == "forced":
-                process_selected_action(vid, vehicle, start_edge, context, recent, int(decision_mode.action))
+                effective_action = process_selected_action(
+                    vid,
+                    vehicle,
+                    start_edge,
+                    context,
+                    recent,
+                    int(decision_mode.action),
+                    coordination_state=step_coordination_state,
+                )
+                if effective_action is not None:
+                    self.shared_policy.reserve_action(
+                        step_coordination_state,
+                        context=context,
+                        destination=vehicle.destination,
+                        action_idx=int(effective_action),
+                    )
                 continue
             elif decision_mode.mode != "open":
                 continue
             else:
-                state = self.getState(vid, start_edge, vehicle.destination, context=context)
-                cooldown_until = self._lane_change_cooldown.get((vid, start_edge), -1)
-                cooldown_active = step < cooldown_until
-                policy_actions = self.shared_policy.policy_action_candidates(
-                    context,
-                    recent_history=recent,
-                    cooldown_active=cooldown_active,
-                    destination=vehicle.destination,
-                    distance_fn=self._dist_to_dest,
-                    edge_density_fn=self._edge_density,
-                    metrics=self._metrics,
-                    distance_slack=self.score_slack,
-                )
-                policy_actions = self.shared_policy.rank_policy_actions(
-                    context=context,
-                    actions=policy_actions,
-                    destination=vehicle.destination,
-                    distance_fn=self._dist_to_dest,
-                    edge_density_fn=self._edge_density,
-                    recent_history=recent,
-                )
-                policy_actions = self._force_stale_lane_now_replan_if_available(
-                    vid,
-                    start_edge,
-                    step,
-                    context,
-                    policy_actions,
-                )
                 self._metrics["decisions"] += 1
                 open_decision_batch.append(
                     {
@@ -1076,25 +1097,71 @@ class QLearningPolicy(RouteController):
                         "start_edge": start_edge,
                         "context": context,
                         "recent": recent,
-                        "state": state,
-                        "policy_actions": policy_actions,
                     }
                 )
 
         if open_decision_batch:
-            action_indices = self.act_batch(
-                [entry["state"] for entry in open_decision_batch],
-                [entry["policy_actions"] for entry in open_decision_batch],
+            ordered_entries = sorted(
+                open_decision_batch,
+                key=lambda entry: self.shared_policy.coordination_priority(
+                    entry["context"],
+                    destination=entry["vehicle"].destination,
+                    edge_density_fn=self._edge_density,
+                ),
             )
-            for entry, action_idx in zip(open_decision_batch, action_indices):
-                process_selected_action(
+            for entry in ordered_entries:
+                state = self.getState(
+                    entry["vid"],
+                    entry["start_edge"],
+                    entry["vehicle"].destination,
+                    context=entry["context"],
+                    coordination_state=step_coordination_state,
+                )
+                cooldown_until = self._lane_change_cooldown.get((entry["vid"], entry["start_edge"]), -1)
+                cooldown_active = step < cooldown_until
+                policy_actions = self.shared_policy.policy_action_candidates(
+                    entry["context"],
+                    recent_history=entry["recent"],
+                    cooldown_active=cooldown_active,
+                    destination=entry["vehicle"].destination,
+                    distance_fn=self._dist_to_dest,
+                    edge_density_fn=self._edge_density,
+                    metrics=self._metrics,
+                    distance_slack=self.score_slack,
+                )
+                policy_actions = self.shared_policy.rank_policy_actions(
+                    context=entry["context"],
+                    actions=policy_actions,
+                    destination=entry["vehicle"].destination,
+                    distance_fn=self._dist_to_dest,
+                    edge_density_fn=self._edge_density,
+                    recent_history=entry["recent"],
+                    coordination_state=step_coordination_state,
+                )
+                policy_actions = self._force_stale_lane_now_replan_if_available(
+                    entry["vid"],
+                    entry["start_edge"],
+                    step,
+                    entry["context"],
+                    policy_actions,
+                )
+                action_idx = self.act(state, policy_actions)
+                effective_action = process_selected_action(
                     entry["vid"],
                     entry["vehicle"],
                     entry["start_edge"],
                     entry["context"],
                     entry["recent"],
                     action_idx,
+                    coordination_state=step_coordination_state,
                 )
+                if effective_action is not None:
+                    self.shared_policy.reserve_action(
+                        step_coordination_state,
+                        context=entry["context"],
+                        destination=entry["vehicle"].destination,
+                        action_idx=int(effective_action),
+                    )
 
         if self._metrics["decisions"] > 0:
             snapshot = (
@@ -1162,7 +1229,7 @@ class QLearningPolicy(RouteController):
             results.append(int(np.argmax(masked)))
         return results
     # this function gives the current state of the vehicle based on the state size
-    def getState(self, vehicle_id, edge_now, destination_edge, context=None):
+    def getState(self, vehicle_id, edge_now, destination_edge, context=None, coordination_state=None):
         en = edge_now
         current_step = int(context.step) if context is not None else int(
             self._step_cache_step if self._step_cache_step is not None else traci.simulation.getTime()
@@ -1248,4 +1315,6 @@ class QLearningPolicy(RouteController):
             edge_index_lookup=self.connection_info.edge_index_dict,
             legacy_aux_features=deadline_features,
             legacy_density_values=[cached_edge_density(edge_id) for edge_id in self.connection_info.edge_list] if not self.use_compact_state else None,
+            include_coordination=bool(self.use_compact_state and self.use_coordination_state),
+            coordination_state=coordination_state,
         )

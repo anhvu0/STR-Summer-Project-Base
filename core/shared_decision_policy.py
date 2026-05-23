@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import math
 
@@ -40,6 +40,14 @@ class ActionCorridorStats:
     trap_score: float
     revisit_hits: int
     score: float
+
+
+@dataclass
+class CoordinationReservationState:
+    reserved_agents: int = 0
+    next_edge_loads: Dict[str, float] = field(default_factory=dict)
+    corridor_edge_loads: Dict[str, float] = field(default_factory=dict)
+    destination_loads: Dict[str, float] = field(default_factory=dict)
 
 
 class SharedDecisionPolicy:
@@ -104,6 +112,13 @@ class SharedDecisionPolicy:
         self.policy_detour_density_relief = 0.12
         self.lane_now_replan_distance_slack_m = 14.0
         self.lane_now_deadlock_distance_slack_m = 10.0
+        self.coordination_global_feature_count = 4
+        self.coordination_action_feature_count = 2
+        self.coordination_next_edge_load_cap = 4.0
+        self.coordination_corridor_load_cap = 8.0
+        self.coordination_destination_load_cap = 8.0
+        self.coordination_reserved_agents_cap = 16.0
+        self.coordination_rank_penalty_scale = 0.45
         self.corridor_horizon_m = max(
             float(getattr(self.decision_engine, "default_fragment_horizon_m", 180.0)),
             120.0,
@@ -111,7 +126,7 @@ class SharedDecisionPolicy:
         self.corridor_congestion_density_threshold = 0.32
         self.corridor_recent_revisit_window = 8
 
-        self.compact_state_size = (
+        self.compact_state_size_without_coordination = (
             (2 * self.edge_embedding_dim)
             + (4 * self.action_count)
             + 1
@@ -120,9 +135,172 @@ class SharedDecisionPolicy:
             + self.local_congestion_k
             + (5 * self.action_count)
         )
+        self.compact_state_size = (
+            self.compact_state_size_without_coordination
+            + self.coordination_global_feature_count
+            + (self.coordination_action_feature_count * self.action_count)
+        )
 
     def legacy_state_size(self, edge_count: int) -> int:
         return 2 + self.action_count + 3 + 3 + int(edge_count)
+
+    def empty_coordination_state(self) -> CoordinationReservationState:
+        return CoordinationReservationState()
+
+    def coordination_priority(
+        self,
+        context: DecisionContext,
+        *,
+        destination: str,
+        edge_density_fn: Optional[Callable[[str], float]] = None,
+    ) -> Tuple[object, ...]:
+        density = float(edge_density_fn(context.edge_id)) if edge_density_fn is not None else 0.0
+        return (
+            0.0 if context.commit_window else 1.0,
+            float(context.dist_to_end),
+            float(max(len(context.available_actions), 1)),
+            -float(density),
+            -float(context.speed),
+            float(len(context.lane_feasible_now_actions)),
+            str(destination),
+            str(context.vehicle_id),
+        )
+
+    def _normalize_coordination_value(self, value: float, cap: float) -> float:
+        cap = max(float(cap), 1.0)
+        return float(np.clip(float(value) / cap, 0.0, 1.0))
+
+    def coordination_features(
+        self,
+        *,
+        context: DecisionContext,
+        destination: str,
+        coordination_state: Optional[CoordinationReservationState],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        global_features = np.zeros(self.coordination_global_feature_count, dtype=np.float32)
+        action_features = np.zeros(
+            self.coordination_action_feature_count * self.action_count,
+            dtype=np.float32,
+        )
+        if coordination_state is None:
+            return global_features, action_features
+
+        outgoing_edges = tuple(
+            str(edge_id)
+            for edge_id in self.connection_info.outgoing_edges_dict.get(context.edge_id, {}).values()
+            if edge_id
+        )
+        outgoing_next_edge_load = sum(
+            float(coordination_state.next_edge_loads.get(edge_id, 0.0))
+            for edge_id in outgoing_edges
+        )
+        max_outgoing_next_edge_load = max(
+            [float(coordination_state.next_edge_loads.get(edge_id, 0.0)) for edge_id in outgoing_edges] or [0.0]
+        )
+        destination_load = float(coordination_state.destination_loads.get(destination, 0.0))
+        current_edge_corridor_load = float(coordination_state.corridor_edge_loads.get(context.edge_id, 0.0))
+
+        global_features[0] = self._normalize_coordination_value(
+            coordination_state.reserved_agents,
+            self.coordination_reserved_agents_cap,
+        )
+        global_features[1] = self._normalize_coordination_value(
+            destination_load,
+            self.coordination_destination_load_cap,
+        )
+        global_features[2] = self._normalize_coordination_value(
+            max_outgoing_next_edge_load,
+            self.coordination_next_edge_load_cap,
+        )
+        global_features[3] = self._normalize_coordination_value(
+            current_edge_corridor_load + outgoing_next_edge_load,
+            self.coordination_corridor_load_cap,
+        )
+
+        for action_idx in range(self.action_count):
+            next_edge, corridor_edges = self._action_corridor_edges(
+                edge_id=context.edge_id,
+                action_idx=action_idx,
+                destination=destination,
+            )
+            if next_edge is None:
+                continue
+            base = action_idx * self.coordination_action_feature_count
+            next_edge_load = float(coordination_state.next_edge_loads.get(next_edge, 0.0))
+            corridor_overlap = sum(
+                float(coordination_state.corridor_edge_loads.get(edge_id, 0.0))
+                for edge_id in corridor_edges
+            )
+            action_features[base + 0] = self._normalize_coordination_value(
+                next_edge_load,
+                self.coordination_next_edge_load_cap,
+            )
+            action_features[base + 1] = self._normalize_coordination_value(
+                corridor_overlap,
+                self.coordination_corridor_load_cap,
+            )
+        return global_features, action_features
+
+    def coordination_pressure_score(
+        self,
+        *,
+        context: DecisionContext,
+        destination: str,
+        action_idx: int,
+        coordination_state: Optional[CoordinationReservationState],
+    ) -> float:
+        if coordination_state is None:
+            return 0.0
+        next_edge, corridor_edges = self._action_corridor_edges(
+            edge_id=context.edge_id,
+            action_idx=action_idx,
+            destination=destination,
+        )
+        if next_edge is None:
+            return 0.0
+
+        next_edge_load = float(coordination_state.next_edge_loads.get(next_edge, 0.0))
+        corridor_overlap = sum(
+            float(coordination_state.corridor_edge_loads.get(edge_id, 0.0))
+            for edge_id in corridor_edges
+        ) / max(len(corridor_edges), 1)
+        destination_load = float(coordination_state.destination_loads.get(destination, 0.0))
+        required_shift = float(max(context.required_lane_shift.get(action_idx, 0), 0))
+        return float(
+            (1.0 * next_edge_load)
+            + (0.35 * corridor_overlap)
+            + (0.10 * destination_load)
+            + (0.08 * required_shift)
+        )
+
+    def reserve_action(
+        self,
+        coordination_state: Optional[CoordinationReservationState],
+        *,
+        context: DecisionContext,
+        destination: str,
+        action_idx: int,
+    ) -> None:
+        if coordination_state is None:
+            return
+        next_edge, corridor_edges = self._action_corridor_edges(
+            edge_id=context.edge_id,
+            action_idx=action_idx,
+            destination=destination,
+        )
+        if next_edge is None:
+            return
+        coordination_state.reserved_agents += 1
+        coordination_state.destination_loads[destination] = (
+            float(coordination_state.destination_loads.get(destination, 0.0)) + 1.0
+        )
+        coordination_state.next_edge_loads[next_edge] = (
+            float(coordination_state.next_edge_loads.get(next_edge, 0.0)) + 1.0
+        )
+        for edge_id in corridor_edges:
+            coordination_state.corridor_edge_loads[edge_id] = (
+                float(coordination_state.corridor_edge_loads.get(edge_id, 0.0)) + 1.0
+            )
 
     def classify_decision(self, context: DecisionContext) -> DecisionMode:
         if context.forced_action is not None:
@@ -367,9 +545,15 @@ class SharedDecisionPolicy:
         edge_index_lookup: Optional[Dict[str, int]] = None,
         legacy_aux_features: Optional[Sequence[float]] = None,
         legacy_density_values: Optional[Sequence[float]] = None,
+        include_coordination: bool = False,
+        coordination_state: Optional[CoordinationReservationState] = None,
     ) -> np.ndarray:
         if use_compact_state:
-            state = np.zeros(self.compact_state_size, dtype=np.float32)
+            state_size = (
+                self.compact_state_size
+                if include_coordination else self.compact_state_size_without_coordination
+            )
+            state = np.zeros(state_size, dtype=np.float32)
             state[0:self.edge_embedding_dim] = edge_embedding_fn(edge_id)
             state[self.edge_embedding_dim:(2 * self.edge_embedding_dim)] = edge_embedding_fn(destination_edge)
 
@@ -410,13 +594,24 @@ class SharedDecisionPolicy:
                 global_density_stats=global_density_stats,
             )
             state[congestion_base:congestion_base + self.local_congestion_k] = congestion_features
-            state[congestion_base + self.local_congestion_k:] = self.per_action_branch_features(
+            branch_base = congestion_base + self.local_congestion_k
+            branch_features = self.per_action_branch_features(
                 context,
                 destination_edge,
                 edge_density_fn=edge_density_fn,
                 eta_fn=eta_fn,
                 social_cost_fn=social_cost_fn,
             )
+            state[branch_base:branch_base + len(branch_features)] = branch_features
+            if include_coordination:
+                global_coord_features, action_coord_features = self.coordination_features(
+                    context=context,
+                    destination=destination_edge,
+                    coordination_state=coordination_state,
+                )
+                coord_base = branch_base + len(branch_features)
+                state[coord_base:coord_base + self.coordination_global_feature_count] = global_coord_features
+                state[coord_base + self.coordination_global_feature_count:] = action_coord_features
             return state.reshape(1, -1)
 
         if edge_index_lookup is None:
@@ -588,6 +783,7 @@ class SharedDecisionPolicy:
         distance_fn: Callable[[str, str], float],
         edge_density_fn: Optional[Callable[[str], float]],
         recent_history: Optional[Sequence[str]] = None,
+        coordination_state: Optional[CoordinationReservationState] = None,
     ) -> List[int]:
         """
         Return policy candidates in best-first heuristic order.
@@ -656,6 +852,12 @@ class SharedDecisionPolicy:
                 score += 0.80
             if action in lane_now:
                 score -= 0.05
+            score += self.coordination_rank_penalty_scale * self.coordination_pressure_score(
+                context=context,
+                destination=destination,
+                action_idx=action,
+                coordination_state=coordination_state,
+            )
             scored.append((float(score), action))
 
         if not scored:
@@ -969,6 +1171,7 @@ class SharedDecisionPolicy:
         distance_fn: Callable[[str, str], float],
         edge_density_fn: Optional[Callable[[str], float]] = None,
         lane_now_only: bool = False,
+        coordination_state: Optional[CoordinationReservationState] = None,
     ) -> Optional[int]:
         lane_now_candidates = self.decision_engine.lane_feasible_fallback_actions(
             context,
@@ -1026,6 +1229,7 @@ class SharedDecisionPolicy:
                 distance_fn=distance_fn,
                 edge_density_fn=edge_density_fn,
                 recent_history=recent_history,
+                coordination_state=coordination_state,
             )
         if ranked:
             return int(ranked[0])

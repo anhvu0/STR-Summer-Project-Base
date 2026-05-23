@@ -73,7 +73,7 @@ def build_parser():
     parser.add_argument(
         "--pattern",
         type=int,
-        default=3,
+        default=1,
         help="Vehicle generation pattern. Defaults to the training/frozen-eval pattern.",
     )
     parser.add_argument(

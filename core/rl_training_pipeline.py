@@ -720,6 +720,8 @@ class RLTrainingPipeline:
         self.travel_time_penalty = 0.05
         self.eta_progress_scale = 0.65
         self.distance_tiebreak_scale = 0.06
+        self.coordination_pressure_penalty = 0.35
+        self.pending_coordination_penalty = 0.04
         self.score_slack = 30.0
         self.reward_clip_low = -20.0
         self.reward_clip_high = 20.0
@@ -1290,7 +1292,7 @@ class RLTrainingPipeline:
         route_file = route_file_node[0].attributes['value'].nodeValue
         return net_file, route_file
 
-    def encode_state(self, vehicle_id, edge_id, destination_edge, context=None, vehicle=None, step=None, snapshot=None):
+    def encode_state(self, vehicle_id, edge_id, destination_edge, context=None, vehicle=None, step=None, snapshot=None, coordination_state=None):
         """
         Build a state vector for the given edge using cached per-step densities.
         """
@@ -1318,6 +1320,8 @@ class RLTrainingPipeline:
             global_density_stats=(float(self._density_mean), float(self._density_std)),
             step=step,
             vehicle_start_time=(float(vehicle.start_time) if vehicle is not None else None),
+            include_coordination=True,
+            coordination_state=coordination_state,
         )
     
     def valid_actions_for_vehicle(self, vehicle_id, edge_id, destination_edge, step):
@@ -1344,7 +1348,7 @@ class RLTrainingPipeline:
             recent_history=recent_history,
         )
 
-    def _select_fallback_action(self, context, blocked_action, destination, recent_history, lane_now_only=False):
+    def _select_fallback_action(self, context, blocked_action, destination, recent_history, lane_now_only=False, coordination_state=None):
         return self.shared_policy.select_fallback_action(
             context,
             blocked_action=blocked_action,
@@ -1353,6 +1357,7 @@ class RLTrainingPipeline:
             distance_fn=self.get_distance_to_destination,
             edge_density_fn=self._edge_density,
             lane_now_only=lane_now_only,
+            coordination_state=coordination_state,
         )
 
     def _record_recent_decision_attribution(self, decision_attribution_by_vehicle, vehicle_id, step, action_source, resolution_mode):
@@ -1534,8 +1539,17 @@ class RLTrainingPipeline:
         step,
         snapshot,
         context=None,
+        coordination_state=None,
     ):
-        key = (str(vehicle_id), snapshot.edge_id, vehicle.destination, int(step))
+        coord_key = None
+        if coordination_state is not None:
+            coord_key = (
+                int(coordination_state.reserved_agents),
+                tuple(sorted((str(edge), float(load)) for edge, load in coordination_state.next_edge_loads.items())),
+                tuple(sorted((str(edge), float(load)) for edge, load in coordination_state.corridor_edge_loads.items())),
+                tuple(sorted((str(dest), float(load)) for dest, load in coordination_state.destination_loads.items())),
+            )
+        key = (str(vehicle_id), snapshot.edge_id, vehicle.destination, int(step), coord_key)
         cached = state_cache.get(key)
         if cached is not None:
             self._cache_metrics["snapshot_cache_hits"] += 1
@@ -1557,6 +1571,7 @@ class RLTrainingPipeline:
             vehicle=vehicle,
             step=step,
             snapshot=snapshot,
+            coordination_state=coordination_state,
         )
         state_cache[key] = state
         return state
@@ -1777,6 +1792,7 @@ class RLTrainingPipeline:
                 arrived=True,
                 delta_t=max(step - pending.last_credit_step, 1),
                 reached_global_destination=True,
+                coordination_pressure=float((pending.metadata or {}).get("coordination_pressure", 0.0)),
                 hard_brake_events=hard_brake_events,
                 terminal_outcome=outcome,
             )
@@ -1810,6 +1826,7 @@ class RLTrainingPipeline:
                 pending_age=max(step - pending.decision_step, 0),
                 lane_change_deferrals=pending.metadata.get("lane_change_deferrals", 0),
                 hard_brake_events=hard_brake_events,
+                coordination_pressure=float((pending.metadata or {}).get("coordination_pressure", 0.0)),
             ) + self.pending_timeout_penalty
             reward = self._clip_reward(reward)
             done = True
@@ -1966,6 +1983,7 @@ class RLTrainingPipeline:
         long_horizon_loop=False,
         externality_penalty=0.0,
         selfless_delta=0.0,
+        coordination_pressure=0.0,
         hard_brake_events=0,
         terminal_outcome=None,
     ):
@@ -1997,6 +2015,7 @@ class RLTrainingPipeline:
         reward += self.selfless_reward_scale * float(
             np.clip(selfless_delta, -self.selfless_reward_clip, self.selfless_reward_clip)
         )
+        reward -= self.coordination_pressure_penalty * float(np.clip(coordination_pressure, 0.0, 6.0))
         reward -= self._tail_delay_penalty_increment(
             vehicle,
             current_edge,
@@ -2055,7 +2074,7 @@ class RLTrainingPipeline:
     def _clip_reward(self, reward_value):
         return float(np.clip(reward_value, self.reward_clip_low, self.reward_clip_high))
 
-    def compute_pending_step_reward(self, vehicle, edge_id, elapsed, step, externality_penalty=0.0, pending_age=0, lane_change_deferrals=0, hard_brake_events=0):
+    def compute_pending_step_reward(self, vehicle, edge_id, elapsed, step, externality_penalty=0.0, pending_age=0, lane_change_deferrals=0, hard_brake_events=0, coordination_pressure=0.0):
         """
         Dense reward used while a decision is pending and has not finalized yet.
         Keeps the training objective travel-time centric without waiting for an edge transition.
@@ -2072,6 +2091,7 @@ class RLTrainingPipeline:
         mean_density = float(self._density_mean)
         marginal_pressure = max(edge_density - mean_density, 0.0)
         reward -= self.system_congestion_scale * marginal_pressure * elapsed
+        reward -= self.pending_coordination_penalty * float(np.clip(coordination_pressure, 0.0, 6.0)) * elapsed
         reward -= self.pending_latency_penalty_per_step * float(max(pending_age, 0))
         reward -= 0.02 * float(max(lane_change_deferrals, 0))
         if hard_brake_events > 0:
@@ -2528,6 +2548,7 @@ class RLTrainingPipeline:
                 state,
                 action,
                 action_source,
+                coordination_state=None,
             ):
                 nonlocal episode_return_total
 
@@ -2538,7 +2559,7 @@ class RLTrainingPipeline:
                     decision_metrics["safety_overrides"] += 1
                     self._record_override_event(decision_metrics, "invalid_action")
                     prev_edge_by_vehicle[vehicle_id] = current_edge
-                    return
+                    return None
 
                 safe_ok, safety_details = self.decision_engine.prefilter_action_for_loops(
                     context=context,
@@ -2558,10 +2579,11 @@ class RLTrainingPipeline:
                         blocked_action=action,
                         destination=vehicle.destination,
                         recent_history=recent_history,
+                        coordination_state=coordination_state,
                     )
                     if action is None:
                         prev_edge_by_vehicle[vehicle_id] = current_edge
-                        return
+                        return None
                     decision_metrics["fallback_overrides"] += 1
                     decision_metrics["fallback_selected_total"] += 1
                     self._record_override_event(decision_metrics, "loop_prefilter")
@@ -2618,7 +2640,7 @@ class RLTrainingPipeline:
                     next_edge = self.decision_engine.get_next_edge(current_edge, action)
                     if next_edge is None:
                         prev_edge_by_vehicle[vehicle_id] = current_edge
-                        return
+                        return None
 
                 lane_change_requested = False
                 if action not in context.lane_feasible_now_actions:
@@ -2632,10 +2654,11 @@ class RLTrainingPipeline:
                             destination=vehicle.destination,
                             recent_history=recent_history,
                             lane_now_only=True,
+                            coordination_state=coordination_state,
                         )
                         if fallback_action is None:
                             prev_edge_by_vehicle[vehicle_id] = current_edge
-                            return
+                            return None
                         action = fallback_action
                         action_source = "cooldown_fallback"
                         decision_metrics["fallback_overrides"] += 1
@@ -2725,6 +2748,14 @@ class RLTrainingPipeline:
                             action_source=action_source,
                             observe_metadata=observe_metadata,
                             decision_open_recorded=False,
+                            extra_metadata={
+                                "coordination_pressure": self.shared_policy.coordination_pressure_score(
+                                    context=context,
+                                    destination=vehicle.destination,
+                                    action_idx=action,
+                                    coordination_state=coordination_state,
+                                ),
+                            },
                         )
                         self._record_recent_decision_attribution(
                             decision_attribution_by_vehicle,
@@ -2743,7 +2774,7 @@ class RLTrainingPipeline:
                         ):
                             decision_metrics["same_edge_reopen_after_abort_count"] += 1
                         prev_edge_by_vehicle[vehicle_id] = current_edge
-                        return
+                        return int(action)
 
                 candidate_next_edges = {
                     candidate_action: self.decision_engine.get_next_edge(current_edge, candidate_action)
@@ -2774,6 +2805,12 @@ class RLTrainingPipeline:
                 ]
                 baseline_cost = float(min(baseline_finite_costs)) if baseline_finite_costs else math.inf
                 selfless_delta = float(baseline_cost - chosen_cost) if math.isfinite(chosen_cost) and math.isfinite(baseline_cost) else 0.0
+                coordination_pressure = self.shared_policy.coordination_pressure_score(
+                    context=context,
+                    destination=vehicle.destination,
+                    action_idx=action,
+                    coordination_state=coordination_state,
+                )
                 if len(candidate_actions) > 1 and finite_costs and action in finite_costs:
                     best_action = min(finite_costs, key=finite_costs.get)
                     best_cost = finite_costs[best_action]
@@ -2825,7 +2862,7 @@ class RLTrainingPipeline:
                     decision_metrics["override_learning_negative"] += 1
                     episode_return_total += override_penalty
                     prev_edge_by_vehicle[vehicle_id] = current_edge
-                    return
+                    return None
                 last_planned_terminal_edge_by_vehicle[vehicle_id] = full_route[-1] if full_route else vehicle.destination
 
                 decision_id = self._next_decision_id(decision_metrics)
@@ -2849,6 +2886,7 @@ class RLTrainingPipeline:
                         "chosen_social_cost": chosen_cost,
                         "baseline_social_cost": baseline_cost,
                         "selfless_delta": selfless_delta,
+                        "coordination_pressure": coordination_pressure,
                     },
                 )
                 self._record_recent_decision_attribution(
@@ -2869,6 +2907,7 @@ class RLTrainingPipeline:
                 ):
                     decision_metrics["same_edge_reopen_after_abort_count"] += 1
                 prev_edge_by_vehicle[vehicle_id] = current_edge
+                return int(action)
 
             try:
                 for step in range(MAX_SIMULATION_STEPS):
@@ -2895,6 +2934,7 @@ class RLTrainingPipeline:
                     step_context_cache = {}
                     step_state_cache = {}
                     open_decision_batch = []
+                    step_coordination_state = self.shared_policy.empty_coordination_state()
                     recent_history_for_decision = {}
                     step_mean_density = float(self._density_mean)
                     step_p95_density = float(self._density_p95)
@@ -3039,6 +3079,7 @@ class RLTrainingPipeline:
                                 long_horizon_loop=loop_signals.get("long_horizon_loop") or loop_signals.get("revisit_without_progress"),
                                 externality_penalty=ext_pen,
                                 selfless_delta=float(pending.metadata.get("selfless_delta", 0.0)),
+                                coordination_pressure=float((pending.metadata or {}).get("coordination_pressure", 0.0)),
                                 hard_brake_events=self._consume_hard_brake_events(hard_brake_counts_by_vehicle, vehicle_id),
                             )
                             next_ctx = self._get_or_build_step_context(
@@ -3194,6 +3235,12 @@ class RLTrainingPipeline:
                                         committed_next_edge=committed_next_edge,
                                         full_route=full_route,
                                     )
+                                    self.shared_policy.reserve_action(
+                                        step_coordination_state,
+                                        context=obs_context,
+                                        destination=vehicle.destination,
+                                        action_idx=int(pending.intended_action),
+                                    )
                                     self._record_recent_decision_attribution(
                                         decision_attribution_by_vehicle,
                                         vehicle_id,
@@ -3272,6 +3319,7 @@ class RLTrainingPipeline:
                                     destination=vehicle.destination,
                                     recent_history=decision_recent_history(vehicle_id),
                                     lane_now_only=True,
+                                    coordination_state=step_coordination_state,
                                 )
                                 if fallback_action is None:
                                     prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -3290,6 +3338,7 @@ class RLTrainingPipeline:
                                     step,
                                     snapshot,
                                     context=obs_context,
+                                    coordination_state=step_coordination_state,
                                 )
                                 pending_decisions[vehicle_id] = self.shared_policy.build_route_pending(
                                     state=next_state,
@@ -3305,7 +3354,21 @@ class RLTrainingPipeline:
                                     action_source="observe_fallback",
                                     full_route=full_route,
                                     decision_open_recorded=True,
-                                    extra_metadata={"override_learning": True},
+                                    extra_metadata={
+                                        "override_learning": True,
+                                        "coordination_pressure": self.shared_policy.coordination_pressure_score(
+                                            context=obs_context,
+                                            destination=vehicle.destination,
+                                            action_idx=fallback_action,
+                                            coordination_state=step_coordination_state,
+                                        ),
+                                    },
+                                )
+                                self.shared_policy.reserve_action(
+                                    step_coordination_state,
+                                    context=obs_context,
+                                    destination=vehicle.destination,
+                                    action_idx=int(fallback_action),
                                 )
                                 self._record_recent_decision_attribution(
                                     decision_attribution_by_vehicle,
@@ -3365,6 +3428,7 @@ class RLTrainingPipeline:
                                     pending_age=pending_age,
                                     lane_change_deferrals=pending.metadata.get("lane_change_deferrals", 0),
                                     hard_brake_events=self._consume_hard_brake_events(hard_brake_counts_by_vehicle, vehicle_id),
+                                    coordination_pressure=float((pending.metadata or {}).get("coordination_pressure", 0.0)),
                                 )
                                 next_ctx = self._get_or_build_step_context(
                                     step_context_cache,
@@ -3584,15 +3648,6 @@ class RLTrainingPipeline:
                             prev_edge_by_vehicle[vehicle_id] = current_edge
                             continue
 
-                        state = self._get_or_encode_step_state(
-                            step_state_cache,
-                            step_context_cache,
-                            vehicle_id,
-                            vehicle,
-                            step,
-                            snapshot,
-                            context=context,
-                        )
                         cooldown_until = lane_change_cooldown_until.get((vehicle_id, current_edge), -1)
                         decision_mode = self.shared_policy.classify_decision(context)
                         action_source = "forced" if decision_mode.mode == "forced" else ""
@@ -3600,7 +3655,17 @@ class RLTrainingPipeline:
                             decision_metrics["forced_actions"] += 1
                             if decision_mode.skip_reason:
                                 decision_metrics[f"skip_reason_{decision_mode.skip_reason}"] += 1
-                            process_selected_action(
+                            state = self._get_or_encode_step_state(
+                                step_state_cache,
+                                step_context_cache,
+                                vehicle_id,
+                                vehicle,
+                                step,
+                                snapshot,
+                                context=context,
+                                coordination_state=step_coordination_state,
+                            )
+                            effective_action = process_selected_action(
                                 vehicle_id,
                                 vehicle,
                                 current_edge,
@@ -3610,7 +3675,15 @@ class RLTrainingPipeline:
                                 state,
                                 decision_mode.action,
                                 action_source,
+                                coordination_state=step_coordination_state,
                             )
+                            if effective_action is not None:
+                                self.shared_policy.reserve_action(
+                                    step_coordination_state,
+                                    context=context,
+                                    destination=vehicle.destination,
+                                    action_idx=int(effective_action),
+                                )
                             continue
                         elif decision_mode.mode == "skip":
                             if decision_mode.skip_reason == "no_branch":
@@ -3642,13 +3715,6 @@ class RLTrainingPipeline:
                                 destination=vehicle.destination,
                                 decision_metrics=decision_metrics,
                             )
-                            policy_actions = force_stale_lane_now_replan_if_available(
-                                vehicle_id,
-                                current_edge,
-                                step,
-                                context,
-                                policy_actions,
-                            )
                             removed_actions = max(len(context.available_actions) - len(policy_actions), 0)
                             decision_metrics["policy_masked_actions_removed"] += removed_actions
                             open_decision_batch.append({
@@ -3657,19 +3723,55 @@ class RLTrainingPipeline:
                                 "current_edge": current_edge,
                                 "snapshot": snapshot,
                                 "context": context,
-                                "state": state,
+                                "recent_history": decision_recent_history(vehicle_id),
+                                "cooldown_active": cooldown_active,
                                 "policy_actions": policy_actions,
                             })
                             continue
 
                     if open_decision_batch:
-                        batch_results = self.trainer.select_actions_batch(
-                            [entry["state"] for entry in open_decision_batch],
-                            [entry["policy_actions"] for entry in open_decision_batch],
+                        ordered_entries = sorted(
+                            open_decision_batch,
+                            key=lambda entry: self.shared_policy.coordination_priority(
+                                entry["context"],
+                                destination=entry["vehicle"].destination,
+                                edge_density_fn=self._edge_density,
+                            ),
                         )
-                        for entry, (action, action_source) in zip(open_decision_batch, batch_results):
+                        for entry in ordered_entries:
                             vehicle_id = entry["vehicle_id"]
                             current_edge = entry["current_edge"]
+                            state = self._get_or_encode_step_state(
+                                step_state_cache,
+                                step_context_cache,
+                                vehicle_id,
+                                entry["vehicle"],
+                                step,
+                                entry["snapshot"],
+                                context=entry["context"],
+                                coordination_state=step_coordination_state,
+                            )
+                            policy_actions = self.shared_policy.rank_policy_actions(
+                                context=entry["context"],
+                                actions=entry["policy_actions"],
+                                destination=entry["vehicle"].destination,
+                                distance_fn=self.get_distance_to_destination,
+                                edge_density_fn=self._edge_density,
+                                recent_history=entry["recent_history"],
+                                coordination_state=step_coordination_state,
+                            )
+                            policy_actions = force_stale_lane_now_replan_if_available(
+                                vehicle_id,
+                                current_edge,
+                                step,
+                                entry["context"],
+                                policy_actions,
+                            )
+                            action, action_source = self.trainer.select_action(
+                                state,
+                                policy_actions,
+                                return_source=True,
+                            )
                             if action is None:
                                 self._record_skip(decision_metrics, "actionable_no_candidate")
                                 decision_metrics["actionable_skips"] += 1
@@ -3679,17 +3781,25 @@ class RLTrainingPipeline:
                                 decision_metrics["exploration_actions"] += 1
                             elif action_source == "policy":
                                 decision_metrics["policy_actions"] += 1
-                            process_selected_action(
+                            effective_action = process_selected_action(
                                 vehicle_id,
                                 entry["vehicle"],
                                 current_edge,
                                 step,
                                 entry["snapshot"],
                                 entry["context"],
-                                entry["state"],
+                                state,
                                 action,
                                 action_source,
+                                coordination_state=step_coordination_state,
                             )
+                            if effective_action is not None:
+                                self.shared_policy.reserve_action(
+                                    step_coordination_state,
+                                    context=entry["context"],
+                                    destination=entry["vehicle"].destination,
+                                    action_idx=int(effective_action),
+                                )
 
                     simulation_step()
 
