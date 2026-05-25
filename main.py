@@ -61,7 +61,7 @@ def build_parser():
     parser.add_argument(
         "--controlled-vehicles",
         type=int,
-        default=80,
+        default=140,
         help="Number of controlled vehicles. Defaults to the frozen-eval training value.",
     )
     parser.add_argument(

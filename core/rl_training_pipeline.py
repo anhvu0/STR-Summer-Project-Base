@@ -37,7 +37,7 @@ import sumolib
 In this file, we build a DQN network
 """
 
-MAX_SIMULATION_STEPS = 2000 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
+MAX_SIMULATION_STEPS = 4000 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
 
 # Compact metric glossary used by training CSV + logs.
 # type ∈ {event_count, gauge, per_episode_aggregate, cumulative_counter, ratio}
@@ -110,7 +110,7 @@ class DQNTrainer:
         learning_rate=0.0005,
         gamma=0.97,
         epsilon=1.0,
-        epsilon_decay=0.995,
+        epsilon_decay=0.998,
         epsilon_min=0.01,
         replay_capacity=150000,
         elite_replay_capacity=None,
@@ -631,7 +631,7 @@ class RLTrainingPipeline:
         seed_with_episode=True,
         destination_reward=50.0,
         teleport_penalty=-40.0,
-        epsilon_decay=0.995,
+        epsilon_decay=0.998,
         epsilon_min=0.01,
         gamma=0.97,
         replay_capacity=150000,
@@ -2438,8 +2438,8 @@ class RLTrainingPipeline:
         route_path = os.path.join(self.sumocfg_dir, self.route_file)
         spawn_interval_value = self.spawn_interval if spawn_interval_override is None else float(spawn_interval_override)
         vehicle_list = generator.generate_vehicles(
-            num_target_vehicles=100,
-            num_random_vehicles=100,
+            num_target_vehicles=150,
+            num_random_vehicles=150,
             pattern=self.target_pattern,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),

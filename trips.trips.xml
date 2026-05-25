@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2026-05-23 17:19:59.415794 by Eclipse SUMO randomTrips.py v1.27.0
-  options: -n ./configurations/./maps/map.net.xml -e 200.0 -p 2.0 -r ./configurations/./rou/str_sumo_map.rou.xml -s 6005
+<!-- generated on 2026-05-25 18:46:21.508406 by Eclipse SUMO randomTrips.py v1.27.0
+  options: -n ./configurations/./maps/map.net.xml -e 280.0 -p 2.0 -r ./configurations/./rou/str_sumo_map.rou.xml -s 6005
 -->
 
 <routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
@@ -105,4 +105,44 @@
     <trip id="97" depart="194.00" from="-195743203#3" to="5670542"/>
     <trip id="98" depart="196.00" from="501844297" to="-570148130"/>
     <trip id="99" depart="198.00" from="5670859#4" to="-309956784#0"/>
+    <trip id="100" depart="200.00" from="-420881462" to="402097156#0"/>
+    <trip id="101" depart="202.00" from="418371676#1" to="-166084358"/>
+    <trip id="102" depart="204.00" from="196116983#0" to="5671452"/>
+    <trip id="103" depart="206.00" from="420877073" to="-46583484#0"/>
+    <trip id="104" depart="208.00" from="-327917960#0" to="125774603#0"/>
+    <trip id="105" depart="210.00" from="196116986" to="420877070"/>
+    <trip id="106" depart="212.00" from="630828570#4" to="174827929"/>
+    <trip id="107" depart="214.00" from="195743203#4" to="584850099"/>
+    <trip id="108" depart="216.00" from="-420881460" to="418371676#11"/>
+    <trip id="109" depart="218.00" from="gneE6" to="5672660"/>
+    <trip id="110" depart="220.00" from="420882493" to="420877074"/>
+    <trip id="111" depart="222.00" from="-47796089#1" to="-418371676#5"/>
+    <trip id="112" depart="224.00" from="420882495#0" to="-165893413#1"/>
+    <trip id="113" depart="226.00" from="46613632#1" to="5670742#3"/>
+    <trip id="114" depart="228.00" from="-5670859#6" to="-49688932"/>
+    <trip id="115" depart="230.00" from="497250991#0" to="46613632#1"/>
+    <trip id="116" depart="232.00" from="524569306#1" to="-581134346#0"/>
+    <trip id="117" depart="234.00" from="-195743202" to="46583484#11"/>
+    <trip id="118" depart="236.00" from="-46583484#0" to="455674352"/>
+    <trip id="119" depart="238.00" from="196117056#0" to="420877106#1"/>
+    <trip id="120" depart="240.00" from="46583480#1" to="569369532#2"/>
+    <trip id="121" depart="242.00" from="630828570#1" to="5672656#4"/>
+    <trip id="122" depart="244.00" from="46562972" to="195743187#1"/>
+    <trip id="123" depart="246.00" from="5669863" to="195743202"/>
+    <trip id="124" depart="248.00" from="-497250991#1" to="5672575"/>
+    <trip id="125" depart="250.00" from="305323028#2" to="-501844295"/>
+    <trip id="126" depart="252.00" from="305323028#2" to="-196116986"/>
+    <trip id="127" depart="254.00" from="630828570#2" to="-418371676#7"/>
+    <trip id="128" depart="256.00" from="5672762#0" to="-420881458"/>
+    <trip id="129" depart="258.00" from="5670544#1" to="-327917961"/>
+    <trip id="130" depart="260.00" from="-5670859#1" to="46613633"/>
+    <trip id="131" depart="262.00" from="-327917960#2" to="-511673770"/>
+    <trip id="132" depart="264.00" from="204085730#0" to="-195743203#2"/>
+    <trip id="133" depart="266.00" from="49688932" to="-420881458"/>
+    <trip id="134" depart="268.00" from="5669985#5" to="-630828563#1"/>
+    <trip id="135" depart="270.00" from="439801905#1" to="569369534#1"/>
+    <trip id="136" depart="272.00" from="47796089#5" to="-5672019#0"/>
+    <trip id="137" depart="274.00" from="-46583484#7" to="5671298#4"/>
+    <trip id="138" depart="276.00" from="420877079" to="-5670859#2"/>
+    <trip id="139" depart="278.00" from="-439801896" to="-497250991#1"/>
 </routes>

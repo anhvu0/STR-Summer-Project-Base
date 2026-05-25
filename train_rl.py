@@ -41,7 +41,7 @@ def build_parser():
     parser.add_argument(
         "--episodes",
         type=int,
-        default=1000,
+        default=2500,
         help="Number of training episodes.",
     )
     parser.add_argument(
@@ -58,7 +58,7 @@ def build_parser():
     )
     parser.add_argument(
         "--eval-seeds",
-        default="6000,6001,6002,6003,6004,6005",
+        default="6000,6001,6002,6003,6004,6005,6006,6007,6008,6009,6010",
         help="Comma-separated held-out seeds for frozen inference evaluation.",
     )
     parser.add_argument(
