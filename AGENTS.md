@@ -1,21 +1,5 @@
 # Project Agent Notes
-# SUMO/traci runs problem:
-The live inference run from main.py (line 184) was failing because SUMO could not open the TraCI socket in this sandboxed environment. The concrete error was:
 
-tcpip::Socket::accept() @ socket: Operation not permitted
-traci.exceptions.FatalTraCIError: Could not connect.
-
-That is not a bug in your controller logic or in main.py; it is an environment restriction on opening the TraCI TCP connection. I did not patch project code for that, because the right “fix” is to run it in an environment where SUMO is allowed to open the port. In this session I worked around it by:
-
-not using the blocked live SUMO run as the main verification path,
-restoring the generated trips.trips.xml and route files after the failed run so the workspace stayed clean,
-verifying the policy changes with pure-Python tests instead.
-
-## Expectations:
-Reading files with PowerShell commands like Get-Content and Select-String.
-Editing files with direct PowerShell file replacement instead of apply_patch when the UNC path caused trouble.
-Using the WSL path for git commands, for example:
-wsl git -C /home/anhvu01212001/anhvu/STR_Project/STR-Summer-Project-Base diff ...
 
 ## RL objective context (updated April 2026)
 
