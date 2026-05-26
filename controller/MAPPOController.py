@@ -98,22 +98,11 @@ class MAPPOPolicy(RouteController):
             "small_set_loop_unique4_events": 0,
             "committed_cyclic_revisit_events": 0,
             "committed_cyclic_revisit_after_fallback_events": 0,
-            "policy_candidates_with_broader_available": 0,
-            "policy_candidates_collapsed_to_lane_now_only": 0,
             "pending_commit_window_grace_kept": 0,
-            "proactive_shift2_candidates_seen": 0,
-            "proactive_shift2_candidates_rejected": 0,
-            "proactive_brake_risk_candidates_seen": 0,
-            "proactive_brake_risk_candidates_rejected": 0,
-            "proactive_brake_risk_fallback_kept": 0,
             "lane_now_replan_releases": 0,
             "lane_now_replan_forced_alternative": 0,
             "lane_now_replan_blocked_reopen_actions": 0,
-            "commit_window_candidates_rejected": 0,
-            "commit_window_non_lane_candidates_seen": 0,
             "coordination_pending_reservations_seeded": 0,
-            "coordination_pressure_candidates_seen": 0,
-            "coordination_pressure_candidates_rejected": 0,
             "step_control_edge_change": 0,
             "step_control_pending": 0,
             "step_control_near_junction": 0,
@@ -594,11 +583,9 @@ class MAPPOPolicy(RouteController):
                 self._format_pending_descriptor(pending_snapshot["oldest_descriptor"]),
             ),
             (
-                "[RL-INFER] coordination pending_seeded={} pressure_filtered={}/{}"
+                "[RL-INFER] coordination pending_seeded={}"
             ).format(
                 int(metrics["coordination_pending_reservations_seeded"]),
-                int(metrics["coordination_pressure_candidates_rejected"]),
-                int(metrics["coordination_pressure_candidates_seen"]),
             ),
         ]
 
@@ -1139,7 +1126,6 @@ class MAPPOPolicy(RouteController):
             elif decision_mode.mode != "open":
                 continue
             else:
-                self._metrics["decisions"] += 1
                 open_decision_batch.append(
                     {
                         "vid": vid,
@@ -1196,6 +1182,27 @@ class MAPPOPolicy(RouteController):
                     entry["context"],
                     policy_actions,
                 )
+                if len(policy_actions) <= 1:
+                    if not policy_actions:
+                        continue
+                    effective_action = process_selected_action(
+                        entry["vid"],
+                        entry["vehicle"],
+                        entry["start_edge"],
+                        entry["context"],
+                        entry["recent"],
+                        int(policy_actions[0]),
+                        coordination_state=step_coordination_state,
+                    )
+                    if effective_action is not None:
+                        self.shared_policy.reserve_action(
+                            step_coordination_state,
+                            context=entry["context"],
+                            destination=entry["vehicle"].destination,
+                            action_idx=int(effective_action),
+                        )
+                    continue
+                self._metrics["decisions"] += 1
                 action_idx = self.act(state, policy_actions)
                 effective_action = process_selected_action(
                     entry["vid"],

@@ -2145,16 +2145,7 @@ class RLTrainingPipeline:
             "fallback_rate_per_opened_decision", "controlled_teleport_rate",
             "skip_reason_forced_by_lane_commit", "skip_reason_too_late_or_unreachable",
             "skip_reason_forced_single_path", "skip_reason_no_branch",
-            "reachable_lane_change_nonempty", "reachable_lane_change_excluded_any",
-            "reachable_lane_change_excluded_all", "policy_candidates_with_broader_available",
-            "policy_candidates_collapsed_to_lane_now_only",
             "coordination_pending_reservations_seeded",
-            "coordination_pressure_candidates_seen", "coordination_pressure_candidates_rejected",
-            "lane_now_congestion_candidates_seen", "lane_now_congestion_candidates_rejected",
-            "commit_window_non_lane_candidates_seen", "commit_window_candidates_rejected",
-            "proactive_shift2_candidates_seen", "proactive_shift2_candidates_rejected",
-            "proactive_brake_risk_candidates_seen", "proactive_brake_risk_candidates_rejected",
-            "proactive_brake_risk_fallback_kept",
             "pending_commit_window_grace_kept",
             "proactive_decisions_opened", "proactive_decisions_finalized",
             "lane_now_decisions_opened", "lane_now_decisions_finalized",
@@ -3279,14 +3270,6 @@ class RLTrainingPipeline:
                             snapshot=snapshot,
                         )
                         decision_metrics["decisions_considered"] += 1
-                        reachable_set = set(context.reachable_with_lane_change_actions)
-                        available_set = set(context.available_actions)
-                        if reachable_set:
-                            decision_metrics["reachable_lane_change_nonempty"] += 1
-                            if not reachable_set.issubset(available_set):
-                                decision_metrics["reachable_lane_change_excluded_any"] += 1
-                            if reachable_set.isdisjoint(available_set):
-                                decision_metrics["reachable_lane_change_excluded_all"] += 1
                         if vehicle_id in pending_decisions:
                             if self.shared_policy.pending_requires_active_same_edge_monitoring(pending_decisions[vehicle_id]):
                                 self._record_skip(decision_metrics, "pending_hold")
@@ -3350,8 +3333,8 @@ class RLTrainingPipeline:
                         else:
                             decision_metrics["actionable_decision_points"] += 1
                             # available_actions = executor/safety feasibility set (unchanged semantics).
-                            # policy_actions = stricter learning-time subset to reduce harmful overrides.
-                            # Fallback machinery below remains the final safety layer.
+                            # policy_actions = loop-safe learning mask; one-action masks are executed
+                            # deterministically later instead of becoming actor transitions.
                             cooldown_active = step < cooldown_until
                             policy_actions = self._policy_action_candidates(
                                 context=context,
@@ -3428,6 +3411,32 @@ class RLTrainingPipeline:
                                 entry["context"],
                                 policy_actions,
                             )
+                            if len(policy_actions) <= 1:
+                                if not policy_actions:
+                                    self._record_skip(decision_metrics, "actionable_no_candidate")
+                                    decision_metrics["actionable_skips"] += 1
+                                    prev_edge_by_vehicle[vehicle_id] = current_edge
+                                    continue
+                                effective_action = process_selected_action(
+                                    vehicle_id,
+                                    entry["vehicle"],
+                                    current_edge,
+                                    step,
+                                    entry["snapshot"],
+                                    entry["context"],
+                                    state,
+                                    int(policy_actions[0]),
+                                    "forced",
+                                    coordination_state=step_coordination_state,
+                                )
+                                if effective_action is not None:
+                                    self.shared_policy.reserve_action(
+                                        step_coordination_state,
+                                        context=entry["context"],
+                                        destination=entry["vehicle"].destination,
+                                        action_idx=int(effective_action),
+                                    )
+                                continue
                             selection = self.trainer.select_action(
                                 state,
                                 policy_actions,
@@ -3801,14 +3810,6 @@ class RLTrainingPipeline:
                 top_emergency_brake_vehicles = self._format_top_counts(emergency_brake_events_by_vehicle)
                 top_loop_signal_edges = self._format_top_counts(loop_signal_events_by_edge)
                 top_loop_repeat_only_edges = self._format_top_counts(loop_repeat_only_events_by_edge)
-                reachable_lane_change_excluded_any_rate = (
-                    float(decision_metrics["reachable_lane_change_excluded_any"])
-                    / float(max(decision_metrics["reachable_lane_change_nonempty"], 1.0))
-                )
-                policy_lane_now_collapse_rate = (
-                    float(decision_metrics["policy_candidates_collapsed_to_lane_now_only"])
-                    / float(max(decision_metrics["policy_candidates_with_broader_available"], 1.0))
-                )
                 policy_candidate_mean_count = (
                     float(decision_metrics["policy_candidate_count_sum"])
                     / float(max(decision_metrics["policy_candidate_decisions"], 1.0))
@@ -4239,23 +4240,7 @@ class RLTrainingPipeline:
                         "skip_reason_too_late_or_unreachable": decision_metrics["skip_reason_too_late_or_unreachable"],
                         "skip_reason_forced_single_path": decision_metrics["skip_reason_forced_single_path"],
                         "skip_reason_no_branch": decision_metrics["skip_reason_no_branch"],
-                        "reachable_lane_change_nonempty": decision_metrics["reachable_lane_change_nonempty"],
-                        "reachable_lane_change_excluded_any": decision_metrics["reachable_lane_change_excluded_any"],
-                        "reachable_lane_change_excluded_all": decision_metrics["reachable_lane_change_excluded_all"],
-                        "policy_candidates_with_broader_available": decision_metrics["policy_candidates_with_broader_available"],
-                        "policy_candidates_collapsed_to_lane_now_only": decision_metrics["policy_candidates_collapsed_to_lane_now_only"],
                         "coordination_pending_reservations_seeded": decision_metrics["coordination_pending_reservations_seeded"],
-                        "coordination_pressure_candidates_seen": decision_metrics["coordination_pressure_candidates_seen"],
-                        "coordination_pressure_candidates_rejected": decision_metrics["coordination_pressure_candidates_rejected"],
-                        "lane_now_congestion_candidates_seen": decision_metrics["lane_now_congestion_candidates_seen"],
-                        "lane_now_congestion_candidates_rejected": decision_metrics["lane_now_congestion_candidates_rejected"],
-                        "commit_window_non_lane_candidates_seen": decision_metrics["commit_window_non_lane_candidates_seen"],
-                        "commit_window_candidates_rejected": decision_metrics["commit_window_candidates_rejected"],
-                        "proactive_shift2_candidates_seen": decision_metrics["proactive_shift2_candidates_seen"],
-                        "proactive_shift2_candidates_rejected": decision_metrics["proactive_shift2_candidates_rejected"],
-                        "proactive_brake_risk_candidates_seen": decision_metrics["proactive_brake_risk_candidates_seen"],
-                        "proactive_brake_risk_candidates_rejected": decision_metrics["proactive_brake_risk_candidates_rejected"],
-                        "proactive_brake_risk_fallback_kept": decision_metrics["proactive_brake_risk_fallback_kept"],
                         "pending_commit_window_grace_kept": decision_metrics["pending_commit_window_grace_kept"],
                         "proactive_decisions_opened": decision_metrics["proactive_decisions_opened"],
                         "proactive_decisions_finalized": decision_metrics["proactive_decisions_finalized"],

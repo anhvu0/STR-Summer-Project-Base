@@ -251,8 +251,6 @@ class JunctionDecisionEngine:
                 shift = required_shift.get(idx, 999)
                 if shift not in (1, 2):
                     continue
-                if speed < 0.5:
-                    continue
                 if shift == 1:
                     required_budget = self.lane_change_margin_m
                     strong_threshold = (

@@ -87,7 +87,7 @@ class DummyDecisionEngine:
         return len(context.available_actions) > 1
 
 
-class SharedDecisionPolicyBrakeRiskTests(unittest.TestCase):
+class SharedDecisionPolicyLearningMaskTests(unittest.TestCase):
     def setUp(self):
         self.engine = DummyDecisionEngine()
         self.policy = SharedDecisionPolicy(DummyConnectionInfo(), self.engine, ['L', 'S', 'R'])
@@ -114,7 +114,7 @@ class SharedDecisionPolicyBrakeRiskTests(unittest.TestCase):
             skip_reason=None,
         )
 
-    def test_prefers_lane_now_when_dense_proactive_is_brake_risky(self):
+    def test_keeps_dense_proactive_branch_in_learning_mask(self):
         context = self._context(lane_now=[0], available=[0, 1], shifts={0: 0, 1: 1}, dist_to_end=29.0, speed=14.0)
         metrics = defaultdict(float)
         density = {'edgeA': 0.34, 'edgeC': 0.42}
@@ -129,12 +129,9 @@ class SharedDecisionPolicyBrakeRiskTests(unittest.TestCase):
             metrics=metrics,
         )
 
-        self.assertEqual(actions, [0])
-        self.assertEqual(metrics['proactive_brake_risk_candidates_seen'], 1.0)
-        self.assertEqual(metrics['proactive_brake_risk_candidates_rejected'], 1.0)
-        self.assertEqual(metrics['policy_candidates_collapsed_to_lane_now_only'], 1.0)
+        self.assertEqual(actions, [0, 1])
 
-    def test_keeps_least_risky_proactive_when_no_lane_now_option_exists(self):
+    def test_keeps_all_executor_feasible_proactive_options_when_no_lane_now_exists(self):
         context = self._context(lane_now=[], available=[1, 2], shifts={1: 1, 2: 2}, dist_to_end=32.0, speed=13.0)
         metrics = defaultdict(float)
         density = {'edgeA': 0.33, 'edgeC': 0.36, 'edgeD': 0.50}
@@ -149,9 +146,7 @@ class SharedDecisionPolicyBrakeRiskTests(unittest.TestCase):
             metrics=metrics,
         )
 
-        self.assertEqual(actions, [1])
-        self.assertEqual(metrics['proactive_brake_risk_candidates_seen'], 2.0)
-        self.assertEqual(metrics['proactive_brake_risk_fallback_kept'], 1.0)
+        self.assertEqual(actions, [1, 2])
 
     def test_keeps_proactive_option_when_density_is_low(self):
         context = self._context(lane_now=[0], available=[0, 1], shifts={0: 0, 1: 1}, dist_to_end=27.0, speed=12.0)
@@ -169,9 +164,8 @@ class SharedDecisionPolicyBrakeRiskTests(unittest.TestCase):
         )
 
         self.assertEqual(actions, [0, 1])
-        self.assertEqual(metrics['proactive_brake_risk_candidates_seen'], 0.0)
 
-    def test_prunes_congested_lane_now_branch_when_cleaner_branch_is_comparable(self):
+    def test_keeps_congested_lane_now_branch_in_learning_mask(self):
         context = self._context(lane_now=[0, 1], available=[0, 1], shifts={0: 0, 1: 0}, dist_to_end=24.0, speed=10.0)
         metrics = defaultdict(float)
         density = {'edgeB': 0.56, 'edgeC': 0.14}
@@ -187,9 +181,7 @@ class SharedDecisionPolicyBrakeRiskTests(unittest.TestCase):
             metrics=metrics,
         )
 
-        self.assertEqual(actions, [1])
-        self.assertEqual(metrics['lane_now_congestion_candidates_seen'], 1.0)
-        self.assertEqual(metrics['lane_now_congestion_candidates_rejected'], 1.0)
+        self.assertEqual(actions, [0, 1])
 
     def test_keeps_congested_lane_now_branch_when_it_is_much_shorter(self):
         context = self._context(lane_now=[0, 1], available=[0, 1], shifts={0: 0, 1: 0}, dist_to_end=24.0, speed=10.0)
@@ -207,11 +199,9 @@ class SharedDecisionPolicyBrakeRiskTests(unittest.TestCase):
             metrics=metrics,
         )
 
-        self.assertEqual(actions, [0])
-        self.assertEqual(metrics['lane_now_congestion_candidates_seen'], 1.0)
-        self.assertEqual(metrics['lane_now_congestion_candidates_rejected'], 0.0)
+        self.assertEqual(actions, [0, 1])
 
-    def test_prunes_comparable_branch_when_corridor_revisits_recent_edge(self):
+    def test_keeps_comparable_branch_when_corridor_revisits_recent_edge(self):
         context = self._context(lane_now=[0, 1], available=[0, 1], shifts={0: 0, 1: 0}, dist_to_end=48.0, speed=10.0)
         metrics = defaultdict(float)
         density = {'edgeB': 0.08, 'edgeC': 0.07, 'edgeFree': 0.05}
@@ -234,9 +224,9 @@ class SharedDecisionPolicyBrakeRiskTests(unittest.TestCase):
             metrics=metrics,
         )
 
-        self.assertEqual(actions, [0])
+        self.assertEqual(actions, [0, 1])
 
-    def test_prunes_moderately_congested_lane_now_branch_when_close_to_junction(self):
+    def test_keeps_moderately_congested_lane_now_branch_when_close_to_junction(self):
         context = self._context(lane_now=[0, 1], available=[0, 1], shifts={0: 0, 1: 0}, dist_to_end=12.0, speed=12.0)
         metrics = defaultdict(float)
         density = {'edgeB': 0.31, 'edgeC': 0.18}
@@ -252,9 +242,7 @@ class SharedDecisionPolicyBrakeRiskTests(unittest.TestCase):
             metrics=metrics,
         )
 
-        self.assertEqual(actions, [1])
-        self.assertEqual(metrics['lane_now_congestion_candidates_seen'], 1.0)
-        self.assertEqual(metrics['lane_now_congestion_candidates_rejected'], 1.0)
+        self.assertEqual(actions, [0, 1])
 
     def test_keeps_same_moderately_congested_lane_now_branch_when_far_from_junction(self):
         context = self._context(lane_now=[0, 1], available=[0, 1], shifts={0: 0, 1: 0}, dist_to_end=80.0, speed=12.0)
@@ -273,8 +261,21 @@ class SharedDecisionPolicyBrakeRiskTests(unittest.TestCase):
         )
 
         self.assertEqual(actions, [0, 1])
-        self.assertEqual(metrics['lane_now_congestion_candidates_seen'], 0.0)
-        self.assertEqual(metrics['lane_now_congestion_candidates_rejected'], 0.0)
+
+    def test_cooldown_keeps_learning_mask_to_lane_now_actions(self):
+        context = self._context(lane_now=[0], available=[0, 1], shifts={0: 0, 1: 1}, dist_to_end=40.0, speed=8.0)
+
+        actions = self.policy.policy_action_candidates(
+            context,
+            recent_history=['edgeZ'],
+            cooldown_active=True,
+            destination='destX',
+            distance_fn=lambda edge, dest: 10.0,
+            edge_density_fn=lambda edge: 0.0,
+            metrics=defaultdict(float),
+        )
+
+        self.assertEqual(actions, [0])
 
     def test_rank_policy_actions_looks_beyond_next_edge(self):
         context = self._context(lane_now=[0, 1], available=[0, 1], shifts={0: 0, 1: 0}, dist_to_end=40.0, speed=10.0)
