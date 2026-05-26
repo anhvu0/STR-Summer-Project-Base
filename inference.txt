@@ -1,0 +1,673 @@
+Inference scenario: controlled=140, uncontrolled=140, pattern=3, spawn_interval=2.0, seeds=6000,6001,6002,6003,6004,6005,6006,6007,6008,6009,6010,6011,6012,6013,6014,6015,6016,6017,6018,6019,6020,6021,6022,6023,6024,6025,6026,6027,6028,6029,6030
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6000
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 177.2, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=146.50, p90=336.80, tail_gap=297.21, p95/p50=3.08, timeout_rate=0.000
+8 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1647 overrides=17 override_ratio=1.0% fallbacks(total/lane_now)=17/17
+[RL-INFER] loops total=10 short=0 aba=1 dead_end=0 long=9 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=10 after_fallback=0
+[RL-INFER] pending_timeouts=29 release(no_prog/stall/hard)=16/0/29 lane_now_rescue(release/forced/blocked)=16/16/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=24/23/1/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=25060 pressure_filtered=22/22
+Average timespan: 189.52142857142857, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=163.50, p90=356.10, tail_gap=295.57, p95/p50=2.72, timeout_rate=0.000
+11 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6001
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 222.11428571428573, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=157.00, p90=421.80, tail_gap=637.36, p95/p50=5.50, timeout_rate=0.000
+18 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1627 overrides=27 override_ratio=1.7% fallbacks(total/lane_now)=27/27
+[RL-INFER] loops total=13 short=0 aba=1 dead_end=0 long=12 revisit_no_progress=0
+[RL-INFER] small_set_loops total=1 unique<=3=1 unique=4=0 committed_cyclic=13 after_fallback=0
+[RL-INFER] pending_timeouts=36 release(no_prog/stall/hard)=14/0/36 lane_now_rescue(release/forced/blocked)=14/14/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=26/24/0/0/2 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=25717 pressure_filtered=32/32
+Average timespan: 190.56428571428572, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=176.00, p90=359.30, tail_gap=263.50, p95/p50=2.46, timeout_rate=0.000
+11 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6002
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 163.90714285714284, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=144.00, p90=310.00, tail_gap=268.64, p95/p50=2.70, timeout_rate=0.000
+8 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1545 overrides=39 override_ratio=2.5% fallbacks(total/lane_now)=23/23
+[RL-INFER] loops total=17 short=0 aba=2 dead_end=0 long=15 revisit_no_progress=0
+[RL-INFER] small_set_loops total=1 unique<=3=0 unique=4=1 committed_cyclic=17 after_fallback=0
+[RL-INFER] pending_timeouts=9 release(no_prog/stall/hard)=13/0/9 lane_now_rescue(release/forced/blocked)=13/13/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=31/26/4/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=21617 pressure_filtered=23/23
+Average timespan: 160.55, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=145.50, p90=284.80, tail_gap=237.00, p95/p50=2.38, timeout_rate=0.000
+9 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6003
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 215.86428571428573, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=166.00, p90=428.20, tail_gap=448.64, p95/p50=3.75, timeout_rate=0.000
+20 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1637 overrides=26 override_ratio=1.6% fallbacks(total/lane_now)=23/23
+[RL-INFER] loops total=11 short=0 aba=0 dead_end=0 long=11 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=11 after_fallback=0
+[RL-INFER] pending_timeouts=11 release(no_prog/stall/hard)=44/0/11 lane_now_rescue(release/forced/blocked)=44/44/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=23/19/3/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=24782 pressure_filtered=41/41
+Average timespan: 187.79285714285714, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=177.00, p90=365.10, tail_gap=227.36, p95/p50=2.17, timeout_rate=0.000
+15 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6004
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 157.52142857142857, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=139.50, p90=299.10, tail_gap=207.57, p95/p50=2.34, timeout_rate=0.000
+6 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1688 overrides=24 override_ratio=1.4% fallbacks(total/lane_now)=23/23
+[RL-INFER] loops total=7 short=0 aba=2 dead_end=0 long=5 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=7 after_fallback=0
+[RL-INFER] pending_timeouts=15 release(no_prog/stall/hard)=31/0/15 lane_now_rescue(release/forced/blocked)=31/31/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=36/31/2/0/3 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=24546 pressure_filtered=31/31
+Average timespan: 185.15714285714284, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=163.50, p90=359.10, tail_gap=290.57, p95/p50=2.70, timeout_rate=0.000
+15 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6005
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 161.62857142857143, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=151.50, p90=283.00, tail_gap=180.83, p95/p50=2.16, timeout_rate=0.000
+5 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1653 overrides=77 override_ratio=4.7% fallbacks(total/lane_now)=17/17
+[RL-INFER] loops total=3 short=1 aba=2 dead_end=0 long=1 revisit_no_progress=0
+[RL-INFER] small_set_loops total=1 unique<=3=1 unique=4=0 committed_cyclic=3 after_fallback=1
+[RL-INFER] pending_timeouts=1 release(no_prog/stall/hard)=21/0/1 lane_now_rescue(release/forced/blocked)=21/21/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=31/27/2/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=23227 pressure_filtered=28/28
+Average timespan: 168.9142857142857, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=156.00, p90=304.40, tail_gap=200.86, p95/p50=2.28, timeout_rate=0.000
+7 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6006
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 163.25, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=137.00, p90=307.00, tail_gap=232.93, p95/p50=2.54, timeout_rate=0.000
+4 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1690 overrides=65 override_ratio=3.8% fallbacks(total/lane_now)=9/9
+[RL-INFER] loops total=2 short=0 aba=2 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=1 unique<=3=0 unique=4=1 committed_cyclic=2 after_fallback=0
+[RL-INFER] pending_timeouts=2 release(no_prog/stall/hard)=28/0/2 lane_now_rescue(release/forced/blocked)=28/28/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=30/26/3/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=23345 pressure_filtered=31/31
+Average timespan: 173.30714285714285, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=139.00, p90=328.00, tail_gap=290.93, p95/p50=2.76, timeout_rate=0.000
+7 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6007
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 225.7357142857143, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=171.50, p90=434.20, tail_gap=563.79, p95/p50=2.99, timeout_rate=0.000
+20 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1667 overrides=27 override_ratio=1.6% fallbacks(total/lane_now)=26/26
+[RL-INFER] loops total=10 short=0 aba=0 dead_end=0 long=10 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=10 after_fallback=0
+[RL-INFER] pending_timeouts=12 release(no_prog/stall/hard)=14/0/12 lane_now_rescue(release/forced/blocked)=14/14/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=28/25/2/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=24428 pressure_filtered=30/30
+Average timespan: 191.70714285714286, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=158.50, p90=366.60, tail_gap=372.36, p95/p50=3.36, timeout_rate=0.000
+11 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6008
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 176.54285714285714, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=142.50, p90=288.10, tail_gap=348.64, p95/p50=2.80, timeout_rate=0.000
+13 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1752 overrides=37 override_ratio=2.1% fallbacks(total/lane_now)=26/26
+[RL-INFER] loops total=19 short=0 aba=0 dead_end=0 long=19 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=19 after_fallback=0
+[RL-INFER] pending_timeouts=90 release(no_prog/stall/hard)=39/0/90 lane_now_rescue(release/forced/blocked)=39/39/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=30/24/3/0/3 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=29899 pressure_filtered=41/41
+Average timespan: 230.00714285714287, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=165.00, p90=378.90, tail_gap=672.00, p95/p50=3.41, timeout_rate=0.000
+15 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6009
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 249.97142857142856, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=198.50, p90=470.20, tail_gap=413.07, p95/p50=3.21, timeout_rate=0.000
+24 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1821 overrides=15 override_ratio=0.8% fallbacks(total/lane_now)=14/14
+[RL-INFER] loops total=5 short=0 aba=0 dead_end=0 long=5 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=5 after_fallback=0
+[RL-INFER] pending_timeouts=13 release(no_prog/stall/hard)=10/0/13 lane_now_rescue(release/forced/blocked)=10/10/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=23/21/1/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=26944 pressure_filtered=28/28
+Average timespan: 200.4142857142857, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=187.00, p90=325.30, tail_gap=272.43, p95/p50=2.10, timeout_rate=0.000
+10 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6010
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 195.99285714285713, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=159.00, p90=400.80, tail_gap=406.71, p95/p50=3.08, timeout_rate=0.000
+13 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1602 overrides=12 override_ratio=0.7% fallbacks(total/lane_now)=12/12
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=16 release(no_prog/stall/hard)=12/0/16 lane_now_rescue(release/forced/blocked)=12/12/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=24/22/0/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=24014 pressure_filtered=32/32
+Average timespan: 185.72142857142856, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=157.00, p90=351.70, tail_gap=329.57, p95/p50=3.13, timeout_rate=0.000
+12 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6011
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 174.62857142857143, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=147.50, p90=323.00, tail_gap=280.36, p95/p50=2.62, timeout_rate=0.000
+8 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1575 overrides=11 override_ratio=0.7% fallbacks(total/lane_now)=11/11
+[RL-INFER] loops total=5 short=0 aba=2 dead_end=0 long=3 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=5 after_fallback=0
+[RL-INFER] pending_timeouts=8 release(no_prog/stall/hard)=19/0/8 lane_now_rescue(release/forced/blocked)=19/19/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=17/16/1/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=23641 pressure_filtered=32/32
+Average timespan: 173.84285714285716, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=145.00, p90=322.40, tail_gap=277.79, p95/p50=2.46, timeout_rate=0.000
+6 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6012
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 246.68571428571428, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=171.00, p90=572.60, tail_gap=641.64, p95/p50=4.62, timeout_rate=0.000
+25 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1766 overrides=13 override_ratio=0.7% fallbacks(total/lane_now)=13/13
+[RL-INFER] loops total=4 short=0 aba=0 dead_end=0 long=4 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=4 after_fallback=0
+[RL-INFER] pending_timeouts=26 release(no_prog/stall/hard)=27/0/26 lane_now_rescue(release/forced/blocked)=27/27/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=27/27/0/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=26039 pressure_filtered=33/33
+Average timespan: 210.56428571428572, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=173.00, p90=402.70, tail_gap=410.86, p95/p50=3.32, timeout_rate=0.000
+17 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6013
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 172.40714285714284, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=156.50, p90=329.20, tail_gap=243.64, p95/p50=2.51, timeout_rate=0.000
+13 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1547 overrides=7 override_ratio=0.5% fallbacks(total/lane_now)=7/7
+[RL-INFER] loops total=2 short=0 aba=0 dead_end=0 long=2 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=2 after_fallback=0
+[RL-INFER] pending_timeouts=10 release(no_prog/stall/hard)=9/0/10 lane_now_rescue(release/forced/blocked)=9/9/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=19/19/0/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=22932 pressure_filtered=29/29
+Average timespan: 170.94285714285715, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=158.00, p90=310.20, tail_gap=265.79, p95/p50=2.55, timeout_rate=0.000
+11 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6014
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 183.71428571428572, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=161.00, p90=327.10, tail_gap=329.36, p95/p50=2.87, timeout_rate=0.000
+9 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1621 overrides=39 override_ratio=2.4% fallbacks(total/lane_now)=39/39
+[RL-INFER] loops total=24 short=0 aba=0 dead_end=0 long=24 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=24 after_fallback=0
+[RL-INFER] pending_timeouts=1 release(no_prog/stall/hard)=9/0/1 lane_now_rescue(release/forced/blocked)=9/9/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=22/21/0/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=24413 pressure_filtered=29/29
+Average timespan: 178.22857142857143, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=174.00, p90=291.00, tail_gap=207.80, p95/p50=2.04, timeout_rate=0.000
+10 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6015
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 163.1, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=146.00, p90=298.50, tail_gap=211.07, p95/p50=2.29, timeout_rate=0.000
+4 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1639 overrides=15 override_ratio=0.9% fallbacks(total/lane_now)=15/15
+[RL-INFER] loops total=12 short=0 aba=3 dead_end=0 long=9 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=12 after_fallback=0
+[RL-INFER] pending_timeouts=9 release(no_prog/stall/hard)=23/0/9 lane_now_rescue(release/forced/blocked)=23/23/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=17/17/0/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=23589 pressure_filtered=34/34
+Average timespan: 170.60714285714286, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=151.50, p90=319.30, tail_gap=239.57, p95/p50=2.44, timeout_rate=0.000
+4 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6016
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 157.20714285714286, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=146.50, p90=282.80, tail_gap=227.29, p95/p50=2.23, timeout_rate=0.000
+8 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1544 overrides=32 override_ratio=2.1% fallbacks(total/lane_now)=32/32
+[RL-INFER] loops total=22 short=0 aba=2 dead_end=0 long=20 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=22 after_fallback=0
+[RL-INFER] pending_timeouts=7 release(no_prog/stall/hard)=24/0/7 lane_now_rescue(release/forced/blocked)=24/24/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=15/10/3/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=21658 pressure_filtered=36/36
+Average timespan: 162.22142857142856, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=150.00, p90=288.50, tail_gap=273.07, p95/p50=2.63, timeout_rate=0.000
+7 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6017
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 279.4214285714286, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=188.50, p90=635.10, tail_gap=727.29, p95/p50=5.01, timeout_rate=0.000
+29 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1551 overrides=61 override_ratio=3.9% fallbacks(total/lane_now)=21/21
+[RL-INFER] loops total=11 short=0 aba=0 dead_end=0 long=11 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=11 after_fallback=0
+[RL-INFER] pending_timeouts=11 release(no_prog/stall/hard)=13/0/11 lane_now_rescue(release/forced/blocked)=13/13/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=31/28/1/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=23307 pressure_filtered=27/27
+Average timespan: 172.17142857142858, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=161.50, p90=303.60, tail_gap=230.00, p95/p50=2.18, timeout_rate=0.000
+4 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6018
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 190.72857142857143, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=174.00, p90=357.80, tail_gap=252.79, p95/p50=2.31, timeout_rate=0.000
+7 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1635 overrides=31 override_ratio=1.9% fallbacks(total/lane_now)=29/29
+[RL-INFER] loops total=18 short=0 aba=0 dead_end=0 long=18 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=18 after_fallback=0
+[RL-INFER] pending_timeouts=5 release(no_prog/stall/hard)=18/0/5 lane_now_rescue(release/forced/blocked)=18/18/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=20/16/1/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=24916 pressure_filtered=26/26
+Average timespan: 180.9142857142857, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=167.00, p90=341.10, tail_gap=248.93, p95/p50=2.24, timeout_rate=0.000
+6 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6019
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 188.74285714285713, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=171.00, p90=311.60, tail_gap=274.50, p95/p50=2.10, timeout_rate=0.000
+6 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1727 overrides=36 override_ratio=2.1% fallbacks(total/lane_now)=36/36
+[RL-INFER] loops total=27 short=0 aba=1 dead_end=0 long=26 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=27 after_fallback=0
+[RL-INFER] pending_timeouts=11 release(no_prog/stall/hard)=18/0/11 lane_now_rescue(release/forced/blocked)=18/18/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=53/47/3/0/2 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=27320 pressure_filtered=38/38
+Average timespan: 207.06428571428572, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=194.00, p90=355.30, tail_gap=311.36, p95/p50=2.25, timeout_rate=0.000
+15 deadlines missed.
+./configurations/./maps/map.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/map.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 280.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_map.rou.xml
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Success.
+140
+Scenario seed: 6020
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+Average timespan: 178.36428571428573, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=162.00, p90=321.30, tail_gap=237.71, p95/p50=2.26, timeout_rate=0.000
+5 deadlines missed.
+Using RL checkpoint: ./configurations/model/rl_model_map.best.pt
+Testing Q Learning Route Controller
+ Retrying in 1 seconds
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+pj_obj_create: Cannot find proj.db
+[RL-INFER] decisions=1610 overrides=21 override_ratio=1.3% fallbacks(total/lane_now)=21/21
+[RL-INFER] loops total=11 short=0 aba=0 dead_end=0 long=11 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=11 after_fallback=0
+[RL-INFER] pending_timeouts=10 release(no_prog/stall/hard)=10/0/10 lane_now_rescue(release/forced/blocked)=10/10/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=12/10/0/0/2 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=24817 pressure_filtered=22/22
+Average timespan: 180.67142857142858, total vehicle number: 140, total vehicles reached destination: 140
+Travel summary: completion=1.000, p50=170.50, p90=308.90, tail_gap=224.36, p95/p50=2.22, timeout_rate=0.000
+6 deadlines missed.

@@ -24,7 +24,10 @@ from sumolib import checkBinary
 import traci
 
 
-DEFAULT_EVAL_SEEDS = "6000,6001,6002,6003,6004,6005"
+DEFAULT_EVAL_SEEDS = ""
+for i in range(1,50):
+    DEFAULT_EVAL_SEEDS += str(4000+i) + ","
+DEFAULT_EVAL_SEEDS = DEFAULT_EVAL_SEEDS[:-1]  # Remove trailing comma
 
 
 def parse_seed_list(raw_value):
