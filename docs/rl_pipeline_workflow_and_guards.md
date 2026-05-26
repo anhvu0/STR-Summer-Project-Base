@@ -30,7 +30,7 @@ Main files:
 - `core/junction_decision_engine.py`: lane feasibility, commit-window logic, route application, and progress checks.
 - `core/shared_decision_policy.py`: shared decision classification and pending lifecycle logic.
 - `core/rl_training_pipeline.py`: training controller plus held-out frozen evaluation and checkpoint selection.
-- `controller/QLearningController.py`: frozen inference controller.
+- `controller/MAPPOController.py`: frozen inference controller.
 
 Mental model:
 - `STR_SUMO` decides when a vehicle is eligible for control.
@@ -159,7 +159,7 @@ CLI flags:
 What happens during frozen evaluation:
 1. the current training checkpoint is saved to a temporary eval model,
 2. held-out seeds are generated with the chosen evaluation spawn interval,
-3. the real inference controller (`QLearningController`) is run through `STR_SUMO`,
+3. the real inference controller (`MAPPOController`) is run through `STR_SUMO`,
 4. aggregate metrics are written to `rl_frozen_eval_metrics.csv`,
 5. the best checkpoint is updated if the new frozen-eval score is better.
 
@@ -176,7 +176,7 @@ This is the deployment-quality metric path.
 
 ## Inference cadence alignment
 
-`QLearningController.should_control_vehicle(...)` now wakes the controller on the same structural `forced` and `open` decision cases that training evaluates, while still preserving edge-change and active-pending monitoring.
+`MAPPOController.should_control_vehicle(...)` now wakes the controller on the same structural `forced` and `open` decision cases that training evaluates, while still preserving edge-change and active-pending monitoring.
 
 This reduces one of the main rollout mismatches that previously made `main.py` look much worse than training suggested.
 

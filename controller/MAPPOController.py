@@ -1,5 +1,5 @@
 ﻿from controller.RouteController import RouteController
-from core.Util import ConnectionInfo, Vehicle
+from core.Util import ConnectionInfo
 import numpy as np
 import torch
 import traci
@@ -10,8 +10,8 @@ from collections import deque
 
 from xml.dom.minidom import parse
 import os
-from core.dueling_q_layers import load_torch_checkpoint
-from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision, VehicleSnapshot
+from core.mappo import load_mappo_checkpoint, action_mask_from_valid_actions
+from core.junction_decision_engine import JunctionDecisionEngine, VehicleSnapshot
 from core.shared_decision_policy import SharedDecisionPolicy
 from core.route_loop_safety import transition_signal
 
@@ -22,12 +22,12 @@ def parse_sumocfg(sumocfg_path):
 net_path = parse_sumocfg("./configurations/myconfig.sumocfg")
 
 
-class QLearningPolicy(RouteController):
-    def __init__(self, vehicles, connection_info, model_file, net_xml_file = net_path):
+class MAPPOPolicy(RouteController):
+    def __init__(self, vehicles, connection_info, model_file, net_xml_file=net_path):
         super().__init__(connection_info)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model, self.model_checkpoint = load_torch_checkpoint(model_file, device=self.device)
-        self.model_state_size = int(self.model.state_size)
+        self.actor, _, self.model_checkpoint = load_mappo_checkpoint(model_file, device=self.device)
+        self.model_state_size = int(self.actor.observation_size)
         self.vehicles = vehicles
         self.net = sumolib.net.readNet(net_xml_file)
         self.decision_engine = JunctionDecisionEngine(connection_info, self.net, self.direction_choices)
@@ -123,40 +123,16 @@ class QLearningPolicy(RouteController):
             edge_embedding_dim=self.edge_embedding_dim,
             density_scale_m=100.0,
         )
-        # Must match RLTrainingPipeline compact state spec; retrained models are required when this changes.
-        self.compact_state_size_without_coordination = self.shared_policy.compact_state_size_without_coordination
         self.compact_state_size = self.shared_policy.compact_state_size
-        self.compact_state_size_without_coordination_v1 = self.shared_policy.compact_state_size_without_coordination_v1
-        self.compact_state_size_v1 = self.shared_policy.compact_state_size_v1
-        self.legacy_state_size = self.shared_policy.legacy_state_size(len(self.connection_info.edge_list))
-        self.compact_state_version = 2
-        self.use_coordination_state = (self.model_state_size == self.compact_state_size)
-        if self.model_state_size == self.compact_state_size:
-            self.use_compact_state = True
-            self.compact_state_version = 2
-        elif self.model_state_size == self.compact_state_size_without_coordination:
-            self.use_compact_state = True
-            self.compact_state_version = 2
-        elif self.model_state_size == self.compact_state_size_v1:
-            self.use_compact_state = True
-            self.use_coordination_state = True
-            self.compact_state_version = 1
-        elif self.model_state_size == self.compact_state_size_without_coordination_v1:
-            self.use_compact_state = True
-            self.use_coordination_state = False
-            self.compact_state_version = 1
-        elif self.model_state_size == self.legacy_state_size:
-            self.use_compact_state = False
-        else:
+        self.compact_state_version = self.shared_policy.compact_state_version
+        self.use_compact_state = True
+        self.use_coordination_state = True
+        if self.model_state_size != self.compact_state_size:
             raise ValueError(
-                "Checkpoint state_size={} is incompatible with current controller specs "
-                "(coordination_compact_v2={}, compact_v2={}, coordination_compact_v1={}, compact_v1={}, legacy={}).".format(
+                "Checkpoint state_size={} is incompatible with the current MAPPO controller "
+                "(expected compact_state_size={} with coordination enabled).".format(
                     self.model_state_size,
                     self.compact_state_size,
-                    self.compact_state_size_without_coordination,
-                    self.compact_state_size_v1,
-                    self.compact_state_size_without_coordination_v1,
-                    self.legacy_state_size,
                 )
             )
         self.density_scale_m = 100.0
@@ -193,15 +169,14 @@ class QLearningPolicy(RouteController):
         self._step_vehicle_wait_cache = {}
         self._step_lane_occupancy_cache = {}
         self._step_lane_halting_cache = {}
-        self.direction_mask_start = (2 * self.edge_embedding_dim) if self.use_compact_state else 2
         self._init_edge_embeddings(seed=1337)
 
-    def _predict_q_values(self, states):
-        self.model.eval()
+    def _predict_action_logits(self, states):
+        self.actor.eval()
         state_array = np.asarray(states, dtype=np.float32)
         with torch.no_grad():
             state_tensor = torch.as_tensor(state_array, dtype=torch.float32, device=self.device)
-            return self.model(state_tensor).detach().cpu().numpy()
+            return self.actor(state_tensor).detach().cpu().numpy()
 
     def _next_decision_id(self):
         self._decision_seq += 1
@@ -1282,34 +1257,32 @@ class QLearningPolicy(RouteController):
 
 
 
-    # this function reacheds the Neural Network trained before and let it make a decision for the situation now
+    # This uses the shared MAPPO actor in greedy inference mode.
     def act(self, state, available_actions=None):
-        act_values = self._predict_q_values(state)[0]
+        logits = self._predict_action_logits(state)[0]
         if available_actions is None:
-            mask_start = self.direction_mask_start + 18 if self.use_compact_state else self.direction_mask_start
-            available = [i for i, v in enumerate(state[0][mask_start:mask_start + 6]) if v > 0.5]
+            available = list(range(self.shared_policy.action_count))
         else:
             available = list(available_actions)
         if not available:
-            return int(np.argmax(act_values))
-        masked = np.full_like(act_values, -1e9)
-        masked[available] = act_values[available]
+            return int(np.argmax(logits))
+        action_mask = action_mask_from_valid_actions(self.shared_policy.action_count, available)
+        masked = np.where(action_mask > 0.5, logits, -1.0e9)
         return int(np.argmax(masked))
 
     def act_batch(self, states, available_actions_batch):
         if not states:
             return []
         state_batch = np.array([state[0] for state in states], dtype=np.float32)
-        q_batch = self._predict_q_values(state_batch)
+        logits_batch = self._predict_action_logits(state_batch)
         results = []
-        for q_values, available_actions in zip(q_batch, available_actions_batch):
+        for logits, available_actions in zip(logits_batch, available_actions_batch):
             available = list(available_actions) if available_actions is not None else []
             if not available:
-                results.append(int(np.argmax(q_values)))
+                results.append(int(np.argmax(logits)))
                 continue
-            masked = np.full_like(q_values, -1e9)
-            valid_idx = np.asarray(available, dtype=np.intp)
-            masked[valid_idx] = q_values[valid_idx]
+            action_mask = action_mask_from_valid_actions(self.shared_policy.action_count, available)
+            masked = np.where(action_mask > 0.5, logits, -1.0e9)
             results.append(int(np.argmax(masked)))
         return results
     # this function gives the current state of the vehicle based on the state size
@@ -1323,18 +1296,6 @@ class QLearningPolicy(RouteController):
             context = self._get_step_context(str(vehicle_id), en, destination_edge, current_step)
 
         vehicle_obj = self.vehicles.get(str(vehicle_id))
-        deadline_features = [0.0, 0.0, 0.0]
-        if vehicle_obj is not None:
-            now = float(current_step)
-            deadline_window = max(float(vehicle_obj.deadline) - float(vehicle_obj.start_time), 1.0)
-            time_left = max(float(vehicle_obj.deadline) - float(now), 0.0)
-            elapsed = max(float(now) - float(vehicle_obj.start_time), 0.0)
-            urgency = 1.0 - min(time_left / deadline_window, 1.0)
-            deadline_features = [
-                min(time_left / deadline_window, 1.0),
-                min(elapsed / deadline_window, 1.0),
-                urgency,
-            ]
 
         density_cache = {}
         eta_cache = {}
@@ -1392,17 +1353,14 @@ class QLearningPolicy(RouteController):
             edge_density_fn=cached_edge_density,
             eta_fn=cached_eta,
             social_cost_fn=lambda current_edge, action_idx, destination: social_cost_cache.get(action_idx, float("inf")),
-            global_density_stats=(float(self._density_mean), float(self._density_std)) if self.use_compact_state else None,
+            global_density_stats=(float(self._density_mean), float(self._density_std)),
             edge_lane_meters_fn=self._edge_lane_meters,
             step=current_step,
             vehicle_start_time=(float(vehicle_obj.start_time) if vehicle_obj is not None else None),
             vehicle_wait_time_fn=self._vehicle_wait_time,
             lane_halting_density_fn=self._lane_halting_density,
             lane_occupancy_fn=self._lane_occupancy,
-            edge_index_lookup=self.connection_info.edge_index_dict,
-            legacy_aux_features=deadline_features,
-            legacy_density_values=[cached_edge_density(edge_id) for edge_id in self.connection_info.edge_list] if not self.use_compact_state else None,
-            include_coordination=bool(self.use_compact_state and self.use_coordination_state),
+            include_coordination=True,
             coordination_state=coordination_state,
             compact_state_version=self.compact_state_version,
         )

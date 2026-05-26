@@ -26,7 +26,7 @@ You also need a working SUMO installation:
 
 `main.py`
 - Main benchmark entry point.
-- Runs Dijkstra and the trained Q-learning controller on the configured SUMO scenario.
+- Runs Dijkstra and the trained MAPPO controller on the configured SUMO scenario.
 - Inference now supports `--spawn-interval` and `--seed` so you can match training-style generation when comparing controllers.
 
 Example:
@@ -44,17 +44,18 @@ python3 main.py --spawn-interval 2.0 --seed 42
 - `STR_SUMO.py`: SUMO runtime wrapper used by evaluation/inference.
 - `junction_decision_engine.py`: lane-feasibility, commit-window, and route-application logic.
 - `shared_decision_policy.py`: shared decision lifecycle logic used by both training and inference.
-- `rl_training_pipeline.py`: DQN training pipeline plus held-out frozen evaluation and best-checkpoint selection.
+- `rl_training_pipeline.py`: MAPPO training pipeline plus held-out frozen evaluation and best-checkpoint selection.
+- `mappo.py`: shared actor/critic networks, action masking, and checkpoint utilities.
 
 `controller`
 - `RouteController.py`: base controller interface.
 - `DijkstraController.py`: shortest-path baseline.
-- `QLearningController.py`: trained-policy inference controller.
+- `MAPPOController.py`: trained-policy inference controller.
 
 `docs`
 - Analysis and operational notes for loop mitigation, telemetry interpretation, and training/inference workflow.
 
-***Training the RL policy***
+***Training the MAPPO policy***
 
 Basic training:
 
@@ -65,11 +66,11 @@ python3 train_rl.py
 Useful options:
 
 ```bash
-python3 train_rl.py   --sumocfg ./configurations/myconfig.sumocfg   --model-output ./configurations/model/rl_model_map.pt   --episodes 500   --spawn-interval 2.0   --eval-every 25   --eval-seeds 1001,1002,1003   --eval-spawn-interval 2.0
+python3 train_rl.py   --sumocfg ./configurations/myconfig.sumocfg   --model-output ./configurations/model/mappo_policy_map.pt   --episodes 500   --spawn-interval 2.0   --eval-every 25   --eval-seeds 1001,1002,1003   --eval-spawn-interval 2.0
 ```
 
 What the outputs mean:
-- `rl_episode_metrics.csv`: training-rollout metrics. These runs still include replay updates during the episode, so they are useful for training trends but are not a pure deployment-quality inference measure.
+- `rl_episode_metrics.csv`: training-rollout metrics. The MAPPO policy stays fixed during each episode and updates after the rollout is collected.
 - `rl_frozen_eval_metrics.csv`: held-out frozen evaluation metrics. These runs use the saved checkpoint with no online learning and average results across held-out seeds.
 - `<model-output>`: the final checkpoint at the end of training.
 - `<model-output>.best.pt`: the best held-out frozen-eval checkpoint, selected by completion rate first, then timeout rate, average travel time, `p90` travel time, tail gap, tail spread ratio, and deadline misses.
@@ -94,7 +95,7 @@ Hard-brake diagnostics:
 
 Inference parity improvements:
 - `main.py` can now match training generation via `--spawn-interval` and `--seed`.
-- `QLearningController.should_control_vehicle(...)` now wakes the inference controller on the same structural `forced` and `open` decision cases that training evaluates, instead of relying on an extra near-junction heuristic gate.
+- `MAPPOController.should_control_vehicle(...)` now wakes the inference controller on the same structural `forced` and `open` decision cases that training evaluates, instead of relying on an extra near-junction heuristic gate.
 - Training now supports held-out frozen evaluation so checkpoint selection is based on deployment-style behavior instead of optimistic in-training rollouts.
 
 ***Contribution guidance***

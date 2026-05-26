@@ -1,35 +1,35 @@
-# STR SUMO RL Training Improvement Playbook
+# STR SUMO MAPPO Training Improvement Playbook
 
 This project already tracks useful online metrics:
 - `teleport_events/ep`
 - `teleported_controlled/ep`
-- `completion_before_deadline`
+- `completion_rate`
 - `avg_return`
 
 (Printed in `core/rl_training_pipeline.py`.)
 
 ## 1) Optimize for the right objective first
 
-Treat **`completion_before_deadline`** as the primary KPI and `avg_return` as a secondary signal.
+Treat travel-time quality as the primary KPI: `completion_rate`, `avg_travel_time`, `p90_travel_time`, and `tail_completion_gap_steps`.
 
-Why: reward can improve without true task success if reward shaping overweights terms that do not directly increase on-time arrivals.
+Why: reward can improve without true deployment gains if shaping terms overpower completion and travel-time outcomes.
 
 ## 2) Run controlled A/B sweeps (one variable at a time)
 
 The highest-impact knobs in this codebase:
 
-- Exploration schedule in `DQNTrainer` (`epsilon_decay`, `epsilon_min`).
-- Q-learning discount (`gamma`).
-- Replay behavior (`batch_size`, replay frequency).
+- MAPPO learning rates (`actor_learning_rate`, `critic_learning_rate`).
+- Decision-level discount (`gamma`).
+- PPO update shape (`clip_epsilon`, `update_epochs`, `minibatch_size`, `min_transitions_per_update`).
 - Reward shaping constants (`destination_reward`, `deadline_penalty`, progress/loop penalties).
 - Teleport terminal penalty (currently hardcoded to `-200.0`).
 
 Recommended sweep order:
-1. `epsilon_decay`: try `0.995`, `0.997`, `0.999`.
-2. `epsilon_min`: try `0.10`, `0.15`.
+1. Actor LR: try `3e-4`, `2e-4`, `1e-4`.
+2. Critic LR: try `1e-3`, `7e-4`, `5e-4`.
 3. `gamma`: try `0.97` and `0.99`.
-4. Teleport penalty: try `-120`, `-150`, `-200`.
-5. `TRAIN_EVERY` / `GRAD_STEPS`: try `(5,2)` and `(10,2)`.
+4. `clip_epsilon`: try `0.15`, `0.20`, `0.25`.
+5. `update_epochs` / `minibatch_size`: try `(4, 512)` and `(6, 256)`.
 
 ## 3) Improve metric stability before changing architecture
 
@@ -37,7 +37,7 @@ The run is noisy. Use robust comparison rules:
 
 - Compare means over fixed windows (e.g., last 100 episodes).
 - Report at least 3 random seeds.
-- Select config by highest `completion_before_deadline`, then lowest `teleported_controlled/ep`, then best `avg_return`.
+- Select config by highest `completion_rate`, then lowest `timeout_rate`, then best `avg_travel_time`.
 
 ## 4) Reward-shaping guidance for this implementation
 

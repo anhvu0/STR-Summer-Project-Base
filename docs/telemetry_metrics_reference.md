@@ -8,7 +8,7 @@ This document explains the telemetry that matters most after the April 2026 rout
 
 Primary producers:
 - training: `core/rl_training_pipeline.py`
-- inference/runtime controller: `controller/QLearningController.py`
+- inference/runtime controller: `controller/MAPPOController.py`
 - runtime simulation wrapper: `core/STR_SUMO.py`
 
 The two main CSV outputs now serve different purposes:

@@ -29,7 +29,7 @@
   - ranked fallback selection (`ranked_fallback_actions`)
   - observe / cooldown flow for proactive lane changes
   - active vs passive pending handling for truthful same-edge monitoring
-  - inference wake-up alignment on structural `forced` and `open` decisions in `controller/QLearningController.py`
+  - inference wake-up alignment on structural `forced` and `open` decisions in `controller/MAPPOController.py`
 
 ### Key telemetry to track
 
@@ -45,7 +45,7 @@
 ## Frozen evaluation context (updated April 21, 2026)
 
 - `rl_episode_metrics.csv` is a training-rollout log, not a pure frozen deployment metric.
-- Training episodes can look optimistic relative to inference because replay updates still happen during the episode.
+- Training episodes are now fixed-policy MAPPO rollouts with updates applied after each episode, so they are cleaner than the older replay-updated rollouts but still not a substitute for held-out frozen inference.
 - `core/rl_training_pipeline.py` now supports held-out frozen evaluation with:
   - `eval_every`
   - `frozen_eval_seeds`
@@ -74,7 +74,7 @@
 
 - `core/rl_training_pipeline.py`
 - `core/STR_SUMO.py`
-- `controller/QLearningController.py`
+- `controller/MAPPOController.py`
 - `train_rl.py`
 - `main.py`
 - `README.md`

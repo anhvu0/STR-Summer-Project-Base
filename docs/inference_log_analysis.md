@@ -41,7 +41,7 @@ If inference uses a different `spawn_interval` or seed regime than training, con
 
 This lets inference reproduce the same vehicle-generation settings used in training.
 
-`controller/QLearningController.py`
+`controller/MAPPOController.py`
 - `should_control_vehicle(...)` now wakes on the same structural `forced` and `open` decision cases that training evaluates.
 - active pending and edge-change handling remain intact.
 

@@ -7,16 +7,14 @@ import json
 import copy
 
 from xml.dom.minidom import parse
-import torch
-from torch import nn
 from collections import Counter, defaultdict, deque
 import random
 from controller.DijkstraController import DijkstraPolicy
 from controller.RouteController import RouteController
-from controller.QLearningController import QLearningPolicy
+from controller.MAPPOController import MAPPOPolicy
 from core.STR_SUMO import StrSumo, build_runtime_sumocfg
-from core.dueling_q_layers import build_dueling_dqn, save_torch_checkpoint
-from core.junction_decision_engine import JunctionDecisionEngine, PendingDecision, VehicleSnapshot
+from core.mappo import MAPPOConfig, MAPPOTrainer, action_mask_from_valid_actions
+from core.junction_decision_engine import JunctionDecisionEngine, VehicleSnapshot
 from core.shared_decision_policy import SharedDecisionPolicy
 from core.Util import ConnectionInfo
 from core.target_vehicles_generation_protocols import target_vehicles_generator
@@ -33,9 +31,7 @@ import traci
 from traci import constants as tc
 import sumolib
 
-"""
-In this file, we build a DQN network
-"""
+"""Training pipeline for the shared MAPPO traffic-routing policy."""
 
 MAX_SIMULATION_STEPS = 4000 # This is the limit for each episode. Because vehicle might be stuck in infinite loop
 
@@ -44,37 +40,17 @@ MAX_SIMULATION_STEPS = 4000 # This is the limit for each episode. Because vehicl
 METRIC_DOCS = {
     "episode_return_total": {"description": "Sum of all rewards in the episode.", "type": "per_episode_aggregate"},
     "avg_return_per_vehicle": {"description": "episode_return_total / controlled_vehicle_count.", "type": "ratio", "numerator": "episode_return_total", "denominator": "total_controlled"},
-    "episode_mean_loss": {"description": "Mean of replay batch losses observed in this episode.", "type": "per_episode_aggregate"},
-    "last_batch_loss": {"description": "Loss from the latest replay optimizer step this episode.", "type": "gauge"},
+    "policy_loss": {"description": "Mean clipped-policy loss from the latest MAPPO update.", "type": "per_episode_aggregate"},
+    "value_loss": {"description": "Mean critic regression loss from the latest MAPPO update.", "type": "per_episode_aggregate"},
+    "entropy": {"description": "Mean action-distribution entropy from the latest MAPPO update.", "type": "gauge"},
+    "approx_kl": {"description": "Approximate KL divergence between old and new MAPPO policies.", "type": "gauge"},
+    "clip_fraction": {"description": "Share of samples clipped by the PPO ratio constraint.", "type": "ratio"},
     "decisions_opened": {"description": "Unique strategic decisions opened (one count per decision_id).", "type": "event_count", "mutually_exclusive_with_siblings": False},
     "decisions_finalized": {"description": "Strategic decisions that resolved/finalized; excludes synthetic terminal finalizations.", "type": "event_count"},
     "synthetic_terminal_finalizations": {"description": "Terminal transitions emitted when no pending strategic decision exists.", "type": "event_count"},
     "actionable_skip_ratio": {"description": "actionable_skips / actionable_decision_points.", "type": "ratio", "numerator": "actionable_skips", "denominator": "actionable_decision_points"},
     "pending_release_route_no_progress_abort": {"description": "Pending route releases aborted after no progress before timeout threshold.", "type": "event_count"},
 }
-
-class ReplayBuffer:
-    """
-    This is the replay buffer mechanism in DQN
-    """
-    def __init__(self, capacity):
-        """
-        :param capacity: Maximum number of transitions
-        """
-        self.buffer = deque(maxlen=capacity) # Use deque here so you can pop the first element later easily
-        self.capacity = capacity
-
-    def add(self, state, action, reward, next_state, done, next_valid_actions=None, metadata=None):
-        """      
-        Store one transition into the buffer
-        """
-        self.buffer.append((state, action, reward, next_state, done, next_valid_actions, metadata or {}))
-
-    def sample(self, batch_size):
-        return random.sample(self.buffer, batch_size)
-    
-    def __len__(self):
-        return len(self.buffer)
 
 class TrainingRouteHelper(RouteController):
     """
@@ -86,539 +62,10 @@ class TrainingRouteHelper(RouteController):
 
     def make_decisions(self, vehicles, connection_info):
         return {}
-
-class DQNTrainer:
-    """
-    Deep Q-Network trainer for routing decisions
-    """
-
-    EPISODE_COUNTER_EXPORT_SPECS = (
-        ("elite_transitions_added", "elite_transitions_added"),
-        ("elite_samples_drawn", "elite_samples_drawn"),
-        ("replay_main_kept_finalized", "replay_main_finalized"),
-        ("replay_main_kept_pending_timeout", "replay_main_pending_timeout"),
-        ("replay_main_kept_terminal", "replay_main_terminal"),
-        ("replay_main_kept_override", "replay_main_override"),
-        ("replay_main_kept_other", "replay_main_other"),
-        ("replay_main_dropped", "replay_main_dropped"),
-    )
-
-    def __init__(
-        self,
-        state_size,
-        action_size,
-        learning_rate=0.0005,
-        gamma=0.97,
-        epsilon=1.0,
-        epsilon_decay=0.995,
-        epsilon_min=0.01,
-        replay_capacity=150000,
-        elite_replay_capacity=None,
-        elite_fraction=0.25,
-        batch_size=128,
-        replay_warmup=2000,
-        target_update_every=400,
-        target_soft_tau=1.0,
-        use_double_dqn=True,
-        guided_exploration_best_prob=0.75,
-    ):
-        """
-        :param learning_rate: Can be adjusted for further optimization
-        :param gamma: Can be adjusted for further optimization
-        :param epsilon: 1.0 allows free exploration
-        :param epsilon_decay: epsilon value in next episode
-        :param epsilon_min: minimum epsilon to ensure that there's still some chance for free exploration later
-        :param use_double_dqn: If True, use online argmax + target evaluation for bootstrapping.
-        """
-        self.state_size = state_size
-        self.action_size = action_size
-        self.gamma = gamma
-        self.epsilon = epsilon
-        self.epsilon_decay = epsilon_decay
-        self.epsilon_min = epsilon_min
-        self.batch_size = batch_size
-        self.replay_warmup = max(int(replay_warmup), self.batch_size)
-        self.target_update_every = max(int(target_update_every), 1)
-        self.target_soft_tau = float(np.clip(target_soft_tau, 0.0, 1.0))
-        self.use_double_dqn = bool(use_double_dqn)
-        self.guided_exploration_best_prob = float(np.clip(guided_exploration_best_prob, 0.0, 1.0))
-        self.memory = ReplayBuffer(replay_capacity)
-        self.elite_fraction = float(np.clip(elite_fraction, 0.0, 0.5))
-        elite_capacity = elite_replay_capacity if elite_replay_capacity is not None else max(replay_capacity // 4, batch_size * 4)
-        self.elite_memory = ReplayBuffer(elite_capacity)
-        # Lifetime cumulative replay counters (monotonic across all episodes).
-        self.elite_transitions_added = 0
-        self.elite_samples_drawn = 0
-        self.replay_main_kept_finalized = 0
-        self.replay_main_kept_pending_timeout = 0
-        self.replay_main_kept_terminal = 0
-        self.replay_main_kept_override = 0
-        self.replay_main_kept_other = 0
-        self.replay_main_dropped = 0
-        self.staged_episode_transitions = []
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = self.build_model(learning_rate)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
-        self.loss_fn = nn.SmoothL1Loss()
-        self.target_model = self._build_target_model()
-        self.train_steps = 0
-        self.last_loss = None
-        self.episode_loss_values = []
-
-    @classmethod
-    def episode_metric_fields(cls):
-        fields = [
-            "epsilon",
-            "replay",
-            "train_steps_cumulative",
-            "train_steps_episode",
-            "episode_mean_loss",
-            "last_batch_loss",
-            "elite_buffer_size",
-        ]
-        for _, field_stem in cls.EPISODE_COUNTER_EXPORT_SPECS:
-            fields.extend([f"{field_stem}_episode", f"{field_stem}_cumulative"])
-        return tuple(fields)
-
-    def reset_episode_tracking(self):
-        self.episode_loss_values = []
-        self.last_loss = None
-
-    def capture_episode_metric_snapshot(self):
-        snapshot = {"train_steps": int(self.train_steps)}
-        for attr_name, _ in self.EPISODE_COUNTER_EXPORT_SPECS:
-            snapshot[attr_name] = int(getattr(self, attr_name))
-        return snapshot
-
-    def episode_metric_row(self, counter_start):
-        row = {
-            "epsilon": self.epsilon,
-            "replay": len(self.memory),
-            "train_steps_cumulative": self.train_steps,
-            "train_steps_episode": int(self.train_steps - int(counter_start.get("train_steps", 0))),
-            "episode_mean_loss": (float(np.mean(self.episode_loss_values)) if self.episode_loss_values else ""),
-            "last_batch_loss": self.last_loss if self.last_loss is not None else "",
-            "elite_buffer_size": len(self.elite_memory),
-        }
-        for attr_name, field_stem in self.EPISODE_COUNTER_EXPORT_SPECS:
-            cumulative_value = int(getattr(self, attr_name))
-            row[f"{field_stem}_episode"] = cumulative_value - int(counter_start.get(attr_name, 0))
-            row[f"{field_stem}_cumulative"] = cumulative_value
-        return row
-
-    def _build_target_model(self):
-        target_model = build_dueling_dqn(self.state_size, self.action_size, device=self.device)
-        target_model.load_state_dict(self.model.state_dict())
-        target_model.eval()
-        return target_model
-
-    def update_target_network(self, force=False):
-        """
-        Synchronize online-network weights into target network.
-        - Hard update when target_soft_tau=1.0.
-        - Polyak averaging when target_soft_tau is in (0, 1).
-        """
-        if not force and (self.train_steps % self.target_update_every != 0):
-            return
-
-        if self.target_soft_tau >= 1.0:
-            self.target_model.load_state_dict(self.model.state_dict())
-            return
-
-        tau = self.target_soft_tau
-        with torch.no_grad():
-            for target_param, online_param in zip(self.target_model.parameters(), self.model.parameters()):
-                target_param.data.mul_(1.0 - tau).add_(online_param.data, alpha=tau)
-
-    def build_model(self, learning_rate):
-        del learning_rate
-        return build_dueling_dqn(self.state_size, self.action_size, device=self.device)
-
-    def predict_q_values(self, states, target=False):
-        model = self.target_model if target else self.model
-        model.eval()
-        state_array = np.asarray(states, dtype=np.float32)
-        with torch.no_grad():
-            state_tensor = torch.as_tensor(state_array, dtype=torch.float32, device=self.device)
-            return model(state_tensor).detach().cpu().numpy()
-
-    def save_checkpoint(self, path):
-        save_torch_checkpoint(
-            path,
-            self.model,
-            optimizer=self.optimizer,
-            train_steps=int(self.train_steps),
-            epsilon=float(self.epsilon),
-            use_double_dqn=bool(self.use_double_dqn),
-        )
-
-    def _ranked_exploration_choice(self, valid_actions):
-        """
-        Exploration receives policy candidates in best-first order. Keep a real
-        exploration tail, but make destructive uniform wandering much rarer.
-        """
-        ranked_actions = []
-        seen = set()
-        for action in valid_actions:
-            action = int(action)
-            if action in seen:
-                continue
-            seen.add(action)
-            ranked_actions.append(action)
-        if not ranked_actions:
-            return None
-        if len(ranked_actions) == 1:
-            return ranked_actions[0]
-        if random.random() < self.guided_exploration_best_prob:
-            return ranked_actions[0]
-        weights = np.array([1.0 / float(idx + 1) for idx in range(len(ranked_actions))], dtype=np.float64)
-        weights /= np.sum(weights)
-        return int(np.random.choice(ranked_actions, p=weights))
-    
-    def select_action(self, state, valid_actions, return_source=False):
-        """
-        Select an action with epsilon-greedy exploration
-        :param valid_actions: List of valid actions at a specific edge
-        """
-        if not valid_actions:
-            return (None, "none") if return_source else None
-        if np.random.rand() <= self.epsilon: # Random to see if the agent should choose a new path
-            action = self._ranked_exploration_choice(valid_actions)
-            return (action, "explore") if return_source else action
-        q_values = self.predict_q_values(state)[0]
-        masked_values = np.full_like(q_values, -1e9)    #Make all q-values -1e9, then valid actions will update their according value, invalid actions will not be updated and stay negative
-        valid_idx = np.asarray(valid_actions, dtype=np.intp)
-        masked_values[valid_idx] = q_values[valid_idx]
-        selected = int(np.argmax(masked_values))
-        return (selected, "policy") if return_source else selected
-
-    def select_actions_batch(self, states, valid_actions_batch):
-        """
-        Batch epsilon-greedy selection for multiple vehicles in one model pass.
-        Returns list of (action, source).
-        """
-        n = len(states)
-        results = [(None, "none") for _ in range(n)]
-        policy_indices = []
-        policy_states = []
-        for idx, (state, valid_actions) in enumerate(zip(states, valid_actions_batch)):
-            if not valid_actions:
-                continue
-            if np.random.rand() <= self.epsilon:
-                results[idx] = (self._ranked_exploration_choice(valid_actions), "explore")
-            else:
-                policy_indices.append(idx)
-                policy_states.append(state[0])
-        if policy_states:
-            q_batch = self.predict_q_values(np.array(policy_states, dtype=np.float32))
-            for local_idx, global_idx in enumerate(policy_indices):
-                valid_actions = valid_actions_batch[global_idx]
-                masked_values = np.full_like(q_batch[local_idx], -1e9)
-                valid_idx = np.asarray(valid_actions, dtype=np.intp)
-                masked_values[valid_idx] = q_batch[local_idx][valid_idx]
-                results[global_idx] = (int(np.argmax(masked_values)), "policy")
-        return results
-    
-    def _is_elite_transition(self, reward, done, metadata):
-        metadata = metadata or {}
-        if metadata.get("override_learning", False):
-            return False
-        if metadata.get("imitation_credit", False):
-            return False
-        if metadata.get("synthetic_terminal_no_pending", False):
-            return False
-        if metadata.get("interim_pending_credit", False):
-            return False
-        terminal_outcome = metadata.get("terminal_outcome")
-        if terminal_outcome in {"teleport", "timeout", "removed_nonarrival"}:
-            return False
-        if metadata.get("episode_bucket") != "good":
-            return False
-        if not metadata.get("decision_open", False):
-            return False
-        if int(metadata.get("available_count", 0)) < 2:
-            return False
-        if metadata.get("forced_action", False):
-            return False
-        if terminal_outcome == "global_arrival":
-            return True
-        return bool(
-            metadata.get("decision_finalized", False)
-            and (not metadata.get("mismatch", False))
-            and float(reward) >= -2.0
-        )
-
-    def _should_store_interim_pending_transition(self, metadata):
-        """
-        Keep a thin, age-aware sample of same-edge pending wait costs.
-
-        Storing every pending step would let long queues dominate replay, but
-        dropping all of them hides the exact travel-time cost that makes stale
-        lane-change and route decisions bad.
-        """
-        if not metadata.get("decision_open", False):
-            return False
-        if int(metadata.get("available_count", 0)) < 2:
-            return False
-        if metadata.get("forced_action", False):
-            return False
-
-        age = max(int(metadata.get("pending_age", 0)), 0)
-        stall_age = max(int(metadata.get("pending_stall_age", 0)), 0)
-        if age < 2:
-            return False
-
-        resolution_mode = str(metadata.get("pending_resolution_mode", "lane_now"))
-        if age < 10:
-            interval = 4
-            keep_prob = 0.45
-        elif age < 24:
-            interval = 6
-            keep_prob = 0.60
-        elif age < 64:
-            interval = 8
-            keep_prob = 0.75
-        else:
-            interval = 10
-            keep_prob = 0.85
-
-        if resolution_mode != "lane_now":
-            keep_prob = min(keep_prob + 0.05, 0.90)
-        if stall_age >= 8:
-            interval = max(2, interval - 2)
-            keep_prob = min(keep_prob + 0.10, 0.95)
-        if age % interval != 0:
-            return False
-        return random.random() < keep_prob
-
-    def _should_store_override_transition(self, reward, metadata):
-        """
-        Safety overrides are the model's most actionable negative examples.
-        Earlier versions staged them but filtered them out of replay, so the
-        guardrails kept correcting the same policy mistakes without teaching
-        the Q-network to avoid them.
-        """
-        if metadata.get("imitation_credit", False):
-            return False
-        if float(reward) >= 0.0:
-            return False
-        override_type = str(metadata.get("override_type", ""))
-        if override_type in {
-            "loop_prefilter_fallback",
-            "route_apply_failure",
-            "cooldown_fallback",
-            "observe_abort_fallback",
-        }:
-            return True
-        return bool(metadata.get("override_cause"))
-
-    def _should_store_main_transition(self, reward, done, metadata):
-        metadata = metadata or {}
-        if metadata.get("imitation_credit", False):
-            return False
-        if metadata.get("override_learning", False):
-            return self._should_store_override_transition(reward, metadata)
-        if metadata.get("synthetic_terminal_no_pending", False):
-            return False
-
-        terminal_outcome = metadata.get("terminal_outcome")
-        if terminal_outcome in {"global_arrival", "teleport", "timeout", "removed_nonarrival"}:
-            return True
-
-        if metadata.get("interim_pending_credit", False):
-            return self._should_store_interim_pending_transition(metadata)
-
-        if not metadata.get("decision_open", False):
-            return False
-        if int(metadata.get("available_count", 0)) < 2:
-            return False
-        if metadata.get("forced_action", False):
-            return False
-
-        is_finalized = bool(metadata.get("decision_finalized", False))
-        is_timeout_or_observe = bool(
-            metadata.get("pending_timeout_replan", False)
-            or metadata.get("route_pending_replan", False)
-            or metadata.get("observe_no_progress", False)
-            or metadata.get("observe_low_speed", False)
-            or metadata.get("observe_commit_window_miss", False)
-        )
-        if not (is_finalized or is_timeout_or_observe):
-            return False
-
-        bucket = str(metadata.get("episode_bucket", "bad"))
-        if bucket == "good":
-            keep_prob = 1.0 if is_finalized else 0.75
-        elif bucket == "okay":
-            keep_prob = 0.70 if is_finalized else 0.40
-        else:
-            keep_prob = 0.35 if is_finalized else 0.15
-        return random.random() < keep_prob
-
-    def stage_transition(self, state, action, reward, next_state, done, next_valid_actions=None, metadata=None):
-        self.staged_episode_transitions.append(
-            (state, action, reward, next_state, done, next_valid_actions, metadata)
-        )
-
-    def _episode_bucket(
-        self,
-        avg_tt,
-        avg_return,
-        completion_rate,
-        teleported_controlled,
-        timeout_rate=0.0,
-        tail_completion_gap_steps=0.0,
-        p95_to_p50_travel_ratio=0.0,
-    ):
-        if avg_tt < 240 and completion_rate >= 0.99 and teleported_controlled <= 2:
-            bucket = "good"
-        elif avg_tt < 280 and completion_rate >= 0.97 and teleported_controlled <= 5:
-            bucket = "okay"
-        else:
-            bucket = "bad"
-
-        # Keep replay curation aligned with the travel-time objective while
-        # filtering episodes with clearly unstable long tails.
-        timeout_rate = float(timeout_rate)
-        tail_completion_gap_steps = float(tail_completion_gap_steps)
-        p95_to_p50_travel_ratio = float(p95_to_p50_travel_ratio)
-        if timeout_rate > 0.0:
-            return "bad"
-        if bucket == "good" and (
-            tail_completion_gap_steps > 360.0
-            or p95_to_p50_travel_ratio > 2.8
-        ):
-            return "okay"
-        if bucket in {"good", "okay"} and (
-            tail_completion_gap_steps > 460.0
-            or p95_to_p50_travel_ratio > 3.2
-        ):
-            return "bad"
-        return bucket
-
-    def flush_staged_episode(
-        self,
-        avg_tt,
-        avg_return,
-        completion_rate,
-        teleported_controlled,
-        timeout_rate=0.0,
-        tail_completion_gap_steps=0.0,
-        p95_to_p50_travel_ratio=0.0,
-    ):
-        bucket = self._episode_bucket(
-            avg_tt,
-            avg_return,
-            completion_rate,
-            teleported_controlled,
-            timeout_rate=timeout_rate,
-            tail_completion_gap_steps=tail_completion_gap_steps,
-            p95_to_p50_travel_ratio=p95_to_p50_travel_ratio,
-        )
-        for state, action, reward, next_state, done, next_valid_actions, metadata in self.staged_episode_transitions:
-            metadata = dict(metadata) if isinstance(metadata, dict) else {}
-            metadata["episode_bucket"] = bucket
-            if self._should_store_main_transition(reward, done, metadata):
-                self.memory.add(state, action, reward, next_state, done, next_valid_actions, metadata=metadata)
-                terminal_outcome = metadata.get("terminal_outcome")
-                if terminal_outcome in {"global_arrival", "teleport", "timeout", "removed_nonarrival"}:
-                    self.replay_main_kept_terminal += 1
-                elif metadata.get("decision_finalized", False):
-                    self.replay_main_kept_finalized += 1
-                elif metadata.get("pending_timeout_replan", False):
-                    self.replay_main_kept_pending_timeout += 1
-                elif metadata.get("override_learning", False):
-                    self.replay_main_kept_override += 1
-                else:
-                    self.replay_main_kept_other += 1
-            else:
-                self.replay_main_dropped += 1
-            if self._is_elite_transition(reward, done, metadata):
-                self.elite_memory.add(state, action, reward, next_state, done, next_valid_actions, metadata=metadata)
-                self.elite_transitions_added += 1
-        self.staged_episode_transitions.clear()
-
-    def remember(self, state, action, reward, next_state, done, next_valid_actions=None, metadata=None):
-        """
-        Store 1 transition for replay
-        """
-        self.stage_transition(state, action, reward, next_state, done, next_valid_actions, metadata)
-    
-    def replay(self):
-        """
-        Train the Q-network from replayed experiences. Update q-values of previous state based on the most recent one.
-        """
-        if len(self.memory) < self.replay_warmup:
-            return
-        elite_bs = 0
-        if len(self.elite_memory) >= max(8, self.batch_size // 8):
-            elite_bs = min(int(round(self.batch_size * self.elite_fraction)), len(self.elite_memory))
-        base_bs = self.batch_size - elite_bs
-        base_bs = min(base_bs, len(self.memory))
-        if base_bs <= 0:
-            return
-        minibatch = self.memory.sample(base_bs)
-        if elite_bs > 0:
-            elite_batch = self.elite_memory.sample(elite_bs)
-            minibatch += elite_batch
-            self.elite_samples_drawn += elite_bs
-        random.shuffle(minibatch)
-        states      = np.vstack([s[0] for s in minibatch])
-        actions     = np.array([s[1] for s in minibatch], dtype=np.int32)
-        rewards     = np.array([s[2] for s in minibatch], dtype=np.float32)
-        next_states = np.vstack([s[3] for s in minibatch])
-        dones       = np.array([s[4] for s in minibatch], dtype=np.bool_)
-        next_valid_actions_batch = [s[5] for s in minibatch]
-        batch_len = states.shape[0]
-
-        # Keep inference fast:
-        # - Fuse ONLINE model calls for q(s) and q_online(s') in one pass.
-        # - Use TARGET model only for bootstrap values.
-        # This preserves Double-DQN behavior when enabled.
-        stacked_states = np.vstack((states, next_states))
-        q_all_online = self.predict_q_values(stacked_states)
-        q = q_all_online[:batch_len]
-        q_next_online = q_all_online[batch_len:]
-        q_next_target = self.predict_q_values(next_states, target=True)
-
-        valid_action_mask = np.zeros((batch_len, self.action_size), dtype=np.bool_)
-        for idx, valid_actions in enumerate(next_valid_actions_batch):
-            if dones[idx] or not valid_actions:
-                continue
-            valid_action_mask[idx, valid_actions] = True
-
-        selection_q = q_next_online if self.use_double_dqn else q_next_target
-        masked_selection_q = np.where(valid_action_mask, selection_q, -1e9)
-        best_next_actions = np.argmax(masked_selection_q, axis=1)
-        bootstrap_values = q_next_target[np.arange(batch_len), best_next_actions]
-        bootstrap_values[~valid_action_mask.any(axis=1)] = 0.0
-
-        target = q.copy()
-        target[np.arange(batch_len), actions] = (
-            rewards + (1.0 - dones.astype(np.float32)) * self.gamma * bootstrap_values
-        )
-
-        self.model.train()
-        states_tensor = torch.as_tensor(states, dtype=torch.float32, device=self.device)
-        target_tensor = torch.as_tensor(target, dtype=torch.float32, device=self.device)
-        predicted = self.model(states_tensor)
-        loss = self.loss_fn(predicted, target_tensor)
-        self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
-        self.optimizer.step()
-
-        self.last_loss = float(loss.detach().cpu().item())
-        self.episode_loss_values.append(self.last_loss)
-        self.train_steps += 1
-        self.update_target_network()
-
-        # if self.epsilon > self.epsilon_min:
-        #     self.epsilon *= self.epsilon_decay
             
 class RLTrainingPipeline:
     """
-    Pipeline for training a routing policy with Deep Q-Learning.
+    Pipeline for training a routing policy with MAPPO.
     """
 
     def __init__(
@@ -631,16 +78,8 @@ class RLTrainingPipeline:
         seed_with_episode=True,
         destination_reward=50.0,
         teleport_penalty=-40.0,
-        epsilon_decay=0.995,
-        epsilon_min=0.01,
-        gamma=0.97,
-        replay_capacity=150000,
-        batch_size=128,
-        replay_warmup=2000,
-        train_every=6,
-        grad_steps=1,
+        mappo_config=None,
         rolling_window=100,
-        use_double_dqn=True,
         target_pattern=3,
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
@@ -666,7 +105,7 @@ class RLTrainingPipeline:
             seed_with_episode: Whether to use the episode number as random seed.
             destination_reward: Reward when reaching the destination.
             teleport_penalty: Terminal penalty for teleport events.
-            use_double_dqn: Enable Double-DQN bootstrap action selection.
+            mappo_config: Optional MAPPOConfig override for policy/value updates.
             target_pattern: Vehicle generation pattern. 2 means varied origins
                 and one shared destination (helps controlled travel-time comparison).
             normalize_per_step_cost_by_route_difficulty: If True, scales only the
@@ -687,10 +126,8 @@ class RLTrainingPipeline:
         self.seed_with_episode = seed_with_episode
         self.destination_reward = destination_reward
         self.teleport_penalty = teleport_penalty
-        self.train_every = train_every
-        self.grad_steps = grad_steps
+        self.mappo_config = mappo_config or MAPPOConfig()
         self.rolling_window = rolling_window
-        self.use_double_dqn = bool(use_double_dqn)
         self.target_pattern = target_pattern
         self.debug_exit_diagnostics = debug_exit_diagnostics
         self.debug_exit_diagnostics_limit = max(int(debug_exit_diagnostics_limit), 0)
@@ -788,6 +225,7 @@ class RLTrainingPipeline:
         self.local_congestion_k = self.shared_policy.local_congestion_k
         self._init_edge_embeddings(seed=1337)
         self.state_size = self.shared_policy.compact_state_size
+        self.central_observation_size = 18
         self.action_size = 6
         self.metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_episode_metrics.csv")
         self.frozen_eval_metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_frozen_eval_metrics.csv")
@@ -821,20 +259,11 @@ class RLTrainingPipeline:
         self.congestion_low_speed_threshold = 2.0
         self.emergency_decel_threshold = 4.5
         self.teleport_jam_density_threshold = 0.55
-        self.trainer = DQNTrainer(
+        self.trainer = MAPPOTrainer(
             self.state_size,
+            self.central_observation_size,
             self.action_size,
-            gamma=gamma,
-            epsilon_decay=epsilon_decay,
-            epsilon_min=epsilon_min,
-            replay_capacity=replay_capacity,
-            elite_replay_capacity=max(replay_capacity // 4, batch_size * 4),
-            elite_fraction=0.25,
-            batch_size=batch_size,
-            replay_warmup=replay_warmup,
-            target_update_every=400,
-            target_soft_tau=1.0,
-            use_double_dqn=self.use_double_dqn,
+            config=self.mappo_config,
         )
         self._decision_debug_fields = [
             "episode", "step", "vehicle_id", "decision_edge", "action", "action_source", "available_actions",
@@ -867,6 +296,157 @@ class RLTrainingPipeline:
         with open(self.decision_debug_csv_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=self._decision_debug_fields)
             writer.writerows(rows)
+
+    def _zero_central_observation(self):
+        return np.zeros((1, self.central_observation_size), dtype=np.float32)
+
+    def _action_mask_vector(self, valid_actions):
+        return action_mask_from_valid_actions(self.action_size, valid_actions)
+
+    def _build_central_observation(
+        self,
+        *,
+        step,
+        total_controlled,
+        arrived_ids,
+        step_snapshots,
+        vehicles,
+        pending_decisions,
+        coordination_state,
+        open_decision_count,
+    ):
+        observation = np.zeros(self.central_observation_size, dtype=np.float32)
+        total_controlled = max(int(total_controlled), 1)
+        live_count = int(len(step_snapshots))
+        arrived_count = int(len(arrived_ids))
+        pending_summary = self._summarize_pending_backlog(pending_decisions, step)
+
+        speeds = [float(snapshot.speed) for snapshot in step_snapshots.values()]
+        waits = [self._vehicle_wait_time(vehicle_id) for vehicle_id in step_snapshots.keys()]
+        remaining_etas = []
+        for vehicle_id, snapshot in step_snapshots.items():
+            vehicle = vehicles.get(vehicle_id)
+            if vehicle is None:
+                continue
+            eta = self._estimate_remaining_eta(snapshot.edge_id, vehicle.destination)
+            if math.isfinite(eta):
+                remaining_etas.append(float(eta))
+
+        observation[0] = min(float(step) / float(MAX_SIMULATION_STEPS), 1.0)
+        observation[1] = float(arrived_count) / float(total_controlled)
+        observation[2] = float(live_count) / float(total_controlled)
+        observation[3] = float(pending_summary["total_open"]) / float(total_controlled)
+        observation[4] = float(max(int(open_decision_count), 0)) / float(total_controlled)
+        observation[5] = min(float(np.mean(speeds)) / 20.0, 1.0) if speeds else 0.0
+        observation[6] = min(float(np.std(speeds)) / 10.0, 1.0) if len(speeds) > 1 else 0.0
+        observation[7] = (
+            min(float(np.mean(remaining_etas)) / float(MAX_SIMULATION_STEPS), 1.0)
+            if remaining_etas else 0.0
+        )
+        observation[8] = (
+            min(float(max(remaining_etas)) / float(MAX_SIMULATION_STEPS), 1.0)
+            if remaining_etas else 0.0
+        )
+        observation[9] = min(float(np.mean(waits)) / 120.0, 1.0) if waits else 0.0
+        observation[10] = float(np.clip(self._density_mean, 0.0, 1.0))
+        observation[11] = float(np.clip(self._density_std, 0.0, 1.0))
+        observation[12] = float(np.clip(self._density_p95, 0.0, 1.0))
+        if coordination_state is not None:
+            observation[13] = float(
+                np.clip(
+                    float(coordination_state.reserved_agents)
+                    / max(float(self.shared_policy.coordination_reserved_agents_cap), 1.0),
+                    0.0,
+                    1.0,
+                )
+            )
+        observation[14] = min(
+            float(pending_summary["mean_age_all"]) / float(self.decision_engine.route_pending_hard_timeout_steps),
+            1.0,
+        )
+        observation[15] = min(
+            float(pending_summary["max_age_all"]) / float(self.decision_engine.route_pending_hard_timeout_steps),
+            1.0,
+        )
+        observation[16] = float(pending_summary["active_monitoring_open"]) / float(total_controlled)
+        observation[17] = 1.0 if (
+            live_count > 0
+            and float(np.mean([self._edge_density(snapshot.edge_id) for snapshot in step_snapshots.values()])) >= self.congestion_density_threshold
+            and float(np.mean(speeds)) <= self.congestion_low_speed_threshold
+        ) else 0.0
+        return observation.reshape(1, -1)
+
+    def _build_mappo_trace(self, state, central_observation, selection):
+        return {
+            "mappo_training": True,
+            "mappo_initial_state": np.asarray(state, dtype=np.float32).reshape(1, -1).copy(),
+            "mappo_initial_central_observation": np.asarray(central_observation, dtype=np.float32).reshape(1, -1).copy(),
+            "mappo_log_prob": float(selection.log_prob),
+            "mappo_value": float(selection.value),
+            "mappo_action_mask": np.asarray(selection.action_mask, dtype=np.float32).reshape(-1).copy(),
+            "mappo_reward_accumulator": 0.0,
+        }
+
+    def _accumulate_mappo_reward(self, metadata, reward):
+        if not isinstance(metadata, dict) or not metadata.get("mappo_training", False):
+            return
+        metadata["mappo_reward_accumulator"] = float(metadata.get("mappo_reward_accumulator", 0.0)) + float(reward)
+
+    def _record_immediate_mappo_transition(
+        self,
+        trace,
+        *,
+        action,
+        reward,
+        next_state,
+        next_central_observation,
+        done,
+        discount_steps=1,
+        metadata=None,
+    ):
+        if not isinstance(trace, dict) or not trace.get("mappo_training", False):
+            return False
+        total_reward = float(trace.get("mappo_reward_accumulator", 0.0)) + float(reward)
+        self.trainer.record_transition(
+            observation=trace["mappo_initial_state"],
+            central_observation=trace["mappo_initial_central_observation"],
+            action=int(action),
+            action_mask=trace["mappo_action_mask"],
+            log_prob=float(trace["mappo_log_prob"]),
+            value=float(trace["mappo_value"]),
+            reward=total_reward,
+            next_observation=np.asarray(next_state, dtype=np.float32).reshape(1, -1),
+            next_central_observation=np.asarray(next_central_observation, dtype=np.float32).reshape(1, -1),
+            done=bool(done),
+            discount_steps=max(int(discount_steps), 1),
+            metadata=metadata,
+        )
+        trace["mappo_transition_recorded"] = True
+        return True
+
+    def _record_pending_mappo_transition(
+        self,
+        pending,
+        *,
+        reward,
+        next_state,
+        next_central_observation,
+        done,
+        discount_steps=1,
+        metadata=None,
+    ):
+        if pending is None or not isinstance(getattr(pending, "metadata", None), dict):
+            return False
+        return self._record_immediate_mappo_transition(
+            pending.metadata,
+            action=int(pending.intended_action),
+            reward=reward,
+            next_state=next_state,
+            next_central_observation=next_central_observation,
+            done=done,
+            discount_steps=discount_steps,
+            metadata=metadata,
+        )
 
     def _format_top_counts(self, counts, limit=3):
         if not counts:
@@ -1088,11 +668,10 @@ class RLTrainingPipeline:
         completion = (len(arrived_ids) / float(total_controlled)) if total_controlled > 0 else 0.0
         failed = max(total_controlled - len(arrived_ids), 0)
         print(
-            "[EP {:03d} | STEP {:04d}] eps={:.3f} replay={} train={} loss={} "
+            "[EP {:03d} | STEP {:04d}] rollout={} updates={} policy_loss={} "
             "done={}/{} fail={} open/final/skip={:.0f}/{:.0f}/{:.0f} forced={:.0f}".format(
                 episode,
                 step,
-                self.trainer.epsilon,
                 len(self.trainer.memory),
                 self.trainer.train_steps,
                 "n/a" if self.trainer.last_loss is None else f"{self.trainer.last_loss:.4f}",
@@ -1740,6 +1319,7 @@ class RLTrainingPipeline:
         in_arrived_ids=False,
         in_teleport_ids=False,
         ever_teleported=False,
+        next_central_observation=None,
     ):
         if vehicle_id in terminal_recorded_ids:
             return 0.0
@@ -1791,21 +1371,6 @@ class RLTrainingPipeline:
                 decision_metrics["fail_removed_non_destination"] += 1
             else:
                 raise ValueError(f"Unknown terminal outcome: {outcome}")
-            self.trainer.stage_transition(
-                base_state,
-                0,
-                reward,
-                next_state,
-                done,
-                next_valid_actions=[],
-                metadata={
-                    "terminal_outcome": outcome,
-                    "synthetic_terminal_no_pending": True,
-                    "decision_finalized": True,
-                    "ever_teleported": bool(ever_teleported),
-                    "teleport_assisted_arrival": bool(ever_teleported and outcome == "global_arrival"),
-                },
-            )
             decision_metrics["synthetic_terminal_finalizations"] += 1
             decision_debug_rows.append({
                 "episode": episode,
@@ -1921,13 +1486,16 @@ class RLTrainingPipeline:
         if ever_teleported:
             final_metadata["ever_teleported"] = True
             final_metadata["teleport_assisted_arrival"] = (outcome == "global_arrival")
-        self.trainer.stage_transition(
-            pending.state,
-            pending.intended_action,
-            reward,
-            next_state,
-            done,
-            next_valid_actions=[],
+        self._record_pending_mappo_transition(
+            pending,
+            reward=reward,
+            next_state=next_state,
+            next_central_observation=(
+                self._zero_central_observation()
+                if next_central_observation is None else next_central_observation
+            ),
+            done=done,
+            discount_steps=max(step - pending.decision_step, 1),
             metadata=final_metadata,
         )
         pending_decisions.pop(vehicle_id, None)
@@ -2184,7 +1752,7 @@ class RLTrainingPipeline:
             "seed_count",
             "seed_list",
             "spawn_interval",
-            "use_double_dqn",
+            "algorithm",
             "baseline_seed_source",
             "win_count",
             "win_rate",
@@ -2329,7 +1897,7 @@ class RLTrainingPipeline:
                 self._frozen_eval_baseline_cache[dijkstra_cache_key] = dict(baseline_stats)
 
             rl_vehicles = copy.deepcopy(vehicles)
-            policy = QLearningPolicy(
+            policy = MAPPOPolicy(
                 rl_vehicles,
                 self.connection_info,
                 self._frozen_eval_model_path,
@@ -2379,7 +1947,7 @@ class RLTrainingPipeline:
             "seed_count": int(len(per_seed_rows)),
             "seed_list": ",".join(str(row["seed"]) for row in per_seed_rows),
             "spawn_interval": float(self.eval_spawn_interval),
-            "use_double_dqn": int(self.use_double_dqn),
+            "algorithm": "mappo",
             "baseline_seed_source": ",".join(str(seed) for seed in self.frozen_eval_seeds),
             "win_count": float(sum(float(row["win_vs_dijkstra"]) for row in per_seed_rows)),
             "win_rate": mean_metric("win_vs_dijkstra", 0.0),
@@ -2463,7 +2031,7 @@ class RLTrainingPipeline:
         rolling_mismatch = deque(maxlen=self.rolling_window)
         trainer_csv_fields = list(self.trainer.episode_metric_fields())
         csv_fields = [
-            "episode", *trainer_csv_fields[:2], "use_double_dqn",
+            "episode", *trainer_csv_fields[:2], "algorithm",
             *trainer_csv_fields[2:6],
             "episode_return_total", "avg_return_per_vehicle",
             *trainer_csv_fields[6:],
@@ -2672,24 +2240,6 @@ class RLTrainingPipeline:
                         return filtered_actions
                 return policy_actions
 
-            def policy_actions_for_bootstrap(vehicle_id, vehicle, step, context, recent_history=None, cooldown_active=None):
-                decision_mode = self.shared_policy.classify_decision(context)
-                if decision_mode.mode == "forced":
-                    return [int(decision_mode.action)] if decision_mode.action is not None else []
-                if decision_mode.mode != "open":
-                    return []
-                if cooldown_active is None:
-                    cooldown_until = lane_change_cooldown_until.get((vehicle_id, context.edge_id), -1)
-                    cooldown_active = int(step) < int(cooldown_until)
-                return self._policy_action_candidates(
-                    context=context,
-                    recent_history=(recent_history if recent_history is not None else decision_recent_history(vehicle_id)),
-                    cooldown_active=bool(cooldown_active),
-                    destination=vehicle.destination,
-                    decision_metrics=None,
-                    coordination_state=step_coordination_state,
-                )
-
             def process_selected_action(
                 vehicle_id,
                 vehicle,
@@ -2700,16 +2250,36 @@ class RLTrainingPipeline:
                 state,
                 action,
                 action_source,
+                selection=None,
+                central_observation=None,
                 coordination_state=None,
             ):
                 nonlocal episode_return_total
 
                 recent_history = decision_recent_history(vehicle_id)
                 cooldown_until = lane_change_cooldown_until.get((vehicle_id, current_edge), -1)
+                policy_trace = None
+                if selection is not None and central_observation is not None:
+                    policy_trace = self._build_mappo_trace(state, central_observation, selection)
                 next_edge = self.decision_engine.get_next_edge(current_edge, action)
                 if next_edge is None:
                     decision_metrics["safety_overrides"] += 1
                     self._record_override_event(decision_metrics, "invalid_action")
+                    if policy_trace is not None:
+                        penalty = self._clip_reward(-2.0)
+                        self._record_immediate_mappo_transition(
+                            policy_trace,
+                            action=action,
+                            reward=penalty,
+                            next_state=state,
+                            next_central_observation=(
+                                self._zero_central_observation()
+                                if central_observation is None else central_observation
+                            ),
+                            done=False,
+                            metadata={"override_type": "invalid_action"},
+                        )
+                        episode_return_total += penalty
                     prev_edge_by_vehicle[vehicle_id] = current_edge
                     return None
 
@@ -2744,52 +2314,25 @@ class RLTrainingPipeline:
                     decision_metrics["safety_overrides"] += 1
                     action_source = "loop_prefilter_fallback"
                     override_penalty = self._clip_reward(self.loop_trap_override_penalty)
-                    policy_actions_after_override = self._policy_action_candidates(
-                        context=context,
-                        recent_history=recent_history,
-                        cooldown_active=step < cooldown_until,
-                        destination=vehicle.destination,
-                        decision_metrics=decision_metrics,
-                        coordination_state=coordination_state,
-                    )
-                    self.trainer.stage_transition(
-                        state,
-                        original_action,
-                        override_penalty,
-                        state,
-                        False,
-                        next_valid_actions=policy_actions_after_override,
-                        metadata={
-                            "override_learning": True,
-                            "override_type": "loop_prefilter_fallback",
-                            "original_action": original_action,
-                            "fallback_action": action,
-                            "override_cause": "loop_prefilter_fallback",
-                            "decision_finalized": False,
-                        },
-                    )
-                    decision_metrics["override_learning_transitions"] += 1
-                    decision_metrics["override_learning_negative"] += 1
-                    imitation_reward = self._clip_reward(0.15)
-                    self.trainer.stage_transition(
-                        state,
-                        action,
-                        imitation_reward,
-                        state,
-                        False,
-                        next_valid_actions=policy_actions_after_override,
-                        metadata={
-                            "override_learning": True,
-                            "override_type": "loop_prefilter_fallback",
-                            "original_action": original_action,
-                            "fallback_action": action,
-                            "imitation_credit": True,
-                            "decision_finalized": False,
-                        },
-                    )
-                    decision_metrics["override_learning_transitions"] += 1
-                    decision_metrics["override_learning_imitation"] += 1
+                    if policy_trace is not None:
+                        self._record_immediate_mappo_transition(
+                            policy_trace,
+                            action=original_action,
+                            reward=override_penalty,
+                            next_state=state,
+                            next_central_observation=(
+                                self._zero_central_observation()
+                                if central_observation is None else central_observation
+                            ),
+                            done=False,
+                            metadata={
+                                "override_type": "loop_prefilter_fallback",
+                                "original_action": original_action,
+                                "fallback_action": action,
+                            },
+                        )
                     episode_return_total += override_penalty
+                    policy_trace = None
                     next_edge = self.decision_engine.get_next_edge(current_edge, action)
                     if next_edge is None:
                         prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -2828,52 +2371,25 @@ class RLTrainingPipeline:
                         ):
                             decision_metrics["fallback_after_timeout_count"] += 1
                         override_penalty = self._clip_reward(self.same_edge_repeat_chase_penalty)
-                        policy_actions_after_override = self._policy_action_candidates(
-                            context=context,
-                            recent_history=recent_history,
-                            cooldown_active=True,
-                            destination=vehicle.destination,
-                            decision_metrics=decision_metrics,
-                            coordination_state=coordination_state,
-                        )
-                        self.trainer.stage_transition(
-                            state,
-                            original_action,
-                            override_penalty,
-                            state,
-                            False,
-                            next_valid_actions=policy_actions_after_override,
-                            metadata={
-                                "override_learning": True,
-                                "override_type": "cooldown_fallback",
-                                "original_action": original_action,
-                                "fallback_action": action,
-                                "override_cause": "cooldown_fallback",
-                                "decision_finalized": False,
-                            },
-                        )
-                        decision_metrics["override_learning_transitions"] += 1
-                        decision_metrics["override_learning_negative"] += 1
-                        imitation_reward = self._clip_reward(0.10)
-                        self.trainer.stage_transition(
-                            state,
-                            action,
-                            imitation_reward,
-                            state,
-                            False,
-                            next_valid_actions=policy_actions_after_override,
-                            metadata={
-                                "override_learning": True,
-                                "override_type": "cooldown_fallback",
-                                "original_action": original_action,
-                                "fallback_action": action,
-                                "imitation_credit": True,
-                                "decision_finalized": False,
-                            },
-                        )
-                        decision_metrics["override_learning_transitions"] += 1
-                        decision_metrics["override_learning_imitation"] += 1
+                        if policy_trace is not None:
+                            self._record_immediate_mappo_transition(
+                                policy_trace,
+                                action=original_action,
+                                reward=override_penalty,
+                                next_state=state,
+                                next_central_observation=(
+                                    self._zero_central_observation()
+                                    if central_observation is None else central_observation
+                                ),
+                                done=False,
+                                metadata={
+                                    "override_type": "cooldown_fallback",
+                                    "original_action": original_action,
+                                    "fallback_action": action,
+                                },
+                            )
                         episode_return_total += override_penalty
+                        policy_trace = None
                     else:
                         lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action)
                         decision_metrics["lane_change_attempts"] += 1
@@ -2909,6 +2425,7 @@ class RLTrainingPipeline:
                                     action_idx=action,
                                     coordination_state=coordination_state,
                                 ),
+                                **({} if policy_trace is None else policy_trace),
                             },
                         )
                         self._record_recent_decision_attribution(
@@ -2988,33 +2505,23 @@ class RLTrainingPipeline:
                     self._record_override_event(decision_metrics, "route_apply_fail")
                     decision_metrics["fragment_build_failures"] += 1
                     override_penalty = self._clip_reward(-6.0)
-                    policy_actions_after_override = self._policy_action_candidates(
-                        context=context,
-                        recent_history=recent_history,
-                        cooldown_active=step < cooldown_until,
-                        destination=vehicle.destination,
-                        decision_metrics=decision_metrics,
-                        coordination_state=coordination_state,
-                    )
-                    self.trainer.stage_transition(
-                        state,
-                        action,
-                        override_penalty,
-                        state,
-                        False,
-                        next_valid_actions=policy_actions_after_override,
-                        metadata={
-                            "override_learning": True,
-                            "override_type": "route_apply_failure",
-                            "original_action": action,
-                            "fallback_action": None,
-                            "override_cause": "route_apply_failure",
-                            "route_apply_failed": True,
-                            "decision_finalized": False,
-                        },
-                    )
-                    decision_metrics["override_learning_transitions"] += 1
-                    decision_metrics["override_learning_negative"] += 1
+                    if policy_trace is not None:
+                        self._record_immediate_mappo_transition(
+                            policy_trace,
+                            action=action,
+                            reward=override_penalty,
+                            next_state=state,
+                            next_central_observation=(
+                                self._zero_central_observation()
+                                if central_observation is None else central_observation
+                            ),
+                            done=False,
+                            metadata={
+                                "override_type": "route_apply_failure",
+                                "original_action": action,
+                                "route_apply_failed": True,
+                            },
+                        )
                     episode_return_total += override_penalty
                     prev_edge_by_vehicle[vehicle_id] = current_edge
                     return None
@@ -3042,6 +2549,7 @@ class RLTrainingPipeline:
                         "baseline_social_cost": baseline_cost,
                         "selfless_delta": selfless_delta,
                         "coordination_pressure": coordination_pressure,
+                        **({} if policy_trace is None else policy_trace),
                     },
                 )
                 self._record_recent_decision_attribution(
@@ -3118,6 +2626,17 @@ class RLTrainingPipeline:
                             and mean_controlled_speed <= self.congestion_low_speed_threshold
                         ):
                             congestion_high_pressure_steps += 1
+
+                    step_transition_central_observation = self._build_central_observation(
+                        step=step,
+                        total_controlled=total_controlled,
+                        arrived_ids=arrived_ids,
+                        step_snapshots=step_snapshots,
+                        vehicles=vehicles,
+                        pending_decisions=pending_decisions,
+                        coordination_state=step_coordination_state,
+                        open_decision_count=0,
+                    )
 
                     for vehicle_id in controlled_live_ids:
                         snapshot = step_snapshots.get(vehicle_id)
@@ -3267,25 +2786,20 @@ class RLTrainingPipeline:
                                 context=next_ctx,
                                 coordination_state=step_coordination_state,
                             )
-                            self.trainer.stage_transition(
-                                pending.state,
-                                pending.intended_action,
-                                reward,
-                                next_state,
-                                done,
-                                next_valid_actions=policy_actions_for_bootstrap(
-                                    vehicle_id,
-                                    vehicle,
-                                    step,
-                                    next_ctx,
-                                    recent_history=list(recent_edge_history[vehicle_id]),
-                                ),
-                                metadata={
-                                    **(pending.metadata if isinstance(pending.metadata, dict) else {}),
-                                    "forced_action": pending.context.forced_action is not None,
-                                    "mismatch": mismatch,
-                                    "decision_finalized": True,
-                                },
+                            final_metadata = {
+                                **(pending.metadata if isinstance(pending.metadata, dict) else {}),
+                                "forced_action": pending.context.forced_action is not None,
+                                "mismatch": mismatch,
+                                "decision_finalized": True,
+                            }
+                            self._record_pending_mappo_transition(
+                                pending,
+                                reward=reward,
+                                next_state=next_state,
+                                next_central_observation=step_transition_central_observation,
+                                done=done,
+                                discount_steps=max(step - pending.decision_step, 1),
+                                metadata=final_metadata,
                             )
                             self._register_decision_finalized(decision_metrics, pending)
                             action_source = str(pending.metadata.get("action_source", ""))
@@ -3366,34 +2880,21 @@ class RLTrainingPipeline:
                                         decision_metrics["route_apply_fail_overrides"] += 1
                                         self._record_override_event(decision_metrics, "route_apply_fail")
                                         override_penalty = self._clip_reward(-6.0)
-                                        obs_policy_actions = self._policy_action_candidates(
-                                            context=obs_context,
-                                            recent_history=decision_recent_history(vehicle_id),
-                                            cooldown_active=step < lane_change_cooldown_until.get((vehicle_id, current_edge), -1),
-                                            destination=vehicle.destination,
-                                            decision_metrics=decision_metrics,
-                                            coordination_state=step_coordination_state,
-                                        )
-                                        self.trainer.stage_transition(
-                                            pending.state,
-                                            pending.intended_action,
-                                            override_penalty,
-                                            pending.state,
-                                            False,
-                                            next_valid_actions=obs_policy_actions,
+                                        self._record_pending_mappo_transition(
+                                            pending,
+                                            reward=override_penalty,
+                                            next_state=pending.state,
+                                            next_central_observation=step_transition_central_observation,
+                                            done=False,
+                                            discount_steps=max(step - pending.decision_step, 1),
                                             metadata={
-                                                "override_learning": True,
+                                                **(pending.metadata if isinstance(pending.metadata, dict) else {}),
                                                 "override_type": "route_apply_failure",
-                                                "original_action": pending.intended_action,
-                                                "fallback_action": None,
-                                                "override_cause": "route_apply_failure",
                                                 "route_apply_failed": True,
                                                 "observe_phase": True,
                                                 "decision_finalized": False,
                                             },
                                         )
-                                        decision_metrics["override_learning_transitions"] += 1
-                                        decision_metrics["override_learning_negative"] += 1
                                         episode_return_total += override_penalty
                                         prev_edge_by_vehicle[vehicle_id] = current_edge
                                         continue
@@ -3429,45 +2930,34 @@ class RLTrainingPipeline:
                                     decision_metrics["lane_change_observe_abort_no_progress"] += 1
                                     pending_pen = self.observe_no_progress_penalty
                                 pending_pen = self._clip_reward(pending_pen + self.same_edge_repeat_chase_penalty)
-                                self.trainer.stage_transition(
-                                    pending.state,
-                                    pending.intended_action,
-                                    pending_pen,
-                                    self._get_or_encode_step_state(
-                                        step_state_cache,
-                                        step_context_cache,
-                                        vehicle_id,
-                                        vehicle,
-                                        step,
-                                        snapshot,
-                                        context=obs_context,
-                                        coordination_state=step_coordination_state,
-                                    ),
-                                    False,
-                                    next_valid_actions=policy_actions_for_bootstrap(
-                                        vehicle_id,
-                                        vehicle,
-                                        step,
-                                        obs_context,
-                                        recent_history=decision_recent_history(vehicle_id),
-                                        cooldown_active=True,
-                                    ),
+                                observe_abort_state = self._get_or_encode_step_state(
+                                    step_state_cache,
+                                    step_context_cache,
+                                    vehicle_id,
+                                    vehicle,
+                                    step,
+                                    snapshot,
+                                    context=obs_context,
+                                    coordination_state=step_coordination_state,
+                                )
+                                self._record_pending_mappo_transition(
+                                    pending,
+                                    reward=pending_pen,
+                                    next_state=observe_abort_state,
+                                    next_central_observation=step_transition_central_observation,
+                                    done=False,
+                                    discount_steps=max(step - pending.decision_step, 1),
                                     metadata={
                                         **(pending.metadata if isinstance(pending.metadata, dict) else {}),
-                                        "override_learning": True,
                                         "observe_abort": reason or "no_progress",
                                         "observe_no_progress": (reason or "no_progress") == "no_progress",
                                         "observe_low_speed": (reason or "") == "low_speed",
                                         "observe_commit_window_miss": (reason or "") == "commit_window",
-                                        "override_cause": "lane_change_observe_abort",
                                         "abort_reason": reason or "no_progress",
                                         "override_type": "observe_abort_fallback",
-                                        "original_action": pending.intended_action,
                                         "decision_finalized": False,
                                     },
                                 )
-                                decision_metrics["override_learning_transitions"] += 1
-                                decision_metrics["override_learning_negative"] += 1
                                 episode_return_total += pending_pen
                                 decision_metrics["pending_resolved_abort_no_progress"] += 1
                                 if reason == "commit_window":
@@ -3525,7 +3015,6 @@ class RLTrainingPipeline:
                                     full_route=full_route,
                                     decision_open_recorded=True,
                                     extra_metadata={
-                                        "override_learning": True,
                                         "coordination_pressure": self.shared_policy.coordination_pressure_score(
                                             context=obs_context,
                                             destination=vehicle.destination,
@@ -3554,33 +3043,6 @@ class RLTrainingPipeline:
                                     decision_metrics["fallback_selected_lane_now"] += 1
                                 decision_metrics["observe_abort_fallback_overrides"] += 1
                                 decision_metrics["fallback_after_observe_abort_count"] += 1
-                                observe_policy_actions = self._policy_action_candidates(
-                                    context=obs_context,
-                                    recent_history=decision_recent_history(vehicle_id),
-                                    cooldown_active=True,
-                                    destination=vehicle.destination,
-                                    decision_metrics=decision_metrics,
-                                    coordination_state=step_coordination_state,
-                                )
-                                imitation_reward = self._clip_reward(0.10)
-                                self.trainer.stage_transition(
-                                    next_state,
-                                    fallback_action,
-                                    imitation_reward,
-                                    next_state,
-                                    False,
-                                    next_valid_actions=observe_policy_actions,
-                                    metadata={
-                                        "override_learning": True,
-                                        "override_type": "observe_abort_fallback",
-                                        "original_action": pending.intended_action,
-                                        "fallback_action": fallback_action,
-                                        "imitation_credit": True,
-                                        "decision_finalized": False,
-                                    },
-                                )
-                                decision_metrics["override_learning_transitions"] += 1
-                                decision_metrics["override_learning_imitation"] += 1
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
                                 continue
                             pending_age = self.decision_engine.pending_age_steps(pending, step)
@@ -3619,25 +3081,7 @@ class RLTrainingPipeline:
                                     context=next_ctx,
                                     coordination_state=step_coordination_state,
                                 )
-                                self.trainer.stage_transition(
-                                    pending.state,
-                                    pending.intended_action,
-                                    pending_reward,
-                                    next_state,
-                                    False,
-                                    next_valid_actions=[int(pending.intended_action)],
-                                    metadata={
-                                        **(pending.metadata if isinstance(pending.metadata, dict) else {}),
-                                        "interim_pending_credit": True,
-                                        "pending_age": int(pending_age),
-                                        "pending_elapsed_steps": int(elapsed_pending),
-                                        "pending_resolution_mode": self.shared_policy.pending_resolution_mode(pending),
-                                        "pending_stall_age": int(
-                                            max(step - int((pending.metadata or {}).get("last_progress_step", pending.decision_step)), 0)
-                                        ),
-                                        "decision_finalized": False,
-                                    },
-                                )
+                                self._accumulate_mappo_reward(pending.metadata, pending_reward)
                                 episode_return_total += pending_reward
                                 pending.state = next_state
                                 pending.last_credit_edge = current_edge
@@ -3662,20 +3106,13 @@ class RLTrainingPipeline:
                                     coordination_state=step_coordination_state,
                                 )
                                 timeout_penalty = self._clip_reward(self.pending_timeout_penalty)
-                                self.trainer.stage_transition(
-                                    pending.state,
-                                    pending.intended_action,
-                                    timeout_penalty,
-                                    timeout_state,
-                                    False,
-                                    next_valid_actions=policy_actions_for_bootstrap(
-                                        vehicle_id,
-                                        vehicle,
-                                        step,
-                                        timeout_ctx,
-                                        recent_history=decision_recent_history(vehicle_id),
-                                        cooldown_active=True,
-                                    ),
+                                self._record_pending_mappo_transition(
+                                    pending,
+                                    reward=timeout_penalty,
+                                    next_state=timeout_state,
+                                    next_central_observation=step_transition_central_observation,
+                                    done=False,
+                                    discount_steps=max(step - pending.decision_step, 1),
                                     metadata={
                                         **(pending.metadata if isinstance(pending.metadata, dict) else {}),
                                         "pending_timeout_replan": True,
@@ -3739,20 +3176,13 @@ class RLTrainingPipeline:
                                 else:
                                     release_penalty = self.pending_replan_penalty
                                 release_penalty = self._clip_reward(release_penalty)
-                                self.trainer.stage_transition(
-                                    pending.state,
-                                    pending.intended_action,
-                                    release_penalty,
-                                    release_state,
-                                    False,
-                                    next_valid_actions=policy_actions_for_bootstrap(
-                                        vehicle_id,
-                                        vehicle,
-                                        step,
-                                        pending_ctx,
-                                        recent_history=decision_recent_history(vehicle_id),
-                                        cooldown_active=True,
-                                    ),
+                                self._record_pending_mappo_transition(
+                                    pending,
+                                    reward=release_penalty,
+                                    next_state=release_state,
+                                    next_central_observation=step_transition_central_observation,
+                                    done=False,
+                                    discount_steps=max(step - pending.decision_step, 1),
                                     metadata={
                                         **(pending.metadata if isinstance(pending.metadata, dict) else {}),
                                         "pending_timeout_replan": bool(release_eval.release_as_timeout),
@@ -3905,6 +3335,16 @@ class RLTrainingPipeline:
                             continue
 
                     if open_decision_batch:
+                        step_central_observation = self._build_central_observation(
+                            step=step,
+                            total_controlled=total_controlled,
+                            arrived_ids=arrived_ids,
+                            step_snapshots=step_snapshots,
+                            vehicles=vehicles,
+                            pending_decisions=pending_decisions,
+                            coordination_state=step_coordination_state,
+                            open_decision_count=len(open_decision_batch),
+                        )
                         ordered_entries = sorted(
                             open_decision_batch,
                             key=lambda entry: self.shared_policy.coordination_priority(
@@ -3942,20 +3382,20 @@ class RLTrainingPipeline:
                                 entry["context"],
                                 policy_actions,
                             )
-                            action, action_source = self.trainer.select_action(
+                            selection = self.trainer.select_action(
                                 state,
                                 policy_actions,
-                                return_source=True,
+                                step_central_observation,
+                                deterministic=False,
                             )
+                            action = int(selection.action)
+                            action_source = "sample"
                             if action is None:
                                 self._record_skip(decision_metrics, "actionable_no_candidate")
                                 decision_metrics["actionable_skips"] += 1
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
                                 continue
-                            if action_source == "explore":
-                                decision_metrics["exploration_actions"] += 1
-                            elif action_source == "policy":
-                                decision_metrics["policy_actions"] += 1
+                            decision_metrics["policy_actions"] += 1
                             effective_action = process_selected_action(
                                 vehicle_id,
                                 entry["vehicle"],
@@ -3966,6 +3406,8 @@ class RLTrainingPipeline:
                                 state,
                                 action,
                                 action_source,
+                                selection=selection,
+                                central_observation=step_central_observation,
                                 coordination_state=step_coordination_state,
                             )
                             if effective_action is not None:
@@ -4066,10 +3508,6 @@ class RLTrainingPipeline:
                         emergency_brake_active_by_vehicle.pop(removed_id, None)
                         prev_speed_by_vehicle.pop(removed_id, None)
                         last_observed_brake_step_by_vehicle.pop(removed_id, None)
-
-                    if step % self.train_every == 0:
-                        for _ in range(self.grad_steps):
-                            self.trainer.replay()
 
                     if step % self.step_log_every == 0:
                         self._print_step_progress(
@@ -4334,27 +3772,16 @@ class RLTrainingPipeline:
                 roll_avg_travel_time = sum(rolling_avg_travel_time) / len(rolling_avg_travel_time)
                 roll_mismatch = sum(rolling_mismatch) / len(rolling_mismatch)
 
-                self.trainer.flush_staged_episode(
-                    avg_tt=avg_travel_time,
-                    avg_return=avg_return_per_vehicle,
-                    completion_rate=completion_rate,
-                    teleported_controlled=len(teleported_controlled_ids),
-                    timeout_rate=timeout_rate,
-                    tail_completion_gap_steps=tail_completion_gap_steps,
-                    p95_to_p50_travel_ratio=p95_to_p50_travel_ratio,
-                )
-                self.trainer.epsilon = max(
-                    self.trainer.epsilon_min,
-                    self.trainer.epsilon * self.trainer.epsilon_decay
-                )
+                updated_transition_count = self.trainer.update()
                 pending_observe_abort_total = (
                     float(decision_metrics["pending_release_observe_abort_no_progress"])
                     + float(decision_metrics["pending_release_observe_abort_low_speed"])
                     + float(decision_metrics["pending_release_observe_abort_commit_window"])
                 )
                 print(
-                    f"\n[EP {episode:03d} DONE] eps={self.trainer.epsilon:.4f} train={self.trainer.train_steps} "
-                    f"replay={len(self.trainer.memory)} ret={avg_return_per_vehicle:.3f} "
+                    f"\n[EP {episode:03d} DONE] updates={self.trainer.train_steps} "
+                    f"rollout={updated_transition_count} buffered={len(self.trainer.memory)} "
+                    f"ret={avg_return_per_vehicle:.3f} "
                     f"done={global_arrival_count}/{total_controlled} "
                     f"failed={max(total_controlled-global_arrival_count,0)} avg_tt={avg_travel_time:.2f} "
                     f"p50_tt={p50_travel_time:.2f} p90_tt={p90_travel_time:.2f}"
@@ -4544,7 +3971,7 @@ class RLTrainingPipeline:
                     row = {
                         "episode": episode,
                         **trainer_row,
-                        "use_double_dqn": int(self.use_double_dqn),
+                        "algorithm": "mappo",
                         "episode_return_total": episode_return_total,
                         "avg_return_per_vehicle": avg_return_per_vehicle,
                         "completion_rate": completion_rate,

@@ -14,7 +14,7 @@ This note applies to:
 - `core/junction_decision_engine.py`
 - `core/shared_decision_policy.py`
 - `core/rl_training_pipeline.py`
-- `controller/QLearningController.py`
+- `controller/MAPPOController.py`
 
 ## What changed
 
@@ -28,7 +28,7 @@ Loop and trap mitigation:
 
 Inference-alignment mitigation:
 1. unified route application keeps training and inference on the same SUMO route-commit semantics.
-2. `QLearningController.should_control_vehicle(...)` now wakes inference on the same structural `forced` and `open` decision cases that training evaluates.
+2. `MAPPOController.should_control_vehicle(...)` now wakes inference on the same structural `forced` and `open` decision cases that training evaluates.
 3. held-out frozen evaluation now measures deployment-style behavior directly during training.
 
 These changes reduce fallback churn and tail instability, but they are still mitigations rather than a proof that loops are impossible.

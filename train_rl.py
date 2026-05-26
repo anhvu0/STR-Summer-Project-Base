@@ -1,12 +1,7 @@
-"""
-Entry point for training a reinforcement learning routing policy.
-
-RIGHT HERE, DEFAULT SETTINGS USE FILES IN configurations folder. They affect the location of sumocfg file and xml file.
-Files used here and files used in main.py must match. Otherwise -> Wrong dimensions
-
-"""
+"""Entry point for training the MAPPO routing policy."""
 import argparse
 
+from core.mappo import MAPPOConfig
 from core.rl_training_pipeline import RLTrainingPipeline
 
 
@@ -21,7 +16,7 @@ def build_parser():
     """
     Build the CLI argument parser.
     """
-    parser = argparse.ArgumentParser(description="Train a routing policy with DQN.")
+    parser = argparse.ArgumentParser(description="Train a routing policy with MAPPO.")
     parser.add_argument(
         "--sumocfg",
         default="./configurations/myconfig.sumocfg",
@@ -30,12 +25,12 @@ def build_parser():
 
     parser.add_argument(
         "--model-output",
-        default="./configurations/model/rl_model_nyc.pt",
+        default="./configurations/model/mappo_policy_nyc.pt",
         help="Path to save the trained model.",
     )
     parser.add_argument(
         "--best-model-output",
-        default="./configurations/model/rl_model_nyc.best.pt",
+        default="./configurations/model/mappo_policy_nyc.best.pt",
         help="Optional path for the best held-out frozen-eval checkpoint. Defaults to <model-output>.best.pt.",
     )
     parser.add_argument(
@@ -79,19 +74,21 @@ def build_parser():
         action="store_false",
         help="Disable fast mode and keep the heavier debug outputs.",
     )
+    parser.add_argument("--actor-lr", type=float, default=3.0e-4, help="MAPPO actor learning rate.")
+    parser.add_argument("--critic-lr", type=float, default=1.0e-3, help="MAPPO critic learning rate.")
+    parser.add_argument("--gamma", type=float, default=0.97, help="Discount factor for decision-level returns.")
+    parser.add_argument("--clip-epsilon", type=float, default=0.20, help="PPO clipping coefficient.")
+    parser.add_argument("--entropy-coef", type=float, default=0.01, help="Entropy bonus coefficient.")
+    parser.add_argument("--value-coef", type=float, default=0.50, help="Value-loss coefficient.")
+    parser.add_argument("--update-epochs", type=int, default=6, help="MAPPO epochs per episode rollout.")
+    parser.add_argument("--minibatch-size", type=int, default=512, help="MAPPO minibatch size.")
     parser.add_argument(
-        "--double-dqn",
-        dest="use_double_dqn",
-        action="store_true",
-        help="Use online argmax plus target-network evaluation for replay bootstrapping.",
+        "--min-transitions-per-update",
+        type=int,
+        default=64,
+        help="Skip policy updates until at least this many decision transitions are collected.",
     )
-    parser.add_argument(
-        "--no-double-dqn",
-        dest="use_double_dqn",
-        action="store_false",
-        help="Use the target network for both replay action selection and evaluation.",
-    )
-    parser.set_defaults(fast_mode=True, use_double_dqn=True)
+    parser.set_defaults(fast_mode=True)
     return parser
 
 
@@ -103,17 +100,28 @@ def main():
     """
     parser = build_parser()
     args = parser.parse_args()
+    mappo_config = MAPPOConfig(
+        actor_learning_rate=args.actor_lr,
+        critic_learning_rate=args.critic_lr,
+        gamma=args.gamma,
+        clip_epsilon=args.clip_epsilon,
+        entropy_coef=args.entropy_coef,
+        value_coef=args.value_coef,
+        update_epochs=args.update_epochs,
+        minibatch_size=args.minibatch_size,
+        min_transitions_per_update=args.min_transitions_per_update,
+    )
     pipeline = RLTrainingPipeline(
         sumocfg_path=args.sumocfg,
         model_output_path=args.model_output,
         best_model_output_path=args.best_model_output,
         episodes=args.episodes,
         spawn_interval=args.spawn_interval,
+        mappo_config=mappo_config,
         eval_every=args.eval_every,
         frozen_eval_seeds=parse_eval_seeds(args.eval_seeds),
         eval_spawn_interval=args.eval_spawn_interval,
         fast_training_profile=args.fast_mode,
-        use_double_dqn=args.use_double_dqn,
     )
     pipeline.run()
 

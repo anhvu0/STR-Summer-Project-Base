@@ -10,7 +10,7 @@ from xml.dom.minidom import parse, parseString
 from core.Util import *
 from controller.RouteController import *
 from controller.DijkstraController import DijkstraPolicy
-from controller.QLearningController import QLearningPolicy
+from controller.MAPPOController import MAPPOPolicy
 from core.target_vehicles_generation_protocols import *
 import copy
 
@@ -59,7 +59,7 @@ def build_parser():
     parser.add_argument(
         "--seeds",
         default=DEFAULT_EVAL_SEEDS,
-        help="Comma-separated seeds for repeated Dijkstra/RL comparison runs.",
+        help="Comma-separated seeds for repeated Dijkstra/MAPPO comparison runs.",
     )
     parser.add_argument(
         "--controlled-vehicles",
@@ -104,8 +104,8 @@ def build_parser():
 def resolve_model_path(raw_model_path=None):
     if raw_model_path:
         return raw_model_path
-    best_model_path = "./configurations/model/rl_model_nyc.best.pt"
-    final_model_path = "./configurations/model/rl_model_nyc.pt"
+    best_model_path = "./configurations/model/mappo_policy_nyc.best.pt"
+    final_model_path = "./configurations/model/mappo_policy_nyc.pt"
     if os.path.exists(best_model_path):
         return best_model_path
     return final_model_path
@@ -165,9 +165,9 @@ def test_dijkstra_policy(vehicles, fast_mode=False, traci_port=8873):
     return run_simulation(scheduler, vehicles, fast_mode=fast_mode, traci_port=traci_port)
 
 
-def test_q_learning(vehicles, model_path, fast_mode=False, traci_port=8873):
-    print("Testing Q Learning Route Controller")
-    scheduler = QLearningPolicy(vehicles, init_connection_info, model_path)
+def test_mappo(vehicles, model_path, fast_mode=False, traci_port=8873):
+    print("Testing MAPPO Route Controller")
+    scheduler = MAPPOPolicy(vehicles, init_connection_info, model_path)
     return run_simulation(scheduler, vehicles, fast_mode=fast_mode, traci_port=traci_port)
 
 
@@ -293,9 +293,9 @@ if __name__ == "__main__":
         dijkstra_results.append(
             test_dijkstra_policy(copy.deepcopy(vehicles), fast_mode=args.fast_mode, traci_port=args.traci_port)
         )
-        print("Using RL checkpoint:", model_path)
+        print("Using MAPPO checkpoint:", model_path)
         rl_results.append(
-            test_q_learning(copy.deepcopy(vehicles), model_path, fast_mode=args.fast_mode, traci_port=args.traci_port)
+            test_mappo(copy.deepcopy(vehicles), model_path, fast_mode=args.fast_mode, traci_port=args.traci_port)
         )
     summarize_runs("Dijkstra", dijkstra_results)
-    summarize_runs("Q-learning", rl_results)
+    summarize_runs("MAPPO", rl_results)

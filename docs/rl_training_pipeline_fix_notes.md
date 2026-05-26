@@ -1,5 +1,7 @@
 # RL Training Pipeline Fix Notes
 
+Historical note: this file describes the structural cleanup that happened before the MAPPO migration. The current training path is fully on-policy and no longer uses replay backups.
+
 This document summarizes the structural fixes applied to `core/rl_training_pipeline.py` in response to training-pathology feedback.
 
 ## 1) Reward now scales with elapsed simulation time
@@ -11,15 +13,15 @@ Previously, transition rewards were charged once per decision transition regardl
 - On transition close, `delta_t = current_step - decision_step` is computed.
 - `compute_reward(...)` now accepts `delta_t`, and the base time + congestion penalties are scaled by elapsed time.
 
-## 2) Target backup now respects valid-next-action constraints
+## 2) Historical: target backup respected valid-next-action constraints
 
 Previously, action masking was used for behavior policy only; TD backup used unmasked max over all actions.
 
 ### Changes
 - Replay buffer now stores `next_valid_actions` per transition.
-- Replay uses masked Double-DQN style backup:
-  - online network selects best next action over valid actions only,
-  - target network evaluates that selected action.
+- The replay implementation used masked next-action backup:
+  - the online network selected the best valid next action,
+  - the target network evaluated that selected action.
 
 ## 3) Reduced heuristic takeover in execution policy
 
