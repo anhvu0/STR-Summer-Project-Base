@@ -207,26 +207,16 @@ class RLTrainingPipeline:
             self.route_helper.direction_choices,
         )
 
-        # state = [edge_embedding, destination_embedding]
-        #         + edge/lane/reachable/available feasibility masks (4*6)
-        #         + commit flag + 3 lane features + 3 travel-time features
-        #         + local congestion summary
-        #         + per-action branch features (6 actions * 5 features)
-        # NOTE: compact-state size changed; retraining is required.
-        self.edge_embedding_dim = 8
         self.shared_policy = SharedDecisionPolicy(
             self.connection_info,
             self.decision_engine,
             self.route_helper.direction_choices,
-            edge_embedding_dim=self.edge_embedding_dim,
             density_scale_m=100.0,
             max_simulation_steps=MAX_SIMULATION_STEPS,
         )
-        self.local_congestion_k = self.shared_policy.local_congestion_k
-        self._init_edge_embeddings(seed=1337)
-        self.state_size = self.shared_policy.compact_state_size
+        self.graph_spec = self.shared_policy.graph_spec
         self.central_observation_size = 18
-        self.action_size = 6
+        self.action_size = self.shared_policy.action_count
         self.metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_episode_metrics.csv")
         self.frozen_eval_metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_frozen_eval_metrics.csv")
         self.best_model_metadata_path = self.best_model_output_path + ".meta.json"
@@ -255,12 +245,13 @@ class RLTrainingPipeline:
         self._step_vehicle_wait_cache = {}
         self._step_lane_occupancy_cache = {}
         self._step_lane_halting_cache = {}
+        self._destination_eta_vector_cache = {}
         self.congestion_density_threshold = 0.30
         self.congestion_low_speed_threshold = 2.0
         self.emergency_decel_threshold = 4.5
         self.teleport_jam_density_threshold = 0.55
         self.trainer = MAPPOTrainer(
-            self.state_size,
+            self.graph_spec,
             self.central_observation_size,
             self.action_size,
             config=self.mappo_config,
@@ -379,7 +370,7 @@ class RLTrainingPipeline:
     def _build_mappo_trace(self, state, central_observation, selection):
         return {
             "mappo_training": True,
-            "mappo_initial_state": np.asarray(state, dtype=np.float32).reshape(1, -1).copy(),
+            "mappo_initial_observation": state,
             "mappo_initial_central_observation": np.asarray(central_observation, dtype=np.float32).reshape(1, -1).copy(),
             "mappo_log_prob": float(selection.log_prob),
             "mappo_value": float(selection.value),
@@ -408,14 +399,14 @@ class RLTrainingPipeline:
             return False
         total_reward = float(trace.get("mappo_reward_accumulator", 0.0)) + float(reward)
         self.trainer.record_transition(
-            observation=trace["mappo_initial_state"],
+            observation=trace["mappo_initial_observation"],
             central_observation=trace["mappo_initial_central_observation"],
             action=int(action),
             action_mask=trace["mappo_action_mask"],
             log_prob=float(trace["mappo_log_prob"]),
             value=float(trace["mappo_value"]),
             reward=total_reward,
-            next_observation=np.asarray(next_state, dtype=np.float32).reshape(1, -1),
+            next_observation=next_state,
             next_central_observation=np.asarray(next_central_observation, dtype=np.float32).reshape(1, -1),
             done=bool(done),
             discount_steps=max(int(discount_steps), 1),
@@ -852,21 +843,18 @@ class RLTrainingPipeline:
             return 0.0
         return float(np.percentile(occupied, 95))
 
-    def _init_edge_embeddings(self, seed=1337):
-        """
-        Fixed edge embeddings avoid fake ordinal structure from raw edge indices.
-        """
-        rng = np.random.default_rng(seed)
-        self._edge_embeddings = {}
-        for edge_id in self.connection_info.edge_list:
-            emb = rng.normal(loc=0.0, scale=0.1, size=self.edge_embedding_dim).astype(np.float32)
-            self._edge_embeddings[edge_id] = emb
+    def _destination_eta_vector(self, destination_edge):
+        destination_edge = str(destination_edge)
+        cached = self._destination_eta_vector_cache.get(destination_edge)
+        if cached is not None:
+            return cached
 
-    def _get_edge_embedding(self, edge_id):
-        return self._edge_embeddings.get(
-            edge_id,
-            np.zeros(self.edge_embedding_dim, dtype=np.float32),
-        )
+        eta_vector = np.full(self.graph_spec.node_count, np.inf, dtype=np.float32)
+        for idx, edge_id in enumerate(self.graph_spec.edge_ids):
+            eta = self._estimate_remaining_eta(edge_id, destination_edge)
+            eta_vector[idx] = float(eta)
+        self._destination_eta_vector_cache[destination_edge] = eta_vector
+        return eta_vector
 
     def parse_sumocfg(self, sumocfg_path):
         """
@@ -881,7 +869,7 @@ class RLTrainingPipeline:
 
     def encode_state(self, vehicle_id, edge_id, destination_edge, context=None, vehicle=None, step=None, snapshot=None, coordination_state=None):
         """
-        Build a state vector for the given edge using cached per-step densities.
+        Build a graph observation for the given edge using cached per-step densities.
         """
         if context is None:
             if snapshot is not None:
@@ -895,24 +883,25 @@ class RLTrainingPipeline:
             )
         if vehicle is not None and step is None:
             step = int(snapshot.step) if snapshot is not None else 0
-        return self.shared_policy.encode_state(
+        return self.shared_policy.encode_graph_observation(
             edge_id=edge_id,
             destination_edge=destination_edge,
             context=context,
-            use_compact_state=True,
-            edge_embedding_fn=self._get_edge_embedding,
+            node_density_vector=self._density_vec,
+            destination_eta_vector=self._destination_eta_vector(destination_edge),
             edge_density_fn=self._edge_density,
             eta_fn=self._estimate_remaining_eta,
             social_cost_fn=self._action_social_cost_proxy,
-            global_density_stats=(float(self._density_mean), float(self._density_std)),
+            distance_fn=self.get_distance_to_destination,
+            global_density_stats=(
+                float(self._density_mean),
+                float(self._density_std),
+                float(self._density_p95),
+            ),
             step=step,
             vehicle_start_time=(float(vehicle.start_time) if vehicle is not None else None),
             vehicle_wait_time_fn=self._vehicle_wait_time,
-            lane_halting_density_fn=self._lane_halting_density,
-            lane_occupancy_fn=self._lane_occupancy,
-            include_coordination=True,
             coordination_state=coordination_state,
-            compact_state_version=self.shared_policy.compact_state_version,
         )
     
     def valid_actions_for_vehicle(self, vehicle_id, edge_id, destination_edge, step):
@@ -948,6 +937,48 @@ class RLTrainingPipeline:
             recent_history=recent_history,
             coordination_state=coordination_state,
         )
+
+    def _record_policy_candidate_profile(self, decision_metrics, context, policy_actions):
+        if decision_metrics is None:
+            return
+        actions = sorted(set(int(action) for action in (policy_actions or [])))
+        lane_now = set(int(action) for action in context.lane_feasible_now_actions)
+        lane_now_count = sum(1 for action in actions if action in lane_now)
+        proactive_count = max(len(actions) - lane_now_count, 0)
+
+        decision_metrics["policy_candidate_decisions"] += 1
+        decision_metrics["policy_candidate_count_sum"] += len(actions)
+        decision_metrics["policy_candidate_lane_now_count_sum"] += lane_now_count
+        decision_metrics["policy_candidate_proactive_count_sum"] += proactive_count
+        if len(actions) <= 1:
+            decision_metrics["policy_candidate_single_count"] += 1
+        else:
+            decision_metrics["policy_candidate_multi_count"] += 1
+        if lane_now_count > 0 and proactive_count > 0:
+            decision_metrics["policy_candidate_mixed_count"] += 1
+            decision_metrics["policy_candidate_proactive_available_count"] += 1
+        elif proactive_count > 0:
+            decision_metrics["policy_candidate_proactive_only_count"] += 1
+            decision_metrics["policy_candidate_proactive_available_count"] += 1
+        elif lane_now_count > 0:
+            decision_metrics["policy_candidate_lane_now_only_count"] += 1
+        else:
+            decision_metrics["policy_candidate_empty_count"] += 1
+
+    def _record_policy_selection_profile(self, decision_metrics, context, policy_actions, action):
+        if decision_metrics is None:
+            return
+        actions = sorted(set(int(candidate) for candidate in (policy_actions or [])))
+        action = int(action)
+        if len(actions) <= 1:
+            decision_metrics["policy_selected_from_single_candidate"] += 1
+        else:
+            decision_metrics["policy_selected_from_multi_candidate"] += 1
+
+        if action in set(int(candidate) for candidate in context.lane_feasible_now_actions):
+            decision_metrics["policy_selected_lane_now"] += 1
+        else:
+            decision_metrics["policy_selected_proactive"] += 1
 
     def _select_fallback_action(self, context, blocked_action, destination, recent_history, lane_now_only=False, coordination_state=None):
         return self.shared_policy.select_fallback_action(
@@ -1258,8 +1289,8 @@ class RLTrainingPipeline:
 
     def make_terminal_next_state_from_edge(self, edge_id, destination_edge, vehicle=None, step=None):
         if (
-            edge_id in self.connection_info.edge_index_dict
-            and destination_edge in self.connection_info.edge_index_dict
+            edge_id in self.graph_spec.edge_id_to_index
+            and destination_edge in self.graph_spec.edge_id_to_index
         ):
             terminal_context = self.decision_engine.build_context(
                 vehicle_id="__terminal__",
@@ -1287,7 +1318,7 @@ class RLTrainingPipeline:
                 vehicle=vehicle,
                 step=step,
             )
-        return np.zeros((1, self.state_size), dtype=np.float32)
+        return self.graph_spec.zero_observation()
 
     def _classify_terminal_outcome(self, vehicle_id, arrived_ids, teleport_ids, is_live):
         """
@@ -2007,7 +2038,7 @@ class RLTrainingPipeline:
         spawn_interval_value = self.spawn_interval if spawn_interval_override is None else float(spawn_interval_override)
         vehicle_list = generator.generate_vehicles(
             num_target_vehicles=150,
-            num_random_vehicles=200,
+            num_random_vehicles=150,
             pattern=self.target_pattern,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
@@ -2064,7 +2095,17 @@ class RLTrainingPipeline:
             "override_event_loop_prefilter", "override_event_cooldown_fallback",
             "override_event_observe_abort_fallback", "override_event_route_apply_fail",
             "override_event_invalid_action",
-            "policy_masked_actions_removed", "override_learning_transitions",
+            "policy_masked_actions_removed",
+            "policy_candidate_decisions", "policy_candidate_count_sum", "policy_candidate_mean_count",
+            "policy_candidate_single_count", "policy_candidate_multi_count",
+            "policy_candidate_lane_now_only_count", "policy_candidate_mixed_count",
+            "policy_candidate_proactive_only_count", "policy_candidate_empty_count",
+            "policy_candidate_lane_now_count_sum", "policy_candidate_proactive_count_sum",
+            "policy_candidate_proactive_available_count", "policy_candidate_proactive_share",
+            "policy_selected_lane_now", "policy_selected_proactive",
+            "policy_selected_lane_now_share", "policy_selected_proactive_share",
+            "policy_selected_from_single_candidate", "policy_selected_from_multi_candidate",
+            "override_learning_transitions",
             "cooldown_fallback_overrides", "observe_abort_fallback_overrides",
             "route_apply_fail_overrides", "override_learning_negative", "override_learning_imitation",
             "alive_at_step_cap", "decision_pending_at_episode_end", "mean_pending_age", "mean_decision_latency_steps",
@@ -3382,6 +3423,11 @@ class RLTrainingPipeline:
                                 entry["context"],
                                 policy_actions,
                             )
+                            self._record_policy_candidate_profile(
+                                decision_metrics,
+                                entry["context"],
+                                policy_actions,
+                            )
                             selection = self.trainer.select_action(
                                 state,
                                 policy_actions,
@@ -3396,6 +3442,12 @@ class RLTrainingPipeline:
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
                                 continue
                             decision_metrics["policy_actions"] += 1
+                            self._record_policy_selection_profile(
+                                decision_metrics,
+                                entry["context"],
+                                policy_actions,
+                                action,
+                            )
                             effective_action = process_selected_action(
                                 vehicle_id,
                                 entry["vehicle"],
@@ -3757,6 +3809,22 @@ class RLTrainingPipeline:
                     float(decision_metrics["policy_candidates_collapsed_to_lane_now_only"])
                     / float(max(decision_metrics["policy_candidates_with_broader_available"], 1.0))
                 )
+                policy_candidate_mean_count = (
+                    float(decision_metrics["policy_candidate_count_sum"])
+                    / float(max(decision_metrics["policy_candidate_decisions"], 1.0))
+                )
+                policy_candidate_proactive_share = (
+                    float(decision_metrics["policy_candidate_proactive_count_sum"])
+                    / float(max(decision_metrics["policy_candidate_count_sum"], 1.0))
+                )
+                policy_selected_lane_now_share = (
+                    float(decision_metrics["policy_selected_lane_now"])
+                    / float(max(decision_metrics["policy_actions"], 1.0))
+                )
+                policy_selected_proactive_share = (
+                    float(decision_metrics["policy_selected_proactive"])
+                    / float(max(decision_metrics["policy_actions"], 1.0))
+                )
 
                 rolling_teleport_events.append(float(episode_teleport_events))
                 rolling_teleported_controlled.append(float(len(teleported_controlled_ids)))
@@ -3801,6 +3869,23 @@ class RLTrainingPipeline:
                         decision_metrics["fallback_overrides"],
                         decision_metrics["override_events_total"] / max(decision_metrics["decisions_opened"], 1.0),
                         actionable_skip_ratio,
+                    )
+                )
+                print(
+                    "  policy: actions={:.0f} selected_lane/pro={:.0f}/{:.0f} lane_share={:.1%} "
+                    "candidate_mean={:.2f} single/multi={:.0f}/{:.0f} "
+                    "lane_only/mixed/pro_only={:.0f}/{:.0f}/{:.0f} proactive_candidate_share={:.1%}".format(
+                        decision_metrics["policy_actions"],
+                        decision_metrics["policy_selected_lane_now"],
+                        decision_metrics["policy_selected_proactive"],
+                        policy_selected_lane_now_share,
+                        policy_candidate_mean_count,
+                        decision_metrics["policy_candidate_single_count"],
+                        decision_metrics["policy_candidate_multi_count"],
+                        decision_metrics["policy_candidate_lane_now_only_count"],
+                        decision_metrics["policy_candidate_mixed_count"],
+                        decision_metrics["policy_candidate_proactive_only_count"],
+                        policy_candidate_proactive_share,
                     )
                 )
                 print(
@@ -4043,6 +4128,25 @@ class RLTrainingPipeline:
                         "override_event_route_apply_fail": decision_metrics["override_event_route_apply_fail"],
                         "override_event_invalid_action": decision_metrics["override_event_invalid_action"],
                         "policy_masked_actions_removed": decision_metrics["policy_masked_actions_removed"],
+                        "policy_candidate_decisions": decision_metrics["policy_candidate_decisions"],
+                        "policy_candidate_count_sum": decision_metrics["policy_candidate_count_sum"],
+                        "policy_candidate_mean_count": policy_candidate_mean_count,
+                        "policy_candidate_single_count": decision_metrics["policy_candidate_single_count"],
+                        "policy_candidate_multi_count": decision_metrics["policy_candidate_multi_count"],
+                        "policy_candidate_lane_now_only_count": decision_metrics["policy_candidate_lane_now_only_count"],
+                        "policy_candidate_mixed_count": decision_metrics["policy_candidate_mixed_count"],
+                        "policy_candidate_proactive_only_count": decision_metrics["policy_candidate_proactive_only_count"],
+                        "policy_candidate_empty_count": decision_metrics["policy_candidate_empty_count"],
+                        "policy_candidate_lane_now_count_sum": decision_metrics["policy_candidate_lane_now_count_sum"],
+                        "policy_candidate_proactive_count_sum": decision_metrics["policy_candidate_proactive_count_sum"],
+                        "policy_candidate_proactive_available_count": decision_metrics["policy_candidate_proactive_available_count"],
+                        "policy_candidate_proactive_share": policy_candidate_proactive_share,
+                        "policy_selected_lane_now": decision_metrics["policy_selected_lane_now"],
+                        "policy_selected_proactive": decision_metrics["policy_selected_proactive"],
+                        "policy_selected_lane_now_share": policy_selected_lane_now_share,
+                        "policy_selected_proactive_share": policy_selected_proactive_share,
+                        "policy_selected_from_single_candidate": decision_metrics["policy_selected_from_single_candidate"],
+                        "policy_selected_from_multi_candidate": decision_metrics["policy_selected_from_multi_candidate"],
                         "override_learning_transitions": decision_metrics["override_learning_transitions"],
                         "cooldown_fallback_overrides": decision_metrics["cooldown_fallback_overrides"],
                         "observe_abort_fallback_overrides": decision_metrics["observe_abort_fallback_overrides"],

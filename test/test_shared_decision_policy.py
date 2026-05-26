@@ -4,6 +4,8 @@ from pathlib import Path
 import sys
 import types
 
+import numpy as np
+
 sys.modules.setdefault('traci', types.SimpleNamespace(TraCIException=Exception))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -13,7 +15,7 @@ from core.shared_decision_policy import SharedDecisionPolicy
 
 
 class DummyConnectionInfo:
-    edge_list = []
+    edge_list = ['edgeA', 'edgeB', 'edgeC', 'edgeD', 'edgeJam', 'edgeFree', 'edgeD1', 'destX']
     outgoing_edges_dict = {
         'edgeA': {'L': 'edgeB', 'S': 'edgeC', 'R': 'edgeD'},
         'edgeB': {'S': 'edgeJam'},
@@ -290,20 +292,29 @@ class SharedDecisionPolicyBrakeRiskTests(unittest.TestCase):
 
         self.assertEqual(ranked, [1, 0])
 
-    def test_per_action_branch_features_use_corridor_density(self):
+    def test_graph_action_features_use_corridor_density(self):
         context = self._context(lane_now=[0, 1], available=[0, 1], shifts={0: 0, 1: 0})
         density = {'edgeB': 0.05, 'edgeJam': 0.72, 'destX': 0.0, 'edgeC': 0.12, 'edgeFree': 0.05}
 
-        features = self.policy.per_action_branch_features(
-            context,
-            'destX',
+        density_vector = np.asarray(
+            [density.get(edge_id, 0.0) for edge_id in self.policy.graph_spec.edge_ids],
+            dtype=np.float32,
+        )
+        eta_vector = np.full(self.policy.graph_spec.node_count, 90.0, dtype=np.float32)
+        observation = self.policy.encode_graph_observation(
+            edge_id='edgeA',
+            destination_edge='destX',
+            context=context,
+            node_density_vector=density_vector,
+            destination_eta_vector=eta_vector,
             edge_density_fn=lambda edge: density.get(edge, 0.0),
             eta_fn=lambda edge, dest: 80.0 if edge == 'edgeB' else 90.0,
             social_cost_fn=lambda current_edge, action_idx, destination: float(action_idx),
+            distance_fn=lambda edge, dest: 40.0,
         )
 
-        action0_density = features[2]
-        action1_density = features[7]
+        action0_density = observation.action_features[0, 5]
+        action1_density = observation.action_features[1, 5]
         self.assertGreater(action0_density, density['edgeB'])
         self.assertLess(action1_density, action0_density)
 

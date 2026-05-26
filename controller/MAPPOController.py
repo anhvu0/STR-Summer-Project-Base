@@ -14,6 +14,7 @@ from core.mappo import load_mappo_checkpoint, action_mask_from_valid_actions
 from core.junction_decision_engine import JunctionDecisionEngine, VehicleSnapshot
 from core.shared_decision_policy import SharedDecisionPolicy
 from core.route_loop_safety import transition_signal
+from core.routing_graph import routing_graph_batch_to_tensors, stack_routing_graph_observations
 
 def parse_sumocfg(sumocfg_path):
     dom = parse(sumocfg_path)
@@ -26,11 +27,21 @@ class MAPPOPolicy(RouteController):
     def __init__(self, vehicles, connection_info, model_file, net_xml_file=net_path):
         super().__init__(connection_info)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.actor, _, self.model_checkpoint = load_mappo_checkpoint(model_file, device=self.device)
-        self.model_state_size = int(self.actor.observation_size)
         self.vehicles = vehicles
         self.net = sumolib.net.readNet(net_xml_file)
         self.decision_engine = JunctionDecisionEngine(connection_info, self.net, self.direction_choices)
+        self.shared_policy = SharedDecisionPolicy(
+            self.connection_info,
+            self.decision_engine,
+            self.direction_choices,
+            density_scale_m=100.0,
+        )
+        self.graph_spec = self.shared_policy.graph_spec
+        self.actor, _, self.model_checkpoint = load_mappo_checkpoint(
+            model_file,
+            graph_spec=self.graph_spec,
+            device=self.device,
+        )
         self._visit_count = {}
         self._best_dist = {}
         self._recent_edges = {}
@@ -115,26 +126,7 @@ class MAPPOPolicy(RouteController):
         self.loop_window = 10
         self.loop_repeat_threshold = 2
         self.score_slack = 30.0
-        self.edge_embedding_dim = 8
-        self.shared_policy = SharedDecisionPolicy(
-            self.connection_info,
-            self.decision_engine,
-            self.direction_choices,
-            edge_embedding_dim=self.edge_embedding_dim,
-            density_scale_m=100.0,
-        )
-        self.compact_state_size = self.shared_policy.compact_state_size
-        self.compact_state_version = self.shared_policy.compact_state_version
-        self.use_compact_state = True
         self.use_coordination_state = True
-        if self.model_state_size != self.compact_state_size:
-            raise ValueError(
-                "Checkpoint state_size={} is incompatible with the current MAPPO controller "
-                "(expected compact_state_size={} with coordination enabled).".format(
-                    self.model_state_size,
-                    self.compact_state_size,
-                )
-            )
         self.density_scale_m = 100.0
         self._edge_list = tuple(self.connection_info.edge_list)
         self._lane_length_cache = {}
@@ -169,31 +161,31 @@ class MAPPOPolicy(RouteController):
         self._step_vehicle_wait_cache = {}
         self._step_lane_occupancy_cache = {}
         self._step_lane_halting_cache = {}
-        self._init_edge_embeddings(seed=1337)
+        self._destination_eta_vector_cache = {}
 
     def _predict_action_logits(self, states):
         self.actor.eval()
-        state_array = np.asarray(states, dtype=np.float32)
+        observations = list(states) if isinstance(states, (list, tuple)) else [states]
+        observation_batch = stack_routing_graph_observations(observations)
+        tensor_batch = routing_graph_batch_to_tensors(observation_batch, self.device)
         with torch.no_grad():
-            state_tensor = torch.as_tensor(state_array, dtype=torch.float32, device=self.device)
-            return self.actor(state_tensor).detach().cpu().numpy()
+            return self.actor(tensor_batch).detach().cpu().numpy()
 
     def _next_decision_id(self):
         self._decision_seq += 1
         return f"inf_dec_{self._decision_seq}"
 
-    def _init_edge_embeddings(self, seed=1337):
-        rng = np.random.default_rng(seed)
-        self._edge_embeddings = {}
-        for edge_id in self.connection_info.edge_list:
-            emb = rng.normal(loc=0.0, scale=0.1, size=self.edge_embedding_dim).astype(np.float32)
-            self._edge_embeddings[edge_id] = emb
+    def _destination_eta_vector(self, destination_edge):
+        destination_edge = str(destination_edge)
+        cached = self._destination_eta_vector_cache.get(destination_edge)
+        if cached is not None:
+            return cached
 
-    def _get_edge_embedding(self, edge_id):
-        return self._edge_embeddings.get(
-            edge_id,
-            np.zeros(self.edge_embedding_dim, dtype=np.float32),
-        )
+        eta_vector = np.full(self.graph_spec.node_count, np.inf, dtype=np.float32)
+        for idx, edge_id in enumerate(self.graph_spec.edge_ids):
+            eta_vector[idx] = float(self._estimate_eta(edge_id, destination_edge))
+        self._destination_eta_vector_cache[destination_edge] = eta_vector
+        return eta_vector
 
     def _edge_lane_count(self, edge_id):
         return max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1)
@@ -1273,8 +1265,7 @@ class MAPPOPolicy(RouteController):
     def act_batch(self, states, available_actions_batch):
         if not states:
             return []
-        state_batch = np.array([state[0] for state in states], dtype=np.float32)
-        logits_batch = self._predict_action_logits(state_batch)
+        logits_batch = self._predict_action_logits(states)
         results = []
         for logits, available_actions in zip(logits_batch, available_actions_batch):
             available = list(available_actions) if available_actions is not None else []
@@ -1344,23 +1335,23 @@ class MAPPOPolicy(RouteController):
                     social_cost -= 0.10
             social_cost_cache[action_idx] = float(max(social_cost, 0.0))
 
-        return self.shared_policy.encode_state(
+        return self.shared_policy.encode_graph_observation(
             edge_id=en,
             destination_edge=destination_edge,
             context=context,
-            use_compact_state=self.use_compact_state,
-            edge_embedding_fn=self._get_edge_embedding,
+            node_density_vector=self._density_vec,
+            destination_eta_vector=self._destination_eta_vector(destination_edge),
             edge_density_fn=cached_edge_density,
             eta_fn=cached_eta,
             social_cost_fn=lambda current_edge, action_idx, destination: social_cost_cache.get(action_idx, float("inf")),
-            global_density_stats=(float(self._density_mean), float(self._density_std)),
-            edge_lane_meters_fn=self._edge_lane_meters,
+            distance_fn=self._dist_to_dest,
+            global_density_stats=(
+                float(self._density_mean),
+                float(self._density_std),
+                float(self._density_p95),
+            ),
             step=current_step,
             vehicle_start_time=(float(vehicle_obj.start_time) if vehicle_obj is not None else None),
             vehicle_wait_time_fn=self._vehicle_wait_time,
-            lane_halting_density_fn=self._lane_halting_density,
-            lane_occupancy_fn=self._lane_occupancy,
-            include_coordination=True,
             coordination_state=coordination_state,
-            compact_state_version=self.compact_state_version,
         )

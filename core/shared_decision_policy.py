@@ -5,6 +5,11 @@ import math
 import numpy as np
 
 from core.junction_decision_engine import DecisionContext, JunctionDecisionEngine, PendingDecision
+from core.routing_graph import (
+    RoutingGraphFeatureLayout,
+    RoutingGraphObservation,
+    RoutingGraphSpec,
+)
 
 
 @dataclass(frozen=True)
@@ -56,7 +61,7 @@ class SharedDecisionPolicy:
 
     The engine remains the source of truth for route continuity and raw feasibility.
     This helper owns:
-    - state feature spec
+    - graph observation spec
     - decision-mode classification
     - policy candidate filtering
     - fallback selection mode
@@ -70,8 +75,6 @@ class SharedDecisionPolicy:
         decision_engine: JunctionDecisionEngine,
         direction_choices: Sequence[str],
         *,
-        edge_embedding_dim: int = 8,
-        local_congestion_k: int = 6,
         density_scale_m: float = 100.0,
         max_simulation_steps: int = 2000,
     ):
@@ -79,8 +82,6 @@ class SharedDecisionPolicy:
         self.decision_engine = decision_engine
         self.direction_choices = list(direction_choices)
         self.action_count = len(self.direction_choices)
-        self.edge_embedding_dim = int(edge_embedding_dim)
-        self.local_congestion_k = int(local_congestion_k)
         self.density_scale_m = float(density_scale_m)
         self.max_simulation_steps = max(int(max_simulation_steps), 1)
         self.proactive_brake_risk_speed_floor = 4.5
@@ -128,54 +129,100 @@ class SharedDecisionPolicy:
         )
         self.corridor_congestion_density_threshold = 0.32
         self.corridor_recent_revisit_window = 8
-        self.base_lane_feature_count = 3
-        self.spillback_lane_feature_count = 2
-        self.objective_feature_count = 3
-        self.base_branch_feature_count = 5
-        self.spillback_branch_feature_count = 2
-        self.compact_state_version = 2
         self.vehicle_wait_time_clip_s = 120.0
-
-        self.compact_state_size_without_coordination_v1 = (
-            (2 * self.edge_embedding_dim)
-            + (4 * self.action_count)
-            + 1
-            + self.base_lane_feature_count
-            + self.objective_feature_count
-            + self.local_congestion_k
-            + (self.base_branch_feature_count * self.action_count)
-        )
-        self.compact_state_size_v1 = (
-            self.compact_state_size_without_coordination_v1
-            + self.coordination_global_feature_count
-            + (self.coordination_action_feature_count * self.action_count)
-        )
-        self.compact_state_size_without_coordination = (
-            self.compact_state_size_without_coordination_v1
-            + self.spillback_lane_feature_count
-            + (self.spillback_branch_feature_count * self.action_count)
-        )
-        self.compact_state_size = (
-            self.compact_state_size_without_coordination
-            + self.coordination_global_feature_count
-            + (self.coordination_action_feature_count * self.action_count)
-        )
-
-    def legacy_state_size(self, edge_count: int) -> int:
-        return 2 + self.action_count + 3 + 3 + int(edge_count)
-
-    def compact_lane_feature_count(self, version: int = 2) -> int:
-        if int(version) <= 1:
-            return self.base_lane_feature_count
-        return self.base_lane_feature_count + self.spillback_lane_feature_count
-
-    def compact_branch_feature_count(self, version: int = 2) -> int:
-        if int(version) <= 1:
-            return self.base_branch_feature_count
-        return self.base_branch_feature_count + self.spillback_branch_feature_count
+        self.graph_node_static_feature_count = 5
+        self.graph_node_dynamic_feature_count = 7
+        self.graph_scalar_feature_count = 16
+        self.graph_action_feature_count = 13
+        self.graph_spec = self._build_graph_spec()
 
     def empty_coordination_state(self) -> CoordinationReservationState:
         return CoordinationReservationState()
+
+    def _build_graph_spec(self) -> RoutingGraphSpec:
+        edge_ids = tuple(str(edge_id) for edge_id in self.connection_info.edge_list)
+        edge_id_to_index = {
+            edge_id: idx for idx, edge_id in enumerate(edge_ids)
+        }
+
+        in_degree = {edge_id: 0 for edge_id in edge_ids}
+        for edge_id in edge_ids:
+            outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {}) or {}
+            for next_edge in outgoing.values():
+                next_edge = str(next_edge)
+                if next_edge in in_degree:
+                    in_degree[next_edge] += 1
+
+        edge_lengths = np.array(
+            [
+                max(float(self.connection_info.edge_length_dict.get(edge_id, 5.0)), 5.0)
+                for edge_id in edge_ids
+            ],
+            dtype=np.float32,
+        )
+        lane_counts = np.array(
+            [
+                max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1)
+                for edge_id in edge_ids
+            ],
+            dtype=np.float32,
+        )
+        out_degrees = np.array(
+            [
+                len(self.connection_info.outgoing_edges_dict.get(edge_id, {}) or {})
+                for edge_id in edge_ids
+            ],
+            dtype=np.float32,
+        )
+        in_degrees = np.array(
+            [float(in_degree.get(edge_id, 0)) for edge_id in edge_ids],
+            dtype=np.float32,
+        )
+
+        max_length = max(float(np.percentile(edge_lengths, 95)), 5.0) if edge_lengths.size else 5.0
+        static_features = np.zeros(
+            (len(edge_ids), self.graph_node_static_feature_count),
+            dtype=np.float32,
+        )
+        if edge_ids:
+            static_features[:, 0] = np.clip(edge_lengths / max_length, 0.0, 1.0)
+            static_features[:, 1] = np.clip(lane_counts / 6.0, 0.0, 1.0)
+            static_features[:, 2] = np.clip(out_degrees / max(float(self.action_count), 1.0), 0.0, 1.0)
+            static_features[:, 3] = np.clip(in_degrees / max(float(self.action_count), 1.0), 0.0, 1.0)
+            static_features[:, 4] = (out_degrees <= 0.0).astype(np.float32)
+
+        edge_pairs = set()
+        for edge_id in edge_ids:
+            src = edge_id_to_index[edge_id]
+            edge_pairs.add((src, src))
+            outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {}) or {}
+            for next_edge in outgoing.values():
+                next_edge = str(next_edge)
+                dst = edge_id_to_index.get(next_edge)
+                if dst is None:
+                    continue
+                edge_pairs.add((src, dst))
+                edge_pairs.add((dst, src))
+
+        sorted_pairs = sorted(edge_pairs)
+        if sorted_pairs:
+            edge_index = np.asarray(sorted_pairs, dtype=np.int64).T
+        else:
+            edge_index = np.empty((2, 0), dtype=np.int64)
+        feature_layout = RoutingGraphFeatureLayout(
+            node_static_dim=self.graph_node_static_feature_count,
+            node_dynamic_dim=self.graph_node_dynamic_feature_count,
+            scalar_dim=self.graph_scalar_feature_count,
+            action_feature_dim=self.graph_action_feature_count,
+            action_count=self.action_count,
+        )
+        return RoutingGraphSpec(
+            edge_ids=edge_ids,
+            edge_id_to_index=edge_id_to_index,
+            edge_index=edge_index,
+            node_static_features=static_features,
+            feature_layout=feature_layout,
+        )
 
     def coordination_priority(
         self,
@@ -392,51 +439,6 @@ class SharedDecisionPolicy:
             return DecisionMode("open")
         return DecisionMode("hold")
 
-    def global_density_stats(
-        self,
-        edge_density_fn: Callable[[str], float],
-        edge_lane_meters_fn: Callable[[str], float],
-    ) -> Tuple[float, float]:
-        edge_list = list(self.connection_info.edge_list)
-        if not edge_list:
-            return 0.0, 0.0
-
-        lane_meters = np.array([edge_lane_meters_fn(edge) for edge in edge_list], dtype=np.float32)
-        densities = np.array([edge_density_fn(edge) for edge in edge_list], dtype=np.float32)
-        total_lane_meters = float(np.sum(lane_meters))
-        if total_lane_meters <= 0.0:
-            return 0.0, 0.0
-
-        mean_global = float(np.average(densities, weights=lane_meters))
-        std_global = float(np.sqrt(np.average((densities - mean_global) ** 2, weights=lane_meters)))
-        return mean_global, std_global
-
-    def local_congestion_features(
-        self,
-        edge_id: str,
-        *,
-        edge_density_fn: Callable[[str], float],
-        global_density_stats: Tuple[float, float],
-    ) -> np.ndarray:
-        current_density = float(edge_density_fn(edge_id))
-        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
-        outgoing_densities = [float(edge_density_fn(next_edge)) for next_edge in outgoing.values()]
-        mean_out = float(np.mean(outgoing_densities)) if outgoing_densities else current_density
-        max_out = float(np.max(outgoing_densities)) if outgoing_densities else current_density
-        min_out = float(np.min(outgoing_densities)) if outgoing_densities else current_density
-        mean_global, std_global = global_density_stats
-        return np.array(
-            [
-                current_density,
-                mean_out,
-                max_out,
-                min_out,
-                current_density - float(mean_global),
-                float(std_global),
-            ],
-            dtype=np.float32,
-        )
-
     def _action_corridor_edges(
         self,
         *,
@@ -581,232 +583,190 @@ class SharedDecisionPolicy:
             )
         )
 
-    def _normalize_lane_occupancy(self, occupancy_value: float) -> float:
-        occupancy = max(float(occupancy_value), 0.0)
-        if occupancy > 1.0:
-            occupancy /= 100.0
-        return float(np.clip(occupancy, 0.0, 1.0))
-
-    def _normalize_halting_density(self, halting_density: float) -> float:
-        return float(np.clip(max(float(halting_density), 0.0), 0.0, 1.0))
-
-    def _next_edge_spillback_features(
-        self,
-        *,
-        edge_id: str,
-        action_idx: int,
-        lane_occupancy_fn: Optional[Callable[[str], float]],
-        lane_halting_density_fn: Optional[Callable[[str], float]],
-    ) -> Tuple[float, float]:
-        if lane_occupancy_fn is None or lane_halting_density_fn is None:
-            return 0.0, 0.0
-
-        next_edge = self.decision_engine.get_next_edge(edge_id, action_idx)
-        if next_edge is None:
-            return 0.0, 0.0
-
-        lane_ids = self.connection_info.edge_lane_ids.get(next_edge, [])
-        if not lane_ids:
-            return 0.0, 0.0
-
-        occupancy_values = [
-            self._normalize_lane_occupancy(lane_occupancy_fn(lane_id))
-            for lane_id in lane_ids
-        ]
-        halting_values = [
-            self._normalize_halting_density(lane_halting_density_fn(lane_id))
-            for lane_id in lane_ids
-        ]
-        return (
-            float(np.mean(occupancy_values)) if occupancy_values else 0.0,
-            float(np.mean(halting_values)) if halting_values else 0.0,
-        )
-
-    def per_action_branch_features(
-        self,
-        context: DecisionContext,
-        destination: str,
-        *,
-        edge_density_fn: Callable[[str], float],
-        eta_fn: Callable[[str, str], float],
-        social_cost_fn: Callable[[str, int, str], float],
-        lane_occupancy_fn: Optional[Callable[[str], float]] = None,
-        lane_halting_density_fn: Optional[Callable[[str], float]] = None,
-        compact_state_version: int = 2,
-    ) -> np.ndarray:
-        branch_feature_count = self.compact_branch_feature_count(version=compact_state_version)
-        features = np.zeros(branch_feature_count * self.action_count, dtype=np.float32)
-        lane_now = set(context.lane_feasible_now_actions)
-        for action_idx in range(self.action_count):
-            base = action_idx * branch_feature_count
-            if action_idx not in context.edge_valid_actions:
-                continue
-            stats = self.action_corridor_stats(
-                edge_id=context.edge_id,
-                action_idx=action_idx,
-                destination=destination,
-                edge_density_fn=edge_density_fn,
-                eta_fn=eta_fn,
-            )
-            if stats is None or stats.next_edge is None:
-                continue
-            features[base + 0] = float(context.required_lane_shift.get(action_idx, 0)) / 3.0
-            features[base + 1] = 1.0 if action_idx in lane_now else 0.0
-            features[base + 2] = float(stats.mean_density)
-            eta = float(stats.eta)
-            features[base + 3] = (
-                min(float(eta) / float(self.max_simulation_steps), 1.0)
-                if math.isfinite(eta) else 1.0
-            )
-            social = social_cost_fn(context.edge_id, action_idx, destination)
-            features[base + 4] = min(float(social), 10.0) if math.isfinite(social) else 10.0
-            if compact_state_version >= 2:
-                next_edge_occupancy, next_edge_halting = self._next_edge_spillback_features(
-                    edge_id=context.edge_id,
-                    action_idx=action_idx,
-                    lane_occupancy_fn=lane_occupancy_fn,
-                    lane_halting_density_fn=lane_halting_density_fn,
-                )
-                features[base + 5] = next_edge_occupancy
-                features[base + 6] = next_edge_halting
-        return features
-
-    def encode_state(
+    def encode_graph_observation(
         self,
         *,
         edge_id: str,
         destination_edge: str,
         context: DecisionContext,
-        use_compact_state: bool,
-        edge_embedding_fn: Callable[[str], np.ndarray],
+        node_density_vector: np.ndarray,
+        destination_eta_vector: np.ndarray,
         edge_density_fn: Callable[[str], float],
         eta_fn: Callable[[str, str], float],
         social_cost_fn: Callable[[str, int, str], float],
-        global_density_stats: Optional[Tuple[float, float]] = None,
-        edge_lane_meters_fn: Optional[Callable[[str], float]] = None,
+        distance_fn: Optional[Callable[[str, str], float]] = None,
+        global_density_stats: Optional[Tuple[float, float, float]] = None,
         step: Optional[int] = None,
         vehicle_start_time: Optional[float] = None,
         vehicle_wait_time_fn: Optional[Callable[[str], float]] = None,
-        lane_halting_density_fn: Optional[Callable[[str], float]] = None,
-        lane_occupancy_fn: Optional[Callable[[str], float]] = None,
-        edge_index_lookup: Optional[Dict[str, int]] = None,
-        legacy_aux_features: Optional[Sequence[float]] = None,
-        legacy_density_values: Optional[Sequence[float]] = None,
-        include_coordination: bool = False,
         coordination_state: Optional[CoordinationReservationState] = None,
-        compact_state_version: int = 2,
-    ) -> np.ndarray:
-        if use_compact_state:
-            lane_feature_count = self.compact_lane_feature_count(version=compact_state_version)
-            branch_feature_count = self.compact_branch_feature_count(version=compact_state_version)
-            if int(compact_state_version) <= 1:
-                state_size = (
-                    self.compact_state_size_v1
-                    if include_coordination else self.compact_state_size_without_coordination_v1
+        recent_history: Optional[Sequence[str]] = None,
+    ) -> RoutingGraphObservation:
+        edge_lookup = self.graph_spec.edge_id_to_index
+        current_idx = edge_lookup.get(str(edge_id))
+        destination_idx = edge_lookup.get(str(destination_edge))
+        if current_idx is None or destination_idx is None:
+            return self.graph_spec.zero_observation()
+
+        density_vector = np.asarray(node_density_vector, dtype=np.float32).reshape(-1)
+        eta_vector = np.asarray(destination_eta_vector, dtype=np.float32).reshape(-1)
+        if density_vector.shape[0] != self.graph_spec.node_count:
+            raise ValueError(
+                "node_density_vector has length {} but graph has {} nodes.".format(
+                    density_vector.shape[0],
+                    self.graph_spec.node_count,
                 )
+            )
+        if eta_vector.shape[0] != self.graph_spec.node_count:
+            raise ValueError(
+                "destination_eta_vector has length {} but graph has {} nodes.".format(
+                    eta_vector.shape[0],
+                    self.graph_spec.node_count,
+                )
+            )
+
+        if global_density_stats is None:
+            mean_global = float(np.mean(density_vector)) if density_vector.size else 0.0
+            std_global = float(np.std(density_vector)) if density_vector.size else 0.0
+            occupied = density_vector[density_vector > 0.0]
+            p95_global = float(np.percentile(occupied, 95)) if occupied.size else 0.0
+        else:
+            if len(global_density_stats) == 2:
+                mean_global = float(global_density_stats[0])
+                std_global = float(global_density_stats[1])
+                occupied = density_vector[density_vector > 0.0]
+                p95_global = float(np.percentile(occupied, 95)) if occupied.size else 0.0
             else:
-                state_size = (
-                    self.compact_state_size
-                    if include_coordination else self.compact_state_size_without_coordination
-                )
-            state = np.zeros(state_size, dtype=np.float32)
-            state[0:self.edge_embedding_dim] = edge_embedding_fn(edge_id)
-            state[self.edge_embedding_dim:(2 * self.edge_embedding_dim)] = edge_embedding_fn(destination_edge)
+                mean_global = float(global_density_stats[0])
+                std_global = float(global_density_stats[1])
+                p95_global = float(global_density_stats[2])
 
-            edge_mask, lane_mask, reach_mask, avail_mask = self.decision_engine.direction_masks(context)
-            base = 2 * self.edge_embedding_dim
-            state[base:base + self.action_count] = np.array(edge_mask, dtype=np.float32)
-            state[base + self.action_count:base + (2 * self.action_count)] = np.array(lane_mask, dtype=np.float32)
-            state[base + (2 * self.action_count):base + (3 * self.action_count)] = np.array(reach_mask, dtype=np.float32)
-            state[base + (3 * self.action_count):base + (4 * self.action_count)] = np.array(avail_mask, dtype=np.float32)
-            state[base + (4 * self.action_count)] = 1.0 if context.commit_window else 0.0
+        node_dynamic_features = np.zeros(
+            (self.graph_spec.node_count, self.graph_node_dynamic_feature_count),
+            dtype=np.float32,
+        )
+        node_dynamic_features[:, 0] = np.clip(density_vector, 0.0, 1.0)
+        node_dynamic_features[:, 1] = np.clip(density_vector - mean_global, -1.0, 1.0)
+        finite_eta_mask = np.isfinite(eta_vector)
+        node_dynamic_features[:, 2] = 1.0
+        node_dynamic_features[finite_eta_mask, 2] = np.clip(
+            eta_vector[finite_eta_mask] / float(self.max_simulation_steps),
+            0.0,
+            1.0,
+        )
+        node_dynamic_features[current_idx, 3] = 1.0
+        node_dynamic_features[destination_idx, 4] = 1.0
 
-            lane_base = base + (4 * self.action_count) + 1
-            state[lane_base + 0] = context.lane_index / max(context.lane_count - 1, 1)
-            state[lane_base + 1] = min(context.lane_count, 6) / 6.0
-            state[lane_base + 2] = min(max(context.dist_to_end, 0.0), 200.0) / 200.0
-            if compact_state_version >= 2:
-                if vehicle_wait_time_fn is not None:
-                    state[lane_base + 3] = self._normalize_wait_time(
-                        vehicle_wait_time_fn(context.vehicle_id)
+        if coordination_state is not None:
+            for load_edge, load_value in coordination_state.corridor_edge_loads.items():
+                load_idx = edge_lookup.get(str(load_edge))
+                if load_idx is not None:
+                    node_dynamic_features[load_idx, 5] = self._normalize_coordination_value(
+                        load_value,
+                        self.coordination_corridor_load_cap,
                     )
-                if lane_halting_density_fn is not None:
-                    state[lane_base + 4] = self._normalize_halting_density(
-                        lane_halting_density_fn(context.lane_id)
+            for load_edge, load_value in coordination_state.next_edge_loads.items():
+                load_idx = edge_lookup.get(str(load_edge))
+                if load_idx is not None:
+                    node_dynamic_features[load_idx, 6] = self._normalize_coordination_value(
+                        load_value,
+                        self.coordination_next_edge_load_cap,
                     )
 
-            objective_base = lane_base + lane_feature_count
-            current_density = float(edge_density_fn(edge_id))
-            if step is not None and vehicle_start_time is not None:
-                elapsed = max(float(step) - float(vehicle_start_time), 0.0)
-                remaining_eta = eta_fn(edge_id, destination_edge)
-                state[objective_base + 0] = min(elapsed / float(self.max_simulation_steps), 1.0)
-                state[objective_base + 1] = (
-                    min(float(remaining_eta) / float(self.max_simulation_steps), 1.0)
-                    if math.isfinite(remaining_eta) else 1.0
-                )
-                state[objective_base + 2] = min(current_density, 1.0)
+        scalar_features = np.zeros(self.graph_scalar_feature_count, dtype=np.float32)
+        scalar_features[0] = 1.0 if context.commit_window else 0.0
+        scalar_features[1] = context.lane_index / max(context.lane_count - 1, 1)
+        scalar_features[2] = min(context.lane_count, 6) / 6.0
+        scalar_features[3] = min(max(context.dist_to_end, 0.0), 200.0) / 200.0
+        scalar_features[4] = min(max(float(context.speed), 0.0) / 20.0, 1.0)
+        if vehicle_wait_time_fn is not None:
+            scalar_features[5] = self._normalize_wait_time(vehicle_wait_time_fn(context.vehicle_id))
+        if step is not None and vehicle_start_time is not None:
+            elapsed = max(float(step) - float(vehicle_start_time), 0.0)
+            scalar_features[6] = min(elapsed / float(self.max_simulation_steps), 1.0)
 
-            if global_density_stats is None:
-                if edge_lane_meters_fn is None:
-                    raise ValueError("edge_lane_meters_fn is required when global_density_stats is omitted")
-                global_density_stats = self.global_density_stats(edge_density_fn, edge_lane_meters_fn)
+        remaining_eta = float(eta_fn(edge_id, destination_edge))
+        scalar_features[7] = (
+            min(remaining_eta / float(self.max_simulation_steps), 1.0)
+            if math.isfinite(remaining_eta) else 1.0
+        )
+        scalar_features[8] = float(np.clip(density_vector[current_idx], 0.0, 1.0))
+        scalar_features[9] = float(np.clip(mean_global, 0.0, 1.0))
+        scalar_features[10] = float(np.clip(std_global, 0.0, 1.0))
+        scalar_features[11] = float(np.clip(p95_global, 0.0, 1.0))
 
-            congestion_base = objective_base + 3
-            congestion_features = self.local_congestion_features(
-                edge_id,
-                edge_density_fn=edge_density_fn,
-                global_density_stats=global_density_stats,
+        coordination_global_features, coordination_action_features = self.coordination_features(
+            context=context,
+            destination=destination_edge,
+            coordination_state=coordination_state,
+        )
+        scalar_features[12:16] = coordination_global_features
+        coordination_action_features = coordination_action_features.reshape(
+            self.action_count,
+            self.coordination_action_feature_count,
+        )
+
+        action_features = np.zeros(
+            (self.action_count, self.graph_action_feature_count),
+            dtype=np.float32,
+        )
+        action_node_indices = np.full(self.action_count, -1, dtype=np.int64)
+        edge_valid = set(context.edge_valid_actions)
+        lane_now = set(context.lane_feasible_now_actions)
+        reachable = set(context.reachable_with_lane_change_actions)
+        available = set(context.available_actions)
+        recent_history = list(recent_history or [])
+
+        for action_idx in range(self.action_count):
+            next_edge = self.decision_engine.get_next_edge(edge_id, action_idx)
+            next_idx = edge_lookup.get(str(next_edge)) if next_edge is not None else None
+            if next_idx is not None:
+                action_node_indices[action_idx] = int(next_idx)
+
+            action_features[action_idx, 0] = 1.0 if action_idx in edge_valid else 0.0
+            action_features[action_idx, 1] = 1.0 if action_idx in lane_now else 0.0
+            action_features[action_idx, 2] = 1.0 if action_idx in reachable else 0.0
+            action_features[action_idx, 3] = 1.0 if action_idx in available else 0.0
+            action_features[action_idx, 4] = min(
+                float(max(context.required_lane_shift.get(action_idx, 0), 0)) / 3.0,
+                1.0,
             )
-            state[congestion_base:congestion_base + self.local_congestion_k] = congestion_features
-            branch_base = congestion_base + self.local_congestion_k
-            branch_features = self.per_action_branch_features(
-                context,
-                destination_edge,
+
+            stats = self.action_corridor_stats(
+                edge_id=edge_id,
+                action_idx=action_idx,
+                destination=destination_edge,
                 edge_density_fn=edge_density_fn,
+                distance_fn=distance_fn,
                 eta_fn=eta_fn,
-                social_cost_fn=social_cost_fn,
-                lane_occupancy_fn=lane_occupancy_fn,
-                lane_halting_density_fn=lane_halting_density_fn,
-                compact_state_version=compact_state_version,
+                recent_history=recent_history,
             )
-            expected_branch_size = branch_feature_count * self.action_count
-            state[branch_base:branch_base + expected_branch_size] = branch_features
-            if include_coordination:
-                global_coord_features, action_coord_features = self.coordination_features(
-                    context=context,
-                    destination=destination_edge,
-                    coordination_state=coordination_state,
-                )
-                coord_base = branch_base + expected_branch_size
-                state[coord_base:coord_base + self.coordination_global_feature_count] = global_coord_features
-                state[coord_base + self.coordination_global_feature_count:] = action_coord_features
-            return state.reshape(1, -1)
+            if stats is None:
+                continue
 
-        if edge_index_lookup is None:
-            raise ValueError("edge_index_lookup is required for legacy state encoding")
+            action_features[action_idx, 5] = float(np.clip(stats.mean_density, 0.0, 1.0))
+            action_features[action_idx, 6] = float(np.clip(stats.max_density, 0.0, 1.0))
+            action_features[action_idx, 7] = (
+                min(float(stats.eta) / float(self.max_simulation_steps), 1.0)
+                if math.isfinite(stats.eta) else 1.0
+            )
+            social_cost = float(social_cost_fn(edge_id, action_idx, destination_edge))
+            action_features[action_idx, 8] = (
+                min(max(social_cost, 0.0), 10.0) / 10.0
+                if math.isfinite(social_cost) else 1.0
+            )
+            action_features[action_idx, 9] = min(max(float(stats.trap_score), 0.0), 10.0) / 10.0
+            action_features[action_idx, 10] = min(float(max(stats.revisit_hits, 0)), 3.0) / 3.0
+            action_features[action_idx, 11:13] = coordination_action_features[action_idx]
 
-        state_values = [
-            float(edge_index_lookup[edge_id]),
-            float(edge_index_lookup[destination_edge]),
-        ]
-        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
-        state_values.extend(
-            1.0 if direction in outgoing.keys() else 0.0
-            for direction in self.direction_choices
+        return RoutingGraphObservation(
+            node_dynamic_features=node_dynamic_features,
+            scalar_features=scalar_features,
+            action_features=action_features,
+            action_node_indices=action_node_indices,
+            current_node_index=int(current_idx),
+            destination_node_index=int(destination_idx),
         )
-        state_values.extend(
-            [
-                context.lane_index / max(context.lane_count - 1, 1),
-                min(context.lane_count, 6) / 6.0,
-                min(max(context.dist_to_end, 0.0), 200.0) / 200.0,
-            ]
-        )
-        state_values.extend(float(value) for value in (legacy_aux_features or (0.0, 0.0, 0.0)))
-        if legacy_density_values is None:
-            legacy_density_values = [edge_density_fn(edge) for edge in self.connection_info.edge_list]
-        state_values.extend(float(value) for value in legacy_density_values)
-        return np.asarray(state_values, dtype=np.float32).reshape(1, -1)
 
     def _increment_metric(self, metrics: Optional[Dict[str, float]], key: str, amount: float = 1.0) -> None:
         if metrics is None:

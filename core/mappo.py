@@ -4,8 +4,16 @@ import os
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.distributions import Categorical
+
+from core.routing_graph import (
+    RoutingGraphObservation,
+    RoutingGraphSpec,
+    routing_graph_batch_to_tensors,
+    stack_routing_graph_observations,
+)
 
 
 def _build_mlp(input_size: int, hidden_sizes: Sequence[int], output_size: int) -> nn.Sequential:
@@ -41,33 +49,183 @@ def _masked_logits(logits: torch.Tensor, action_masks: torch.Tensor) -> torch.Te
     return safe_logits
 
 
+def _action_distribution_from_logits(
+    logits: torch.Tensor,
+    action_masks: torch.Tensor,
+    config: "MAPPOConfig",
+    *,
+    exploratory: bool,
+) -> Categorical:
+    masked_logits = _masked_logits(logits, action_masks)
+    temperature = max(float(config.action_sampling_temperature), 1.0e-6)
+    if not exploratory or float(config.valid_action_exploration_mix) <= 0.0:
+        return Categorical(logits=masked_logits / temperature)
+
+    valid_mask = action_masks.to(dtype=torch.float32)
+    valid_counts = valid_mask.sum(dim=-1, keepdim=True)
+    no_valid = valid_counts <= 0.0
+    uniform_valid = valid_mask / valid_counts.clamp_min(1.0)
+    full_uniform = torch.full_like(uniform_valid, 1.0 / max(int(logits.shape[-1]), 1))
+    uniform_valid = torch.where(no_valid, full_uniform, uniform_valid)
+
+    base_probs = torch.softmax(masked_logits / temperature, dim=-1)
+    mix = float(np.clip(config.valid_action_exploration_mix, 0.0, 0.50))
+    mixed_probs = ((1.0 - mix) * base_probs) + (mix * uniform_valid)
+    mixed_probs = mixed_probs / mixed_probs.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
+    return Categorical(probs=mixed_probs)
+
+
+def _copy_graph_observation(observation: RoutingGraphObservation) -> RoutingGraphObservation:
+    return RoutingGraphObservation(
+        node_dynamic_features=np.asarray(observation.node_dynamic_features, dtype=np.float32).copy(),
+        scalar_features=np.asarray(observation.scalar_features, dtype=np.float32).reshape(-1).copy(),
+        action_features=np.asarray(observation.action_features, dtype=np.float32).copy(),
+        action_node_indices=np.asarray(observation.action_node_indices, dtype=np.int64).reshape(-1).copy(),
+        current_node_index=int(observation.current_node_index),
+        destination_node_index=int(observation.destination_node_index),
+    )
+
+
+def _slice_graph_tensor_batch(
+    batch: Dict[str, torch.Tensor],
+    batch_indices: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    return {
+        key: value.index_select(0, batch_indices)
+        for key, value in batch.items()
+    }
+
+
+def _gather_node_embeddings(node_embeddings: torch.Tensor, node_indices: torch.Tensor) -> torch.Tensor:
+    hidden_size = int(node_embeddings.shape[-1])
+    safe_indices = torch.clamp(node_indices, min=0)
+    gathered = node_embeddings.gather(
+        1,
+        safe_indices.unsqueeze(-1).expand(-1, -1, hidden_size),
+    )
+    valid_mask = (node_indices >= 0).unsqueeze(-1)
+    return gathered * valid_mask
+
+
+def _gather_single_node_embedding(node_embeddings: torch.Tensor, node_indices: torch.Tensor) -> torch.Tensor:
+    gathered = _gather_node_embeddings(node_embeddings, node_indices.unsqueeze(-1))
+    return gathered.squeeze(1)
+
+
+def _mean_neighbor_aggregate(x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    node_count = int(x.shape[1])
+    if edge_index.numel() == 0:
+        return torch.zeros_like(x)
+
+    src = edge_index[0]
+    dst = edge_index[1]
+    messages = x.index_select(1, src)
+    aggregated = torch.zeros_like(x)
+    aggregated.index_add_(1, dst, messages)
+
+    counts = torch.zeros(node_count, dtype=x.dtype, device=x.device)
+    counts.index_add_(0, dst, torch.ones(dst.shape[0], dtype=x.dtype, device=x.device))
+    return aggregated / counts.clamp_min(1.0).view(1, node_count, 1)
+
+
+class GraphMessagePassingLayer(nn.Module):
+    def __init__(self, hidden_size: int, dropout: float = 0.0):
+        super().__init__()
+        self.update_linear_1 = nn.Linear(2 * int(hidden_size), int(hidden_size))
+        self.update_linear_2 = nn.Linear(int(hidden_size), int(hidden_size))
+        self.norm = nn.LayerNorm(int(hidden_size))
+        self.dropout = float(max(dropout, 0.0))
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        aggregated = _mean_neighbor_aggregate(x, edge_index)
+        update_input = torch.cat((x, aggregated), dim=-1)
+        updates = F.relu(self.update_linear_1(update_input))
+        updates = self.update_linear_2(updates)
+        if self.dropout > 0.0:
+            updates = F.dropout(updates, p=self.dropout, training=self.training)
+        return self.norm(x + updates)
+
+
+class RoutingGraphEncoder(nn.Module):
+    def __init__(
+        self,
+        graph_spec: RoutingGraphSpec,
+        *,
+        hidden_size: int,
+        layers: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.hidden_size = int(hidden_size)
+        self.node_count = int(graph_spec.node_count)
+        self.feature_layout = graph_spec.feature_layout
+
+        edge_index = torch.as_tensor(graph_spec.edge_index, dtype=torch.long)
+        node_static_features = torch.as_tensor(graph_spec.node_static_features, dtype=torch.float32)
+        self.register_buffer("edge_index", edge_index, persistent=False)
+        self.register_buffer("node_static_features", node_static_features, persistent=False)
+
+        node_input_dim = (
+            int(self.feature_layout.node_static_dim)
+            + int(self.feature_layout.node_dynamic_dim)
+        )
+        self.input_projection = nn.Linear(node_input_dim, self.hidden_size)
+        self.layers = nn.ModuleList(
+            GraphMessagePassingLayer(self.hidden_size, dropout=dropout)
+            for _ in range(max(int(layers), 1))
+        )
+        self.output_norm = nn.LayerNorm(self.hidden_size)
+
+    def forward(self, observation_batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        dynamic_features = observation_batch["node_dynamic_features"]
+        if int(dynamic_features.shape[1]) != self.node_count:
+            raise ValueError(
+                "Observation node count {} does not match graph encoder node count {}.".format(
+                    int(dynamic_features.shape[1]),
+                    self.node_count,
+                )
+            )
+
+        static_features = self.node_static_features.unsqueeze(0).expand(dynamic_features.shape[0], -1, -1)
+        node_inputs = torch.cat((static_features, dynamic_features), dim=-1)
+        node_embeddings = F.relu(self.input_projection(node_inputs))
+        for layer in self.layers:
+            node_embeddings = layer(node_embeddings, self.edge_index)
+        return self.output_norm(node_embeddings)
+
+
 @dataclass(frozen=True)
 class MAPPOConfig:
     actor_learning_rate: float = 3.0e-4
     critic_learning_rate: float = 1.0e-3
-    gamma: float = 0.97
+    gamma: float = 0.99
     clip_epsilon: float = 0.20
-    entropy_coef: float = 0.010
+    entropy_coef: float = 0.02
     value_coef: float = 0.50
     max_grad_norm: float = 10.0
     update_epochs: int = 6
-    minibatch_size: int = 512
+    minibatch_size: int = 256
     normalize_advantages: bool = True
     min_transitions_per_update: int = 64
     actor_hidden_sizes: Tuple[int, ...] = (256, 128)
     critic_hidden_sizes: Tuple[int, ...] = (256, 128)
+    graph_hidden_size: int = 128
+    graph_layers: int = 3
+    graph_dropout: float = 0.0
+    action_sampling_temperature: float = 1.0
+    valid_action_exploration_mix: float = 0.04
 
 
 @dataclass
 class MAPPOTransition:
-    observation: np.ndarray
+    observation: RoutingGraphObservation
     central_observation: np.ndarray
     action: int
     action_mask: np.ndarray
     log_prob: float
     value: float
     reward: float
-    next_observation: np.ndarray
+    next_observation: RoutingGraphObservation
     next_central_observation: np.ndarray
     done: bool
     discount_steps: int = 1
@@ -84,53 +242,171 @@ class ActionSelection:
 
 
 class MAPPOActor(nn.Module):
-    def __init__(self, observation_size: int, action_size: int, hidden_sizes: Sequence[int]):
+    def __init__(self, graph_spec: RoutingGraphSpec, action_size: int, config: MAPPOConfig):
         super().__init__()
-        self.observation_size = int(observation_size)
+        self.feature_layout = graph_spec.feature_layout
         self.action_size = int(action_size)
-        self.network = _build_mlp(self.observation_size, hidden_sizes, self.action_size)
+        self.graph_encoder = RoutingGraphEncoder(
+            graph_spec,
+            hidden_size=int(config.graph_hidden_size),
+            layers=int(config.graph_layers),
+            dropout=float(config.graph_dropout),
+        )
+        hidden_size = int(config.graph_hidden_size)
+        self.scalar_encoder = _build_mlp(
+            int(self.feature_layout.scalar_dim),
+            (hidden_size,),
+            hidden_size,
+        )
+        self.context_network = _build_mlp(
+            4 * hidden_size,
+            config.actor_hidden_sizes,
+            hidden_size,
+        )
+        self.action_network = _build_mlp(
+            (2 * hidden_size) + int(self.feature_layout.action_feature_dim),
+            config.actor_hidden_sizes,
+            1,
+        )
 
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        return self.network(observations)
+    def forward(self, observation_batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        node_embeddings = self.graph_encoder(observation_batch)
+        current_embeddings = _gather_single_node_embedding(
+            node_embeddings,
+            observation_batch["current_node_index"],
+        )
+        destination_embeddings = _gather_single_node_embedding(
+            node_embeddings,
+            observation_batch["destination_node_index"],
+        )
+        graph_summary = node_embeddings.mean(dim=1)
+        scalar_embeddings = self.scalar_encoder(observation_batch["scalar_features"])
+
+        context_features = torch.cat(
+            (
+                current_embeddings,
+                destination_embeddings,
+                graph_summary,
+                scalar_embeddings,
+            ),
+            dim=-1,
+        )
+        shared_context = self.context_network(context_features)
+
+        action_node_embeddings = _gather_node_embeddings(
+            node_embeddings,
+            observation_batch["action_node_indices"],
+        )
+        expanded_context = shared_context.unsqueeze(1).expand(-1, self.action_size, -1)
+        action_inputs = torch.cat(
+            (
+                expanded_context,
+                action_node_embeddings,
+                observation_batch["action_features"],
+            ),
+            dim=-1,
+        )
+        logits = self.action_network(action_inputs).squeeze(-1)
+        return logits
 
 
 class MAPPOCritic(nn.Module):
-    def __init__(self, observation_size: int, central_observation_size: int, hidden_sizes: Sequence[int]):
+    def __init__(
+        self,
+        graph_spec: RoutingGraphSpec,
+        central_observation_size: int,
+        config: MAPPOConfig,
+    ):
         super().__init__()
-        self.observation_size = int(observation_size)
+        self.feature_layout = graph_spec.feature_layout
         self.central_observation_size = int(central_observation_size)
-        critic_input_size = self.observation_size + self.central_observation_size
-        self.network = _build_mlp(critic_input_size, hidden_sizes, 1)
+        self.graph_encoder = RoutingGraphEncoder(
+            graph_spec,
+            hidden_size=int(config.graph_hidden_size),
+            layers=int(config.graph_layers),
+            dropout=float(config.graph_dropout),
+        )
+        hidden_size = int(config.graph_hidden_size)
+        self.scalar_encoder = _build_mlp(
+            int(self.feature_layout.scalar_dim),
+            (hidden_size,),
+            hidden_size,
+        )
+        self.central_encoder = _build_mlp(
+            self.central_observation_size,
+            (hidden_size,),
+            hidden_size,
+        )
+        self.value_network = _build_mlp(
+            5 * hidden_size,
+            config.critic_hidden_sizes,
+            1,
+        )
 
-    def forward(self, observations: torch.Tensor, central_observations: torch.Tensor) -> torch.Tensor:
-        critic_input = torch.cat((observations, central_observations), dim=-1)
-        return self.network(critic_input).squeeze(-1)
+    def forward(
+        self,
+        observation_batch: Dict[str, torch.Tensor],
+        central_observations: torch.Tensor,
+    ) -> torch.Tensor:
+        node_embeddings = self.graph_encoder(observation_batch)
+        current_embeddings = _gather_single_node_embedding(
+            node_embeddings,
+            observation_batch["current_node_index"],
+        )
+        destination_embeddings = _gather_single_node_embedding(
+            node_embeddings,
+            observation_batch["destination_node_index"],
+        )
+        graph_summary = node_embeddings.mean(dim=1)
+        scalar_embeddings = self.scalar_encoder(observation_batch["scalar_features"])
+        central_embeddings = self.central_encoder(central_observations)
+
+        critic_inputs = torch.cat(
+            (
+                current_embeddings,
+                destination_embeddings,
+                graph_summary,
+                scalar_embeddings,
+                central_embeddings,
+            ),
+            dim=-1,
+        )
+        return self.value_network(critic_inputs).squeeze(-1)
 
 
 class MAPPOTrainer:
     def __init__(
         self,
-        observation_size: int,
+        graph_spec: RoutingGraphSpec,
         central_observation_size: int,
         action_size: int,
         config: Optional[MAPPOConfig] = None,
         device: Optional[torch.device] = None,
     ):
-        self.observation_size = int(observation_size)
+        self.graph_spec = graph_spec
+        self.feature_layout = graph_spec.feature_layout
         self.central_observation_size = int(central_observation_size)
         self.action_size = int(action_size)
+        if self.action_size != int(self.feature_layout.action_count):
+            raise ValueError(
+                "action_size {} does not match graph feature layout action_count {}.".format(
+                    self.action_size,
+                    int(self.feature_layout.action_count),
+                )
+            )
+
         self.config = config or MAPPOConfig()
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.actor = MAPPOActor(
-            self.observation_size,
+            self.graph_spec,
             self.action_size,
-            self.config.actor_hidden_sizes,
+            self.config,
         ).to(self.device)
         self.critic = MAPPOCritic(
-            self.observation_size,
+            self.graph_spec,
             self.central_observation_size,
-            self.config.critic_hidden_sizes,
+            self.config,
         ).to(self.device)
         self.actor_optimizer = torch.optim.Adam(
             self.actor.parameters(),
@@ -212,32 +488,45 @@ class MAPPOTrainer:
     def _to_tensor(self, array: np.ndarray) -> torch.Tensor:
         return torch.as_tensor(array, dtype=torch.float32, device=self.device)
 
+    def _observation_to_tensor_batch(
+        self,
+        observation: RoutingGraphObservation,
+    ) -> Dict[str, torch.Tensor]:
+        return routing_graph_batch_to_tensors(
+            stack_routing_graph_observations([observation]),
+            self.device,
+        )
+
     def select_action(
         self,
-        observation: np.ndarray,
+        observation: RoutingGraphObservation,
         valid_actions: Optional[Sequence[int]],
         central_observation: np.ndarray,
         *,
         deterministic: bool = False,
     ) -> ActionSelection:
-        observation_array = np.asarray(observation, dtype=np.float32).reshape(1, -1)
         central_array = np.asarray(central_observation, dtype=np.float32).reshape(1, -1)
         action_mask = action_mask_from_valid_actions(self.action_size, valid_actions).reshape(1, -1)
 
         with torch.no_grad():
-            observation_tensor = self._to_tensor(observation_array)
+            observation_tensor_batch = self._observation_to_tensor_batch(observation)
             central_tensor = self._to_tensor(central_array)
             action_mask_tensor = self._to_tensor(action_mask)
-            logits = self.actor(observation_tensor)
+            logits = self.actor(observation_tensor_batch)
             masked_logits = _masked_logits(logits, action_mask_tensor)
-            distribution = Categorical(logits=masked_logits)
+            distribution = _action_distribution_from_logits(
+                logits,
+                action_mask_tensor,
+                self.config,
+                exploratory=True,
+            )
             if deterministic:
                 action_tensor = torch.argmax(masked_logits, dim=-1)
             else:
                 action_tensor = distribution.sample()
             log_prob_tensor = distribution.log_prob(action_tensor)
             entropy_tensor = distribution.entropy()
-            value_tensor = self.critic(observation_tensor, central_tensor)
+            value_tensor = self.critic(observation_tensor_batch, central_tensor)
 
         return ActionSelection(
             action=int(action_tensor.item()),
@@ -250,29 +539,29 @@ class MAPPOTrainer:
     def record_transition(
         self,
         *,
-        observation: np.ndarray,
+        observation: RoutingGraphObservation,
         central_observation: np.ndarray,
         action: int,
         action_mask: np.ndarray,
         log_prob: float,
         value: float,
         reward: float,
-        next_observation: np.ndarray,
+        next_observation: RoutingGraphObservation,
         next_central_observation: np.ndarray,
         done: bool,
         discount_steps: int = 1,
         metadata: Optional[Dict[str, object]] = None,
     ) -> None:
         transition = MAPPOTransition(
-            observation=np.asarray(observation, dtype=np.float32).reshape(-1),
-            central_observation=np.asarray(central_observation, dtype=np.float32).reshape(-1),
+            observation=_copy_graph_observation(observation),
+            central_observation=np.asarray(central_observation, dtype=np.float32).reshape(-1).copy(),
             action=int(action),
-            action_mask=np.asarray(action_mask, dtype=np.float32).reshape(-1),
+            action_mask=np.asarray(action_mask, dtype=np.float32).reshape(-1).copy(),
             log_prob=float(log_prob),
             value=float(value),
             reward=float(reward),
-            next_observation=np.asarray(next_observation, dtype=np.float32).reshape(-1),
-            next_central_observation=np.asarray(next_central_observation, dtype=np.float32).reshape(-1),
+            next_observation=_copy_graph_observation(next_observation),
+            next_central_observation=np.asarray(next_central_observation, dtype=np.float32).reshape(-1).copy(),
             done=bool(done),
             discount_steps=max(int(discount_steps), 1),
             metadata=dict(metadata or {}),
@@ -291,14 +580,18 @@ class MAPPOTrainer:
 
     def _evaluate_actions(
         self,
-        observations: torch.Tensor,
+        observations: Dict[str, torch.Tensor],
         central_observations: torch.Tensor,
         actions: torch.Tensor,
         action_masks: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         logits = self.actor(observations)
-        masked_logits = _masked_logits(logits, action_masks)
-        distribution = Categorical(logits=masked_logits)
+        distribution = _action_distribution_from_logits(
+            logits,
+            action_masks,
+            self.config,
+            exploratory=True,
+        )
         log_probs = distribution.log_prob(actions)
         entropy = distribution.entropy()
         values = self.critic(observations, central_observations)
@@ -309,14 +602,21 @@ class MAPPOTrainer:
         if transition_count < int(self.config.min_transitions_per_update):
             return 0
 
-        observations = np.stack([transition.observation for transition in self.buffer], axis=0)
-        central_observations = np.stack([transition.central_observation for transition in self.buffer], axis=0)
+        observations = stack_routing_graph_observations(
+            [transition.observation for transition in self.buffer]
+        )
+        central_observations = np.stack(
+            [transition.central_observation for transition in self.buffer],
+            axis=0,
+        )
         actions = np.asarray([transition.action for transition in self.buffer], dtype=np.int64)
         action_masks = np.stack([transition.action_mask for transition in self.buffer], axis=0)
         old_log_probs = np.asarray([transition.log_prob for transition in self.buffer], dtype=np.float32)
         old_values = np.asarray([transition.value for transition in self.buffer], dtype=np.float32)
         rewards = np.asarray([transition.reward for transition in self.buffer], dtype=np.float32)
-        next_observations = np.stack([transition.next_observation for transition in self.buffer], axis=0)
+        next_observations = stack_routing_graph_observations(
+            [transition.next_observation for transition in self.buffer]
+        )
         next_central_observations = np.stack(
             [transition.next_central_observation for transition in self.buffer],
             axis=0,
@@ -324,10 +624,13 @@ class MAPPOTrainer:
         dones = np.asarray([transition.done for transition in self.buffer], dtype=np.float32)
         discount_steps = np.asarray([transition.discount_steps for transition in self.buffer], dtype=np.float32)
 
+        observation_tensor_batch = routing_graph_batch_to_tensors(observations, self.device)
+        next_observation_tensor_batch = routing_graph_batch_to_tensors(next_observations, self.device)
+        central_tensor = self._to_tensor(central_observations)
+        next_central_tensor = self._to_tensor(next_central_observations)
+
         with torch.no_grad():
-            next_obs_tensor = self._to_tensor(next_observations)
-            next_central_tensor = self._to_tensor(next_central_observations)
-            next_values = self.critic(next_obs_tensor, next_central_tensor).cpu().numpy()
+            next_values = self.critic(next_observation_tensor_batch, next_central_tensor).cpu().numpy()
 
         discount_factors = np.power(float(self.config.gamma), discount_steps)
         returns = rewards + (1.0 - dones) * discount_factors * next_values
@@ -335,8 +638,6 @@ class MAPPOTrainer:
         if self.config.normalize_advantages and transition_count > 1:
             advantages = (advantages - advantages.mean()) / max(advantages.std(), 1.0e-8)
 
-        obs_tensor = self._to_tensor(observations)
-        central_tensor = self._to_tensor(central_observations)
         actions_tensor = torch.as_tensor(actions, dtype=torch.int64, device=self.device)
         action_mask_tensor = self._to_tensor(action_masks)
         old_log_prob_tensor = self._to_tensor(old_log_probs)
@@ -354,14 +655,15 @@ class MAPPOTrainer:
         for _ in range(int(self.config.update_epochs)):
             np.random.shuffle(index_array)
             for start in range(0, transition_count, minibatch_size):
-                batch_idx = index_array[start:start + minibatch_size]
-                batch_obs = obs_tensor[batch_idx]
-                batch_central = central_tensor[batch_idx]
-                batch_actions = actions_tensor[batch_idx]
-                batch_masks = action_mask_tensor[batch_idx]
-                batch_old_log_probs = old_log_prob_tensor[batch_idx]
-                batch_returns = returns_tensor[batch_idx]
-                batch_advantages = advantage_tensor[batch_idx]
+                batch_idx_array = index_array[start:start + minibatch_size]
+                batch_idx = torch.as_tensor(batch_idx_array, dtype=torch.long, device=self.device)
+                batch_obs = _slice_graph_tensor_batch(observation_tensor_batch, batch_idx)
+                batch_central = central_tensor.index_select(0, batch_idx)
+                batch_actions = actions_tensor.index_select(0, batch_idx)
+                batch_masks = action_mask_tensor.index_select(0, batch_idx)
+                batch_old_log_probs = old_log_prob_tensor.index_select(0, batch_idx)
+                batch_returns = returns_tensor.index_select(0, batch_idx)
+                batch_advantages = advantage_tensor.index_select(0, batch_idx)
 
                 new_log_probs, entropy, predicted_values = self._evaluate_actions(
                     batch_obs,
@@ -413,10 +715,10 @@ class MAPPOTrainer:
     def save_checkpoint(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         checkpoint = {
-            "format": "str-mappo-v1",
-            "state_size": int(self.observation_size),
+            "format": "str-mappo-gnn-v1",
             "central_observation_size": int(self.central_observation_size),
             "action_size": int(self.action_size),
+            "feature_layout": asdict(self.feature_layout),
             "config": asdict(self.config),
             "actor_state_dict": self.actor.state_dict(),
             "critic_state_dict": self.critic.state_dict(),
@@ -428,27 +730,57 @@ class MAPPOTrainer:
         torch.save(checkpoint, path)
 
 
-def load_mappo_checkpoint(path: str, device: Optional[torch.device] = None):
+def _validate_checkpoint_feature_layout(
+    checkpoint: Dict[str, object],
+    graph_spec: RoutingGraphSpec,
+) -> None:
+    checkpoint_layout = dict(checkpoint.get("feature_layout") or {})
+    runtime_layout = asdict(graph_spec.feature_layout)
+    if checkpoint_layout != runtime_layout:
+        raise ValueError(
+            "Checkpoint graph feature layout {} is incompatible with runtime layout {}.".format(
+                checkpoint_layout,
+                runtime_layout,
+            )
+        )
+    checkpoint_action_size = int(checkpoint.get("action_size", -1))
+    if checkpoint_action_size != int(graph_spec.feature_layout.action_count):
+        raise ValueError(
+            "Checkpoint action_size {} is incompatible with runtime action_count {}.".format(
+                checkpoint_action_size,
+                int(graph_spec.feature_layout.action_count),
+            )
+        )
+
+
+def load_mappo_checkpoint(
+    path: str,
+    graph_spec: RoutingGraphSpec,
+    device: Optional[torch.device] = None,
+):
     map_location = device if device is not None else "cpu"
     checkpoint = torch.load(path, map_location=map_location, weights_only=False)
     if not isinstance(checkpoint, dict):
         raise ValueError(f"{path} is not a valid MAPPO checkpoint.")
-    if checkpoint.get("format") != "str-mappo-v1":
+    if checkpoint.get("format") != "str-mappo-gnn-v1":
         raise ValueError(
-            f"{path} uses checkpoint format {checkpoint.get('format')!r}; expected 'str-mappo-v1'."
+            f"{path} uses checkpoint format {checkpoint.get('format')!r}; "
+            "expected 'str-mappo-gnn-v1'. Legacy vector checkpoints are intentionally unsupported."
         )
+
+    _validate_checkpoint_feature_layout(checkpoint, graph_spec)
 
     config = MAPPOConfig(**dict(checkpoint.get("config") or {}))
     runtime_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     actor = MAPPOActor(
-        checkpoint["state_size"],
+        graph_spec,
         checkpoint["action_size"],
-        config.actor_hidden_sizes,
+        config,
     ).to(runtime_device)
     critic = MAPPOCritic(
-        checkpoint["state_size"],
+        graph_spec,
         checkpoint["central_observation_size"],
-        config.critic_hidden_sizes,
+        config,
     ).to(runtime_device)
     actor.load_state_dict(checkpoint["actor_state_dict"])
     critic.load_state_dict(checkpoint["critic_state_dict"])

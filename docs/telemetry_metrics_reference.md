@@ -12,7 +12,7 @@ Primary producers:
 - runtime simulation wrapper: `core/STR_SUMO.py`
 
 The two main CSV outputs now serve different purposes:
-- `rl_episode_metrics.csv`: training-rollout metrics with online replay still active inside the episode.
+- `rl_episode_metrics.csv`: training-rollout metrics from fixed-policy episode rollouts, with PPO updates applied after each episode.
 - `rl_frozen_eval_metrics.csv`: held-out frozen evaluation metrics with no online learning.
 
 ## 2) Decision lifecycle metrics
@@ -53,6 +53,28 @@ Key fallback metrics:
 Interpretation:
 - if loop signals rise together with fallback signals, fallback churn is likely dominating tail failures,
 - modest lane-now fallback growth can be healthy if it replaces long proactive stalls.
+
+## 3.1) Lane-now vs proactive learning diagnostics
+
+Use these counters to separate structural lane-now movement from decisions the MAPPO actor actually controlled:
+- `policy_candidate_decisions`
+- `policy_candidate_mean_count`
+- `policy_candidate_single_count`
+- `policy_candidate_multi_count`
+- `policy_candidate_lane_now_only_count`
+- `policy_candidate_mixed_count`
+- `policy_candidate_proactive_only_count`
+- `policy_candidate_proactive_share`
+- `policy_selected_lane_now`
+- `policy_selected_proactive`
+- `policy_selected_lane_now_share`
+- `policy_selected_proactive_share`
+
+Interpretation:
+- `forced_actions` and `lane_now_decisions_opened` can be high even when the actor had no real alternative,
+- high `policy_candidate_single_count` means the actor mostly receives no action-choice learning signal,
+- high `policy_candidate_mixed_count` with low `policy_selected_proactive_share` means proactive choices exist but the policy is preferring lane-now,
+- high `policy_candidate_lane_now_only_count` with healthy completion is usually network/lane geometry, not a learning failure.
 
 ## 4) Pending-decision and timeout metrics
 

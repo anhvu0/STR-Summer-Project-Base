@@ -36,7 +36,7 @@ def build_parser():
     parser.add_argument(
         "--episodes",
         type=int,
-        default=1000,
+        default=500,
         help="Number of training episodes.",
     )
     parser.add_argument(
@@ -48,7 +48,7 @@ def build_parser():
     parser.add_argument(
         "--eval-every",
         type=int,
-        default=50,
+        default=100,
         help="Run frozen held-out inference evaluation every N episodes. 0 disables frozen evaluation.",
     )
     parser.add_argument(
@@ -78,10 +78,25 @@ def build_parser():
     parser.add_argument("--critic-lr", type=float, default=1.0e-3, help="MAPPO critic learning rate.")
     parser.add_argument("--gamma", type=float, default=0.97, help="Discount factor for decision-level returns.")
     parser.add_argument("--clip-epsilon", type=float, default=0.20, help="PPO clipping coefficient.")
-    parser.add_argument("--entropy-coef", type=float, default=0.01, help="Entropy bonus coefficient.")
+    parser.add_argument("--entropy-coef", type=float, default=0.02, help="Entropy bonus coefficient.")
     parser.add_argument("--value-coef", type=float, default=0.50, help="Value-loss coefficient.")
     parser.add_argument("--update-epochs", type=int, default=6, help="MAPPO epochs per episode rollout.")
     parser.add_argument("--minibatch-size", type=int, default=512, help="MAPPO minibatch size.")
+    parser.add_argument("--graph-hidden-size", type=int, default=128, help="Hidden size for the GNN encoder.")
+    parser.add_argument("--graph-layers", type=int, default=3, help="Number of message-passing layers.")
+    parser.add_argument("--graph-dropout", type=float, default=0.0, help="Dropout applied inside the GNN encoder.")
+    parser.add_argument(
+        "--action-sampling-temperature",
+        type=float,
+        default=1.0,
+        help="Softmax temperature used for non-deterministic MAPPO training action sampling.",
+    )
+    parser.add_argument(
+        "--valid-action-exploration-mix",
+        type=float,
+        default=0.04,
+        help="Uniform valid-action probability mixed into MAPPO training samples; greedy inference is unchanged.",
+    )
     parser.add_argument(
         "--min-transitions-per-update",
         type=int,
@@ -110,6 +125,11 @@ def main():
         update_epochs=args.update_epochs,
         minibatch_size=args.minibatch_size,
         min_transitions_per_update=args.min_transitions_per_update,
+        graph_hidden_size=args.graph_hidden_size,
+        graph_layers=args.graph_layers,
+        graph_dropout=args.graph_dropout,
+        action_sampling_temperature=args.action_sampling_temperature,
+        valid_action_exploration_mix=args.valid_action_exploration_mix,
     )
     pipeline = RLTrainingPipeline(
         sumocfg_path=args.sumocfg,
