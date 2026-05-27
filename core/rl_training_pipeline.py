@@ -85,10 +85,11 @@ class RLTrainingPipeline:
         debug_exit_diagnostics_limit=20,
         step_log_every=100,
         density_refresh_every=4,
-        normalize_per_step_cost_by_route_difficulty=False,
+        normalize_per_step_cost_by_route_difficulty=True,
         route_difficulty_eta_floor=60.0,
         route_difficulty_scale_min=0.35,
         route_difficulty_scale_max=1.0,
+        training_candidate_filter_mode="relaxed",
         decision_debug_csv_path=None,
         fast_training_profile=False,
         eval_every=0,
@@ -111,6 +112,10 @@ class RLTrainingPipeline:
             normalize_per_step_cost_by_route_difficulty: If True, scales only the
                 per-step travel-time cost by estimated O-D ETA so very long routes
                 are not structurally over-penalized.
+            training_candidate_filter_mode: "strict" keeps pre-actor heuristic
+                pruning active during training; "relaxed" broadens the actor mask
+                to executor-feasible actions while preserving runtime safety
+                overrides after sampling.
         """
         self.sumocfg_path = sumocfg_path
         self.model_output_path = model_output_path
@@ -137,6 +142,13 @@ class RLTrainingPipeline:
         self.route_difficulty_eta_floor = max(float(route_difficulty_eta_floor), 1.0)
         self.route_difficulty_scale_min = float(np.clip(route_difficulty_scale_min, 0.05, 1.0))
         self.route_difficulty_scale_max = float(np.clip(route_difficulty_scale_max, self.route_difficulty_scale_min, 1.0))
+        self.training_candidate_filter_mode = str(training_candidate_filter_mode or "relaxed").strip().lower()
+        if self.training_candidate_filter_mode not in {"strict", "relaxed"}:
+            raise ValueError(
+                "training_candidate_filter_mode must be 'strict' or 'relaxed', got {!r}".format(
+                    training_candidate_filter_mode
+                )
+            )
         self.fast_training_profile = bool(fast_training_profile)
         self.decision_debug_csv_path = decision_debug_csv_path
         if self.fast_training_profile and self.decision_debug_csv_path:
@@ -176,6 +188,7 @@ class RLTrainingPipeline:
         self.loop_trap_override_penalty = -1.4
         self.hard_brake_event_penalty = 0.35
         self.override_imitation_sample_weight = 0.35
+        self.override_negative_sample_weight = 0.60
         self.tail_delay_threshold_eta_mult = 1.35
         self.tail_delay_threshold_min_steps = 180.0
         self.tail_delay_threshold_max_steps = 320.0
@@ -508,6 +521,7 @@ class RLTrainingPipeline:
         next_central_observation,
         done,
         discount_steps=1,
+        sample_weight_override=None,
         metadata=None,
     ):
         if not isinstance(trace, dict) or not trace.get("mappo_training", False):
@@ -515,6 +529,9 @@ class RLTrainingPipeline:
         discount_cursor = max(int(trace.get("mappo_discount_cursor_steps", 0)), 0)
         discount_factor = float(self.mappo_config.gamma) ** float(discount_cursor)
         total_reward = float(trace.get("mappo_reward_accumulator", 0.0)) + (discount_factor * float(reward))
+        sample_weight = float(trace.get("mappo_sample_weight", 1.0))
+        if sample_weight_override is not None:
+            sample_weight = max(float(sample_weight_override), 1.0e-3)
         self.trainer.record_transition(
             observation=trace["mappo_initial_observation"],
             central_observation=trace["mappo_initial_central_observation"],
@@ -527,7 +544,7 @@ class RLTrainingPipeline:
             next_central_observation=np.asarray(next_central_observation, dtype=np.float32).reshape(1, -1),
             done=bool(done),
             discount_steps=max(int(discount_steps), 1),
-            sample_weight=float(trace.get("mappo_sample_weight", 1.0)),
+            sample_weight=sample_weight,
             metadata=metadata,
         )
         trace["mappo_transition_recorded"] = True
@@ -542,6 +559,7 @@ class RLTrainingPipeline:
         next_central_observation,
         done,
         discount_steps=1,
+        sample_weight_override=None,
         metadata=None,
     ):
         if pending is None or not isinstance(getattr(pending, "metadata", None), dict):
@@ -554,6 +572,7 @@ class RLTrainingPipeline:
             next_central_observation=next_central_observation,
             done=done,
             discount_steps=discount_steps,
+            sample_weight_override=sample_weight_override,
             metadata=metadata,
         )
 
@@ -1045,6 +1064,7 @@ class RLTrainingPipeline:
             metrics=decision_metrics,
             distance_slack=self.score_slack,
             coordination_state=coordination_state,
+            candidate_mode=self.training_candidate_filter_mode,
         )
         return self.shared_policy.rank_policy_actions(
             context=context,
@@ -1962,6 +1982,13 @@ class RLTrainingPipeline:
 
     def _frozen_eval_score_key(self, summary):
         return (
+            1.0 - float(np.clip(summary.get("completion_rate_mean", 0.0), 0.0, 1.0)),
+            self._safe_eval_metric(summary.get("timeout_rate_mean", 1.0)),
+            self._safe_eval_metric(summary.get("avg_travel_time_mean", float("inf"))),
+            self._safe_eval_metric(summary.get("p90_travel_time_mean", float("inf"))),
+            self._safe_eval_metric(summary.get("tail_completion_gap_steps_mean", float("inf"))),
+            self._safe_eval_metric(summary.get("p95_to_p50_travel_ratio_mean", float("inf"))),
+            self._safe_eval_metric(summary.get("deadlines_missed_mean", float("inf"))),
             1.0 - float(np.clip(summary.get("win_rate", 0.0), 0.0, 1.0)),
             self._safe_eval_metric(summary.get("timeout_rate_delta_mean", 1.0)),
             self._safe_eval_metric(summary.get("avg_travel_time_delta_mean", float("inf"))),
@@ -2370,6 +2397,8 @@ class RLTrainingPipeline:
                 return list(history) if history is not None else list(recent_edge_history[vehicle_id])
 
             def force_stale_lane_now_replan_if_available(vehicle_id, current_edge, step, context, policy_actions):
+                if self.training_candidate_filter_mode != "strict":
+                    return policy_actions
                 key = (vehicle_id, current_edge)
                 target_info = stale_lane_now_replan_targets.get(key)
                 if not target_info:
@@ -2431,6 +2460,7 @@ class RLTrainingPipeline:
                                 if central_observation is None else central_observation
                             ),
                             done=False,
+                            sample_weight_override=self.override_negative_sample_weight,
                             metadata={"override_type": "invalid_action"},
                         )
                         self._record_override_learning_from_trace(
@@ -2486,6 +2516,7 @@ class RLTrainingPipeline:
                                 if central_observation is None else central_observation
                             ),
                             done=False,
+                            sample_weight_override=self.override_negative_sample_weight,
                             metadata={
                                 "override_type": "loop_prefilter_fallback",
                                 "original_action": original_action,
@@ -2567,6 +2598,7 @@ class RLTrainingPipeline:
                                     if central_observation is None else central_observation
                                 ),
                                 done=False,
+                                sample_weight_override=self.override_negative_sample_weight,
                                 metadata={
                                     "override_type": "cooldown_fallback",
                                     "original_action": original_action,
@@ -2728,6 +2760,7 @@ class RLTrainingPipeline:
                                 if central_observation is None else central_observation
                             ),
                             done=False,
+                            sample_weight_override=self.override_negative_sample_weight,
                             metadata={
                                 "override_type": "route_apply_failure",
                                 "original_action": action,
@@ -3108,6 +3141,7 @@ class RLTrainingPipeline:
                                             next_central_observation=step_transition_central_observation,
                                             done=False,
                                             discount_steps=max(step - pending.decision_step, 1),
+                                            sample_weight_override=self.override_negative_sample_weight,
                                             metadata={
                                                 **(pending.metadata if isinstance(pending.metadata, dict) else {}),
                                                 "override_type": "route_apply_failure",
@@ -3175,6 +3209,7 @@ class RLTrainingPipeline:
                                     next_central_observation=step_transition_central_observation,
                                     done=False,
                                     discount_steps=max(step - pending.decision_step, 1),
+                                    sample_weight_override=self.override_negative_sample_weight,
                                     metadata={
                                         **(pending.metadata if isinstance(pending.metadata, dict) else {}),
                                         "observe_abort": reason or "no_progress",
@@ -3371,6 +3406,7 @@ class RLTrainingPipeline:
                                     next_central_observation=step_transition_central_observation,
                                     done=False,
                                     discount_steps=max(step - pending.decision_step, 1),
+                                    sample_weight_override=self.override_negative_sample_weight,
                                     metadata={
                                         **(pending.metadata if isinstance(pending.metadata, dict) else {}),
                                         "pending_timeout_replan": True,
@@ -3442,6 +3478,7 @@ class RLTrainingPipeline:
                                     next_central_observation=step_transition_central_observation,
                                     done=False,
                                     discount_steps=max(step - pending.decision_step, 1),
+                                    sample_weight_override=self.override_negative_sample_weight,
                                     metadata={
                                         **(pending.metadata if isinstance(pending.metadata, dict) else {}),
                                         "pending_timeout_replan": bool(release_eval.release_as_timeout),

@@ -770,11 +770,18 @@ class SharedDecisionPolicy:
         metrics: Optional[Dict[str, float]] = None,
         distance_slack: Optional[float] = None,
         coordination_state: Optional[CoordinationReservationState] = None,
+        candidate_mode: str = "strict",
     ) -> List[int]:
         _ = edge_density_fn, metrics, coordination_state
         available_actions = sorted(set(int(action) for action in context.available_actions))
         if not available_actions:
             return []
+
+        candidate_mode = str(candidate_mode or "strict").strip().lower()
+        if candidate_mode not in {"strict", "relaxed"}:
+            raise ValueError(f"Unsupported candidate_mode: {candidate_mode}")
+        if candidate_mode == "relaxed":
+            return available_actions
 
         lane_now = set(context.lane_feasible_now_actions)
         recent_history = list(recent_history or [])

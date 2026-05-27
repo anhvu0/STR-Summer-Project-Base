@@ -74,13 +74,31 @@ def build_parser():
         action="store_false",
         help="Disable fast mode and keep the heavier debug outputs.",
     )
-    parser.add_argument("--actor-lr", type=float, default=3.0e-4, help="MAPPO actor learning rate.")
+    parser.add_argument(
+        "--training-candidate-filter-mode",
+        choices=("strict", "relaxed"),
+        default="relaxed",
+        help="Action-mask policy during training: 'relaxed' exposes executor-feasible choices to the actor while preserving runtime overrides.",
+    )
+    parser.add_argument(
+        "--normalize-route-difficulty-cost",
+        dest="normalize_route_difficulty_cost",
+        action="store_true",
+        help="Scale only the per-step travel-time reward by route difficulty so longer O-D pairs do not dominate training.",
+    )
+    parser.add_argument(
+        "--no-normalize-route-difficulty-cost",
+        dest="normalize_route_difficulty_cost",
+        action="store_false",
+        help="Disable route-difficulty normalization for the per-step travel-time reward.",
+    )
+    parser.add_argument("--actor-lr", type=float, default=2.0e-4, help="MAPPO actor learning rate.")
     parser.add_argument("--critic-lr", type=float, default=1.0e-3, help="MAPPO critic learning rate.")
     parser.add_argument("--gamma", type=float, default=0.97, help="Discount factor for decision-level returns.")
     parser.add_argument("--clip-epsilon", type=float, default=0.20, help="PPO clipping coefficient.")
     parser.add_argument("--entropy-coef", type=float, default=0.02, help="Entropy bonus coefficient.")
     parser.add_argument("--value-coef", type=float, default=0.50, help="Value-loss coefficient.")
-    parser.add_argument("--update-epochs", type=int, default=6, help="MAPPO epochs per episode rollout.")
+    parser.add_argument("--update-epochs", type=int, default=4, help="MAPPO epochs per episode rollout.")
     parser.add_argument("--minibatch-size", type=int, default=512, help="MAPPO minibatch size.")
     parser.add_argument("--graph-hidden-size", type=int, default=128, help="Hidden size for the GNN encoder.")
     parser.add_argument("--graph-layers", type=int, default=3, help="Number of message-passing layers.")
@@ -100,10 +118,13 @@ def build_parser():
     parser.add_argument(
         "--min-transitions-per-update",
         type=int,
-        default=32,
+        default=64,
         help="Skip policy updates until at least this many decision transitions are collected.",
     )
-    parser.set_defaults(fast_mode=True)
+    parser.set_defaults(
+        fast_mode=True,
+        normalize_route_difficulty_cost=True,
+    )
     return parser
 
 
@@ -142,6 +163,8 @@ def main():
         frozen_eval_seeds=parse_eval_seeds(args.eval_seeds),
         eval_spawn_interval=args.eval_spawn_interval,
         fast_training_profile=args.fast_mode,
+        normalize_per_step_cost_by_route_difficulty=args.normalize_route_difficulty_cost,
+        training_candidate_filter_mode=args.training_candidate_filter_mode,
     )
     pipeline.run()
 

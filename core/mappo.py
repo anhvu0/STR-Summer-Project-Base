@@ -196,17 +196,17 @@ class RoutingGraphEncoder(nn.Module):
 
 @dataclass(frozen=True)
 class MAPPOConfig:
-    actor_learning_rate: float = 3.0e-4
+    actor_learning_rate: float = 2.0e-4
     critic_learning_rate: float = 1.0e-3
     gamma: float = 0.99
     clip_epsilon: float = 0.20
     entropy_coef: float = 0.02
     value_coef: float = 0.50
     max_grad_norm: float = 10.0
-    update_epochs: int = 6
+    update_epochs: int = 4
     minibatch_size: int = 256
     normalize_advantages: bool = True
-    min_transitions_per_update: int = 32
+    min_transitions_per_update: int = 64
     actor_hidden_sizes: Tuple[int, ...] = (256, 128)
     critic_hidden_sizes: Tuple[int, ...] = (256, 128)
     graph_hidden_size: int = 128

@@ -1192,6 +1192,7 @@ class MAPPOPolicy(RouteController):
                     metrics=self._metrics,
                     distance_slack=self.score_slack,
                     coordination_state=step_coordination_state,
+                    candidate_mode="strict",
                 )
                 policy_actions = self.shared_policy.rank_policy_actions(
                     context=entry["context"],
