@@ -98,8 +98,8 @@ def build_parser():
     parser.add_argument("--clip-epsilon", type=float, default=0.20, help="PPO clipping coefficient.")
     parser.add_argument("--entropy-coef", type=float, default=0.005, help="Entropy bonus coefficient.")
     parser.add_argument("--value-coef", type=float, default=0.50, help="Value-loss coefficient.")
-    parser.add_argument("--update-epochs", type=int, default=3, help="MAPPO epochs per episode rollout.")
-    parser.add_argument("--minibatch-size", type=int, default=4096, help="MAPPO minibatch size.")
+    parser.add_argument("--update-epochs", type=int, default=4, help="MAPPO epochs per episode rollout.")
+    parser.add_argument("--minibatch-size", type=int, default=256, help="MAPPO minibatch size.")
     parser.add_argument("--graph-hidden-size", type=int, default=128, help="Hidden size for the GNN encoder.")
     parser.add_argument("--graph-layers", type=int, default=2, help="Number of message-passing layers.")
     parser.add_argument("--graph-dropout", type=float, default=0.0, help="Dropout applied inside the GNN encoder.")
@@ -118,7 +118,7 @@ def build_parser():
     parser.add_argument(
         "--min-transitions-per-update",
         type=int,
-        default=480,
+        default=4500,
         help="Skip policy updates until at least this many decision transitions are collected.",
     )
     parser.set_defaults(

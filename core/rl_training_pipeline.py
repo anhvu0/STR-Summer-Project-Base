@@ -158,44 +158,36 @@ class RLTrainingPipeline:
         self.runtime_sumocfg_path = build_runtime_sumocfg(self.sumocfg_path, fast_mode=self.fast_training_profile)
         self._distance_cache = {}
         self._cache_metrics = defaultdict(float)
-        self.progress_reward_scale = 1.00
-        self.system_congestion_scale = 0.04
-        self.selfless_reward_scale = 0.35
-        self.selfless_reward_clip = 3.0
         self.loop_window = 12
-        self.loop_repeat_penalty = 1.5
-        # Objective priority:
-        # 1) minimize travel time (dominant)
-        # 2) congestion externality (secondary)
-        # 3) shortest-path distance as tie-breaker
+        # Reward design:
+        # 1) dense per-step travel-time cost (dominant)
+        # 2) completion reward
+        # 3) light progress / congestion shaping
+        # 4) compact penalties for major control failures only
         self.travel_time_penalty = 0.05
-        self.eta_progress_scale = 0.65
-        self.distance_tiebreak_scale = 0.06
-        self.coordination_pressure_penalty = 0.35
-        self.pending_coordination_penalty = 0.04
+        self.progress_reward_scale = 0.65
+        self.local_density_penalty = 0.005
         self.score_slack = 30.0
         self.reward_clip_low = -20.0
         self.reward_clip_high = 20.0
         self.pending_timeout_penalty = -18.0
-        self.pending_latency_penalty_per_step = 0.008
-        self.pending_replan_penalty = -0.4
+        self.pending_abort_penalty = -1.0
         self.stale_disappeared_penalty = -14.0
-        self.observe_no_progress_penalty = -0.5
-        self.observe_low_speed_penalty = -0.4
-        self.observe_commit_window_miss_penalty = -0.7
-        self.same_edge_repeat_chase_penalty = -0.5
-        self.fallback_missed_lane_penalty = -0.4
-        self.loop_trap_override_penalty = -1.4
-        self.hard_brake_event_penalty = 0.35
+        self.helper_override_penalty = -0.75
+        self.invalid_action_penalty = -2.0
+        self.route_apply_failure_penalty = -6.0
+        self.loop_signal_penalty = -4.0
+        self.route_mismatch_penalty = -4.0
+        self.unreachable_transition_penalty = -12.0
+        self.dead_end_penalty = -12.0
+        self.non_destination_arrival_penalty = -8.0
+        self.teleport_assisted_arrival_penalty = 8.0
         self.override_imitation_sample_weight = 0.35
         self.override_negative_sample_weight = 0.60
         self.tail_delay_threshold_eta_mult = 1.35
         self.tail_delay_threshold_min_steps = 180.0
         self.tail_delay_threshold_max_steps = 320.0
-        self.tail_delay_linear_penalty = 0.075
-        self.tail_delay_quadratic_penalty = 0.00016
-        self.tail_arrival_penalty_per_25_steps = 0.90
-        self.tail_arrival_penalty_cap = 8.0
+        self.tail_overdue_penalty_per_step = 0.075
         self.hard_brake_attribution_window_steps = 24
 
         self.sumocfg_dir = os.path.dirname(sumocfg_path)
@@ -936,8 +928,8 @@ class RLTrainingPipeline:
 
     def _action_social_cost_proxy(self, current_edge, action_idx, destination):
         """
-        Lower is better for "selfless" local decisions.
-        Proxy combines short-horizon corridor pressure + residual distance.
+        Lower is better for corridor/travel-time quality.
+        Proxy combines short-horizon corridor pressure with residual distance.
         """
         stats = self.shared_policy.action_corridor_stats(
             edge_id=current_edge,
@@ -1159,12 +1151,6 @@ class RLTrainingPipeline:
 
         decision_metrics["emergency_brake_after_lane_now"] += 1
 
-    def _consume_hard_brake_events(self, hard_brake_counts_by_vehicle, vehicle_id):
-        vehicle_key = str(vehicle_id)
-        count = int(hard_brake_counts_by_vehicle.get(vehicle_key, 0))
-        if count > 0:
-            hard_brake_counts_by_vehicle[vehicle_key] = 0
-        return max(count, 0)
     def dist_to_end(self, vehicle_id, snapshot=None):
         """
         Distance (meters) from the vehicle to the end of its current lane.
@@ -1484,7 +1470,6 @@ class RLTrainingPipeline:
         finalized_decision_rewards,
         decision_debug_rows,
         episode,
-        hard_brake_counts_by_vehicle,
         in_arrived_ids=False,
         in_teleport_ids=False,
         ever_teleported=False,
@@ -1493,7 +1478,6 @@ class RLTrainingPipeline:
         if vehicle_id in terminal_recorded_ids:
             return 0.0
         pending = pending_decisions.get(vehicle_id)
-        hard_brake_events = self._consume_hard_brake_events(hard_brake_counts_by_vehicle, vehicle_id)
         if pending is None:
             last_confirmed_edge = last_seen_edge_by_vehicle.get(vehicle_id, vehicle.destination)
             snapshot = last_snapshot_by_vehicle.get(vehicle_id)
@@ -1511,12 +1495,9 @@ class RLTrainingPipeline:
                     step,
                     arrived=True,
                     reached_global_destination=True,
-                    hard_brake_events=hard_brake_events,
-                    terminal_outcome=outcome,
                 )
                 if ever_teleported:
-                    teleport_assisted_arrival_penalty = 8.0
-                    reward = self._clip_reward(reward - teleport_assisted_arrival_penalty)
+                    reward = self._clip_reward(reward - self.teleport_assisted_arrival_penalty)
                 next_state = self.make_terminal_next_state_from_edge(
                     vehicle.destination,
                     vehicle.destination,
@@ -1591,13 +1572,9 @@ class RLTrainingPipeline:
                 arrived=True,
                 delta_t=max(step - pending.last_credit_step, 1),
                 reached_global_destination=True,
-                coordination_pressure=float((pending.metadata or {}).get("coordination_pressure", 0.0)),
-                hard_brake_events=hard_brake_events,
-                terminal_outcome=outcome,
             )
             if ever_teleported:
-                teleport_assisted_arrival_penalty = 8.0
-                reward = self._clip_reward(reward - teleport_assisted_arrival_penalty)
+                reward = self._clip_reward(reward - self.teleport_assisted_arrival_penalty)
             next_state = self.make_terminal_next_state_from_edge(
                 vehicle.destination,
                 vehicle.destination,
@@ -1622,10 +1599,6 @@ class RLTrainingPipeline:
                 last_confirmed_edge,
                 elapsed=timeout_elapsed,
                 step=step,
-                pending_age=max(step - pending.decision_step, 0),
-                lane_change_deferrals=pending.metadata.get("lane_change_deferrals", 0),
-                hard_brake_events=hard_brake_events,
-                coordination_pressure=float((pending.metadata or {}).get("coordination_pressure", 0.0)),
             ) + self.pending_timeout_penalty
             reward = self._clip_reward(reward)
             done = True
@@ -1745,7 +1718,7 @@ class RLTrainingPipeline:
         setattr(vehicle, "tail_delay_threshold_steps", threshold)
         return threshold
 
-    def _tail_delay_penalty_increment(self, vehicle, reference_edge, step, delta_steps):
+    def _overdue_delay_penalty_increment(self, vehicle, reference_edge, step, delta_steps):
         delta_steps = max(float(delta_steps), 0.0)
         if delta_steps <= 0.0:
             return 0.0
@@ -1756,19 +1729,23 @@ class RLTrainingPipeline:
         overflow_prev = max(elapsed_prev - threshold, 0.0)
         if overflow_now <= overflow_prev:
             return 0.0
-        linear = self.tail_delay_linear_penalty * (overflow_now - overflow_prev)
-        quadratic = self.tail_delay_quadratic_penalty * ((overflow_now ** 2) - (overflow_prev ** 2))
-        return float(max(linear + quadratic, 0.0))
+        return float(self.tail_overdue_penalty_per_step * (overflow_now - overflow_prev))
 
-    def _tail_arrival_penalty(self, vehicle, reference_edge, step):
-        threshold = self._tail_delay_threshold(vehicle, reference_edge)
-        elapsed_now = max(float(step) - float(vehicle.start_time), 0.0)
-        overflow = max(elapsed_now - threshold, 0.0)
-        if overflow <= 0.0:
+    def _base_step_reward(self, vehicle, *, route_scale_edge, observed_edge, elapsed, step):
+        elapsed = max(float(elapsed), 0.0)
+        if elapsed <= 0.0:
             return 0.0
-        penalty = self.tail_arrival_penalty_per_25_steps * (overflow / 25.0)
-        return float(min(penalty, self.tail_arrival_penalty_cap))
-    
+        time_cost_scale = self._get_route_difficulty_scale(vehicle, route_scale_edge)
+        reward = -self.travel_time_penalty * time_cost_scale * elapsed
+        reward -= self.local_density_penalty * max(self._edge_density(observed_edge), 0.0) * elapsed
+        reward -= self._overdue_delay_penalty_increment(
+            vehicle,
+            observed_edge,
+            step=step,
+            delta_steps=elapsed,
+        )
+        return float(reward)
+
     def compute_reward(
         self,
         vehicle,
@@ -1776,25 +1753,18 @@ class RLTrainingPipeline:
         current_edge,
         step,
         arrived,
-        repeated_recent_edges=0,
         delta_t=1.0,
         reached_global_destination=False,
         route_mismatch=False,
-        invalid_late_turn=False,
-        route_apply_failed=False,
         uturn_repeat=False,
         long_horizon_loop=False,
-        externality_penalty=0.0,
-        selfless_delta=0.0,
-        coordination_pressure=0.0,
-        hard_brake_events=0,
-        terminal_outcome=None,
     ):
         """
         Compute a bounded reward with clear objective priority:
         1) minimize travel time (per-step cost)
         2) complete trips successfully
-        3) prefer progress with mild congestion awareness.
+        3) prefer progress with mild congestion awareness
+        4) lightly punish only major control failures.
         """
         elapsed = max(float(delta_t), 1.0)
 
@@ -1803,57 +1773,26 @@ class RLTrainingPipeline:
         prev_eta = self._estimate_remaining_eta(prev_edge, vehicle.destination)
         curr_eta = self._estimate_remaining_eta(current_edge, vehicle.destination)
 
-        reward = 0.0
+        reward = self._base_step_reward(
+            vehicle,
+            route_scale_edge=prev_edge,
+            observed_edge=current_edge,
+            elapsed=elapsed,
+            step=step,
+        )
         done = False
 
-        # Dense shaping: small living/time and congestion costs.
-        time_cost_scale = self._get_route_difficulty_scale(vehicle, prev_edge)
-        reward -= self.travel_time_penalty * time_cost_scale * elapsed
-        edge_density = self._edge_density(current_edge)
-        reward -= 0.005 * edge_density * elapsed
-
-        mean_density = float(self._density_mean)
-        marginal_pressure = max(edge_density - mean_density, 0.0)
-        reward -= self.system_congestion_scale * marginal_pressure * elapsed
-        reward += self.selfless_reward_scale * float(
-            np.clip(selfless_delta, -self.selfless_reward_clip, self.selfless_reward_clip)
-        )
-        reward -= self.coordination_pressure_penalty * float(np.clip(coordination_pressure, 0.0, 6.0))
-        reward -= self._tail_delay_penalty_increment(
-            vehicle,
-            current_edge,
-            step=step,
-            delta_steps=elapsed,
-        )
-
-        # Progress shaping using ETA and distance improvement.
+        # Keep one compact progress term; distance progress was redundant with ETA.
         if math.isfinite(prev_eta) and math.isfinite(curr_eta):
-            reward += self.eta_progress_scale * np.clip(prev_eta - curr_eta, -3.0, 3.0)
+            reward += self.progress_reward_scale * np.clip(prev_eta - curr_eta, -3.0, 3.0)
 
-        # Tertiary tie-breaker: shortest-path distance progress.
-        if math.isfinite(prev_distance) and math.isfinite(curr_distance):
-            progress = (prev_distance - curr_distance) * (self.distance_tiebreak_scale * self.progress_reward_scale)
-            reward += float(np.clip(progress, -1.0, 1.0))
-
-        # Safety and control quality penalties.
-        if repeated_recent_edges > 0:
-            reward -= self.loop_repeat_penalty * min(repeated_recent_edges, 3)
-        if uturn_repeat:
-            reward -= 3.0
-        if long_horizon_loop:
-            reward -= 4.0
+        if uturn_repeat or long_horizon_loop:
+            reward -= self.loop_signal_penalty
         if route_mismatch:
-            reward -= 4.0
-        if invalid_late_turn:
-            reward -= 2.0
-        if route_apply_failed:
-            reward -= 6.0
-        if hard_brake_events > 0:
-            reward -= self.hard_brake_event_penalty * min(float(hard_brake_events), 2.0)
+            reward -= self.route_mismatch_penalty
 
-        # Unreachable transition after a decision is strongly terminal-negative.
         if math.isfinite(prev_distance) and not math.isfinite(curr_distance):
-            reward -= 12.0
+            reward -= self.unreachable_transition_penalty
             done = True
 
         if arrived:
@@ -1861,15 +1800,14 @@ class RLTrainingPipeline:
                 reward += self.destination_reward
                 speed_bonus = max(0.0, 1.0 - (float(step) / float(MAX_SIMULATION_STEPS)))
                 reward += 3.0 * speed_bonus
-                reward -= self._tail_arrival_penalty(vehicle, current_edge, step)
             else:
-                reward -= 8.0
+                reward -= self.non_destination_arrival_penalty
             done = True
             return self._clip_reward(reward), done
 
         outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
         if (not outgoing or len(outgoing) == 0) and current_edge != vehicle.destination:
-            reward -= 12.0
+            reward -= self.dead_end_penalty
             done = True
 
         return self._clip_reward(reward), done
@@ -1877,33 +1815,18 @@ class RLTrainingPipeline:
     def _clip_reward(self, reward_value):
         return float(np.clip(reward_value, self.reward_clip_low, self.reward_clip_high))
 
-    def compute_pending_step_reward(self, vehicle, edge_id, elapsed, step, externality_penalty=0.0, pending_age=0, lane_change_deferrals=0, hard_brake_events=0, coordination_pressure=0.0):
+    def compute_pending_step_reward(self, vehicle, edge_id, elapsed, step):
         """
         Dense reward used while a decision is pending and has not finalized yet.
-        Keeps the training objective travel-time centric without waiting for an edge transition.
+        Pending decisions now use the same travel-time-centric base reward rather
+        than stacking extra helper-specific penalties on top.
         """
-        elapsed = max(float(elapsed), 0.0)
-        if elapsed <= 0.0:
-            return 0.0
-        time_cost_scale = self._get_route_difficulty_scale(vehicle, edge_id)
-        reward = -self.travel_time_penalty * time_cost_scale * elapsed
-
-        edge_density = self._edge_density(edge_id)
-        reward -= 0.005 * edge_density * elapsed
-
-        mean_density = float(self._density_mean)
-        marginal_pressure = max(edge_density - mean_density, 0.0)
-        reward -= self.system_congestion_scale * marginal_pressure * elapsed
-        reward -= self.pending_coordination_penalty * float(np.clip(coordination_pressure, 0.0, 6.0)) * elapsed
-        reward -= self.pending_latency_penalty_per_step * float(max(pending_age, 0))
-        reward -= 0.02 * float(max(lane_change_deferrals, 0))
-        if hard_brake_events > 0:
-            reward -= (0.6 * self.hard_brake_event_penalty) * min(float(hard_brake_events), 2.0)
-        reward -= self._tail_delay_penalty_increment(
+        reward = self._base_step_reward(
             vehicle,
-            edge_id,
+            route_scale_edge=edge_id,
+            observed_edge=edge_id,
+            elapsed=elapsed,
             step=step,
-            delta_steps=elapsed,
         )
         return self._clip_reward(reward)
 
@@ -2340,7 +2263,6 @@ class RLTrainingPipeline:
             simulation_get_arrived_ids = traci.simulation.getArrivedIDList
             vehicle_get_ids = traci.vehicle.getIDList
             pending_decisions = {}
-            lane_change_deferrals = defaultdict(int)
             lane_change_cooldown_until = {}
             pending_release_info = {}
             stale_lane_now_replan_targets = {}
@@ -2377,7 +2299,6 @@ class RLTrainingPipeline:
             arrived_with_prestep_edge_not_destination = 0
             prev_speed_by_vehicle = {}
             emergency_brake_active_by_vehicle = {}
-            hard_brake_counts_by_vehicle = defaultdict(int)
             last_observed_brake_step_by_vehicle = {}
             decision_attribution_by_vehicle = {}
             emergency_brake_events_by_edge = Counter()
@@ -2449,7 +2370,7 @@ class RLTrainingPipeline:
                     self._mark_override_decision(decision_metrics, decision_metadata)
                     self._record_override_event(decision_metrics, "invalid_action")
                     if policy_trace is not None:
-                        penalty = self._clip_reward(-2.0)
+                        penalty = self._clip_reward(self.invalid_action_penalty)
                         recorded = self._record_immediate_mappo_transition(
                             policy_trace,
                             action=action,
@@ -2504,7 +2425,7 @@ class RLTrainingPipeline:
                         decision_metrics["fallback_selected_lane_now"] += 1
                     decision_metrics["safety_overrides"] += 1
                     action_source = "loop_prefilter_fallback"
-                    override_penalty = self._clip_reward(self.loop_trap_override_penalty)
+                    override_penalty = self._clip_reward(self.helper_override_penalty)
                     if policy_trace is not None:
                         recorded = self._record_immediate_mappo_transition(
                             policy_trace,
@@ -2586,7 +2507,7 @@ class RLTrainingPipeline:
                             and (step - int(release_info.get("step", step))) <= self.decision_engine.cooldown_after_pending_release(timeout=True)
                         ):
                             decision_metrics["fallback_after_timeout_count"] += 1
-                        override_penalty = self._clip_reward(self.same_edge_repeat_chase_penalty)
+                        override_penalty = self._clip_reward(self.helper_override_penalty)
                         if policy_trace is not None:
                             recorded = self._record_immediate_mappo_transition(
                                 policy_trace,
@@ -2661,12 +2582,6 @@ class RLTrainingPipeline:
                             observe_metadata=observe_metadata,
                             decision_open_recorded=False,
                             extra_metadata={
-                                "coordination_pressure": self.shared_policy.coordination_pressure_score(
-                                    context=context,
-                                    destination=vehicle.destination,
-                                    action_idx=action,
-                                    coordination_state=coordination_state,
-                                ),
                                 **decision_metadata,
                                 **({} if policy_trace is None else policy_trace),
                             },
@@ -2710,21 +2625,6 @@ class RLTrainingPipeline:
                         + (0.01 * float(eta_proxy))
                     )
                 finite_costs = {candidate_action: cost for candidate_action, cost in candidate_costs.items() if math.isfinite(cost)}
-                chosen_cost = float(candidate_costs.get(action, math.inf))
-                baseline_actions = context.lane_feasible_now_actions if context.lane_feasible_now_actions else candidate_actions
-                baseline_finite_costs = [
-                    candidate_costs.get(candidate_action, math.inf)
-                    for candidate_action in baseline_actions
-                    if math.isfinite(candidate_costs.get(candidate_action, math.inf))
-                ]
-                baseline_cost = float(min(baseline_finite_costs)) if baseline_finite_costs else math.inf
-                selfless_delta = float(baseline_cost - chosen_cost) if math.isfinite(chosen_cost) and math.isfinite(baseline_cost) else 0.0
-                coordination_pressure = self.shared_policy.coordination_pressure_score(
-                    context=context,
-                    destination=vehicle.destination,
-                    action_idx=action,
-                    coordination_state=coordination_state,
-                )
                 if len(candidate_actions) > 1 and finite_costs and action in finite_costs:
                     best_action = min(finite_costs, key=finite_costs.get)
                     best_cost = finite_costs[best_action]
@@ -2748,7 +2648,7 @@ class RLTrainingPipeline:
                     self._mark_override_decision(decision_metrics, decision_metadata)
                     self._record_override_event(decision_metrics, "route_apply_fail")
                     decision_metrics["fragment_build_failures"] += 1
-                    override_penalty = self._clip_reward(-6.0)
+                    override_penalty = self._clip_reward(self.route_apply_failure_penalty)
                     if policy_trace is not None:
                         recorded = self._record_immediate_mappo_transition(
                             policy_trace,
@@ -2795,11 +2695,6 @@ class RLTrainingPipeline:
                     full_route=full_route,
                     decision_open_recorded=False,
                     extra_metadata={
-                        "lane_change_deferrals": lane_change_deferrals.get(vehicle_id, 0),
-                        "chosen_social_cost": chosen_cost,
-                        "baseline_social_cost": baseline_cost,
-                        "selfless_delta": selfless_delta,
-                        "coordination_pressure": coordination_pressure,
                         **decision_metadata,
                         **({} if policy_trace is None else policy_trace),
                     },
@@ -2811,7 +2706,6 @@ class RLTrainingPipeline:
                     action_source,
                     "lane_now",
                 )
-                lane_change_deferrals[vehicle_id] = 0
                 self._register_decision_open(decision_metrics, pending_decisions[vehicle_id])
                 release_info = pending_release_info.get(vehicle_id)
                 if (
@@ -2906,7 +2800,6 @@ class RLTrainingPipeline:
                             was_hard_brake_active = bool(emergency_brake_active_by_vehicle.get(vehicle_id, False))
                             if hard_brake and not was_hard_brake_active:
                                 decision_metrics["emergency_brake_events"] += 1
-                                hard_brake_counts_by_vehicle[vehicle_id] += 1
                                 emergency_brake_events_by_edge[str(snapshot.edge_id)] += 1
                                 emergency_brake_events_by_vehicle[str(vehicle_id)] += 1
                                 emergency_reason = "other"
@@ -3010,15 +2903,10 @@ class RLTrainingPipeline:
                             curr_eta = self._estimate_remaining_eta(current_edge, vehicle.destination)
                             reward, done = self.compute_reward(
                                 vehicle, pending.last_credit_edge, current_edge, step, arrived=False,
-                                repeated_recent_edges=repeated_recent_edges,
                                 delta_t=max(step - pending.last_credit_step, 1),
                                 route_mismatch=mismatch,
                                 uturn_repeat=loop_signals["aba_bounce"] or loop_signals["short_cycle"],
                                 long_horizon_loop=loop_signals.get("long_horizon_loop") or loop_signals.get("revisit_without_progress"),
-                                externality_penalty=ext_pen,
-                                selfless_delta=float(pending.metadata.get("selfless_delta", 0.0)),
-                                coordination_pressure=float((pending.metadata or {}).get("coordination_pressure", 0.0)),
-                                hard_brake_events=self._consume_hard_brake_events(hard_brake_counts_by_vehicle, vehicle_id),
                             )
                             next_ctx = self._get_or_build_step_context(
                                 step_context_cache,
@@ -3133,7 +3021,7 @@ class RLTrainingPipeline:
                                         decision_metrics["route_apply_fail_overrides"] += 1
                                         self._mark_override_decision(decision_metrics, pending.metadata)
                                         self._record_override_event(decision_metrics, "route_apply_fail")
-                                        override_penalty = self._clip_reward(-6.0)
+                                        override_penalty = self._clip_reward(self.route_apply_failure_penalty)
                                         recorded = self._record_pending_mappo_transition(
                                             pending,
                                             reward=override_penalty,
@@ -3183,14 +3071,11 @@ class RLTrainingPipeline:
                                     continue
                                 if reason == "commit_window":
                                     decision_metrics["lane_change_observe_abort_commit_window"] += 1
-                                    pending_pen = self.observe_commit_window_miss_penalty
                                 elif reason == "low_speed":
                                     decision_metrics["lane_change_observe_abort_low_speed"] += 1
-                                    pending_pen = self.observe_low_speed_penalty
                                 else:
                                     decision_metrics["lane_change_observe_abort_no_progress"] += 1
-                                    pending_pen = self.observe_no_progress_penalty
-                                pending_pen = self._clip_reward(pending_pen + self.same_edge_repeat_chase_penalty)
+                                pending_pen = self._clip_reward(self.pending_abort_penalty)
                                 self._mark_override_decision(decision_metrics, pending.metadata)
                                 observe_abort_state = self._get_or_encode_step_state(
                                     step_state_cache,
@@ -3303,12 +3188,6 @@ class RLTrainingPipeline:
                                     decision_open_recorded=True,
                                     extra_metadata={
                                         **(pending.metadata if isinstance(pending.metadata, dict) else {}),
-                                        "coordination_pressure": self.shared_policy.coordination_pressure_score(
-                                            context=obs_context,
-                                            destination=vehicle.destination,
-                                            action_idx=fallback_action,
-                                            coordination_state=step_coordination_state,
-                                        ),
                                         **({} if fallback_trace is None else fallback_trace),
                                     },
                                 )
@@ -3340,17 +3219,11 @@ class RLTrainingPipeline:
                                 pending_age_samples.append(float(pending_age))
                             elapsed_pending = max(step - pending.last_credit_step, 0)
                             if elapsed_pending > 0:
-                                ext_pen = max(self._edge_density(current_edge), 0.0)
                                 pending_reward = self.compute_pending_step_reward(
                                     vehicle,
                                     current_edge,
                                     elapsed=elapsed_pending,
                                     step=step,
-                                    externality_penalty=ext_pen,
-                                    pending_age=pending_age,
-                                    lane_change_deferrals=pending.metadata.get("lane_change_deferrals", 0),
-                                    hard_brake_events=self._consume_hard_brake_events(hard_brake_counts_by_vehicle, vehicle_id),
-                                    coordination_pressure=float((pending.metadata or {}).get("coordination_pressure", 0.0)),
                                 )
                                 next_ctx = self._get_or_build_step_context(
                                     step_context_cache,
@@ -3421,7 +3294,6 @@ class RLTrainingPipeline:
                                 if str((pending.metadata or {}).get("decision_origin_mode", pending.decision_origin_mode)) == "proactive":
                                     decision_metrics["proactive_pending_timeout_count"] += 1
                                 pending_decisions.pop(vehicle_id, None)
-                                lane_change_deferrals[vehicle_id] = 0
                                 lane_change_cooldown_until[(vehicle_id, current_edge)] = (
                                     step + self.decision_engine.cooldown_after_pending_release(timeout=True)
                                 )
@@ -3464,12 +3336,8 @@ class RLTrainingPipeline:
                                 )
                                 if release_eval.release_as_timeout:
                                     release_penalty = self.pending_timeout_penalty
-                                elif release_eval.release_reason == "wrong_lane_commit":
-                                    release_penalty = self.pending_replan_penalty + self.observe_commit_window_miss_penalty
-                                elif release_eval.release_reason == "route_no_progress_abort":
-                                    release_penalty = self.pending_replan_penalty + self.observe_no_progress_penalty
                                 else:
-                                    release_penalty = self.pending_replan_penalty
+                                    release_penalty = self.pending_abort_penalty
                                 release_penalty = self._clip_reward(release_penalty)
                                 recorded = self._record_pending_mappo_transition(
                                     pending,
@@ -3819,7 +3687,6 @@ class RLTrainingPipeline:
                             finalized_decision_rewards=finalized_decision_rewards,
                             decision_debug_rows=decision_debug_rows,
                             episode=episode,
-                            hard_brake_counts_by_vehicle=hard_brake_counts_by_vehicle,
                             in_arrived_ids=(removed_id in arrived_this_step),
                             in_teleport_ids=(removed_id in teleported_ids),
                             ever_teleported=ever_teleported,
@@ -3878,7 +3745,6 @@ class RLTrainingPipeline:
                             finalized_decision_rewards=finalized_decision_rewards,
                             decision_debug_rows=decision_debug_rows,
                             episode=episode,
-                            hard_brake_counts_by_vehicle=hard_brake_counts_by_vehicle,
                             in_arrived_ids=False,
                             in_teleport_ids=False,
                             ever_teleported=(vid in ever_teleported_controlled_ids),
