@@ -2183,8 +2183,8 @@ class RLTrainingPipeline:
         route_path = os.path.join(self.sumocfg_dir, self.route_file)
         spawn_interval_value = self.spawn_interval if spawn_interval_override is None else float(spawn_interval_override)
         vehicle_list = generator.generate_vehicles(
-            num_target_vehicles=50,
-            num_random_vehicles=350,
+            num_target_vehicles=100,
+            num_random_vehicles=300,
             pattern=self.target_pattern,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
