@@ -48,7 +48,7 @@ def build_parser():
     parser.add_argument(
         "--eval-every",
         type=int,
-        default=100,
+        default=50,
         help="Run frozen held-out inference evaluation every N episodes. 0 disables frozen evaluation.",
     )
     parser.add_argument(
@@ -100,7 +100,7 @@ def build_parser():
     parser.add_argument(
         "--min-transitions-per-update",
         type=int,
-        default=64,
+        default=32,
         help="Skip policy updates until at least this many decision transitions are collected.",
     )
     parser.set_defaults(fast_mode=True)

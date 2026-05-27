@@ -25,11 +25,14 @@ Core counters:
 
 Useful derived ratios:
 - `override_ratio`
+- `override_event_ratio`
 - `actionable_skip_ratio`
 - `pending_resolution_success_rate`
 - `fallback_rate_per_opened_decision`
 
 Interpretation:
+- `override_ratio` is the share of strategic decisions that hit at least one override event,
+- `override_event_ratio` is the number of override events per opened decision and can exceed `override_ratio`,
 - rising `decisions_opened` with flat `decisions_finalized` usually means pending churn is growing,
 - high `actionable_skip_ratio` with good social-choice quality often means decision availability, not policy ranking, is the bottleneck.
 
@@ -48,7 +51,7 @@ Key fallback metrics:
 - `fallback_selected_total`
 - `fallback_selected_lane_now`
 - `fallback_overrides`
-- `fallback_to_lane_feasible_now`
+- `cooldown_replans_blocked`
 
 Interpretation:
 - if loop signals rise together with fallback signals, fallback churn is likely dominating tail failures,
@@ -57,6 +60,7 @@ Interpretation:
 ## 3.1) Lane-now vs proactive learning diagnostics
 
 Use these counters to separate structural lane-now movement from decisions the MAPPO actor actually controlled:
+- `exploration_actions`
 - `policy_candidate_decisions`
 - `policy_candidate_mean_count`
 - `policy_candidate_single_count`
@@ -73,8 +77,21 @@ Use these counters to separate structural lane-now movement from decisions the M
 Interpretation:
 - `forced_actions` and `lane_now_decisions_opened` can be high even when the actor had no real alternative,
 - high `policy_candidate_single_count` means the actor mostly receives no action-choice learning signal,
+- high `exploration_actions / policy_actions` means stochastic sampling is still materially changing the chosen branch,
 - high `policy_candidate_mixed_count` with low `policy_selected_proactive_share` means proactive choices exist but the policy is preferring lane-now,
 - high `policy_candidate_lane_now_only_count` with healthy completion is usually network/lane geometry, not a learning failure.
+
+## 3.2) Override-learning diagnostics
+
+These counters track extra MAPPO samples injected when the runtime safety layer overrides a policy choice:
+- `override_learning_transitions`
+- `override_learning_negative`
+- `override_learning_imitation`
+
+Interpretation:
+- `override_learning_negative` counts penalty-carrying transitions for the action the policy originally proposed,
+- `override_learning_imitation` counts conservative fallback-imitation traces for the action the controller actually executed,
+- if `override_learning_negative` rises while `override_ratio` falls over time, the model is usually learning away from bad proposals instead of being silently masked.
 
 ## 4) Pending-decision and timeout metrics
 

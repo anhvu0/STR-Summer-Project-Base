@@ -59,7 +59,9 @@ class MAPPOPolicy(RouteController):
         # - ratios: derived at print-time only (not stored as counters)
         self._metrics = {
             "decisions": 0,
+            "decision_points": 0,
             "overrides": 0,
+            "overridden_decisions": 0,
             "loop_overrides": 0,
             "distance_overrides": 0,
             "impossible_action_overrides": 0,
@@ -499,12 +501,21 @@ class MAPPOPolicy(RouteController):
         summary["oldest_descriptor"] = oldest_descriptor
         return summary
 
+    def _mark_runtime_override_decision(self, metadata):
+        if not isinstance(metadata, dict):
+            return
+        if metadata.get("override_decision_counted", False):
+            return
+        metadata["override_decision_counted"] = True
+        self._metrics["overridden_decisions"] += 1
+
     def get_runtime_metrics(self):
         metrics = dict(self._metrics)
-        decisions = float(max(metrics.get("decisions", 0), 1))
+        decisions = float(max(metrics.get("decision_points", 0), 1))
         fallback_total = float(max(metrics.get("fallback_selected_total", 0), 1))
         committed_total = float(max(metrics.get("committed_cyclic_revisit_events", 0), 1))
-        metrics["override_ratio"] = float(metrics.get("overrides", 0)) / decisions
+        metrics["override_ratio"] = float(metrics.get("overridden_decisions", 0)) / decisions
+        metrics["override_event_ratio"] = float(metrics.get("overrides", 0)) / decisions
         metrics["fallback_lane_now_ratio"] = (
             float(metrics.get("fallback_selected_lane_now", 0)) / fallback_total
         )
@@ -518,12 +529,15 @@ class MAPPOPolicy(RouteController):
         pending_snapshot = self._runtime_pending_snapshot()
         return [
             (
-                "[RL-INFER] decisions={} overrides={} override_ratio={:.1%} "
-                "fallbacks(total/lane_now)={}/{}"
+                "[RL-INFER] decisions={} actor_decisions={} override_decisions={} override_ratio={:.1%} "
+                "override_events={} override_event_ratio={:.1%} fallbacks(total/lane_now)={}/{}"
             ).format(
+                int(metrics["decision_points"]),
                 int(metrics["decisions"]),
-                int(metrics["overrides"]),
+                int(metrics["overridden_decisions"]),
                 float(metrics["override_ratio"]),
+                int(metrics["overrides"]),
+                float(metrics["override_event_ratio"]),
                 int(metrics["fallback_selected_total"]),
                 int(metrics["fallback_selected_lane_now"]),
             ),
@@ -840,7 +854,10 @@ class MAPPOPolicy(RouteController):
         )
 
         def process_selected_action(vid, vehicle, start_edge, context, recent, action_idx, coordination_state=None):
+            self._metrics["decision_points"] += 1
+            decision_metadata = {"override_decision_counted": False}
             if action_idx not in context.available_actions:
+                self._mark_runtime_override_decision(decision_metadata)
                 self._metrics["overrides"] += 1
                 self._metrics["impossible_action_overrides"] += 1
                 return None
@@ -853,6 +870,7 @@ class MAPPOPolicy(RouteController):
                 distance_slack=self.score_slack,
             )
             if not safe_ok:
+                self._mark_runtime_override_decision(decision_metadata)
                 self._metrics["overrides"] += 1
                 self._metrics["loop_overrides"] += 1
                 self._metrics["loop_override_count"] += 1
@@ -885,6 +903,7 @@ class MAPPOPolicy(RouteController):
             if action_idx not in context.lane_feasible_now_actions:
                 cooldown_until = self._lane_change_cooldown.get((vid, start_edge), -1)
                 if step < cooldown_until:
+                    self._mark_runtime_override_decision(decision_metadata)
                     self._metrics["overrides"] += 1
                     self._metrics["cooldown_replans_blocked"] += 1
                     action_idx = self.shared_policy.select_fallback_action(
@@ -921,6 +940,7 @@ class MAPPOPolicy(RouteController):
                         action_source="policy",
                         observe_metadata=observe_meta,
                         decision_open_recorded=True,
+                        extra_metadata=decision_metadata,
                     )
                     self._metrics["lane_change_observe_started"] += 1
                     self._metrics["deferred_lane_change_actions"] += 1
@@ -933,6 +953,7 @@ class MAPPOPolicy(RouteController):
                 vehicle.destination,
             )
             if apply_error:
+                self._mark_runtime_override_decision(decision_metadata)
                 self._metrics["overrides"] += 1
                 self._metrics["distance_overrides"] += 1
                 return None
@@ -955,6 +976,7 @@ class MAPPOPolicy(RouteController):
                     action_source="policy",
                     full_route=full_route,
                     decision_open_recorded=True,
+                    extra_metadata=decision_metadata,
                 )
             # Route already committed directly via shared apply_route_decision.
             return int(action_idx)
@@ -1022,6 +1044,7 @@ class MAPPOPolicy(RouteController):
                             str(vid), start_edge, action_idx, vehicle.destination
                         )
                         if apply_error:
+                            self._mark_runtime_override_decision(pending.metadata)
                             self._metrics["overrides"] += 1
                             self._metrics["distance_overrides"] += 1
                             continue
@@ -1049,6 +1072,7 @@ class MAPPOPolicy(RouteController):
                     else:
                         self._metrics["lane_change_observe_abort_no_progress"] += 1
                         self._record_pending_release("observe_abort_no_progress")
+                    self._mark_runtime_override_decision(pending.metadata)
                     self._metrics["overrides"] += 1
                     self._lane_change_cooldown[(vid, start_edge)] = (
                         step + self.decision_engine.cooldown_after_pending_release(timeout=False)
@@ -1075,6 +1099,8 @@ class MAPPOPolicy(RouteController):
                         str(vid), start_edge, action_idx, vehicle.destination
                     )
                     if apply_error:
+                        self._metrics["distance_overrides"] += 1
+                        self._metrics["overrides"] += 1
                         continue
                     self._pending_decisions[vid] = self.shared_policy.build_route_pending(
                         state=None,
@@ -1090,6 +1116,7 @@ class MAPPOPolicy(RouteController):
                         action_source="observe_fallback",
                         full_route=full_route,
                         decision_open_recorded=True,
+                        extra_metadata=dict(pending.metadata or {}),
                     )
                     self.shared_policy.reserve_action(
                         step_coordination_state,

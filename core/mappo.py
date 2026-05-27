@@ -206,7 +206,7 @@ class MAPPOConfig:
     update_epochs: int = 6
     minibatch_size: int = 256
     normalize_advantages: bool = True
-    min_transitions_per_update: int = 64
+    min_transitions_per_update: int = 32
     actor_hidden_sizes: Tuple[int, ...] = (256, 128)
     critic_hidden_sizes: Tuple[int, ...] = (256, 128)
     graph_hidden_size: int = 128
@@ -229,16 +229,20 @@ class MAPPOTransition:
     next_central_observation: np.ndarray
     done: bool
     discount_steps: int = 1
+    sample_weight: float = 1.0
     metadata: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class ActionSelection:
     action: int
+    greedy_action: int
     log_prob: float
     value: float
     entropy: float
     action_mask: np.ndarray
+    exploratory: bool = False
+    sampled: bool = True
 
 
 class MAPPOActor(nn.Module):
@@ -505,6 +509,42 @@ class MAPPOTrainer:
         *,
         deterministic: bool = False,
     ) -> ActionSelection:
+        return self._selection_for_action(
+            observation,
+            valid_actions,
+            central_observation,
+            deterministic=deterministic,
+        )
+
+    def selection_for_action(
+        self,
+        observation: RoutingGraphObservation,
+        valid_actions: Optional[Sequence[int]],
+        central_observation: np.ndarray,
+        action: int,
+    ) -> Optional[ActionSelection]:
+        valid_set = None if valid_actions is None else {int(candidate) for candidate in valid_actions}
+        if valid_set is not None and int(action) not in valid_set:
+            return None
+        return self._selection_for_action(
+            observation,
+            valid_actions,
+            central_observation,
+            chosen_action=int(action),
+            deterministic=False,
+            sampled=False,
+        )
+
+    def _selection_for_action(
+        self,
+        observation: RoutingGraphObservation,
+        valid_actions: Optional[Sequence[int]],
+        central_observation: np.ndarray,
+        *,
+        chosen_action: Optional[int] = None,
+        deterministic: bool,
+        sampled: bool = True,
+    ) -> ActionSelection:
         central_array = np.asarray(central_observation, dtype=np.float32).reshape(1, -1)
         action_mask = action_mask_from_valid_actions(self.action_size, valid_actions).reshape(1, -1)
 
@@ -520,7 +560,11 @@ class MAPPOTrainer:
                 self.config,
                 exploratory=True,
             )
-            if deterministic:
+            greedy_action_tensor = torch.argmax(masked_logits, dim=-1)
+            greedy_action = int(greedy_action_tensor.item())
+            if chosen_action is not None:
+                action_tensor = torch.as_tensor([int(chosen_action)], dtype=torch.int64, device=self.device)
+            elif deterministic:
                 action_tensor = torch.argmax(masked_logits, dim=-1)
             else:
                 action_tensor = distribution.sample()
@@ -528,12 +572,16 @@ class MAPPOTrainer:
             entropy_tensor = distribution.entropy()
             value_tensor = self.critic(observation_tensor_batch, central_tensor)
 
+        action_value = int(action_tensor.item())
         return ActionSelection(
-            action=int(action_tensor.item()),
+            action=action_value,
+            greedy_action=greedy_action,
             log_prob=float(log_prob_tensor.item()),
             value=float(value_tensor.item()),
             entropy=float(entropy_tensor.item()),
             action_mask=action_mask.reshape(-1).copy(),
+            exploratory=bool(sampled and (action_value != greedy_action)),
+            sampled=bool(sampled),
         )
 
     def record_transition(
@@ -550,6 +598,7 @@ class MAPPOTrainer:
         next_central_observation: np.ndarray,
         done: bool,
         discount_steps: int = 1,
+        sample_weight: float = 1.0,
         metadata: Optional[Dict[str, object]] = None,
     ) -> None:
         transition = MAPPOTransition(
@@ -564,6 +613,7 @@ class MAPPOTrainer:
             next_central_observation=np.asarray(next_central_observation, dtype=np.float32).reshape(-1).copy(),
             done=bool(done),
             discount_steps=max(int(discount_steps), 1),
+            sample_weight=max(float(sample_weight), 1.0e-3),
             metadata=dict(metadata or {}),
         )
         self.buffer.append(transition)
@@ -614,6 +664,7 @@ class MAPPOTrainer:
         old_log_probs = np.asarray([transition.log_prob for transition in self.buffer], dtype=np.float32)
         old_values = np.asarray([transition.value for transition in self.buffer], dtype=np.float32)
         rewards = np.asarray([transition.reward for transition in self.buffer], dtype=np.float32)
+        sample_weights = np.asarray([transition.sample_weight for transition in self.buffer], dtype=np.float32)
         next_observations = stack_routing_graph_observations(
             [transition.next_observation for transition in self.buffer]
         )
@@ -643,6 +694,7 @@ class MAPPOTrainer:
         old_log_prob_tensor = self._to_tensor(old_log_probs)
         returns_tensor = self._to_tensor(returns)
         advantage_tensor = self._to_tensor(advantages)
+        sample_weight_tensor = self._to_tensor(sample_weights)
 
         minibatch_size = max(1, min(int(self.config.minibatch_size), transition_count))
         policy_losses: List[float] = []
@@ -664,6 +716,8 @@ class MAPPOTrainer:
                 batch_old_log_probs = old_log_prob_tensor.index_select(0, batch_idx)
                 batch_returns = returns_tensor.index_select(0, batch_idx)
                 batch_advantages = advantage_tensor.index_select(0, batch_idx)
+                batch_weights = sample_weight_tensor.index_select(0, batch_idx)
+                normalized_weights = batch_weights / batch_weights.mean().clamp_min(1.0e-8)
 
                 new_log_probs, entropy, predicted_values = self._evaluate_actions(
                     batch_obs,
@@ -678,9 +732,11 @@ class MAPPOTrainer:
                     1.0 - float(self.config.clip_epsilon),
                     1.0 + float(self.config.clip_epsilon),
                 )
-                policy_loss = -torch.mean(torch.min(ratio * batch_advantages, clipped_ratio * batch_advantages))
-                value_loss = torch.mean((predicted_values - batch_returns) ** 2)
-                entropy_bonus = torch.mean(entropy)
+                surrogate = torch.min(ratio * batch_advantages, clipped_ratio * batch_advantages)
+                policy_loss = -torch.sum(surrogate * normalized_weights) / normalized_weights.sum().clamp_min(1.0e-8)
+                value_residual = (predicted_values - batch_returns) ** 2
+                value_loss = torch.sum(value_residual * normalized_weights) / normalized_weights.sum().clamp_min(1.0e-8)
+                entropy_bonus = torch.sum(entropy * normalized_weights) / normalized_weights.sum().clamp_min(1.0e-8)
                 total_loss = (
                     policy_loss
                     + float(self.config.value_coef) * value_loss
@@ -698,9 +754,18 @@ class MAPPOTrainer:
                 policy_losses.append(float(policy_loss.detach().cpu().item()))
                 value_losses.append(float(value_loss.detach().cpu().item()))
                 entropies.append(float(entropy_bonus.detach().cpu().item()))
-                approx_kls.append(float((batch_old_log_probs - new_log_probs).mean().detach().cpu().item()))
+                approx_kl = torch.sum((batch_old_log_probs - new_log_probs) * normalized_weights) / normalized_weights.sum().clamp_min(1.0e-8)
+                approx_kls.append(float(approx_kl.detach().cpu().item()))
                 clip_fractions.append(
-                    float((torch.abs(ratio - 1.0) > float(self.config.clip_epsilon)).float().mean().detach().cpu().item())
+                    float(
+                        (
+                            torch.sum(
+                                (torch.abs(ratio - 1.0) > float(self.config.clip_epsilon)).float()
+                                * normalized_weights
+                            )
+                            / normalized_weights.sum().clamp_min(1.0e-8)
+                        ).detach().cpu().item()
+                    )
                 )
 
         self.last_policy_loss = float(np.mean(policy_losses)) if policy_losses else None
