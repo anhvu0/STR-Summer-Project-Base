@@ -48,7 +48,7 @@ def build_parser():
     parser.add_argument(
         "--eval-every",
         type=int,
-        default=50,
+        default=25,
         help="Run frozen held-out inference evaluation every N episodes. 0 disables frozen evaluation.",
     )
     parser.add_argument(
@@ -77,15 +77,17 @@ def build_parser():
     parser.add_argument("--actor-lr", type=float, default=3.0e-4, help="MAPPO actor learning rate.")
     parser.add_argument("--critic-lr", type=float, default=1.0e-3, help="MAPPO critic learning rate.")
     parser.add_argument("--gamma", type=float, default=0.97, help="Discount factor for decision-level returns.")
-    parser.add_argument("--clip-epsilon", type=float, default=0.20, help="PPO clipping coefficient.")
-    parser.add_argument("--entropy-coef", type=float, default=0.01, help="Entropy bonus coefficient.")
+    parser.add_argument("--gae-lambda", type=float, default=0.95, help="GAE lambda for advantage estimation.")
+    parser.add_argument("--clip-epsilon", type=float, default=0.15, help="PPO clipping coefficient.")
+    parser.add_argument("--entropy-coef", type=float, default=0.03, help="Entropy bonus coefficient.")
     parser.add_argument("--value-coef", type=float, default=0.50, help="Value-loss coefficient.")
     parser.add_argument("--update-epochs", type=int, default=6, help="MAPPO epochs per episode rollout.")
     parser.add_argument("--minibatch-size", type=int, default=512, help="MAPPO minibatch size.")
+    parser.add_argument("--target-kl", type=float, default=0.015, help="KL divergence threshold for early stopping per update epoch. 0 disables.")
     parser.add_argument(
         "--min-transitions-per-update",
         type=int,
-        default=64,
+        default=2048,
         help="Skip policy updates until at least this many decision transitions are collected.",
     )
     parser.set_defaults(fast_mode=True)
@@ -104,12 +106,14 @@ def main():
         actor_learning_rate=args.actor_lr,
         critic_learning_rate=args.critic_lr,
         gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
         clip_epsilon=args.clip_epsilon,
         entropy_coef=args.entropy_coef,
         value_coef=args.value_coef,
         update_epochs=args.update_epochs,
         minibatch_size=args.minibatch_size,
         min_transitions_per_update=args.min_transitions_per_update,
+        target_kl=args.target_kl if args.target_kl > 0 else None,
     )
     pipeline = RLTrainingPipeline(
         sumocfg_path=args.sumocfg,

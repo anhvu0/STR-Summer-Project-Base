@@ -124,8 +124,6 @@ class MAPPOPolicy(RouteController):
             density_scale_m=100.0,
         )
         self.compact_state_size = self.shared_policy.compact_state_size
-        self.compact_state_version = self.shared_policy.compact_state_version
-        self.use_compact_state = True
         self.use_coordination_state = True
         if self.model_state_size != self.compact_state_size:
             raise ValueError(
@@ -1348,7 +1346,6 @@ class MAPPOPolicy(RouteController):
             edge_id=en,
             destination_edge=destination_edge,
             context=context,
-            use_compact_state=self.use_compact_state,
             edge_embedding_fn=self._get_edge_embedding,
             edge_density_fn=cached_edge_density,
             eta_fn=cached_eta,
@@ -1362,5 +1359,4 @@ class MAPPOPolicy(RouteController):
             lane_occupancy_fn=self._lane_occupancy,
             include_coordination=True,
             coordination_state=coordination_state,
-            compact_state_version=self.compact_state_version,
         )

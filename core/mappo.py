@@ -46,14 +46,16 @@ class MAPPOConfig:
     actor_learning_rate: float = 3.0e-4
     critic_learning_rate: float = 1.0e-3
     gamma: float = 0.97
+    gae_lambda: float = 0.95
     clip_epsilon: float = 0.20
-    entropy_coef: float = 0.010
+    entropy_coef: float = 0.030
     value_coef: float = 0.50
     max_grad_norm: float = 10.0
     update_epochs: int = 6
     minibatch_size: int = 512
     normalize_advantages: bool = True
     min_transitions_per_update: int = 64
+    target_kl: Optional[float] = 0.015
     actor_hidden_sizes: Tuple[int, ...] = (256, 128)
     critic_hidden_sizes: Tuple[int, ...] = (256, 128)
 
@@ -142,6 +144,7 @@ class MAPPOTrainer:
         )
 
         self.buffer: List[MAPPOTransition] = []
+        self.buffer_generation: int = 0
         self.update_steps = 0
         self.transitions_collected = 0
         self.epsilon = 0.0
@@ -304,6 +307,43 @@ class MAPPOTrainer:
         values = self.critic(observations, central_observations)
         return log_probs, entropy, values
 
+    def _compute_gae(
+        self,
+        rewards: np.ndarray,
+        old_values: np.ndarray,
+        next_values: np.ndarray,
+        dones: np.ndarray,
+        discount_steps: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        transition_count = len(rewards)
+        advantages = np.zeros(transition_count, dtype=np.float32)
+
+        # Group buffer indices by vehicle_id for per-trajectory GAE.
+        # Transitions without a vehicle_id are treated as independent single-step rollouts.
+        from collections import defaultdict
+        traj_indices: Dict[str, List[int]] = defaultdict(list)
+        solo_indices: List[int] = []
+        for i, t in enumerate(self.buffer):
+            vid = t.metadata.get("vehicle_id") if isinstance(t.metadata, dict) else None
+            if vid:
+                traj_indices[vid].append(i)
+            else:
+                solo_indices.append(i)
+
+        gamma = float(self.config.gamma)
+        lam = float(self.config.gae_lambda)
+
+        for indices in list(traj_indices.values()) + [[i] for i in solo_indices]:
+            gae = 0.0
+            for i in reversed(indices):
+                df = float(np.power(gamma, discount_steps[i]))
+                delta = rewards[i] + df * next_values[i] * (1.0 - dones[i]) - old_values[i]
+                gae = delta + df * lam * (1.0 - dones[i]) * gae
+                advantages[i] = gae
+
+        returns = advantages + old_values
+        return advantages, returns
+
     def update(self) -> int:
         transition_count = len(self.buffer)
         if transition_count < int(self.config.min_transitions_per_update):
@@ -329,9 +369,7 @@ class MAPPOTrainer:
             next_central_tensor = self._to_tensor(next_central_observations)
             next_values = self.critic(next_obs_tensor, next_central_tensor).cpu().numpy()
 
-        discount_factors = np.power(float(self.config.gamma), discount_steps)
-        returns = rewards + (1.0 - dones) * discount_factors * next_values
-        advantages = returns - old_values
+        advantages, returns = self._compute_gae(rewards, old_values, next_values, dones, discount_steps)
         if self.config.normalize_advantages and transition_count > 1:
             advantages = (advantages - advantages.mean()) / max(advantages.std(), 1.0e-8)
 
@@ -351,7 +389,11 @@ class MAPPOTrainer:
         clip_fractions: List[float] = []
 
         index_array = np.arange(transition_count)
+        target_kl = self.config.target_kl
+        kl_exceeded = False
         for _ in range(int(self.config.update_epochs)):
+            if kl_exceeded:
+                break
             np.random.shuffle(index_array)
             for start in range(0, transition_count, minibatch_size):
                 batch_idx = index_array[start:start + minibatch_size]
@@ -393,13 +435,18 @@ class MAPPOTrainer:
                 self.actor_optimizer.step()
                 self.critic_optimizer.step()
 
+                batch_approx_kl = float((batch_old_log_probs - new_log_probs).mean().detach().cpu().item())
                 policy_losses.append(float(policy_loss.detach().cpu().item()))
                 value_losses.append(float(value_loss.detach().cpu().item()))
                 entropies.append(float(entropy_bonus.detach().cpu().item()))
-                approx_kls.append(float((batch_old_log_probs - new_log_probs).mean().detach().cpu().item()))
+                approx_kls.append(batch_approx_kl)
                 clip_fractions.append(
                     float((torch.abs(ratio - 1.0) > float(self.config.clip_epsilon)).float().mean().detach().cpu().item())
                 )
+
+                if target_kl is not None and batch_approx_kl > float(target_kl):
+                    kl_exceeded = True
+                    break
 
         self.last_policy_loss = float(np.mean(policy_losses)) if policy_losses else None
         self.last_value_loss = float(np.mean(value_losses)) if value_losses else None
@@ -408,6 +455,7 @@ class MAPPOTrainer:
         self.last_clip_fraction = float(np.mean(clip_fractions)) if clip_fractions else None
         self.update_steps += 1
         self.buffer.clear()
+        self.buffer_generation += 1
         return transition_count
 
     def save_checkpoint(self, path: str) -> None:

@@ -156,9 +156,9 @@ class RLTrainingPipeline:
         # 1) minimize travel time (dominant)
         # 2) congestion externality (secondary)
         # 3) shortest-path distance as tie-breaker
-        self.travel_time_penalty = 0.05
-        self.eta_progress_scale = 0.65
-        self.distance_tiebreak_scale = 0.06
+        self.travel_time_penalty = 0.07
+        self.eta_progress_scale = 0.30
+        self.distance_tiebreak_scale = 0.02
         self.coordination_pressure_penalty = 0.35
         self.pending_coordination_penalty = 0.04
         self.score_slack = 30.0
@@ -265,6 +265,8 @@ class RLTrainingPipeline:
             self.action_size,
             config=self.mappo_config,
         )
+        # Maps vehicle_id -> (buffer_index, buffer_generation) for terminal credit patching.
+        self._vehicle_last_buffer_pos: dict = {}
         self._decision_debug_fields = [
             "episode", "step", "vehicle_id", "decision_edge", "action", "action_source", "available_actions",
             "forced_action", "lane_feasible_now_actions", "reachable_with_lane_change_actions",
@@ -407,6 +409,10 @@ class RLTrainingPipeline:
         if not isinstance(trace, dict) or not trace.get("mappo_training", False):
             return False
         total_reward = float(trace.get("mappo_reward_accumulator", 0.0)) + float(reward)
+        stored_metadata = dict(metadata or {})
+        vid = trace.get("vehicle_id")
+        if vid is not None:
+            stored_metadata["vehicle_id"] = vid
         self.trainer.record_transition(
             observation=trace["mappo_initial_state"],
             central_observation=trace["mappo_initial_central_observation"],
@@ -419,8 +425,10 @@ class RLTrainingPipeline:
             next_central_observation=np.asarray(next_central_observation, dtype=np.float32).reshape(1, -1),
             done=bool(done),
             discount_steps=max(int(discount_steps), 1),
-            metadata=metadata,
+            metadata=stored_metadata,
         )
+        if vid is not None:
+            self._vehicle_last_buffer_pos[vid] = (len(self.trainer.buffer) - 1, self.trainer.buffer_generation)
         trace["mappo_transition_recorded"] = True
         return True
 
@@ -899,7 +907,6 @@ class RLTrainingPipeline:
             edge_id=edge_id,
             destination_edge=destination_edge,
             context=context,
-            use_compact_state=True,
             edge_embedding_fn=self._get_edge_embedding,
             edge_density_fn=self._edge_density,
             eta_fn=self._estimate_remaining_eta,
@@ -912,7 +919,6 @@ class RLTrainingPipeline:
             lane_occupancy_fn=self._lane_occupancy,
             include_coordination=True,
             coordination_state=coordination_state,
-            compact_state_version=self.shared_policy.compact_state_version,
         )
     
     def valid_actions_for_vehicle(self, vehicle_id, edge_id, destination_edge, step):
@@ -1372,6 +1378,17 @@ class RLTrainingPipeline:
             else:
                 raise ValueError(f"Unknown terminal outcome: {outcome}")
             decision_metrics["synthetic_terminal_finalizations"] += 1
+            # Patch the last recorded MAPPO transition for this vehicle with the terminal
+            # reward and done=True. When pending is None, the vehicle arrived (or ended)
+            # after its last pending decision was already finalized, so the arrival signal
+            # would otherwise be lost from the policy's learning buffer.
+            entry = self._vehicle_last_buffer_pos.pop(vehicle_id, None)
+            if entry is not None:
+                buf_idx, gen = entry
+                if gen == self.trainer.buffer_generation and buf_idx < len(self.trainer.buffer):
+                    t = self.trainer.buffer[buf_idx]
+                    t.reward = self._clip_reward(t.reward + reward)
+                    t.done = True
             decision_debug_rows.append({
                 "episode": episode,
                 "step": step,
@@ -2007,7 +2024,7 @@ class RLTrainingPipeline:
         spawn_interval_value = self.spawn_interval if spawn_interval_override is None else float(spawn_interval_override)
         vehicle_list = generator.generate_vehicles(
             num_target_vehicles=150,
-            num_random_vehicles=200,
+            num_random_vehicles=150,
             pattern=self.target_pattern,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
@@ -2261,6 +2278,7 @@ class RLTrainingPipeline:
                 policy_trace = None
                 if selection is not None and central_observation is not None:
                     policy_trace = self._build_mappo_trace(state, central_observation, selection)
+                    policy_trace["vehicle_id"] = vehicle_id
                 next_edge = self.decision_engine.get_next_edge(current_edge, action)
                 if next_edge is None:
                     decision_metrics["safety_overrides"] += 1

@@ -133,27 +133,17 @@ class SharedDecisionPolicy:
         self.objective_feature_count = 3
         self.base_branch_feature_count = 5
         self.spillback_branch_feature_count = 2
-        self.compact_state_version = 2
         self.vehicle_wait_time_clip_s = 120.0
 
-        self.compact_state_size_without_coordination_v1 = (
+        self.compact_state_size_without_coordination = (
             (2 * self.edge_embedding_dim)
             + (4 * self.action_count)
             + 1
             + self.base_lane_feature_count
+            + self.spillback_lane_feature_count
             + self.objective_feature_count
             + self.local_congestion_k
-            + (self.base_branch_feature_count * self.action_count)
-        )
-        self.compact_state_size_v1 = (
-            self.compact_state_size_without_coordination_v1
-            + self.coordination_global_feature_count
-            + (self.coordination_action_feature_count * self.action_count)
-        )
-        self.compact_state_size_without_coordination = (
-            self.compact_state_size_without_coordination_v1
-            + self.spillback_lane_feature_count
-            + (self.spillback_branch_feature_count * self.action_count)
+            + ((self.base_branch_feature_count + self.spillback_branch_feature_count) * self.action_count)
         )
         self.compact_state_size = (
             self.compact_state_size_without_coordination
@@ -161,17 +151,10 @@ class SharedDecisionPolicy:
             + (self.coordination_action_feature_count * self.action_count)
         )
 
-    def legacy_state_size(self, edge_count: int) -> int:
-        return 2 + self.action_count + 3 + 3 + int(edge_count)
-
-    def compact_lane_feature_count(self, version: int = 2) -> int:
-        if int(version) <= 1:
-            return self.base_lane_feature_count
+    def compact_lane_feature_count(self) -> int:
         return self.base_lane_feature_count + self.spillback_lane_feature_count
 
-    def compact_branch_feature_count(self, version: int = 2) -> int:
-        if int(version) <= 1:
-            return self.base_branch_feature_count
+    def compact_branch_feature_count(self) -> int:
         return self.base_branch_feature_count + self.spillback_branch_feature_count
 
     def empty_coordination_state(self) -> CoordinationReservationState:
@@ -632,9 +615,8 @@ class SharedDecisionPolicy:
         social_cost_fn: Callable[[str, int, str], float],
         lane_occupancy_fn: Optional[Callable[[str], float]] = None,
         lane_halting_density_fn: Optional[Callable[[str], float]] = None,
-        compact_state_version: int = 2,
     ) -> np.ndarray:
-        branch_feature_count = self.compact_branch_feature_count(version=compact_state_version)
+        branch_feature_count = self.compact_branch_feature_count()
         features = np.zeros(branch_feature_count * self.action_count, dtype=np.float32)
         lane_now = set(context.lane_feasible_now_actions)
         for action_idx in range(self.action_count):
@@ -660,15 +642,14 @@ class SharedDecisionPolicy:
             )
             social = social_cost_fn(context.edge_id, action_idx, destination)
             features[base + 4] = min(float(social), 10.0) if math.isfinite(social) else 10.0
-            if compact_state_version >= 2:
-                next_edge_occupancy, next_edge_halting = self._next_edge_spillback_features(
-                    edge_id=context.edge_id,
-                    action_idx=action_idx,
-                    lane_occupancy_fn=lane_occupancy_fn,
-                    lane_halting_density_fn=lane_halting_density_fn,
-                )
-                features[base + 5] = next_edge_occupancy
-                features[base + 6] = next_edge_halting
+            next_edge_occupancy, next_edge_halting = self._next_edge_spillback_features(
+                edge_id=context.edge_id,
+                action_idx=action_idx,
+                lane_occupancy_fn=lane_occupancy_fn,
+                lane_halting_density_fn=lane_halting_density_fn,
+            )
+            features[base + 5] = next_edge_occupancy
+            features[base + 6] = next_edge_halting
         return features
 
     def encode_state(
@@ -677,7 +658,6 @@ class SharedDecisionPolicy:
         edge_id: str,
         destination_edge: str,
         context: DecisionContext,
-        use_compact_state: bool,
         edge_embedding_fn: Callable[[str], np.ndarray],
         edge_density_fn: Callable[[str], float],
         eta_fn: Callable[[str, str], float],
@@ -689,124 +669,79 @@ class SharedDecisionPolicy:
         vehicle_wait_time_fn: Optional[Callable[[str], float]] = None,
         lane_halting_density_fn: Optional[Callable[[str], float]] = None,
         lane_occupancy_fn: Optional[Callable[[str], float]] = None,
-        edge_index_lookup: Optional[Dict[str, int]] = None,
-        legacy_aux_features: Optional[Sequence[float]] = None,
-        legacy_density_values: Optional[Sequence[float]] = None,
         include_coordination: bool = False,
         coordination_state: Optional[CoordinationReservationState] = None,
-        compact_state_version: int = 2,
     ) -> np.ndarray:
-        if use_compact_state:
-            lane_feature_count = self.compact_lane_feature_count(version=compact_state_version)
-            branch_feature_count = self.compact_branch_feature_count(version=compact_state_version)
-            if int(compact_state_version) <= 1:
-                state_size = (
-                    self.compact_state_size_v1
-                    if include_coordination else self.compact_state_size_without_coordination_v1
-                )
-            else:
-                state_size = (
-                    self.compact_state_size
-                    if include_coordination else self.compact_state_size_without_coordination
-                )
-            state = np.zeros(state_size, dtype=np.float32)
-            state[0:self.edge_embedding_dim] = edge_embedding_fn(edge_id)
-            state[self.edge_embedding_dim:(2 * self.edge_embedding_dim)] = edge_embedding_fn(destination_edge)
+        lane_feature_count = self.compact_lane_feature_count()
+        branch_feature_count = self.compact_branch_feature_count()
+        state_size = self.compact_state_size if include_coordination else self.compact_state_size_without_coordination
+        state = np.zeros(state_size, dtype=np.float32)
+        state[0:self.edge_embedding_dim] = edge_embedding_fn(edge_id)
+        state[self.edge_embedding_dim:(2 * self.edge_embedding_dim)] = edge_embedding_fn(destination_edge)
 
-            edge_mask, lane_mask, reach_mask, avail_mask = self.decision_engine.direction_masks(context)
-            base = 2 * self.edge_embedding_dim
-            state[base:base + self.action_count] = np.array(edge_mask, dtype=np.float32)
-            state[base + self.action_count:base + (2 * self.action_count)] = np.array(lane_mask, dtype=np.float32)
-            state[base + (2 * self.action_count):base + (3 * self.action_count)] = np.array(reach_mask, dtype=np.float32)
-            state[base + (3 * self.action_count):base + (4 * self.action_count)] = np.array(avail_mask, dtype=np.float32)
-            state[base + (4 * self.action_count)] = 1.0 if context.commit_window else 0.0
+        edge_mask, lane_mask, reach_mask, avail_mask = self.decision_engine.direction_masks(context)
+        base = 2 * self.edge_embedding_dim
+        state[base:base + self.action_count] = np.array(edge_mask, dtype=np.float32)
+        state[base + self.action_count:base + (2 * self.action_count)] = np.array(lane_mask, dtype=np.float32)
+        state[base + (2 * self.action_count):base + (3 * self.action_count)] = np.array(reach_mask, dtype=np.float32)
+        state[base + (3 * self.action_count):base + (4 * self.action_count)] = np.array(avail_mask, dtype=np.float32)
+        state[base + (4 * self.action_count)] = 1.0 if context.commit_window else 0.0
 
-            lane_base = base + (4 * self.action_count) + 1
-            state[lane_base + 0] = context.lane_index / max(context.lane_count - 1, 1)
-            state[lane_base + 1] = min(context.lane_count, 6) / 6.0
-            state[lane_base + 2] = min(max(context.dist_to_end, 0.0), 200.0) / 200.0
-            if compact_state_version >= 2:
-                if vehicle_wait_time_fn is not None:
-                    state[lane_base + 3] = self._normalize_wait_time(
-                        vehicle_wait_time_fn(context.vehicle_id)
-                    )
-                if lane_halting_density_fn is not None:
-                    state[lane_base + 4] = self._normalize_halting_density(
-                        lane_halting_density_fn(context.lane_id)
-                    )
+        lane_base = base + (4 * self.action_count) + 1
+        state[lane_base + 0] = context.lane_index / max(context.lane_count - 1, 1)
+        state[lane_base + 1] = min(context.lane_count, 6) / 6.0
+        state[lane_base + 2] = min(max(context.dist_to_end, 0.0), 200.0) / 200.0
+        if vehicle_wait_time_fn is not None:
+            state[lane_base + 3] = self._normalize_wait_time(vehicle_wait_time_fn(context.vehicle_id))
+        if lane_halting_density_fn is not None:
+            state[lane_base + 4] = self._normalize_halting_density(lane_halting_density_fn(context.lane_id))
 
-            objective_base = lane_base + lane_feature_count
-            current_density = float(edge_density_fn(edge_id))
-            if step is not None and vehicle_start_time is not None:
-                elapsed = max(float(step) - float(vehicle_start_time), 0.0)
-                remaining_eta = eta_fn(edge_id, destination_edge)
-                state[objective_base + 0] = min(elapsed / float(self.max_simulation_steps), 1.0)
-                state[objective_base + 1] = (
-                    min(float(remaining_eta) / float(self.max_simulation_steps), 1.0)
-                    if math.isfinite(remaining_eta) else 1.0
-                )
-                state[objective_base + 2] = min(current_density, 1.0)
-
-            if global_density_stats is None:
-                if edge_lane_meters_fn is None:
-                    raise ValueError("edge_lane_meters_fn is required when global_density_stats is omitted")
-                global_density_stats = self.global_density_stats(edge_density_fn, edge_lane_meters_fn)
-
-            congestion_base = objective_base + 3
-            congestion_features = self.local_congestion_features(
-                edge_id,
-                edge_density_fn=edge_density_fn,
-                global_density_stats=global_density_stats,
+        objective_base = lane_base + lane_feature_count
+        current_density = float(edge_density_fn(edge_id))
+        if step is not None and vehicle_start_time is not None:
+            elapsed = max(float(step) - float(vehicle_start_time), 0.0)
+            remaining_eta = eta_fn(edge_id, destination_edge)
+            state[objective_base + 0] = min(elapsed / float(self.max_simulation_steps), 1.0)
+            state[objective_base + 1] = (
+                min(float(remaining_eta) / float(self.max_simulation_steps), 1.0)
+                if math.isfinite(remaining_eta) else 1.0
             )
-            state[congestion_base:congestion_base + self.local_congestion_k] = congestion_features
-            branch_base = congestion_base + self.local_congestion_k
-            branch_features = self.per_action_branch_features(
-                context,
-                destination_edge,
-                edge_density_fn=edge_density_fn,
-                eta_fn=eta_fn,
-                social_cost_fn=social_cost_fn,
-                lane_occupancy_fn=lane_occupancy_fn,
-                lane_halting_density_fn=lane_halting_density_fn,
-                compact_state_version=compact_state_version,
+            state[objective_base + 2] = min(current_density, 1.0)
+
+        if global_density_stats is None:
+            if edge_lane_meters_fn is None:
+                raise ValueError("edge_lane_meters_fn is required when global_density_stats is omitted")
+            global_density_stats = self.global_density_stats(edge_density_fn, edge_lane_meters_fn)
+
+        congestion_base = objective_base + 3
+        congestion_features = self.local_congestion_features(
+            edge_id,
+            edge_density_fn=edge_density_fn,
+            global_density_stats=global_density_stats,
+        )
+        state[congestion_base:congestion_base + self.local_congestion_k] = congestion_features
+        branch_base = congestion_base + self.local_congestion_k
+        branch_features = self.per_action_branch_features(
+            context,
+            destination_edge,
+            edge_density_fn=edge_density_fn,
+            eta_fn=eta_fn,
+            social_cost_fn=social_cost_fn,
+            lane_occupancy_fn=lane_occupancy_fn,
+            lane_halting_density_fn=lane_halting_density_fn,
+        )
+        expected_branch_size = branch_feature_count * self.action_count
+        state[branch_base:branch_base + expected_branch_size] = branch_features
+        if include_coordination:
+            global_coord_features, action_coord_features = self.coordination_features(
+                context=context,
+                destination=destination_edge,
+                coordination_state=coordination_state,
             )
-            expected_branch_size = branch_feature_count * self.action_count
-            state[branch_base:branch_base + expected_branch_size] = branch_features
-            if include_coordination:
-                global_coord_features, action_coord_features = self.coordination_features(
-                    context=context,
-                    destination=destination_edge,
-                    coordination_state=coordination_state,
-                )
-                coord_base = branch_base + expected_branch_size
-                state[coord_base:coord_base + self.coordination_global_feature_count] = global_coord_features
-                state[coord_base + self.coordination_global_feature_count:] = action_coord_features
-            return state.reshape(1, -1)
-
-        if edge_index_lookup is None:
-            raise ValueError("edge_index_lookup is required for legacy state encoding")
-
-        state_values = [
-            float(edge_index_lookup[edge_id]),
-            float(edge_index_lookup[destination_edge]),
-        ]
-        outgoing = self.connection_info.outgoing_edges_dict.get(edge_id, {})
-        state_values.extend(
-            1.0 if direction in outgoing.keys() else 0.0
-            for direction in self.direction_choices
-        )
-        state_values.extend(
-            [
-                context.lane_index / max(context.lane_count - 1, 1),
-                min(context.lane_count, 6) / 6.0,
-                min(max(context.dist_to_end, 0.0), 200.0) / 200.0,
-            ]
-        )
-        state_values.extend(float(value) for value in (legacy_aux_features or (0.0, 0.0, 0.0)))
-        if legacy_density_values is None:
-            legacy_density_values = [edge_density_fn(edge) for edge in self.connection_info.edge_list]
-        state_values.extend(float(value) for value in legacy_density_values)
-        return np.asarray(state_values, dtype=np.float32).reshape(1, -1)
+            coord_base = branch_base + expected_branch_size
+            state[coord_base:coord_base + self.coordination_global_feature_count] = global_coord_features
+            state[coord_base + self.coordination_global_feature_count:] = action_coord_features
+        return state.reshape(1, -1)
 
     def _increment_metric(self, metrics: Optional[Dict[str, float]], key: str, amount: float = 1.0) -> None:
         if metrics is None:
