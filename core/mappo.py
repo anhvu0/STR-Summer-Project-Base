@@ -49,6 +49,9 @@ class MAPPOConfig:
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.20
     entropy_coef: float = 0.030
+    # If set, entropy_coef is linearly annealed toward entropy_coef_end over training.
+    # Set higher than entropy_coef initially: e.g. entropy_coef=0.15, entropy_coef_end=0.01
+    entropy_coef_end: Optional[float] = None
     value_coef: float = 0.50
     max_grad_norm: float = 10.0
     update_epochs: int = 6
@@ -155,10 +158,31 @@ class MAPPOTrainer:
         self.last_entropy: Optional[float] = None
         self.last_approx_kl: Optional[float] = None
         self.last_clip_fraction: Optional[float] = None
+        self.last_entropy_coef: float = float(self.config.entropy_coef)
+        self._effective_entropy_coef: float = float(self.config.entropy_coef)
 
     @property
     def train_steps(self) -> int:
         return int(self.update_steps)
+
+    def set_entropy_progress(self, progress: float) -> float:
+        """Linearly anneal entropy_coef toward entropy_coef_end.
+
+        Args:
+            progress: Training progress in [0, 1] (episode / total_episodes).
+        Returns:
+            The effective entropy coefficient for this update.
+        """
+        end = self.config.entropy_coef_end
+        if end is None:
+            self._effective_entropy_coef = float(self.config.entropy_coef)
+        else:
+            p = float(np.clip(progress, 0.0, 1.0))
+            self._effective_entropy_coef = float(
+                self.config.entropy_coef + (end - self.config.entropy_coef) * p
+            )
+        self.last_entropy_coef = self._effective_entropy_coef
+        return self._effective_entropy_coef
 
     @property
     def memory(self):
@@ -179,6 +203,7 @@ class MAPPOTrainer:
             "policy_loss",
             "value_loss",
             "entropy",
+            "entropy_coef_effective",
             "approx_kl",
             "clip_fraction",
         )
@@ -208,6 +233,7 @@ class MAPPOTrainer:
             "policy_loss": self.last_policy_loss if self.last_policy_loss is not None else "",
             "value_loss": self.last_value_loss if self.last_value_loss is not None else "",
             "entropy": self.last_entropy if self.last_entropy is not None else "",
+            "entropy_coef_effective": self.last_entropy_coef,
             "approx_kl": self.last_approx_kl if self.last_approx_kl is not None else "",
             "clip_fraction": self.last_clip_fraction if self.last_clip_fraction is not None else "",
         }
@@ -424,7 +450,7 @@ class MAPPOTrainer:
                 total_loss = (
                     policy_loss
                     + float(self.config.value_coef) * value_loss
-                    - float(self.config.entropy_coef) * entropy_bonus
+                    - float(self._effective_entropy_coef) * entropy_bonus
                 )
 
                 self.actor_optimizer.zero_grad(set_to_none=True)

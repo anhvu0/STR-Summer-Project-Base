@@ -79,7 +79,11 @@ def build_parser():
     parser.add_argument("--gamma", type=float, default=0.97, help="Discount factor for decision-level returns.")
     parser.add_argument("--gae-lambda", type=float, default=0.95, help="GAE lambda for advantage estimation.")
     parser.add_argument("--clip-epsilon", type=float, default=0.15, help="PPO clipping coefficient.")
-    parser.add_argument("--entropy-coef", type=float, default=0.03, help="Entropy bonus coefficient.")
+    parser.add_argument("--entropy-coef", type=float, default=0.15,
+                        help="Initial entropy bonus coefficient. Raised from 0.03 to combat entropy collapse (see diagnosis).")
+    parser.add_argument("--entropy-coef-end", type=float, default=0.01,
+                        help="Final entropy coefficient after linear annealing over all training episodes. "
+                             "Set equal to --entropy-coef to disable annealing.")
     parser.add_argument("--value-coef", type=float, default=0.50, help="Value-loss coefficient.")
     parser.add_argument("--update-epochs", type=int, default=6, help="MAPPO epochs per episode rollout.")
     parser.add_argument("--minibatch-size", type=int, default=512, help="MAPPO minibatch size.")
@@ -109,6 +113,7 @@ def main():
         gae_lambda=args.gae_lambda,
         clip_epsilon=args.clip_epsilon,
         entropy_coef=args.entropy_coef,
+        entropy_coef_end=args.entropy_coef_end,
         value_coef=args.value_coef,
         update_epochs=args.update_epochs,
         minibatch_size=args.minibatch_size,

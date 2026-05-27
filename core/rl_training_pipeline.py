@@ -164,6 +164,9 @@ class RLTrainingPipeline:
         self.score_slack = 30.0
         self.reward_clip_low = -20.0
         self.reward_clip_high = 20.0
+        # Arrival transitions get a wider ceiling so destination_reward isn't uniformly
+        # saturated. All non-terminal step rewards still use reward_clip_high.
+        self.terminal_reward_clip_high = max(float(destination_reward) + 5.0, self.reward_clip_high)
         self.pending_timeout_penalty = -18.0
         self.pending_latency_penalty_per_step = 0.008
         self.pending_replan_penalty = -0.4
@@ -1712,7 +1715,9 @@ class RLTrainingPipeline:
             else:
                 reward -= 8.0
             done = True
-            return self._clip_reward(reward), done
+            # Use wider clip for terminal transitions so destination_reward
+            # is not uniformly saturated at reward_clip_high.
+            return float(np.clip(reward, self.reward_clip_low, self.terminal_reward_clip_high)), done
 
         outgoing = self.connection_info.outgoing_edges_dict.get(current_edge, {})
         if (not outgoing or len(outgoing) == 0) and current_edge != vehicle.destination:
@@ -2140,6 +2145,8 @@ class RLTrainingPipeline:
             "fallback_after_observe_abort_count", "fallback_after_timeout_count",
             "same_edge_reopen_after_abort_count", "synthetic_terminal_finalizations",
             "finalized_opened_proactive_ratio", "finalized_opened_lane_now_ratio",
+            "penalized_avg_travel_time", "noncompletion_rate",
+            "uncontrolled_total_wait_steps", "mean_uncontrolled_wait_per_step",
         ]
         # Rewrite metrics each new training session to avoid schema drift/appending old runs.
         with open(self.metrics_csv_path, "w", newline="") as f:
@@ -2227,6 +2234,7 @@ class RLTrainingPipeline:
             p95_density_samples = []
             congestion_high_pressure_steps = 0
             social_regret_samples = []
+            uncontrolled_total_wait_steps = 0.0
 
             def decision_recent_history(vehicle_id):
                 try:
@@ -2605,6 +2613,9 @@ class RLTrainingPipeline:
                     )
                     vehicle_ids = list(vehicle_get_ids())
                     controlled_live_ids = [vid for vid in vehicle_ids if vid in vehicles]
+                    for _uid in vehicle_ids:
+                        if _uid not in vehicles:
+                            uncontrolled_total_wait_steps += traci.vehicle.getWaitingTime(_uid)
                     self._ensure_vehicle_subscriptions(controlled_live_ids)
                     vehicle_subscription_results = traci.vehicle.getAllSubscriptionResults() or {}
                     self._step_vehicle_results = vehicle_subscription_results
@@ -3632,6 +3643,11 @@ class RLTrainingPipeline:
                 else:
                     tail_travel_times = []
                 unfinished_count = int(alive_at_step_cap_count + removed_nonarrival_count)
+                noncompletion_rate = 1.0 - completion_rate
+                # Censored metric: unfinished vehicles imputed at MAX_SIMULATION_STEPS.
+                # This prevents survivorship bias when completion_rate is low.
+                penalized_travel_times = list(completed_travel_times) + [float(MAX_SIMULATION_STEPS)] * unfinished_count
+                penalized_avg_travel_time = float(np.mean(penalized_travel_times)) if penalized_travel_times else float(MAX_SIMULATION_STEPS)
                 tail_vehicles_over_p90_count = int(len(tail_travel_times) + unfinished_count)
                 tail_reference = (
                     float(np.mean(tail_travel_times))
@@ -3790,6 +3806,7 @@ class RLTrainingPipeline:
                 roll_avg_travel_time = sum(rolling_avg_travel_time) / len(rolling_avg_travel_time)
                 roll_mismatch = sum(rolling_mismatch) / len(rolling_mismatch)
 
+                self.trainer.set_entropy_progress(episode / max(self.episodes - 1, 1))
                 updated_transition_count = self.trainer.update()
                 pending_observe_abort_total = (
                     float(decision_metrics["pending_release_observe_abort_no_progress"])
@@ -4186,6 +4203,12 @@ class RLTrainingPipeline:
                         "synthetic_terminal_finalizations": decision_metrics["synthetic_terminal_finalizations"],
                         "finalized_opened_proactive_ratio": finalized_opened_proactive_ratio,
                         "finalized_opened_lane_now_ratio": finalized_opened_lane_now_ratio,
+                        "penalized_avg_travel_time": penalized_avg_travel_time,
+                        "noncompletion_rate": noncompletion_rate,
+                        "uncontrolled_total_wait_steps": uncontrolled_total_wait_steps,
+                        "mean_uncontrolled_wait_per_step": (
+                            uncontrolled_total_wait_steps / max(last_step_executed, 1)
+                        ),
                     }
                     row = {field: row.get(field, "") for field in csv_fields}
                     if set(row.keys()) != set(csv_fields):

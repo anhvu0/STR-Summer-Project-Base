@@ -494,10 +494,17 @@ class target_vehicles_generator:
         if len(spawn_edges) == 0 or len(dest_edges) == 0:
             print("ERROR: No valid spawn/destination edge candidates after one-way/dead-end filtering.")
             return None
-        command_str = "python randomTrips.py -n "+net_xml_file+" -e "+str(latest_release_time)+" -p "+str(density) +" -r "+target_xml_file
+        import subprocess
+        cmd = [
+            sys.executable, "randomTrips.py",
+            "-n", net_xml_file,
+            "-e", str(latest_release_time),
+            "-p", str(density),
+            "-r", target_xml_file,
+        ]
         if seed is not None:
-            command_str += " -s " + str(int(seed))
-        if os.system(command_str) != 0:
+            cmd += ["-s", str(int(seed))]
+        if subprocess.run(cmd).returncode != 0:
             print("ERROR: Failed to invoke randomTrips.py.")
             return None
         #delete randomTrips.py

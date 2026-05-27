@@ -22,7 +22,7 @@ from controller.RouteController import *
 SUMO Selfless Traffic Routing (STR) Testbed
 """
 
-MAX_SIMULATION_STEPS = 2000
+MAX_SIMULATION_STEPS = 4000
 
 # TODO: decide which file to put these in. Right now they're also defined in RouteController!!
 STRAIGHT = "s"
