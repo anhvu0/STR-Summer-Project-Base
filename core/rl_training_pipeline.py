@@ -411,6 +411,11 @@ class RLTrainingPipeline:
             return
         metadata["mappo_reward_accumulator"] = float(metadata.get("mappo_reward_accumulator", 0.0)) + float(reward)
 
+    def _accumulate_route_trace_reward(self, vehicle_route_trace, vehicle_id, reward):
+        trace = vehicle_route_trace.get(vehicle_id) if isinstance(vehicle_route_trace, dict) else None
+        if trace is not None:
+            self._accumulate_mappo_reward(trace, reward)
+
     def _record_immediate_mappo_transition(
         self,
         trace,
@@ -1800,9 +1805,6 @@ class RLTrainingPipeline:
             "baseline_seed_source",
             "win_count",
             "win_rate",
-            "completion_rate_mean",
-            "baseline_completion_rate_mean",
-            "completion_rate_delta_mean",
             "avg_travel_time_mean",
             "baseline_avg_travel_time_mean",
             "avg_travel_time_delta_mean",
@@ -1863,7 +1865,6 @@ class RLTrainingPipeline:
             self._safe_eval_metric(summary.get("tail_completion_gap_steps_delta_mean", float("inf"))),
             self._safe_eval_metric(summary.get("p95_to_p50_travel_ratio_delta_mean", float("inf"))),
             self._safe_eval_metric(summary.get("deadlines_missed_delta_mean", float("inf"))),
-            self._safe_eval_metric(-summary.get("completion_rate_delta_mean", 0.0), 0.0),
         )
 
     def _append_frozen_eval_row(self, row):
@@ -1954,9 +1955,6 @@ class RLTrainingPipeline:
             per_seed_rows.append({
                 "seed": int(eval_seed),
                 "win_vs_dijkstra": int(win),
-                "completion_rate": float(stats["completion_rate"]),
-                "baseline_completion_rate": float(baseline_stats["completion_rate"]),
-                "completion_rate_delta": float(stats["completion_rate"]) - float(baseline_stats["completion_rate"]),
                 "avg_travel_time": float(stats["avg_travel_time"]),
                 "baseline_avg_travel_time": float(baseline_stats["avg_travel_time"]),
                 "avg_travel_time_delta": float(stats["avg_travel_time"]) - float(baseline_stats["avg_travel_time"]),
@@ -1995,9 +1993,6 @@ class RLTrainingPipeline:
             "baseline_seed_source": ",".join(str(seed) for seed in self.frozen_eval_seeds),
             "win_count": float(sum(float(row["win_vs_dijkstra"]) for row in per_seed_rows)),
             "win_rate": mean_metric("win_vs_dijkstra", 0.0),
-            "completion_rate_mean": mean_metric("completion_rate", 0.0),
-            "baseline_completion_rate_mean": mean_metric("baseline_completion_rate", 0.0),
-            "completion_rate_delta_mean": mean_metric("completion_rate_delta", 0.0),
             "avg_travel_time_mean": mean_metric("avg_travel_time", float("inf")),
             "baseline_avg_travel_time_mean": mean_metric("baseline_avg_travel_time", float("inf")),
             "avg_travel_time_delta_mean": mean_metric("avg_travel_time_delta", float("inf")),
@@ -2079,7 +2074,7 @@ class RLTrainingPipeline:
             *trainer_csv_fields[2:6],
             "episode_return_total", "avg_return_per_vehicle",
             *trainer_csv_fields[6:],
-            "completion_rate", "avg_travel_time", "p50_travel_time", "p90_travel_time", "teleports", "teleported_controlled",
+            "completion_rate", "avg_travel_time", "p50_travel_time", "p90_travel_time", "teleports",
             "controlled_ever_teleported", "arrived_after_teleport", "clean_arrivals_without_teleport",
             "forced_actions", "critic_only_queued", "route_decisions_total",
             "decisions_considered", "decisions_opened", "decisions_finalized", "decisions_skipped",
@@ -2124,16 +2119,7 @@ class RLTrainingPipeline:
             "p90_route_difficulty_eta", "fail_teleport", "fail_timeout", "fail_removed_non_destination",
             "fail_unreachable_transition", "fail_dead_end_no_outgoing",
             "mean_network_density", "p95_network_density", "congestion_high_pressure_steps",
-            "emergency_brake_events", "emergency_brake_due_to_leader", "emergency_brake_due_to_congestion",
-            "emergency_brake_near_junction", "emergency_brake_other_reason",
-            "emergency_brake_after_fallback", "emergency_brake_after_proactive",
-            "emergency_brake_after_lane_now", "emergency_brake_without_recent_decision",
-            "emergency_brake_rate_per_100_decisions", "emergency_brake_rate_per_100_arrivals",
-            "emergency_brake_leader_share", "emergency_brake_congestion_share",
-            "emergency_brake_junction_share", "emergency_brake_other_share",
-            "emergency_brake_after_fallback_share", "emergency_brake_after_proactive_share",
-            "emergency_brake_after_lane_now_share", "emergency_brake_without_recent_decision_share",
-            "top_emergency_brake_edges", "top_emergency_brake_vehicles",
+            "emergency_brake_events",
             "teleport_inferred_jam", "teleport_inferred_yield_or_deadlock",
             "lane_change_request_accepted_rate", "lane_change_observe_resolution_rate",
             "lane_change_observe_success_overcount",
@@ -2320,8 +2306,8 @@ class RLTrainingPipeline:
                 if next_edge is None:
                     decision_metrics["safety_overrides"] += 1
                     self._record_override_event(decision_metrics, "invalid_action")
+                    penalty = self._clip_reward(-2.0)
                     if policy_trace is not None:
-                        penalty = self._clip_reward(-2.0)
                         self._record_immediate_mappo_transition(
                             policy_trace,
                             action=action,
@@ -2334,7 +2320,8 @@ class RLTrainingPipeline:
                             done=False,
                             metadata={"override_type": "invalid_action"},
                         )
-                        episode_return_total += penalty
+                    episode_return_total += penalty
+                    self._accumulate_route_trace_reward(vehicle_route_trace, vehicle_id, penalty)
                     prev_edge_by_vehicle[vehicle_id] = current_edge
                     return None
 
@@ -2387,6 +2374,7 @@ class RLTrainingPipeline:
                             },
                         )
                     episode_return_total += override_penalty
+                    self._accumulate_route_trace_reward(vehicle_route_trace, vehicle_id, override_penalty)
                     policy_trace = None
                     next_edge = self.decision_engine.get_next_edge(current_edge, action)
                     if next_edge is None:
@@ -2444,6 +2432,7 @@ class RLTrainingPipeline:
                                 },
                             )
                         episode_return_total += override_penalty
+                        self._accumulate_route_trace_reward(vehicle_route_trace, vehicle_id, override_penalty)
                         policy_trace = None
                     else:
                         lane_change_requested, lane_change_ok = self.decision_engine.try_request_lane_change(context, action)
@@ -2578,6 +2567,7 @@ class RLTrainingPipeline:
                             },
                         )
                     episode_return_total += override_penalty
+                    self._accumulate_route_trace_reward(vehicle_route_trace, vehicle_id, override_penalty)
                     prev_edge_by_vehicle[vehicle_id] = current_edge
                     return None
                 last_planned_terminal_edge_by_vehicle[vehicle_id] = full_route[-1] if full_route else vehicle.destination
@@ -2862,6 +2852,7 @@ class RLTrainingPipeline:
                                 discount_steps=max(step - pending.decision_step, 1),
                                 metadata=final_metadata,
                             )
+                            self._accumulate_route_trace_reward(vehicle_route_trace, vehicle_id, reward)
                             self._register_decision_finalized(decision_metrics, pending)
                             action_source = str(pending.metadata.get("action_source", ""))
                             if "fallback" in action_source:
@@ -2956,6 +2947,7 @@ class RLTrainingPipeline:
                                                 "decision_finalized": False,
                                             },
                                         )
+                                        self._accumulate_route_trace_reward(vehicle_route_trace, vehicle_id, override_penalty)
                                         episode_return_total += override_penalty
                                         prev_edge_by_vehicle[vehicle_id] = current_edge
                                         continue
@@ -3019,6 +3011,7 @@ class RLTrainingPipeline:
                                         "decision_finalized": False,
                                     },
                                 )
+                                self._accumulate_route_trace_reward(vehicle_route_trace, vehicle_id, pending_pen)
                                 episode_return_total += pending_pen
                                 decision_metrics["pending_resolved_abort_no_progress"] += 1
                                 if reason == "commit_window":
@@ -3143,6 +3136,7 @@ class RLTrainingPipeline:
                                     coordination_state=step_coordination_state,
                                 )
                                 self._accumulate_mappo_reward(pending.metadata, pending_reward)
+                                self._accumulate_route_trace_reward(vehicle_route_trace, vehicle_id, pending_reward)
                                 episode_return_total += pending_reward
                                 pending.state = next_state
                                 pending.last_credit_edge = current_edge
@@ -3180,6 +3174,7 @@ class RLTrainingPipeline:
                                         "decision_finalized": False,
                                     },
                                 )
+                                self._accumulate_route_trace_reward(vehicle_route_trace, vehicle_id, timeout_penalty)
                                 episode_return_total += timeout_penalty
                                 decision_metrics["pending_decision_timeouts"] += 1
                                 self._record_pending_release(decision_metrics, "route_stall_timeout")
@@ -3256,6 +3251,7 @@ class RLTrainingPipeline:
                                         "decision_finalized": False,
                                     },
                                 )
+                                self._accumulate_route_trace_reward(vehicle_route_trace, vehicle_id, release_penalty)
                                 episode_return_total += release_penalty
 
                                 if release_eval.release_as_timeout:
@@ -3513,20 +3509,13 @@ class RLTrainingPipeline:
                                 entry["context"],
                                 policy_actions,
                             )
-                            selection = self.trainer.select_action(
-                                state,
-                                policy_actions,
-                                step_central_observation,
-                                deterministic=False,
-                            )
-                            action = int(selection.action)
-                            action_source = "sample"
-                            if action is None:
+                            if not policy_actions:
                                 self._record_skip(decision_metrics, "actionable_no_candidate")
                                 decision_metrics["actionable_skips"] += 1
                                 prev_edge_by_vehicle[vehicle_id] = current_edge
                                 continue
-                            decision_metrics["policy_actions"] += 1
+                            action = int(policy_actions[0])
+                            action_source = "heuristic"
                             effective_action = process_selected_action(
                                 vehicle_id,
                                 entry["vehicle"],
@@ -3537,8 +3526,8 @@ class RLTrainingPipeline:
                                 state,
                                 action,
                                 action_source,
-                                selection=selection,
-                                central_observation=step_central_observation,
+                                selection=None,
+                                central_observation=None,
                                 coordination_state=step_coordination_state,
                             )
                             if effective_action is not None:
@@ -3608,7 +3597,9 @@ class RLTrainingPipeline:
                             "reached_global_destination": reached_global_destination,
                             "terminal_outcome": outcome,
                         })
-                        episode_return_total += self._finalize_terminal_transition(
+                        if removed_id in vehicle_route_trace:
+                            self._vehicle_last_buffer_pos.pop(removed_id, None)
+                        terminal_reward = self._finalize_terminal_transition(
                             vehicle_id=removed_id,
                             vehicle=vehicle,
                             outcome=outcome,
@@ -3627,6 +3618,7 @@ class RLTrainingPipeline:
                             in_teleport_ids=(removed_id in teleported_ids),
                             ever_teleported=ever_teleported,
                         )
+                        episode_return_total += terminal_reward
                         # Finalize any open route-epoch trace for this vehicle.
                         if removed_id in vehicle_route_trace:
                             final_trace = vehicle_route_trace.pop(removed_id)
@@ -3641,7 +3633,7 @@ class RLTrainingPipeline:
                             self._record_immediate_mappo_transition(
                                 final_trace,
                                 action=int(final_trace.get("route_action", 0)),
-                                reward=0.0,
+                                reward=terminal_reward,
                                 next_state=terminal_state,
                                 next_central_observation=step_transition_central_observation,
                                 done=True,
@@ -3689,7 +3681,9 @@ class RLTrainingPipeline:
                         if vid not in final_outcome_by_vehicle:
                             final_outcome_by_vehicle[vid] = "alive_at_step_cap"
                         timeout_vehicle = vehicles[vid]
-                        episode_return_total += self._finalize_terminal_transition(
+                        if vid in vehicle_route_trace:
+                            self._vehicle_last_buffer_pos.pop(vid, None)
+                        terminal_reward = self._finalize_terminal_transition(
                             vehicle_id=vid,
                             vehicle=timeout_vehicle,
                             outcome="timeout",
@@ -3708,6 +3702,26 @@ class RLTrainingPipeline:
                             in_teleport_ids=False,
                             ever_teleported=(vid in ever_teleported_controlled_ids),
                         )
+                        episode_return_total += terminal_reward
+                        if vid in vehicle_route_trace:
+                            final_trace = vehicle_route_trace.pop(vid)
+                            terminal_snap = last_snapshot_by_vehicle.get(vid)
+                            terminal_state = (
+                                self.make_terminal_next_state_from_snapshot(
+                                    terminal_snap, timeout_vehicle.destination,
+                                    vehicle=timeout_vehicle, step=last_step_executed
+                                ) if terminal_snap is not None
+                                else np.zeros((1, self.state_size), dtype=np.float32)
+                            )
+                            self._record_immediate_mappo_transition(
+                                final_trace,
+                                action=int(final_trace.get("route_action", 0)),
+                                reward=terminal_reward,
+                                next_state=terminal_state,
+                                next_central_observation=step_transition_central_observation,
+                                done=True,
+                                discount_steps=max(int(vehicle_edges_since_reroute.get(vid, 1)), 1),
+                            )
                 global_arrival_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "global_arrival")
                 terminal_teleport_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "teleport")
                 controlled_ever_teleported = len(ever_teleported_controlled_ids)
@@ -4138,7 +4152,6 @@ class RLTrainingPipeline:
                         "p50_travel_time": p50_travel_time,
                         "p90_travel_time": p90_travel_time,
                         "teleports": episode_teleport_events,
-                        "teleported_controlled": len(teleported_controlled_ids),
                         "controlled_ever_teleported": controlled_ever_teleported,
                         "arrived_after_teleport": arrived_after_teleport,
                         "clean_arrivals_without_teleport": clean_arrivals_without_teleport,
@@ -4242,26 +4255,6 @@ class RLTrainingPipeline:
                         "p95_network_density": p95_network_density,
                         "congestion_high_pressure_steps": congestion_high_pressure_steps,
                         "emergency_brake_events": decision_metrics["emergency_brake_events"],
-                        "emergency_brake_due_to_leader": decision_metrics["emergency_brake_due_to_leader"],
-                        "emergency_brake_due_to_congestion": decision_metrics["emergency_brake_due_to_congestion"],
-                        "emergency_brake_near_junction": decision_metrics["emergency_brake_near_junction"],
-                        "emergency_brake_other_reason": decision_metrics["emergency_brake_other_reason"],
-                        "emergency_brake_after_fallback": decision_metrics["emergency_brake_after_fallback"],
-                        "emergency_brake_after_proactive": decision_metrics["emergency_brake_after_proactive"],
-                        "emergency_brake_after_lane_now": decision_metrics["emergency_brake_after_lane_now"],
-                        "emergency_brake_without_recent_decision": decision_metrics["emergency_brake_without_recent_decision"],
-                        "emergency_brake_rate_per_100_decisions": emergency_brake_rate_per_100_decisions,
-                        "emergency_brake_rate_per_100_arrivals": emergency_brake_rate_per_100_arrivals,
-                        "emergency_brake_leader_share": emergency_brake_leader_share,
-                        "emergency_brake_congestion_share": emergency_brake_congestion_share,
-                        "emergency_brake_junction_share": emergency_brake_junction_share,
-                        "emergency_brake_other_share": emergency_brake_other_share,
-                        "emergency_brake_after_fallback_share": emergency_brake_after_fallback_share,
-                        "emergency_brake_after_proactive_share": emergency_brake_after_proactive_share,
-                        "emergency_brake_after_lane_now_share": emergency_brake_after_lane_now_share,
-                        "emergency_brake_without_recent_decision_share": emergency_brake_without_recent_decision_share,
-                        "top_emergency_brake_edges": top_emergency_brake_edges,
-                        "top_emergency_brake_vehicles": top_emergency_brake_vehicles,
                         "teleport_inferred_jam": decision_metrics["teleport_inferred_jam"],
                         "teleport_inferred_yield_or_deadlock": decision_metrics["teleport_inferred_yield_or_deadlock"],
                         "lane_change_request_accepted_rate": lane_change_request_accepted_rate,

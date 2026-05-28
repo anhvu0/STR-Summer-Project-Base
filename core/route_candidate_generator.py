@@ -96,14 +96,6 @@ class RouteCandidateGenerator:
                 route_index=i,
             ))
 
-        # Pad with duplicates of path 0 if fewer than k_routes (should be rare)
-        while len(candidates) < self.k_routes and candidates:
-            pad = RouteCandidate(
-                route_edges=candidates[0].route_edges,
-                features=candidates[0].features.copy(),
-                route_index=len(candidates),
-            )
-            candidates.append(pad)
         return candidates
 
     # ------------------------------------------------------------------

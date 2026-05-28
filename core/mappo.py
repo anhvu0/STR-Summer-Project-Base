@@ -347,14 +347,18 @@ class MAPPOTrainer:
         transition_count = len(rewards)
         advantages = np.zeros(transition_count, dtype=np.float32)
 
-        # Group buffer indices by vehicle_id for per-trajectory GAE.
-        # Transitions without a vehicle_id are treated as independent single-step rollouts.
+        # Group policy transitions by vehicle_id for per-trajectory GAE.
+        # Critic-only samples are value targets for forced junction mechanics; keeping
+        # them out of the route trajectory prevents macro-route advantages from being
+        # chained through overlapping micro decisions.
         from collections import defaultdict
         traj_indices: Dict[str, List[int]] = defaultdict(list)
         solo_indices: List[int] = []
         for i, t in enumerate(self.buffer):
             vid = t.metadata.get("vehicle_id") if isinstance(t.metadata, dict) else None
-            if vid:
+            if bool(getattr(t, "critic_only", False)):
+                solo_indices.append(i)
+            elif vid:
                 traj_indices[vid].append(i)
             else:
                 solo_indices.append(i)
@@ -402,7 +406,13 @@ class MAPPOTrainer:
 
         advantages, returns = self._compute_gae(rewards, old_values, next_values, dones, discount_steps)
         if self.config.normalize_advantages and transition_count > 1:
-            advantages = (advantages - advantages.mean()) / max(advantages.std(), 1.0e-8)
+            policy_mask = ~critic_only_flags
+            if policy_mask.sum() > 1:
+                policy_advantages = advantages[policy_mask]
+                advantages[policy_mask] = (
+                    (policy_advantages - policy_advantages.mean())
+                    / max(policy_advantages.std(), 1.0e-8)
+                )
 
         obs_tensor = self._to_tensor(observations)
         central_tensor = self._to_tensor(central_observations)
