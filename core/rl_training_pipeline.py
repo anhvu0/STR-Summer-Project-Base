@@ -157,6 +157,18 @@ class RLTrainingPipeline:
         self.system_congestion_scale = 0.04
         self.selfless_reward_scale = 0.35
         self.selfless_reward_clip = 3.0
+        # Selfless routing should tolerate small traffic noise. Detours are only
+        # rewarded when density relief clears a deadband and scales with the
+        # travel-time sacrifice being asked of the routed vehicle.
+        self.externality_density_deadband = 0.05
+        self.externality_pressure_scale = 0.015
+        self.route_balance_density_deadband = 0.035
+        self.route_balance_detour_relief_slope = 0.55
+        self.route_balance_reward_scale = 3.0
+        self.route_balance_detour_penalty_scale = 2.0
+        self.route_balance_congestion_penalty_scale = 1.5
+        self.route_balance_reward_clip = 2.0
+        self.route_eta_delta_feature_scale_s = 120.0
         self.loop_window = 12
         self.loop_repeat_penalty = 1.5
         # Objective priority:
@@ -362,6 +374,84 @@ class RLTrainingPipeline:
             decision_metrics["route_chosen_density_sum"] += float(features[2])
             decision_metrics["route_chosen_first_density_sum"] += float(features[4])
 
+    def _route_candidate_balance_components(self, feasible_candidates, chosen_idx):
+        if not feasible_candidates:
+            return {
+                "reward": 0.0,
+                "eta_delta_steps": 0.0,
+                "density_relief": 0.0,
+                "required_relief": self.route_balance_density_deadband,
+                "accepted_detour": False,
+                "penalized_detour": False,
+            }
+        try:
+            chosen = feasible_candidates[int(chosen_idx)]
+        except (IndexError, TypeError, ValueError):
+            chosen = feasible_candidates[0]
+
+        features = np.asarray(chosen.features, dtype=np.float32).reshape(-1)
+        if features.size <= 10:
+            return {
+                "reward": 0.0,
+                "eta_delta_steps": 0.0,
+                "density_relief": 0.0,
+                "required_relief": self.route_balance_density_deadband,
+                "accepted_detour": False,
+                "penalized_detour": False,
+            }
+
+        eta_delta_norm = float(features[7])
+        eta_delta_steps = eta_delta_norm * float(self.route_eta_delta_feature_scale_s)
+        density_relief = (0.65 * float(features[9])) + (0.35 * float(features[10]))
+        detour_norm = max(eta_delta_norm, 0.0)
+        faster_norm = max(-eta_delta_norm, 0.0)
+        required_relief = (
+            float(self.route_balance_density_deadband)
+            + float(self.route_balance_detour_relief_slope) * detour_norm
+        )
+
+        reward = 0.0
+        if faster_norm > 0.0:
+            reward += float(self.route_balance_reward_scale) * min(faster_norm, 0.25)
+
+        accepted_detour = bool(detour_norm > 0.0 and density_relief > required_relief)
+        penalized_detour = bool(detour_norm > 0.0 and not accepted_detour)
+        if accepted_detour:
+            reward += float(self.route_balance_reward_scale) * (density_relief - required_relief)
+        elif penalized_detour:
+            reward -= float(self.route_balance_detour_penalty_scale) * detour_norm
+
+        if density_relief < -float(self.route_balance_density_deadband):
+            reward -= (
+                float(self.route_balance_congestion_penalty_scale)
+                * abs(density_relief + float(self.route_balance_density_deadband))
+            )
+
+        reward = float(np.clip(
+            reward,
+            -float(self.route_balance_reward_clip),
+            float(self.route_balance_reward_clip),
+        ))
+        return {
+            "reward": reward,
+            "eta_delta_steps": float(eta_delta_steps),
+            "density_relief": float(density_relief),
+            "required_relief": float(required_relief),
+            "accepted_detour": accepted_detour,
+            "penalized_detour": penalized_detour,
+        }
+
+    def _record_route_balance_metrics(self, decision_metrics, components):
+        decision_metrics["route_balance_reward_sum"] += float(components.get("reward", 0.0))
+        decision_metrics["route_balance_reward_count"] += 1
+        decision_metrics["route_eta_delta_steps_sum"] += float(components.get("eta_delta_steps", 0.0))
+        decision_metrics["route_density_relief_sum"] += float(components.get("density_relief", 0.0))
+        decision_metrics["route_required_relief_sum"] += float(components.get("required_relief", 0.0))
+        if bool(components.get("accepted_detour", False)):
+            decision_metrics["route_selfless_detour_accept_count"] += 1
+        if bool(components.get("penalized_detour", False)):
+            decision_metrics["route_bad_detour_count"] += 1
+
     def _build_central_observation(
         self,
         *,
@@ -482,6 +572,7 @@ class RLTrainingPipeline:
             edge_id,
             elapsed=elapsed,
             step=step,
+            externality_penalty=max(self._edge_density(edge_id), 0.0),
             coordination_pressure=coordination_pressure,
         )
         self._accumulate_mappo_reward(trace, reward)
@@ -1773,6 +1864,11 @@ class RLTrainingPipeline:
         mean_density = float(self._density_mean)
         marginal_pressure = max(edge_density - mean_density, 0.0)
         reward -= self.system_congestion_scale * marginal_pressure * elapsed
+        externality_pressure = max(
+            float(externality_penalty) - float(self.externality_density_deadband),
+            0.0,
+        )
+        reward -= float(self.externality_pressure_scale) * externality_pressure * elapsed
         reward += self.selfless_reward_scale * float(
             np.clip(selfless_delta, -self.selfless_reward_clip, self.selfless_reward_clip)
         )
@@ -1854,6 +1950,11 @@ class RLTrainingPipeline:
         mean_density = float(self._density_mean)
         marginal_pressure = max(edge_density - mean_density, 0.0)
         reward -= self.system_congestion_scale * marginal_pressure * elapsed
+        externality_pressure = max(
+            float(externality_penalty) - float(self.externality_density_deadband),
+            0.0,
+        )
+        reward -= float(self.externality_pressure_scale) * externality_pressure * elapsed
         reward -= self.pending_coordination_penalty * float(np.clip(coordination_pressure, 0.0, 6.0)) * elapsed
         reward -= self.pending_latency_penalty_per_step * float(max(pending_age, 0))
         reward -= 0.02 * float(max(lane_change_deferrals, 0))
@@ -1914,6 +2015,8 @@ class RLTrainingPipeline:
             "route_choice_nonzero_rate_mean",
             "route_mean_valid_candidates_mean",
             "route_mean_logit_margin_mean",
+            "route_mean_eta_delta_steps_mean",
+            "route_mean_density_relief_mean",
             "best_checkpoint_updated",
             "score_key",
         ]
@@ -2074,6 +2177,8 @@ class RLTrainingPipeline:
                 "route_choice_nonzero_rate": float(runtime_metrics.get("route_choice_nonzero_rate", 0.0)),
                 "route_mean_valid_candidates": float(runtime_metrics.get("route_mean_valid_candidates", 0.0)),
                 "route_mean_logit_margin": float(runtime_metrics.get("route_mean_logit_margin", 0.0)),
+                "route_mean_eta_delta_steps": float(runtime_metrics.get("route_mean_eta_delta_steps", 0.0)),
+                "route_mean_density_relief": float(runtime_metrics.get("route_mean_density_relief", 0.0)),
             })
 
         def mean_metric(key, default=0.0):
@@ -2119,6 +2224,8 @@ class RLTrainingPipeline:
             "route_choice_nonzero_rate_mean": mean_metric("route_choice_nonzero_rate", 0.0),
             "route_mean_valid_candidates_mean": mean_metric("route_mean_valid_candidates", 0.0),
             "route_mean_logit_margin_mean": mean_metric("route_mean_logit_margin", 0.0),
+            "route_mean_eta_delta_steps_mean": mean_metric("route_mean_eta_delta_steps", 0.0),
+            "route_mean_density_relief_mean": mean_metric("route_mean_density_relief", 0.0),
         }
         improved, score_key = self._save_best_frozen_checkpoint(
             episode,
@@ -2131,7 +2238,7 @@ class RLTrainingPipeline:
         print(
             "[EP {:03d} FROZEN_EVAL] seeds={} spawn_interval={:.2f} win_rate={:.3f} "
             "completion={:.1%} avg_delta={:.2f} p90_delta={:.2f} "
-            "tail_delta={:.2f} route_nonzero={:.1%} best={}".format(
+            "tail_delta={:.2f} route_nonzero={:.1%} eta_delta={:.1f}s relief={:.3f} best={}".format(
                 int(episode),
                 aggregate_summary["seed_list"],
                 float(self.eval_spawn_interval),
@@ -2141,6 +2248,8 @@ class RLTrainingPipeline:
                 aggregate_summary["p90_travel_time_delta_mean"],
                 aggregate_summary["tail_completion_gap_steps_delta_mean"],
                 aggregate_summary["route_choice_nonzero_rate_mean"],
+                aggregate_summary["route_mean_eta_delta_steps_mean"],
+                aggregate_summary["route_mean_density_relief_mean"],
                 "yes" if improved else "no",
             )
         )
@@ -2196,6 +2305,9 @@ class RLTrainingPipeline:
             "route_mean_logit_margin", "route_mean_chosen_length_norm",
             "route_mean_chosen_eta_norm", "route_mean_chosen_density",
             "route_mean_chosen_first_density",
+            "route_mean_balance_reward", "route_mean_eta_delta_steps",
+            "route_mean_density_relief", "route_mean_required_relief",
+            "route_selfless_detour_rate", "route_bad_detour_rate",
             "decisions_considered", "decisions_opened", "decisions_finalized", "decisions_skipped",
             "decisions_skipped_actionable",
             "skipped_pending_hold", "skipped_structural_no_branch", "skipped_structural_forced_single_path",
@@ -3445,6 +3557,11 @@ class RLTrainingPipeline:
                         edges_done = vehicle_edges_since_reroute.get(vehicle_id, self.reroute_epoch_edges)
                         if edges_done >= self.reroute_epoch_edges:
                             previous_actor_route = vehicle_actor_owned_route.pop(vehicle_id, None)
+                            allowed_first_edges = {
+                                self.decision_engine.get_next_edge(current_edge, action)
+                                for action in context.available_actions
+                            }
+                            allowed_first_edges.discard(None)
                             candidates = self.route_generator.get_candidates(
                                 current_edge,
                                 vehicle.destination,
@@ -3453,13 +3570,9 @@ class RLTrainingPipeline:
                                     list(previous_actor_route)
                                     if previous_actor_route is not None else None
                                 ),
+                                allowed_first_edges=allowed_first_edges,
                             )
                             decision_metrics["route_candidate_count"] += len(candidates)
-                            allowed_first_edges = {
-                                self.decision_engine.get_next_edge(current_edge, action)
-                                for action in context.available_actions
-                            }
-                            allowed_first_edges.discard(None)
                             feasible_candidates = filter_candidates_by_first_edges(
                                 candidates,
                                 allowed_first_edges,
@@ -3529,6 +3642,14 @@ class RLTrainingPipeline:
                                     feasible_candidates,
                                     chosen_filtered_idx,
                                 )
+                                route_balance_components = self._route_candidate_balance_components(
+                                    feasible_candidates,
+                                    chosen_filtered_idx,
+                                )
+                                self._record_route_balance_metrics(
+                                    decision_metrics,
+                                    route_balance_components,
+                                )
                                 decision_metrics[f"route_chosen_original_idx_{original_idx}"] += 1
                                 decision_metrics["route_decisions_total"] += 1
                                 decision_metrics["policy_actions"] += 1
@@ -3553,6 +3674,13 @@ class RLTrainingPipeline:
                                     new_trace["route_last_credit_step"] = int(step)
                                     new_trace["route_elapsed_steps"] = 0
                                     new_trace["route_edges"] = list(chosen_route)
+                                    new_trace["route_balance_reward"] = float(route_balance_components["reward"])
+                                    if abs(float(route_balance_components["reward"])) > 1.0e-9:
+                                        self._accumulate_mappo_reward(
+                                            new_trace,
+                                            float(route_balance_components["reward"]),
+                                        )
+                                        episode_return_total += float(route_balance_components["reward"])
                                     vehicle_route_trace[vehicle_id] = new_trace
                                     decision_metrics["route_actor_epochs_started"] += 1
                                     prev_edge_by_vehicle[vehicle_id] = current_edge
@@ -4160,6 +4288,7 @@ class RLTrainingPipeline:
                 )
                 route_decision_count = float(max(decision_metrics["route_decisions_total"], 1.0))
                 route_logit_margin_count = float(max(decision_metrics["route_logit_margin_count"], 1.0))
+                route_balance_count = float(max(decision_metrics["route_balance_reward_count"], 1.0))
                 route_choice_nonzero_rate = (
                     float(decision_metrics["route_choice_nonzero_count"]) / route_decision_count
                 )
@@ -4180,6 +4309,24 @@ class RLTrainingPipeline:
                 )
                 route_mean_chosen_first_density = (
                     float(decision_metrics["route_chosen_first_density_sum"]) / route_decision_count
+                )
+                route_mean_balance_reward = (
+                    float(decision_metrics["route_balance_reward_sum"]) / route_balance_count
+                )
+                route_mean_eta_delta_steps = (
+                    float(decision_metrics["route_eta_delta_steps_sum"]) / route_balance_count
+                )
+                route_mean_density_relief = (
+                    float(decision_metrics["route_density_relief_sum"]) / route_balance_count
+                )
+                route_mean_required_relief = (
+                    float(decision_metrics["route_required_relief_sum"]) / route_balance_count
+                )
+                route_selfless_detour_rate = (
+                    float(decision_metrics["route_selfless_detour_accept_count"]) / route_balance_count
+                )
+                route_bad_detour_rate = (
+                    float(decision_metrics["route_bad_detour_count"]) / route_balance_count
                 )
 
                 rolling_teleport_events.append(float(episode_teleport_events))
@@ -4230,7 +4377,8 @@ class RLTrainingPipeline:
                 )
                 print(
                     "  route_actor: decisions={:.0f} epochs={:.0f} choices=[{:.0f},{:.0f},{:.0f},{:.0f}] "
-                    "nonzero={:.1%} valid_mean={:.2f} margin={:.3f} owns_skips={:.0f}".format(
+                    "nonzero={:.1%} valid_mean={:.2f} margin={:.3f} balance={:.3f} "
+                    "eta_delta={:.1f}s relief={:.3f}/{:.3f} selfless={:.1%} bad_detour={:.1%} owns_skips={:.0f}".format(
                         decision_metrics["route_decisions_total"],
                         decision_metrics["route_actor_epochs_started"],
                         decision_metrics["route_choice_idx_0"],
@@ -4240,6 +4388,12 @@ class RLTrainingPipeline:
                         route_choice_nonzero_rate,
                         route_mean_valid_candidates,
                         route_mean_logit_margin,
+                        route_mean_balance_reward,
+                        route_mean_eta_delta_steps,
+                        route_mean_density_relief,
+                        route_mean_required_relief,
+                        route_selfless_detour_rate,
+                        route_bad_detour_rate,
                         decision_metrics["route_actor_ownership_skips"],
                     )
                 )
@@ -4446,6 +4600,12 @@ class RLTrainingPipeline:
                         "route_mean_chosen_eta_norm": route_mean_chosen_eta_norm,
                         "route_mean_chosen_density": route_mean_chosen_density,
                         "route_mean_chosen_first_density": route_mean_chosen_first_density,
+                        "route_mean_balance_reward": route_mean_balance_reward,
+                        "route_mean_eta_delta_steps": route_mean_eta_delta_steps,
+                        "route_mean_density_relief": route_mean_density_relief,
+                        "route_mean_required_relief": route_mean_required_relief,
+                        "route_selfless_detour_rate": route_selfless_detour_rate,
+                        "route_bad_detour_rate": route_bad_detour_rate,
                         "decisions_considered": decision_metrics["decisions_considered"],
                         "decisions_opened": decision_metrics["decisions_opened"],
                         "decisions_finalized": decision_metrics["decisions_finalized"],

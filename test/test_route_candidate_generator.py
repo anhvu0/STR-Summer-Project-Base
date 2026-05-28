@@ -40,8 +40,12 @@ def test_route_candidates_include_density_aware_features_and_pack_cleanly():
     )
 
     assert len(candidates) >= 2
+    assert candidates[0].route_edges[:2] == ["A", "B"]
     assert any(candidate.route_edges[:2] == ["A", "C"] for candidate in candidates)
     assert all(candidate.features.shape == (ROUTE_FEATURE_DIM,) for candidate in candidates)
+    relief_candidate = next(candidate for candidate in candidates if candidate.route_edges[:2] == ["A", "C"])
+    assert relief_candidate.features[7] > 0.0
+    assert relief_candidate.features[9] > 0.0
 
     candidates_with_previous = generator.get_candidates(
         "A",
@@ -60,3 +64,11 @@ def test_route_candidates_include_density_aware_features_and_pack_cleanly():
     filtered = filter_candidates_by_first_edges(candidates, {"C"})
     assert filtered
     assert all(candidate.route_edges[1] == "C" for candidate in filtered)
+
+    covered = generator.get_candidates(
+        "A",
+        "E",
+        lambda edge_id: 0.0,
+        allowed_first_edges={"C"},
+    )
+    assert any(candidate.route_edges[:2] == ["A", "C"] for candidate in covered)

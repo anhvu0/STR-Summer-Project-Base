@@ -107,7 +107,30 @@ Interpretation:
 - tail metrics show whether only a few vehicles are collapsing while averages still look acceptable,
 - use `gini`, `p95_to_p50`, and `tail_completion_gap_steps` together to avoid being fooled by a good mean travel time.
 
-## 7) Frozen evaluation metrics
+## 7) Route-balance metrics
+
+Selfless routing is tracked as a balance between the selfish shortest-route baseline and congestion-relief detours.
+
+Key training metrics:
+- `route_choice_nonzero_rate`
+- `route_mean_balance_reward`
+- `route_mean_eta_delta_steps`
+- `route_mean_density_relief`
+- `route_mean_required_relief`
+- `route_selfless_detour_rate`
+- `route_bad_detour_rate`
+
+Key frozen-eval metrics:
+- `route_choice_nonzero_rate_mean`
+- `route_mean_eta_delta_steps_mean`
+- `route_mean_density_relief_mean`
+
+Interpretation:
+- positive `route_mean_eta_delta_steps` with positive `route_mean_density_relief` means vehicles are taking longer routes to relieve congestion,
+- rising `route_bad_detour_rate` means alternatives are being chosen without enough relief to justify the travel-time sacrifice,
+- low `route_choice_nonzero_rate` is not automatically bad if frozen average travel time improves; it means candidate 0 remains the best route most of the time.
+
+## 8) Frozen evaluation metrics
 
 `rl_frozen_eval_metrics.csv` contains aggregate held-out inference results.
 Current fields:
@@ -125,6 +148,9 @@ Current fields:
 - `deadlines_missed_mean`
 - `vehicles_reached_destination_mean`
 - `controlled_vehicle_count_mean`
+- `route_choice_nonzero_rate_mean`
+- `route_mean_eta_delta_steps_mean`
+- `route_mean_density_relief_mean`
 - `best_checkpoint_updated`
 - `score_key`
 
@@ -139,7 +165,7 @@ Checkpoint ranking priority:
 
 This ranking is intentionally deployment-oriented.
 
-## 8) Practical reading order
+## 9) Practical reading order
 
 When a run looks bad, inspect in this order:
 1. `completion_rate`, `avg_travel_time`, `p90_travel_time`, `timeout_rate`

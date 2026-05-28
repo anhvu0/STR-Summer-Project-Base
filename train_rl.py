@@ -76,16 +76,17 @@ def build_parser():
     )
     parser.add_argument("--actor-lr", type=float, default=3.0e-4, help="MAPPO actor learning rate.")
     parser.add_argument("--critic-lr", type=float, default=1.0e-3, help="MAPPO critic learning rate.")
-    parser.add_argument("--gamma", type=float, default=0.97, help="Discount factor for decision-level returns.")
+    parser.add_argument("--gamma", type=float, default=0.995,
+                        help="Discount factor for simulation-step returns. Higher default preserves delayed selfless-routing effects.")
     parser.add_argument("--gae-lambda", type=float, default=0.95, help="GAE lambda for advantage estimation.")
     parser.add_argument("--clip-epsilon", type=float, default=0.15, help="PPO clipping coefficient.")
     parser.add_argument("--entropy-coef", type=float, default=0.15,
                         help="Initial entropy bonus coefficient. Raised from 0.03 to combat entropy collapse (see diagnosis).")
-    parser.add_argument("--entropy-coef-end", type=float, default=0.01,
+    parser.add_argument("--entropy-coef-end", type=float, default=0.05,
                         help="Final entropy coefficient after linear annealing over all training episodes. "
                              "Set equal to --entropy-coef to disable annealing.")
     parser.add_argument("--value-coef", type=float, default=0.50, help="Value-loss coefficient.")
-    parser.add_argument("--update-epochs", type=int, default=6, help="MAPPO epochs per episode rollout.")
+    parser.add_argument("--update-epochs", type=int, default=4, help="MAPPO epochs per episode rollout.")
     parser.add_argument("--minibatch-size", type=int, default=512, help="MAPPO minibatch size.")
     parser.add_argument("--target-kl", type=float, default=0.015, help="KL divergence threshold for early stopping per update epoch. 0 disables.")
     parser.add_argument(

@@ -133,6 +133,7 @@ class MAPPOPolicy(RouteController):
         self.route_k = 4
         self.route_feature_dim = ROUTE_FEATURE_DIM
         self.route_obs_dim = self.route_k * self.route_feature_dim
+        self.route_eta_delta_feature_scale_s = 120.0
         self.reroute_epoch_edges = 5
         self._vehicle_route_obs: dict = {}
         self._vehicle_edges_since_reroute: dict = {}
@@ -572,6 +573,8 @@ class MAPPOPolicy(RouteController):
             "route_chosen_eta_norm_sum": 0.0,
             "route_chosen_density_sum": 0.0,
             "route_chosen_first_density_sum": 0.0,
+            "route_eta_delta_steps_sum": 0.0,
+            "route_density_relief_sum": 0.0,
         })
         for idx in range(self.route_k):
             self._metrics[f"route_choice_idx_{idx}"] = 0
@@ -606,6 +609,13 @@ class MAPPOPolicy(RouteController):
             self._metrics["route_chosen_eta_norm_sum"] += float(features[1])
             self._metrics["route_chosen_density_sum"] += float(features[2])
             self._metrics["route_chosen_first_density_sum"] += float(features[4])
+            if features.size > 10:
+                self._metrics["route_eta_delta_steps_sum"] += (
+                    float(features[7]) * float(self.route_eta_delta_feature_scale_s)
+                )
+                self._metrics["route_density_relief_sum"] += (
+                    0.65 * float(features[9]) + 0.35 * float(features[10])
+                )
 
     def get_runtime_metrics(self):
         metrics = dict(self._metrics)
@@ -642,6 +652,12 @@ class MAPPOPolicy(RouteController):
         metrics["route_mean_chosen_first_density"] = (
             float(metrics.get("route_chosen_first_density_sum", 0.0)) / route_decisions
         )
+        metrics["route_mean_eta_delta_steps"] = (
+            float(metrics.get("route_eta_delta_steps_sum", 0.0)) / route_decisions
+        )
+        metrics["route_mean_density_relief"] = (
+            float(metrics.get("route_density_relief_sum", 0.0)) / route_decisions
+        )
         return metrics
 
     def format_runtime_metrics_summary(self):
@@ -660,7 +676,7 @@ class MAPPOPolicy(RouteController):
             ),
             (
                 "[RL-INFER] route_actor decisions={} epochs={} choices=[{},{},{},{}] nonzero={:.1%} "
-                "valid_mean={:.2f} margin={:.3f} no_feasible={} apply_fail={}"
+                "valid_mean={:.2f} margin={:.3f} eta_delta={:.1f}s relief={:.3f} no_feasible={} apply_fail={}"
             ).format(
                 int(metrics["route_decisions_total"]),
                 int(metrics["route_actor_epochs_started"]),
@@ -671,6 +687,8 @@ class MAPPOPolicy(RouteController):
                 float(metrics["route_choice_nonzero_rate"]),
                 float(metrics["route_mean_valid_candidates"]),
                 float(metrics["route_mean_logit_margin"]),
+                float(metrics["route_mean_eta_delta_steps"]),
+                float(metrics["route_mean_density_relief"]),
                 int(metrics["route_no_feasible_candidates"]),
                 int(metrics["route_apply_failures"]),
             ),
@@ -1260,6 +1278,11 @@ class MAPPOPolicy(RouteController):
             edges_done = self._vehicle_edges_since_reroute.get(vid, self.reroute_epoch_edges)
             if edges_done >= self.reroute_epoch_edges:
                 previous_actor_route = self._vehicle_actor_owned_route.pop(vid, None)
+                allowed_first_edges = {
+                    self.decision_engine.get_next_edge(start_edge, action)
+                    for action in context.available_actions
+                }
+                allowed_first_edges.discard(None)
                 candidates = self.route_generator.get_candidates(
                     start_edge,
                     vehicle.destination,
@@ -1268,13 +1291,9 @@ class MAPPOPolicy(RouteController):
                         list(previous_actor_route)
                         if previous_actor_route is not None else None
                     ),
+                    allowed_first_edges=allowed_first_edges,
                 )
                 self._metrics["route_candidate_count"] += len(candidates)
-                allowed_first_edges = {
-                    self.decision_engine.get_next_edge(start_edge, action)
-                    for action in context.available_actions
-                }
-                allowed_first_edges.discard(None)
                 feasible_candidates = filter_candidates_by_first_edges(
                     candidates,
                     allowed_first_edges,

@@ -45,7 +45,7 @@ def _masked_logits(logits: torch.Tensor, action_masks: torch.Tensor) -> torch.Te
 class MAPPOConfig:
     actor_learning_rate: float = 3.0e-4
     critic_learning_rate: float = 1.0e-3
-    gamma: float = 0.97
+    gamma: float = 0.995
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.20
     entropy_coef: float = 0.030
