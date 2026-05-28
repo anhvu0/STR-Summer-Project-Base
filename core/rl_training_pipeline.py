@@ -19,6 +19,7 @@ from core.shared_decision_policy import SharedDecisionPolicy
 from core.Util import ConnectionInfo
 from core.target_vehicles_generation_protocols import target_vehicles_generator
 from core.route_loop_safety import transition_signal
+from core.route_candidate_generator import RouteCandidateGenerator, RouteCandidate
 
 if 'SUMO_HOME' in os.environ:
     tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
@@ -227,9 +228,22 @@ class RLTrainingPipeline:
         )
         self.local_congestion_k = self.shared_policy.local_congestion_k
         self._init_edge_embeddings(seed=1337)
-        self.state_size = self.shared_policy.compact_state_size
+        self.route_k = 4                           # number of candidate routes offered to policy
+        self.route_feature_dim = 5                 # features per route candidate
+        self.route_obs_dim = self.route_k * self.route_feature_dim  # 20 dims appended to base state
+        self.reroute_epoch_edges = 5               # re-query policy every N completed edges
+        self.state_size = self.shared_policy.compact_state_size + self.route_obs_dim
         self.central_observation_size = 18
-        self.action_size = 6
+        self.action_size = self.route_k            # policy picks a route index, not a direction
+        self.route_generator = RouteCandidateGenerator(
+            connection_info=self.connection_info,
+            net=self.net,
+            k_routes=self.route_k,
+            oversample=max(self.route_k * 2, 8),
+            max_route_length_m=8000.0,
+            lru_maxsize=2048,
+        )
+        self._episode_route_obs: dict = {}         # vehicle_id -> route obs array, reset each episode
         self.metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_episode_metrics.csv")
         self.frozen_eval_metrics_csv_path = os.path.join(self.sumocfg_dir, "rl_frozen_eval_metrics.csv")
         self.best_model_metadata_path = self.best_model_output_path + ".meta.json"
@@ -429,6 +443,7 @@ class RLTrainingPipeline:
             done=bool(done),
             discount_steps=max(int(discount_steps), 1),
             metadata=stored_metadata,
+            critic_only=bool(trace.get("mappo_critic_only", False)),
         )
         if vid is not None:
             self._vehicle_last_buffer_pos[vid] = (len(self.trainer.buffer) - 1, self.trainer.buffer_generation)
@@ -893,6 +908,7 @@ class RLTrainingPipeline:
     def encode_state(self, vehicle_id, edge_id, destination_edge, context=None, vehicle=None, step=None, snapshot=None, coordination_state=None):
         """
         Build a state vector for the given edge using cached per-step densities.
+        Appends route-candidate features from self._episode_route_obs (set at reroute epochs).
         """
         if context is None:
             if snapshot is not None:
@@ -906,7 +922,7 @@ class RLTrainingPipeline:
             )
         if vehicle is not None and step is None:
             step = int(snapshot.step) if snapshot is not None else 0
-        return self.shared_policy.encode_state(
+        base_state = self.shared_policy.encode_state(
             edge_id=edge_id,
             destination_edge=destination_edge,
             context=context,
@@ -923,6 +939,11 @@ class RLTrainingPipeline:
             include_coordination=True,
             coordination_state=coordination_state,
         )
+        route_obs = self._episode_route_obs.get(vehicle_id)
+        if route_obs is None:
+            route_obs = np.zeros(self.route_obs_dim, dtype=np.float32)
+        base_flat = np.asarray(base_state, dtype=np.float32).reshape(-1)
+        return np.concatenate([base_flat, route_obs]).reshape(1, -1)
     
     def valid_actions_for_vehicle(self, vehicle_id, edge_id, destination_edge, step):
         context = self.decision_engine.build_context(vehicle_id, edge_id, destination_edge, step)
@@ -1243,6 +1264,7 @@ class RLTrainingPipeline:
         prev_edge_by_vehicle.pop(vehicle_id, None)
         last_seen_edge_by_vehicle.pop(vehicle_id, None)
         last_planned_terminal_edge_by_vehicle.pop(vehicle_id, None)
+        self._episode_route_obs.pop(vehicle_id, None)
         last_snapshot_by_vehicle.pop(vehicle_id, None)
         recent_edge_history.pop(vehicle_id, None)
 
@@ -2059,7 +2081,8 @@ class RLTrainingPipeline:
             *trainer_csv_fields[6:],
             "completion_rate", "avg_travel_time", "p50_travel_time", "p90_travel_time", "teleports", "teleported_controlled",
             "controlled_ever_teleported", "arrived_after_teleport", "clean_arrivals_without_teleport",
-            "forced_actions", "decisions_considered", "decisions_opened", "decisions_finalized", "decisions_skipped",
+            "forced_actions", "critic_only_queued", "route_decisions_total",
+            "decisions_considered", "decisions_opened", "decisions_finalized", "decisions_skipped",
             "decisions_skipped_actionable",
             "skipped_pending_hold", "skipped_structural_no_branch", "skipped_structural_forced_single_path",
             "skipped_structural_forced_by_lane_commit", "skipped_structural_too_late_or_unreachable",
@@ -2190,6 +2213,9 @@ class RLTrainingPipeline:
             lane_change_cooldown_until = {}
             pending_release_info = {}
             stale_lane_now_replan_targets = {}
+            self._episode_route_obs = {}
+            vehicle_edges_since_reroute: dict = {}   # vehicle_id -> edges completed since last route decision
+            vehicle_route_trace: dict = {}            # vehicle_id -> route-epoch MAPPO trace
             recent_edge_history = defaultdict(lambda: deque(maxlen=self.loop_window))
             prev_edge_by_vehicle = {}
             decision_metrics = defaultdict(float)
@@ -2278,6 +2304,7 @@ class RLTrainingPipeline:
                 selection=None,
                 central_observation=None,
                 coordination_state=None,
+                critic_only=False,
             ):
                 nonlocal episode_return_total
 
@@ -2287,6 +2314,8 @@ class RLTrainingPipeline:
                 if selection is not None and central_observation is not None:
                     policy_trace = self._build_mappo_trace(state, central_observation, selection)
                     policy_trace["vehicle_id"] = vehicle_id
+                    if critic_only:
+                        policy_trace["mappo_critic_only"] = True
                 next_edge = self.decision_engine.get_next_edge(current_edge, action)
                 if next_edge is None:
                     decision_metrics["safety_overrides"] += 1
@@ -2738,6 +2767,9 @@ class RLTrainingPipeline:
                         last_snapshot_by_vehicle[vehicle_id] = snapshot
                         if edge_changed_runtime:
                             recent_edge_history[vehicle_id].append(current_edge)
+                            vehicle_edges_since_reroute[vehicle_id] = (
+                                vehicle_edges_since_reroute.get(vehicle_id, 0) + 1
+                            )
 
                         prev_edge = prev_edge_by_vehicle.get(vehicle_id)
                         if vehicle_id in pending_decisions and current_edge != pending_decisions[vehicle_id].decision_edge:
@@ -3282,6 +3314,66 @@ class RLTrainingPipeline:
                             continue
 
                         cooldown_until = lane_change_cooldown_until.get((vehicle_id, current_edge), -1)
+
+                        # Route-epoch trigger: when enough edges have been completed, select a new macro route.
+                        edges_done = vehicle_edges_since_reroute.get(vehicle_id, self.reroute_epoch_edges)
+                        if edges_done >= self.reroute_epoch_edges:
+                            candidates = self.route_generator.get_candidates(
+                                current_edge,
+                                vehicle.destination,
+                                self._edge_density,
+                            )
+                            if candidates:
+                                # Build and cache updated route observation for this vehicle
+                                route_obs = np.concatenate(
+                                    [c.features for c in candidates[:self.route_k]] +
+                                    ([np.zeros((self.route_k - len(candidates)) * self.route_feature_dim, dtype=np.float32)]
+                                     if len(candidates) < self.route_k else [])
+                                )
+                                self._episode_route_obs[vehicle_id] = route_obs
+                                # Invalidate the per-step state cache for this vehicle so encode_state uses new route obs
+                                for k in [k for k in step_state_cache if k[0] == vehicle_id]:
+                                    del step_state_cache[k]
+                                state = self._get_or_encode_step_state(
+                                    step_state_cache, step_context_cache, vehicle_id, vehicle,
+                                    step, snapshot, context=context, coordination_state=step_coordination_state,
+                                )
+                                valid_route_indices = list(range(len(candidates)))
+                                route_selection = self.trainer.select_action(
+                                    state, valid_route_indices,
+                                    step_transition_central_observation, deterministic=False,
+                                )
+                                chosen_route = candidates[route_selection.action].route_edges
+                                if len(chosen_route) > 1:
+                                    try:
+                                        traci.vehicle.setRoute(vehicle_id, chosen_route)
+                                    except Exception:
+                                        pass
+
+                                # Finalize the previous route-epoch trace (if one is open).
+                                if vehicle_id in vehicle_route_trace:
+                                    prev_trace = vehicle_route_trace.pop(vehicle_id)
+                                    self._record_immediate_mappo_transition(
+                                        prev_trace,
+                                        action=int(prev_trace.get("route_action", 0)),
+                                        reward=0.0,
+                                        next_state=state,
+                                        next_central_observation=step_transition_central_observation,
+                                        done=False,
+                                        discount_steps=max(int(edges_done), 1),
+                                    )
+
+                                # Start a new route-epoch trace.
+                                new_trace = self._build_mappo_trace(
+                                    state, step_transition_central_observation, route_selection
+                                )
+                                new_trace["vehicle_id"] = vehicle_id
+                                new_trace["route_action"] = int(route_selection.action)
+                                vehicle_route_trace[vehicle_id] = new_trace
+                                vehicle_edges_since_reroute[vehicle_id] = 0
+                                decision_metrics["route_decisions_total"] += 1
+                                decision_metrics["policy_actions"] += 1
+
                         decision_mode = self.shared_policy.classify_decision(context)
                         action_source = "forced" if decision_mode.mode == "forced" else ""
                         if decision_mode.mode == "forced":
@@ -3298,6 +3390,13 @@ class RLTrainingPipeline:
                                 context=context,
                                 coordination_state=step_coordination_state,
                             )
+                            forced_selection = self.trainer.select_action(
+                                state,
+                                [decision_mode.action],
+                                step_transition_central_observation,
+                                deterministic=True,
+                            )
+                            decision_metrics["critic_only_queued"] += 1
                             effective_action = process_selected_action(
                                 vehicle_id,
                                 vehicle,
@@ -3308,7 +3407,10 @@ class RLTrainingPipeline:
                                 state,
                                 decision_mode.action,
                                 action_source,
+                                selection=forced_selection,
+                                central_observation=step_transition_central_observation,
                                 coordination_state=step_coordination_state,
+                                critic_only=True,
                             )
                             if effective_action is not None:
                                 self.shared_policy.reserve_action(
@@ -3525,6 +3627,28 @@ class RLTrainingPipeline:
                             in_teleport_ids=(removed_id in teleported_ids),
                             ever_teleported=ever_teleported,
                         )
+                        # Finalize any open route-epoch trace for this vehicle.
+                        if removed_id in vehicle_route_trace:
+                            final_trace = vehicle_route_trace.pop(removed_id)
+                            terminal_snap = last_snapshot_by_vehicle.get(removed_id)
+                            terminal_state = (
+                                self.make_terminal_next_state_from_snapshot(
+                                    terminal_snap, vehicles[removed_id].destination,
+                                    vehicle=vehicles.get(removed_id), step=step
+                                ) if terminal_snap is not None
+                                else np.zeros((1, self.state_size), dtype=np.float32)
+                            )
+                            self._record_immediate_mappo_transition(
+                                final_trace,
+                                action=int(final_trace.get("route_action", 0)),
+                                reward=0.0,
+                                next_state=terminal_state,
+                                next_central_observation=step_transition_central_observation,
+                                done=True,
+                                discount_steps=max(int(vehicle_edges_since_reroute.get(removed_id, 1)), 1),
+                            )
+                        vehicle_route_trace.pop(removed_id, None)
+                        vehicle_edges_since_reroute.pop(removed_id, None)
                         self.cleanup_vehicle_state(
                             removed_id,
                             pending_decisions,
@@ -4019,6 +4143,8 @@ class RLTrainingPipeline:
                         "arrived_after_teleport": arrived_after_teleport,
                         "clean_arrivals_without_teleport": clean_arrivals_without_teleport,
                         "forced_actions": decision_metrics["forced_actions"],
+                        "critic_only_queued": decision_metrics["critic_only_queued"],
+                        "route_decisions_total": decision_metrics["route_decisions_total"],
                         "decisions_considered": decision_metrics["decisions_considered"],
                         "decisions_opened": decision_metrics["decisions_opened"],
                         "decisions_finalized": decision_metrics["decisions_finalized"],

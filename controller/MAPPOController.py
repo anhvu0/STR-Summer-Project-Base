@@ -14,6 +14,7 @@ from core.mappo import load_mappo_checkpoint, action_mask_from_valid_actions
 from core.junction_decision_engine import JunctionDecisionEngine, VehicleSnapshot
 from core.shared_decision_policy import SharedDecisionPolicy
 from core.route_loop_safety import transition_signal
+from core.route_candidate_generator import RouteCandidateGenerator
 
 def parse_sumocfg(sumocfg_path):
     dom = parse(sumocfg_path)
@@ -124,13 +125,29 @@ class MAPPOPolicy(RouteController):
             density_scale_m=100.0,
         )
         self.compact_state_size = self.shared_policy.compact_state_size
+        self.route_k = 4
+        self.route_feature_dim = 5
+        self.route_obs_dim = self.route_k * self.route_feature_dim  # 20
+        self.reroute_epoch_edges = 5
+        self._vehicle_route_obs: dict = {}
+        self._vehicle_edges_since_reroute: dict = {}
+        self.route_generator = RouteCandidateGenerator(
+            connection_info=self.connection_info,
+            net=self.net,
+            k_routes=self.route_k,
+            oversample=max(self.route_k * 2, 8),
+            max_route_length_m=8000.0,
+            lru_maxsize=2048,
+        )
         self.use_coordination_state = True
-        if self.model_state_size != self.compact_state_size:
+        if self.model_state_size != self.compact_state_size + self.route_obs_dim:
             raise ValueError(
                 "Checkpoint state_size={} is incompatible with the current MAPPO controller "
-                "(expected compact_state_size={} with coordination enabled).".format(
+                "(expected compact_state_size={} + route_obs_dim={} = {}).".format(
                     self.model_state_size,
                     self.compact_state_size,
+                    self.route_obs_dim,
+                    self.compact_state_size + self.route_obs_dim,
                 )
             )
         self.density_scale_m = 100.0
@@ -336,6 +353,8 @@ class MAPPOPolicy(RouteController):
         stale_replans = [key for key in self._stale_lane_now_replan_targets if key and key[0] == vid]
         for key in stale_replans:
             self._stale_lane_now_replan_targets.pop(key, None)
+        self._vehicle_route_obs.pop(vid, None)
+        self._vehicle_edges_since_reroute.pop(vid, None)
 
     #-----------------------DEBUGGING-------------------------------------
     def _dist_to_dest(self, edge_id, dest_id):
@@ -1012,6 +1031,8 @@ class MAPPOPolicy(RouteController):
                 self._recent_edges[vid].append(start_edge)
                 self._visit_count[vid][start_edge] = self._visit_count[vid].get(start_edge, 0) + 1
                 self._best_dist[vid] = min(self._best_dist[vid], self._dist_to_dest(start_edge, vehicle.destination))
+                if edge_changed_runtime:
+                    self._vehicle_edges_since_reroute[vid] = self._vehicle_edges_since_reroute.get(vid, 0) + 1
 
             self._last_observed_edge[vid] = start_edge
             self._finalize_commitment(vehicle)
@@ -1123,6 +1144,40 @@ class MAPPOPolicy(RouteController):
             if snapshot is None:
                 continue
             context = self._get_step_context(str(vid), start_edge, vehicle.destination, step, snapshot=snapshot)
+
+            # Reroute epoch: every reroute_epoch_edges completed edges, pick a new route.
+            edges_done = self._vehicle_edges_since_reroute.get(vid, self.reroute_epoch_edges)
+            if edges_done >= self.reroute_epoch_edges:
+                candidates = self.route_generator.get_candidates(
+                    start_edge,
+                    vehicle.destination,
+                    self._edge_density,
+                )
+                if candidates:
+                    route_obs_parts = []
+                    for i in range(self.route_k):
+                        if i < len(candidates):
+                            route_obs_parts.append(candidates[i].features)
+                        else:
+                            route_obs_parts.append(np.zeros(self.route_feature_dim, dtype=np.float32))
+                    self._vehicle_route_obs[vid] = np.concatenate(route_obs_parts)
+                    route_state = self.getState(
+                        vid, start_edge, vehicle.destination,
+                        context=context, coordination_state=step_coordination_state,
+                    )
+                    valid_route_indices = list(range(len(candidates)))
+                    chosen_idx = self._act_route(route_state, valid_route_indices)
+                    chosen_route = candidates[chosen_idx].route_edges
+                    if len(chosen_route) > 1:
+                        try:
+                            traci.vehicle.setRoute(vid, chosen_route)
+                        except Exception:
+                            pass
+                    self._vehicle_edges_since_reroute[vid] = 0
+                    # Rebuild context after route commit so classify_decision sees updated state.
+                    self._step_context_cache.pop((str(vid), start_edge, vehicle.destination, step), None)
+                    context = self._get_step_context(str(vid), start_edge, vehicle.destination, step, snapshot=snapshot)
+
             decision_mode = self.shared_policy.classify_decision(context)
             if decision_mode.mode == "forced":
                 effective_action = process_selected_action(
@@ -1202,7 +1257,11 @@ class MAPPOPolicy(RouteController):
                     entry["context"],
                     policy_actions,
                 )
-                action_idx = self.act(state, policy_actions)
+                # Policy is now route-level (4 outputs); junction decisions use the
+                # heuristic-ranked list directly — rank_policy_actions already scored them.
+                if not policy_actions:
+                    continue
+                action_idx = policy_actions[0]
                 effective_action = process_selected_action(
                     entry["vid"],
                     entry["vehicle"],
@@ -1254,6 +1313,16 @@ class MAPPOPolicy(RouteController):
 
 
 
+
+    def _act_route(self, state, valid_route_indices):
+        """Greedy route selection using the actor (route_k outputs)."""
+        logits = self._predict_action_logits(state)[0]
+        available = list(valid_route_indices)
+        if not available:
+            return 0
+        action_mask = action_mask_from_valid_actions(self.route_k, available)
+        masked = np.where(action_mask > 0.5, logits, -1.0e9)
+        return int(np.argmax(masked))
 
     # This uses the shared MAPPO actor in greedy inference mode.
     def act(self, state, available_actions=None):
@@ -1342,7 +1411,7 @@ class MAPPOPolicy(RouteController):
                     social_cost -= 0.10
             social_cost_cache[action_idx] = float(max(social_cost, 0.0))
 
-        return self.shared_policy.encode_state(
+        base_state = self.shared_policy.encode_state(
             edge_id=en,
             destination_edge=destination_edge,
             context=context,
@@ -1360,3 +1429,8 @@ class MAPPOPolicy(RouteController):
             include_coordination=True,
             coordination_state=coordination_state,
         )
+        route_obs = self._vehicle_route_obs.get(str(vehicle_id))
+        if route_obs is None:
+            route_obs = np.zeros(self.route_obs_dim, dtype=np.float32)
+        base_flat = np.asarray(base_state, dtype=np.float32).reshape(-1)
+        return np.concatenate([base_flat, route_obs]).reshape(1, -1)

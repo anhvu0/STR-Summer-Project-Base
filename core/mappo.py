@@ -77,6 +77,7 @@ class MAPPOTransition:
     done: bool
     discount_steps: int = 1
     metadata: Dict[str, object] = field(default_factory=dict)
+    critic_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -291,6 +292,7 @@ class MAPPOTrainer:
         done: bool,
         discount_steps: int = 1,
         metadata: Optional[Dict[str, object]] = None,
+        critic_only: bool = False,
     ) -> None:
         transition = MAPPOTransition(
             observation=np.asarray(observation, dtype=np.float32).reshape(-1),
@@ -305,6 +307,7 @@ class MAPPOTrainer:
             done=bool(done),
             discount_steps=max(int(discount_steps), 1),
             metadata=dict(metadata or {}),
+            critic_only=bool(critic_only),
         )
         self.buffer.append(transition)
         self.transitions_collected += 1
@@ -389,6 +392,8 @@ class MAPPOTrainer:
         )
         dones = np.asarray([transition.done for transition in self.buffer], dtype=np.float32)
         discount_steps = np.asarray([transition.discount_steps for transition in self.buffer], dtype=np.float32)
+        critic_only_flags = np.asarray([transition.critic_only for transition in self.buffer], dtype=bool)
+        critic_only_tensor = torch.as_tensor(critic_only_flags, dtype=torch.bool, device=self.device)
 
         with torch.no_grad():
             next_obs_tensor = self._to_tensor(next_observations)
@@ -431,10 +436,20 @@ class MAPPOTrainer:
                 batch_returns = returns_tensor[batch_idx]
                 batch_advantages = advantage_tensor[batch_idx]
 
+                batch_critic_only = critic_only_tensor[batch_idx]
+                is_policy = ~batch_critic_only   # True for genuine policy decisions
+
+                # critic_only transitions carry direction-level action indices (0-5) from the
+                # forced branch, which are out of range for the route actor (action_size=4).
+                # Clamp them to 0 — their log_probs are multiplied by a zero mask anyway.
+                batch_actions_safe = batch_actions.clone()
+                if batch_critic_only.any():
+                    batch_actions_safe[batch_critic_only] = batch_actions_safe[batch_critic_only].clamp(0, self.action_size - 1)
+
                 new_log_probs, entropy, predicted_values = self._evaluate_actions(
                     batch_obs,
                     batch_central,
-                    batch_actions,
+                    batch_actions_safe,
                     batch_masks,
                 )
                 log_ratio = new_log_probs - batch_old_log_probs
@@ -444,9 +459,12 @@ class MAPPOTrainer:
                     1.0 - float(self.config.clip_epsilon),
                     1.0 + float(self.config.clip_epsilon),
                 )
-                policy_loss = -torch.mean(torch.min(ratio * batch_advantages, clipped_ratio * batch_advantages))
+                # Policy loss and entropy only from genuine policy decisions (not critic_only forced transitions).
+                surrogate = torch.min(ratio * batch_advantages, clipped_ratio * batch_advantages)
+                n_policy = is_policy.float().sum().clamp(min=1.0)
+                policy_loss = -(surrogate * is_policy.float()).sum() / n_policy
                 value_loss = torch.mean((predicted_values - batch_returns) ** 2)
-                entropy_bonus = torch.mean(entropy)
+                entropy_bonus = (entropy * is_policy.float()).sum() / n_policy
                 total_loss = (
                     policy_loss
                     + float(self.config.value_coef) * value_loss
@@ -461,14 +479,23 @@ class MAPPOTrainer:
                 self.actor_optimizer.step()
                 self.critic_optimizer.step()
 
-                batch_approx_kl = float((batch_old_log_probs - new_log_probs).mean().detach().cpu().item())
+                # KL and clip metrics computed only on policy decisions.
+                if is_policy.any():
+                    batch_approx_kl = float(
+                        (batch_old_log_probs[is_policy] - new_log_probs[is_policy]).mean().detach().cpu().item()
+                    )
+                    clip_frac = float(
+                        (torch.abs(ratio[is_policy] - 1.0) > float(self.config.clip_epsilon))
+                        .float().mean().detach().cpu().item()
+                    )
+                else:
+                    batch_approx_kl = 0.0
+                    clip_frac = 0.0
                 policy_losses.append(float(policy_loss.detach().cpu().item()))
                 value_losses.append(float(value_loss.detach().cpu().item()))
                 entropies.append(float(entropy_bonus.detach().cpu().item()))
                 approx_kls.append(batch_approx_kl)
-                clip_fractions.append(
-                    float((torch.abs(ratio - 1.0) > float(self.config.clip_epsilon)).float().mean().detach().cpu().item())
-                )
+                clip_fractions.append(clip_frac)
 
                 if target_kl is not None and batch_approx_kl > float(target_kl):
                     kl_exceeded = True
