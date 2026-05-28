@@ -8,6 +8,7 @@ import copy
 
 from xml.dom.minidom import parse
 from collections import Counter, defaultdict, deque
+from dataclasses import replace
 import random
 from controller.DijkstraController import DijkstraPolicy
 from controller.RouteController import RouteController
@@ -19,7 +20,12 @@ from core.shared_decision_policy import SharedDecisionPolicy
 from core.Util import ConnectionInfo
 from core.target_vehicles_generation_protocols import target_vehicles_generator
 from core.route_loop_safety import transition_signal
-from core.route_candidate_generator import RouteCandidateGenerator, RouteCandidate
+from core.route_candidate_generator import (
+    ROUTE_FEATURE_DIM,
+    RouteCandidateGenerator,
+    filter_candidates_by_first_edges,
+    pack_route_candidate_features,
+)
 
 if 'SUMO_HOME' in os.environ:
     tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
@@ -229,12 +235,17 @@ class RLTrainingPipeline:
         self.local_congestion_k = self.shared_policy.local_congestion_k
         self._init_edge_embeddings(seed=1337)
         self.route_k = 4                           # number of candidate routes offered to policy
-        self.route_feature_dim = 5                 # features per route candidate
-        self.route_obs_dim = self.route_k * self.route_feature_dim  # 20 dims appended to base state
+        self.route_feature_dim = ROUTE_FEATURE_DIM
+        self.route_obs_dim = self.route_k * self.route_feature_dim
         self.reroute_epoch_edges = 5               # re-query policy every N completed edges
         self.state_size = self.shared_policy.compact_state_size + self.route_obs_dim
         self.central_observation_size = 18
         self.action_size = self.route_k            # policy picks a route index, not a direction
+        if int(getattr(self.mappo_config, "route_candidate_feature_dim", 0)) != self.route_feature_dim:
+            self.mappo_config = replace(
+                self.mappo_config,
+                route_candidate_feature_dim=self.route_feature_dim,
+            )
         self.route_generator = RouteCandidateGenerator(
             connection_info=self.connection_info,
             net=self.net,
@@ -321,6 +332,35 @@ class RLTrainingPipeline:
 
     def _action_mask_vector(self, valid_actions):
         return action_mask_from_valid_actions(self.action_size, valid_actions)
+
+    def _route_logit_margin(self, selection, valid_route_indices):
+        logits = np.asarray(getattr(selection, "masked_logits", []), dtype=np.float32).reshape(-1)
+        valid = [idx for idx in valid_route_indices if 0 <= int(idx) < len(logits)]
+        if len(valid) <= 1:
+            return 0.0
+        valid_logits = np.sort(logits[valid])
+        return float(valid_logits[-1] - valid_logits[-2])
+
+    def _record_route_actor_choice(self, decision_metrics, selection, feasible_candidates, chosen_idx):
+        valid_count = len(feasible_candidates)
+        decision_metrics[f"route_valid_candidates_{valid_count}"] += 1
+        decision_metrics["route_valid_candidate_sum"] += valid_count
+        decision_metrics[f"route_choice_idx_{chosen_idx}"] += 1
+        if int(chosen_idx) != 0:
+            decision_metrics["route_choice_nonzero_count"] += 1
+
+        decision_metrics["route_logit_margin_sum"] += self._route_logit_margin(
+            selection,
+            range(valid_count),
+        )
+        decision_metrics["route_logit_margin_count"] += 1
+
+        features = np.asarray(feasible_candidates[int(chosen_idx)].features, dtype=np.float32)
+        if features.size >= ROUTE_FEATURE_DIM:
+            decision_metrics["route_chosen_length_norm_sum"] += float(features[0])
+            decision_metrics["route_chosen_eta_norm_sum"] += float(features[1])
+            decision_metrics["route_chosen_density_sum"] += float(features[2])
+            decision_metrics["route_chosen_first_density_sum"] += float(features[4])
 
     def _build_central_observation(
         self,
@@ -415,6 +455,47 @@ class RLTrainingPipeline:
         trace = vehicle_route_trace.get(vehicle_id) if isinstance(vehicle_route_trace, dict) else None
         if trace is not None:
             self._accumulate_mappo_reward(trace, reward)
+
+    def _accumulate_route_epoch_step_reward(
+        self,
+        vehicle_route_trace,
+        vehicle_id,
+        vehicle,
+        edge_id,
+        step,
+        coordination_pressure=0.0,
+    ):
+        trace = vehicle_route_trace.get(vehicle_id) if isinstance(vehicle_route_trace, dict) else None
+        if trace is None:
+            return 0.0
+        try:
+            last_credit_step = int(trace.get("route_last_credit_step", step))
+        except (TypeError, ValueError):
+            last_credit_step = int(step)
+        elapsed = max(int(step) - int(last_credit_step), 0)
+        trace["route_last_credit_step"] = int(step)
+        if elapsed <= 0:
+            return 0.0
+
+        reward = self.compute_pending_step_reward(
+            vehicle,
+            edge_id,
+            elapsed=elapsed,
+            step=step,
+            coordination_pressure=coordination_pressure,
+        )
+        self._accumulate_mappo_reward(trace, reward)
+        trace["route_elapsed_steps"] = int(trace.get("route_elapsed_steps", 0)) + int(elapsed)
+        return float(reward)
+
+    def _reset_episode_density_state(self):
+        for edge_id in self._edge_list:
+            self.connection_info.edge_vehicle_count[edge_id] = 0
+        self._density_vec = np.zeros(len(self._edge_list), dtype=np.float32)
+        self._density_mean = 0.0
+        self._density_std = 0.0
+        self._density_p95 = 0.0
+        self._last_density_step = -10**9
 
     def _record_immediate_mappo_transition(
         self,
@@ -1793,7 +1874,7 @@ class RLTrainingPipeline:
         return model_output_path + ".best"
 
     def _default_frozen_eval_seeds(self):
-        return list(range(6000, 6030))
+        return list(range(6000, 6011))
 
     def _frozen_eval_csv_fields(self):
         return [
@@ -1805,6 +1886,9 @@ class RLTrainingPipeline:
             "baseline_seed_source",
             "win_count",
             "win_rate",
+            "completion_rate_mean",
+            "baseline_completion_rate_mean",
+            "completion_rate_delta_mean",
             "avg_travel_time_mean",
             "baseline_avg_travel_time_mean",
             "avg_travel_time_delta_mean",
@@ -1826,6 +1910,10 @@ class RLTrainingPipeline:
             "deadlines_missed_delta_mean",
             "vehicles_reached_destination_mean",
             "controlled_vehicle_count_mean",
+            "route_actor_epochs_mean",
+            "route_choice_nonzero_rate_mean",
+            "route_mean_valid_candidates_mean",
+            "route_mean_logit_margin_mean",
             "best_checkpoint_updated",
             "score_key",
         ]
@@ -1857,17 +1945,16 @@ class RLTrainingPipeline:
         )
 
     def _frozen_eval_score_key(self, summary):
-        # Primary: timeout/completion rate (lower delta = fewer timeouts than baseline).
-        # Secondary: avg travel time delta (lower = faster than baseline).
-        # win_rate is intentionally excluded from primary ranking — at 30 seeds it is
-        # 1/30-resolution and still quantized; travel-time delta is a continuous signal.
+        # Rank deployment checkpoints by absolute policy quality. Baseline deltas are
+        # useful diagnostics, but the best checkpoint should first avoid tail collapse.
         return (
-            self._safe_eval_metric(summary.get("timeout_rate_delta_mean", 1.0)),
-            self._safe_eval_metric(summary.get("avg_travel_time_delta_mean", float("inf"))),
-            self._safe_eval_metric(summary.get("p90_travel_time_delta_mean", float("inf"))),
-            self._safe_eval_metric(summary.get("tail_completion_gap_steps_delta_mean", float("inf"))),
-            self._safe_eval_metric(summary.get("p95_to_p50_travel_ratio_delta_mean", float("inf"))),
-            self._safe_eval_metric(summary.get("deadlines_missed_delta_mean", float("inf"))),
+            1.0 - float(np.clip(summary.get("completion_rate_mean", 0.0), 0.0, 1.0)),
+            self._safe_eval_metric(summary.get("timeout_rate_mean", 1.0)),
+            self._safe_eval_metric(summary.get("avg_travel_time_mean", float("inf"))),
+            self._safe_eval_metric(summary.get("p90_travel_time_mean", float("inf"))),
+            self._safe_eval_metric(summary.get("tail_completion_gap_steps_mean", float("inf"))),
+            self._safe_eval_metric(summary.get("p95_to_p50_travel_ratio_mean", float("inf"))),
+            self._safe_eval_metric(summary.get("deadlines_missed_mean", float("inf"))),
         )
 
     def _append_frozen_eval_row(self, row):
@@ -1952,12 +2039,16 @@ class RLTrainingPipeline:
                 net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
             )
             stats = run_eval_controller(policy, rl_vehicles)
+            runtime_metrics = stats.get("controller_runtime_metrics") or {}
             rl_score = self._travel_score_tuple(stats)
             baseline_score = self._travel_score_tuple(baseline_stats)
             win = int(rl_score < baseline_score)
             per_seed_rows.append({
                 "seed": int(eval_seed),
                 "win_vs_dijkstra": int(win),
+                "completion_rate": float(stats["completion_rate"]),
+                "baseline_completion_rate": float(baseline_stats["completion_rate"]),
+                "completion_rate_delta": float(stats["completion_rate"]) - float(baseline_stats["completion_rate"]),
                 "avg_travel_time": float(stats["avg_travel_time"]),
                 "baseline_avg_travel_time": float(baseline_stats["avg_travel_time"]),
                 "avg_travel_time_delta": float(stats["avg_travel_time"]) - float(baseline_stats["avg_travel_time"]),
@@ -1979,6 +2070,10 @@ class RLTrainingPipeline:
                 "deadlines_missed_delta": float(stats["deadlines_missed"]) - float(baseline_stats["deadlines_missed"]),
                 "vehicles_reached_destination": float(stats["vehicles_reached_destination"]),
                 "controlled_vehicle_count": float(stats["controlled_vehicle_count"]),
+                "route_actor_epochs": float(runtime_metrics.get("route_actor_epochs_started", 0.0)),
+                "route_choice_nonzero_rate": float(runtime_metrics.get("route_choice_nonzero_rate", 0.0)),
+                "route_mean_valid_candidates": float(runtime_metrics.get("route_mean_valid_candidates", 0.0)),
+                "route_mean_logit_margin": float(runtime_metrics.get("route_mean_logit_margin", 0.0)),
             })
 
         def mean_metric(key, default=0.0):
@@ -1996,6 +2091,9 @@ class RLTrainingPipeline:
             "baseline_seed_source": ",".join(str(seed) for seed in self.frozen_eval_seeds),
             "win_count": float(sum(float(row["win_vs_dijkstra"]) for row in per_seed_rows)),
             "win_rate": mean_metric("win_vs_dijkstra", 0.0),
+            "completion_rate_mean": mean_metric("completion_rate", 0.0),
+            "baseline_completion_rate_mean": mean_metric("baseline_completion_rate", 0.0),
+            "completion_rate_delta_mean": mean_metric("completion_rate_delta", -1.0),
             "avg_travel_time_mean": mean_metric("avg_travel_time", float("inf")),
             "baseline_avg_travel_time_mean": mean_metric("baseline_avg_travel_time", float("inf")),
             "avg_travel_time_delta_mean": mean_metric("avg_travel_time_delta", float("inf")),
@@ -2017,6 +2115,10 @@ class RLTrainingPipeline:
             "deadlines_missed_delta_mean": mean_metric("deadlines_missed_delta", float("inf")),
             "vehicles_reached_destination_mean": mean_metric("vehicles_reached_destination", 0.0),
             "controlled_vehicle_count_mean": mean_metric("controlled_vehicle_count", 0.0),
+            "route_actor_epochs_mean": mean_metric("route_actor_epochs", 0.0),
+            "route_choice_nonzero_rate_mean": mean_metric("route_choice_nonzero_rate", 0.0),
+            "route_mean_valid_candidates_mean": mean_metric("route_mean_valid_candidates", 0.0),
+            "route_mean_logit_margin_mean": mean_metric("route_mean_logit_margin", 0.0),
         }
         improved, score_key = self._save_best_frozen_checkpoint(
             episode,
@@ -2027,14 +2129,18 @@ class RLTrainingPipeline:
         aggregate_summary["score_key"] = "|".join(f"{value:.6f}" for value in score_key)
         self._append_frozen_eval_row(aggregate_summary)
         print(
-            "[EP {:03d} FROZEN_EVAL] seeds={} spawn_interval={:.2f} win_rate={:.3f} avg_delta={:.2f} p90_delta={:.2f} tail_delta={:.2f} best={}".format(
+            "[EP {:03d} FROZEN_EVAL] seeds={} spawn_interval={:.2f} win_rate={:.3f} "
+            "completion={:.1%} avg_delta={:.2f} p90_delta={:.2f} "
+            "tail_delta={:.2f} route_nonzero={:.1%} best={}".format(
                 int(episode),
                 aggregate_summary["seed_list"],
                 float(self.eval_spawn_interval),
                 aggregate_summary["win_rate"],
+                aggregate_summary["completion_rate_mean"],
                 aggregate_summary["avg_travel_time_delta_mean"],
                 aggregate_summary["p90_travel_time_delta_mean"],
                 aggregate_summary["tail_completion_gap_steps_delta_mean"],
+                aggregate_summary["route_choice_nonzero_rate_mean"],
                 "yes" if improved else "no",
             )
         )
@@ -2080,6 +2186,16 @@ class RLTrainingPipeline:
             "completion_rate", "avg_travel_time", "p50_travel_time", "p90_travel_time", "teleports",
             "controlled_ever_teleported", "arrived_after_teleport", "clean_arrivals_without_teleport",
             "forced_actions", "critic_only_queued", "route_decisions_total",
+            "route_candidate_count", "route_feasible_candidate_count",
+            "route_actor_epochs_started", "route_actor_ownership_skips",
+            "route_no_feasible_candidates", "route_apply_failures",
+            "route_choice_idx_0", "route_choice_idx_1", "route_choice_idx_2", "route_choice_idx_3",
+            "route_valid_candidates_1", "route_valid_candidates_2",
+            "route_valid_candidates_3", "route_valid_candidates_4",
+            "route_choice_nonzero_rate", "route_mean_valid_candidates",
+            "route_mean_logit_margin", "route_mean_chosen_length_norm",
+            "route_mean_chosen_eta_norm", "route_mean_chosen_density",
+            "route_mean_chosen_first_density",
             "decisions_considered", "decisions_opened", "decisions_finalized", "decisions_skipped",
             "decisions_skipped_actionable",
             "skipped_pending_hold", "skipped_structural_no_branch", "skipped_structural_forced_single_path",
@@ -2206,6 +2322,7 @@ class RLTrainingPipeline:
             vehicle_edges_since_reroute: dict = {}   # vehicle_id -> edges completed since last route decision
             vehicle_route_trace: dict = {}            # vehicle_id -> route-epoch MAPPO trace
             vehicle_actor_owned_route: dict = {}      # vehicle_id -> actor-committed route tuple for current epoch
+            self._reset_episode_density_state()
             recent_edge_history = defaultdict(lambda: deque(maxlen=self.loop_window))
             prev_edge_by_vehicle = {}
             decision_metrics = defaultdict(float)
@@ -2764,6 +2881,15 @@ class RLTrainingPipeline:
                             vehicle_edges_since_reroute[vehicle_id] = (
                                 vehicle_edges_since_reroute.get(vehicle_id, 0) + 1
                             )
+                        if vehicle_id in vehicle_actor_owned_route:
+                            route_epoch_reward = self._accumulate_route_epoch_step_reward(
+                                vehicle_route_trace,
+                                vehicle_id,
+                                vehicle,
+                                current_edge,
+                                step,
+                            )
+                            episode_return_total += route_epoch_reward
 
                         prev_edge = prev_edge_by_vehicle.get(vehicle_id)
                         if vehicle_id in pending_decisions and current_edge != pending_decisions[vehicle_id].decision_edge:
@@ -3318,52 +3444,95 @@ class RLTrainingPipeline:
                         # Route-epoch trigger: when enough edges have been completed, select a new macro route.
                         edges_done = vehicle_edges_since_reroute.get(vehicle_id, self.reroute_epoch_edges)
                         if edges_done >= self.reroute_epoch_edges:
-                            # Clear previous ownership; will be set again only if a new route is successfully applied.
-                            vehicle_actor_owned_route.pop(vehicle_id, None)
+                            previous_actor_route = vehicle_actor_owned_route.pop(vehicle_id, None)
                             candidates = self.route_generator.get_candidates(
                                 current_edge,
                                 vehicle.destination,
                                 self._edge_density,
+                                prev_route_edges=(
+                                    list(previous_actor_route)
+                                    if previous_actor_route is not None else None
+                                ),
                             )
                             decision_metrics["route_candidate_count"] += len(candidates)
-                            # Filter to candidates whose first step is reachable from available_actions.
                             allowed_first_edges = {
                                 self.decision_engine.get_next_edge(current_edge, action)
                                 for action in context.available_actions
                             }
                             allowed_first_edges.discard(None)
-                            feasible_candidates = [
-                                c for c in candidates
-                                if len(c.route_edges) > 1 and c.route_edges[1] in allowed_first_edges
-                            ]
+                            feasible_candidates = filter_candidates_by_first_edges(
+                                candidates,
+                                allowed_first_edges,
+                            )
                             decision_metrics["route_feasible_candidate_count"] += len(feasible_candidates)
                             if feasible_candidates:
-                                # Build route observation using only feasible candidates, padded to route_k.
-                                route_obs = np.concatenate(
-                                    [c.features for c in feasible_candidates[:self.route_k]] +
-                                    ([np.zeros((self.route_k - len(feasible_candidates)) * self.route_feature_dim, dtype=np.float32)]
-                                     if len(feasible_candidates) < self.route_k else [])
+                                self._episode_route_obs[vehicle_id] = pack_route_candidate_features(
+                                    feasible_candidates,
+                                    self.route_k,
+                                    self.route_feature_dim,
                                 )
-                                self._episode_route_obs[vehicle_id] = route_obs
-                                for k in [k for k in step_state_cache if k[0] == vehicle_id]:
-                                    del step_state_cache[k]
-                                state = self._get_or_encode_step_state(
-                                    step_state_cache, step_context_cache, vehicle_id, vehicle,
-                                    step, snapshot, context=context, coordination_state=step_coordination_state,
+                            else:
+                                decision_metrics["route_no_feasible_candidates"] += 1
+                                self._episode_route_obs.pop(vehicle_id, None)
+
+                            for key in [key for key in step_state_cache if key[0] == vehicle_id]:
+                                del step_state_cache[key]
+                            state = self._get_or_encode_step_state(
+                                step_state_cache,
+                                step_context_cache,
+                                vehicle_id,
+                                vehicle,
+                                step,
+                                snapshot,
+                                context=context,
+                                coordination_state=step_coordination_state,
+                            )
+
+                            if vehicle_id in vehicle_route_trace:
+                                prev_trace = vehicle_route_trace.pop(vehicle_id)
+                                route_discount_steps = max(
+                                    int(prev_trace.get("route_elapsed_steps", edges_done)),
+                                    1,
                                 )
+                                self._record_immediate_mappo_transition(
+                                    prev_trace,
+                                    action=int(prev_trace.get("route_action", 0)),
+                                    reward=0.0,
+                                    next_state=state,
+                                    next_central_observation=step_transition_central_observation,
+                                    done=False,
+                                    discount_steps=route_discount_steps,
+                                    metadata={
+                                        "route_epoch_finalized": True,
+                                        "route_elapsed_steps": route_discount_steps,
+                                    },
+                                )
+
+                            vehicle_edges_since_reroute[vehicle_id] = 0
+                            if feasible_candidates:
                                 valid_route_indices = list(range(len(feasible_candidates)))
                                 route_selection = self.trainer.select_action(
-                                    state, valid_route_indices,
-                                    step_transition_central_observation, deterministic=False,
+                                    state,
+                                    valid_route_indices,
+                                    step_transition_central_observation,
+                                    deterministic=False,
                                 )
-                                chosen_filtered_idx = route_selection.action
+                                chosen_filtered_idx = int(route_selection.action)
                                 chosen_route = feasible_candidates[chosen_filtered_idx].route_edges
                                 original_idx = next(
                                     (i for i, c in enumerate(candidates) if c is feasible_candidates[chosen_filtered_idx]),
                                     chosen_filtered_idx,
                                 )
-                                decision_metrics[f"route_chosen_filtered_idx_{chosen_filtered_idx}"] += 1
+                                self._record_route_actor_choice(
+                                    decision_metrics,
+                                    route_selection,
+                                    feasible_candidates,
+                                    chosen_filtered_idx,
+                                )
                                 decision_metrics[f"route_chosen_original_idx_{original_idx}"] += 1
+                                decision_metrics["route_decisions_total"] += 1
+                                decision_metrics["policy_actions"] += 1
+
                                 route_applied = False
                                 if len(chosen_route) > 1:
                                     try:
@@ -3371,36 +3540,44 @@ class RLTrainingPipeline:
                                         vehicle_actor_owned_route[vehicle_id] = tuple(chosen_route)
                                         route_applied = True
                                     except Exception:
-                                        pass
-
-                                # Finalize the previous route-epoch trace (if one is open).
-                                if vehicle_id in vehicle_route_trace:
-                                    prev_trace = vehicle_route_trace.pop(vehicle_id)
-                                    self._record_immediate_mappo_transition(
-                                        prev_trace,
-                                        action=int(prev_trace.get("route_action", 0)),
-                                        reward=0.0,
-                                        next_state=state,
-                                        next_central_observation=step_transition_central_observation,
-                                        done=False,
-                                        discount_steps=max(int(edges_done), 1),
-                                    )
-
-                                # Start a new route-epoch trace.
-                                new_trace = self._build_mappo_trace(
-                                    state, step_transition_central_observation, route_selection
-                                )
-                                new_trace["vehicle_id"] = vehicle_id
-                                new_trace["route_action"] = int(chosen_filtered_idx)
-                                vehicle_route_trace[vehicle_id] = new_trace
-                                vehicle_edges_since_reroute[vehicle_id] = 0
-                                decision_metrics["route_decisions_total"] += 1
-                                decision_metrics["policy_actions"] += 1
-                                decision_metrics["route_actor_epochs_started"] += 1
+                                        decision_metrics["route_apply_failures"] += 1
 
                                 if route_applied:
+                                    new_trace = self._build_mappo_trace(
+                                        state,
+                                        step_transition_central_observation,
+                                        route_selection,
+                                    )
+                                    new_trace["vehicle_id"] = vehicle_id
+                                    new_trace["route_action"] = int(chosen_filtered_idx)
+                                    new_trace["route_last_credit_step"] = int(step)
+                                    new_trace["route_elapsed_steps"] = 0
+                                    new_trace["route_edges"] = list(chosen_route)
+                                    vehicle_route_trace[vehicle_id] = new_trace
+                                    decision_metrics["route_actor_epochs_started"] += 1
                                     prev_edge_by_vehicle[vehicle_id] = current_edge
-                                    continue  # authority barrier: actor owns this route for the epoch
+                                    continue
+
+                                route_failure_penalty = self._clip_reward(-6.0)
+                                episode_return_total += route_failure_penalty
+                                failure_trace = self._build_mappo_trace(
+                                    state,
+                                    step_transition_central_observation,
+                                    route_selection,
+                                )
+                                failure_trace["vehicle_id"] = vehicle_id
+                                self._record_immediate_mappo_transition(
+                                    failure_trace,
+                                    action=int(chosen_filtered_idx),
+                                    reward=route_failure_penalty,
+                                    next_state=state,
+                                    next_central_observation=step_transition_central_observation,
+                                    done=False,
+                                    metadata={"route_apply_failed": True},
+                                )
+                                self._episode_route_obs.pop(vehicle_id, None)
+                                for key in [key for key in step_state_cache if key[0] == vehicle_id]:
+                                    del step_state_cache[key]
 
                         # Ownership guard: while actor owns the route for this epoch skip all junction handling.
                         if vehicle_id in vehicle_actor_owned_route:
@@ -3675,7 +3852,13 @@ class RLTrainingPipeline:
                                 next_state=terminal_state,
                                 next_central_observation=step_transition_central_observation,
                                 done=True,
-                                discount_steps=max(int(vehicle_edges_since_reroute.get(removed_id, 1)), 1),
+                                discount_steps=max(
+                                    int(final_trace.get(
+                                        "route_elapsed_steps",
+                                        vehicle_edges_since_reroute.get(removed_id, 1),
+                                    )),
+                                    1,
+                                ),
                             )
                         vehicle_route_trace.pop(removed_id, None)
                         vehicle_edges_since_reroute.pop(removed_id, None)
@@ -3759,7 +3942,13 @@ class RLTrainingPipeline:
                                 next_state=terminal_state,
                                 next_central_observation=step_transition_central_observation,
                                 done=True,
-                                discount_steps=max(int(vehicle_edges_since_reroute.get(vid, 1)), 1),
+                                discount_steps=max(
+                                    int(final_trace.get(
+                                        "route_elapsed_steps",
+                                        vehicle_edges_since_reroute.get(vid, 1),
+                                    )),
+                                    1,
+                                ),
                             )
                         vehicle_actor_owned_route.pop(vid, None)
                 global_arrival_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "global_arrival")
@@ -3969,6 +4158,29 @@ class RLTrainingPipeline:
                     float(decision_metrics["policy_candidates_collapsed_to_lane_now_only"])
                     / float(max(decision_metrics["policy_candidates_with_broader_available"], 1.0))
                 )
+                route_decision_count = float(max(decision_metrics["route_decisions_total"], 1.0))
+                route_logit_margin_count = float(max(decision_metrics["route_logit_margin_count"], 1.0))
+                route_choice_nonzero_rate = (
+                    float(decision_metrics["route_choice_nonzero_count"]) / route_decision_count
+                )
+                route_mean_valid_candidates = (
+                    float(decision_metrics["route_valid_candidate_sum"]) / route_decision_count
+                )
+                route_mean_logit_margin = (
+                    float(decision_metrics["route_logit_margin_sum"]) / route_logit_margin_count
+                )
+                route_mean_chosen_length_norm = (
+                    float(decision_metrics["route_chosen_length_norm_sum"]) / route_decision_count
+                )
+                route_mean_chosen_eta_norm = (
+                    float(decision_metrics["route_chosen_eta_norm_sum"]) / route_decision_count
+                )
+                route_mean_chosen_density = (
+                    float(decision_metrics["route_chosen_density_sum"]) / route_decision_count
+                )
+                route_mean_chosen_first_density = (
+                    float(decision_metrics["route_chosen_first_density_sum"]) / route_decision_count
+                )
 
                 rolling_teleport_events.append(float(episode_teleport_events))
                 rolling_teleported_controlled.append(float(len(teleported_controlled_ids)))
@@ -4014,6 +4226,21 @@ class RLTrainingPipeline:
                         decision_metrics["fallback_overrides"],
                         decision_metrics["override_events_total"] / max(decision_metrics["decisions_opened"], 1.0),
                         actionable_skip_ratio,
+                    )
+                )
+                print(
+                    "  route_actor: decisions={:.0f} epochs={:.0f} choices=[{:.0f},{:.0f},{:.0f},{:.0f}] "
+                    "nonzero={:.1%} valid_mean={:.2f} margin={:.3f} owns_skips={:.0f}".format(
+                        decision_metrics["route_decisions_total"],
+                        decision_metrics["route_actor_epochs_started"],
+                        decision_metrics["route_choice_idx_0"],
+                        decision_metrics["route_choice_idx_1"],
+                        decision_metrics["route_choice_idx_2"],
+                        decision_metrics["route_choice_idx_3"],
+                        route_choice_nonzero_rate,
+                        route_mean_valid_candidates,
+                        route_mean_logit_margin,
+                        decision_metrics["route_actor_ownership_skips"],
                     )
                 )
                 print(
@@ -4198,6 +4425,27 @@ class RLTrainingPipeline:
                         "forced_actions": decision_metrics["forced_actions"],
                         "critic_only_queued": decision_metrics["critic_only_queued"],
                         "route_decisions_total": decision_metrics["route_decisions_total"],
+                        "route_candidate_count": decision_metrics["route_candidate_count"],
+                        "route_feasible_candidate_count": decision_metrics["route_feasible_candidate_count"],
+                        "route_actor_epochs_started": decision_metrics["route_actor_epochs_started"],
+                        "route_actor_ownership_skips": decision_metrics["route_actor_ownership_skips"],
+                        "route_no_feasible_candidates": decision_metrics["route_no_feasible_candidates"],
+                        "route_apply_failures": decision_metrics["route_apply_failures"],
+                        "route_choice_idx_0": decision_metrics["route_choice_idx_0"],
+                        "route_choice_idx_1": decision_metrics["route_choice_idx_1"],
+                        "route_choice_idx_2": decision_metrics["route_choice_idx_2"],
+                        "route_choice_idx_3": decision_metrics["route_choice_idx_3"],
+                        "route_valid_candidates_1": decision_metrics["route_valid_candidates_1"],
+                        "route_valid_candidates_2": decision_metrics["route_valid_candidates_2"],
+                        "route_valid_candidates_3": decision_metrics["route_valid_candidates_3"],
+                        "route_valid_candidates_4": decision_metrics["route_valid_candidates_4"],
+                        "route_choice_nonzero_rate": route_choice_nonzero_rate,
+                        "route_mean_valid_candidates": route_mean_valid_candidates,
+                        "route_mean_logit_margin": route_mean_logit_margin,
+                        "route_mean_chosen_length_norm": route_mean_chosen_length_norm,
+                        "route_mean_chosen_eta_norm": route_mean_chosen_eta_norm,
+                        "route_mean_chosen_density": route_mean_chosen_density,
+                        "route_mean_chosen_first_density": route_mean_chosen_first_density,
                         "decisions_considered": decision_metrics["decisions_considered"],
                         "decisions_opened": decision_metrics["decisions_opened"],
                         "decisions_finalized": decision_metrics["decisions_finalized"],

@@ -61,6 +61,7 @@ class MAPPOConfig:
     target_kl: Optional[float] = 0.015
     actor_hidden_sizes: Tuple[int, ...] = (256, 128)
     critic_hidden_sizes: Tuple[int, ...] = (256, 128)
+    route_candidate_feature_dim: int = 0
 
 
 @dataclass
@@ -87,17 +88,59 @@ class ActionSelection:
     value: float
     entropy: float
     action_mask: np.ndarray
+    masked_logits: np.ndarray
 
 
 class MAPPOActor(nn.Module):
-    def __init__(self, observation_size: int, action_size: int, hidden_sizes: Sequence[int]):
+    def __init__(
+        self,
+        observation_size: int,
+        action_size: int,
+        hidden_sizes: Sequence[int],
+        route_candidate_feature_dim: int = 0,
+    ):
         super().__init__()
         self.observation_size = int(observation_size)
         self.action_size = int(action_size)
-        self.network = _build_mlp(self.observation_size, hidden_sizes, self.action_size)
+        self.route_candidate_feature_dim = max(int(route_candidate_feature_dim), 0)
+        self.route_feature_block_size = self.action_size * self.route_candidate_feature_dim
+        if self.route_candidate_feature_dim > 0:
+            self.base_observation_size = self.observation_size - self.route_feature_block_size
+            if self.base_observation_size <= 0:
+                raise ValueError(
+                    "route_candidate_feature_dim={} with action_size={} leaves no base observation "
+                    "features for observation_size={}.".format(
+                        self.route_candidate_feature_dim,
+                        self.action_size,
+                        self.observation_size,
+                    )
+                )
+            scorer_input_size = self.base_observation_size + self.route_candidate_feature_dim
+            self.candidate_scorer = _build_mlp(scorer_input_size, hidden_sizes, 1)
+            self.network = None
+        else:
+            self.base_observation_size = self.observation_size
+            self.candidate_scorer = None
+            self.network = _build_mlp(self.observation_size, hidden_sizes, self.action_size)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        return self.network(observations)
+        if self.candidate_scorer is None:
+            return self.network(observations)
+
+        observations = observations.reshape(-1, self.observation_size)
+        batch_size = observations.shape[0]
+        base = observations[:, :self.base_observation_size]
+        route_features = observations[:, self.base_observation_size:].reshape(
+            batch_size,
+            self.action_size,
+            self.route_candidate_feature_dim,
+        )
+        repeated_base = base.unsqueeze(1).expand(-1, self.action_size, -1)
+        scorer_input = torch.cat((repeated_base, route_features), dim=-1)
+        logits = self.candidate_scorer(
+            scorer_input.reshape(batch_size * self.action_size, -1)
+        )
+        return logits.reshape(batch_size, self.action_size)
 
 
 class MAPPOCritic(nn.Module):
@@ -132,6 +175,7 @@ class MAPPOTrainer:
             self.observation_size,
             self.action_size,
             self.config.actor_hidden_sizes,
+            route_candidate_feature_dim=self.config.route_candidate_feature_dim,
         ).to(self.device)
         self.critic = MAPPOCritic(
             self.observation_size,
@@ -275,6 +319,7 @@ class MAPPOTrainer:
             value=float(value_tensor.item()),
             entropy=float(entropy_tensor.item()),
             action_mask=action_mask.reshape(-1).copy(),
+            masked_logits=masked_logits.detach().cpu().numpy().reshape(-1).copy(),
         )
 
     def record_transition(
@@ -555,6 +600,7 @@ def load_mappo_checkpoint(path: str, device: Optional[torch.device] = None):
         checkpoint["state_size"],
         checkpoint["action_size"],
         config.actor_hidden_sizes,
+        route_candidate_feature_dim=config.route_candidate_feature_dim,
     ).to(runtime_device)
     critic = MAPPOCritic(
         checkpoint["state_size"],

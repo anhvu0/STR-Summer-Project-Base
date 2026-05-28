@@ -3,8 +3,7 @@ from __future__ import annotations
 import heapq
 import math
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Sequence, Set
 
 import numpy as np
 
@@ -12,11 +11,37 @@ import numpy as np
 @dataclass
 class RouteCandidate:
     route_edges: List[str]
-    features: np.ndarray   # shape (5,)
+    features: np.ndarray
     route_index: int
 
 
 _MAX_ROUTE_LEN = 40.0    # normalizer for junction count feature
+ROUTE_FEATURE_DIM = 7
+
+
+def pack_route_candidate_features(
+    candidates: Sequence[RouteCandidate],
+    route_k: int,
+    route_feature_dim: int = ROUTE_FEATURE_DIM,
+) -> np.ndarray:
+    parts = []
+    for candidate in list(candidates)[:int(route_k)]:
+        parts.append(
+            np.asarray(candidate.features, dtype=np.float32).reshape(int(route_feature_dim))
+        )
+    while len(parts) < int(route_k):
+        parts.append(np.zeros(int(route_feature_dim), dtype=np.float32))
+    return np.concatenate(parts).astype(np.float32)
+
+
+def filter_candidates_by_first_edges(
+    candidates: Sequence[RouteCandidate],
+    allowed_first_edges: Set[str],
+) -> List[RouteCandidate]:
+    return [
+        candidate for candidate in candidates
+        if len(candidate.route_edges) > 1 and candidate.route_edges[1] in allowed_first_edges
+    ]
 
 
 class RouteCandidateGenerator:
@@ -65,8 +90,6 @@ class RouteCandidateGenerator:
             for edge_id in connection_info.edge_list:
                 self._speed[edge_id] = 8.33
 
-        # Wrap the raw-path cache in lru_cache on an instance method via closure
-        raw_fn = self._compute_raw_candidates_uncached
         self._raw_cache: Dict = {}
         self._lru_maxsize = int(lru_maxsize)
 
@@ -81,14 +104,25 @@ class RouteCandidateGenerator:
         edge_density_fn: Callable[[str], float],
         prev_route_edges: Optional[List[str]] = None,
     ) -> List[RouteCandidate]:
-        """Return up to k_routes diverse RouteCandidate objects."""
-        raw_paths = self._get_raw_paths_cached(current_edge_id, destination_edge_id)
-        if not raw_paths:
+        """Return up to k_routes diverse candidates, including congestion-aware routes."""
+        structural_paths = self._get_raw_paths_cached(current_edge_id, destination_edge_id)
+        density_paths = self._compute_density_aware_paths(
+            current_edge_id,
+            destination_edge_id,
+            edge_density_fn,
+            structural_paths,
+        )
+        candidate_paths = self._select_paths(
+            self._dedupe_paths([*structural_paths, *density_paths]),
+            edge_density_fn,
+            self.k_routes,
+        )
+        if not candidate_paths:
             return []
 
         prev_set: Set[str] = set(prev_route_edges) if prev_route_edges else set()
         candidates = []
-        for i, route_edges in enumerate(raw_paths[: self.k_routes]):
+        for i, route_edges in enumerate(candidate_paths[: self.k_routes]):
             features = self._compute_features(route_edges, edge_density_fn, prev_set)
             candidates.append(RouteCandidate(
                 route_edges=route_edges,
@@ -138,16 +172,7 @@ class RouteCandidateGenerator:
                 if alt is not None:
                     candidates.append(alt)
 
-        # Deduplicate
-        seen_tuples: Set[tuple] = set()
-        unique: List[List[str]] = []
-        for p in candidates:
-            t = tuple(p)
-            if t not in seen_tuples:
-                seen_tuples.add(t)
-                unique.append(p)
-
-        return self._select_diverse(unique, self.k_routes)
+        return self._select_diverse(self._dedupe_paths(candidates), self.k_routes)
 
     # ------------------------------------------------------------------
     # Dijkstra with optional edge exclusion
@@ -158,12 +183,14 @@ class RouteCandidateGenerator:
         src: str,
         dst: str,
         excluded_edges: Set[str],
+        edge_cost_fn: Optional[Callable[[str], float]] = None,
     ) -> Optional[List[str]]:
         """Return shortest-cost path (list of edge IDs) from src to dst, or None."""
         if src == dst:
             return [src]
         if src not in self._adjacency:
             return None
+        edge_cost = edge_cost_fn or (lambda edge_id: self._length.get(edge_id, 5.0))
 
         dist: Dict[str, float] = {src: 0.0}
         prev: Dict[str, Optional[str]] = {src: None}
@@ -186,13 +213,122 @@ class RouteCandidateGenerator:
             for v in self._adjacency.get(u, []):
                 if v in excluded_edges:
                     continue
-                new_cost = cost + self._length.get(v, 5.0)
+                step_cost = max(float(edge_cost(v)), 1.0e-6)
+                new_cost = cost + step_cost
                 if new_cost < dist.get(v, math.inf):
                     dist[v] = new_cost
                     prev[v] = u
                     heapq.heappush(heap, (new_cost, v))
 
         return None
+
+    def _compute_density_aware_paths(
+        self,
+        src: str,
+        dst: str,
+        edge_density_fn: Callable[[str], float],
+        structural_paths: Sequence[List[str]],
+    ) -> List[List[str]]:
+        if src == dst:
+            return [[src]]
+
+        def density(edge_id: str) -> float:
+            try:
+                return float(np.clip(edge_density_fn(edge_id), 0.0, 2.0))
+            except Exception:
+                return 0.0
+
+        def length_density_cost(edge_id: str) -> float:
+            return self._length.get(edge_id, 5.0) * (1.0 + 2.2 * density(edge_id))
+
+        def eta_density_cost(edge_id: str) -> float:
+            eta = self._length.get(edge_id, 5.0) / max(self._speed.get(edge_id, 8.33), 1.0)
+            return eta * (1.0 + 1.8 * density(edge_id))
+
+        paths = [
+            self._dijkstra(src, dst, excluded_edges=set(), edge_cost_fn=length_density_cost),
+            self._dijkstra(src, dst, excluded_edges=set(), edge_cost_fn=eta_density_cost),
+        ]
+
+        if structural_paths:
+            baseline = structural_paths[0]
+            avoid_edges = sorted(
+                baseline[1:-1],
+                key=density,
+                reverse=True,
+            )[:2]
+            for edge_id in avoid_edges:
+                paths.append(
+                    self._dijkstra(src, dst, excluded_edges={edge_id})
+                )
+
+        return [path for path in paths if path]
+
+    @staticmethod
+    def _dedupe_paths(paths: Sequence[List[str]]) -> List[List[str]]:
+        seen_tuples: Set[tuple] = set()
+        unique: List[List[str]] = []
+        for path in paths:
+            if not path:
+                continue
+            key = tuple(path)
+            if key in seen_tuples:
+                continue
+            seen_tuples.add(key)
+            unique.append(list(path))
+        return unique
+
+    def _path_dynamic_score(
+        self,
+        path: List[str],
+        edge_density_fn: Callable[[str], float],
+    ) -> float:
+        if not path:
+            return math.inf
+        length = sum(self._length.get(edge_id, 5.0) for edge_id in path)
+        eta = sum(
+            self._length.get(edge_id, 5.0) / max(self._speed.get(edge_id, 8.33), 1.0)
+            for edge_id in path
+        )
+        densities = []
+        for edge_id in path:
+            try:
+                densities.append(float(np.clip(edge_density_fn(edge_id), 0.0, 2.0)))
+            except Exception:
+                densities.append(0.0)
+        mean_density = float(np.mean(densities)) if densities else 0.0
+        max_density = float(max(densities)) if densities else 0.0
+        return (
+            0.45 * min(length / max(self.max_route_length_m, 1.0), 2.0)
+            + 0.35 * min(eta / 4000.0, 2.0)
+            + 0.55 * mean_density
+            + 0.25 * max_density
+        )
+
+    def _select_paths(
+        self,
+        paths: Sequence[List[str]],
+        edge_density_fn: Callable[[str], float],
+        k: int,
+    ) -> List[List[str]]:
+        remaining = self._dedupe_paths(paths)
+        if len(remaining) <= int(k):
+            return remaining
+
+        selected: List[List[str]] = []
+        while remaining and len(selected) < int(k):
+            def score(path: List[str]) -> float:
+                diversity_bonus = 0.0
+                if selected:
+                    diversity_bonus = 0.18 * min(
+                        self._jaccard_distance(path, chosen) for chosen in selected
+                    )
+                return self._path_dynamic_score(path, edge_density_fn) - diversity_bonus
+
+            best_path = min(remaining, key=score)
+            selected.append(best_path)
+            remaining = [path for path in remaining if tuple(path) != tuple(best_path)]
+        return selected
 
     # ------------------------------------------------------------------
     # Diversity selection (greedy max-Jaccard-distance)
@@ -232,7 +368,7 @@ class RouteCandidateGenerator:
         edge_density_fn: Callable[[str], float],
         prev_set: Set[str],
     ) -> np.ndarray:
-        feats = np.zeros(5, dtype=np.float32)
+        feats = np.zeros(ROUTE_FEATURE_DIM, dtype=np.float32)
         if not route_edges:
             return feats
 
@@ -241,9 +377,15 @@ class RouteCandidateGenerator:
             self._length.get(e, 5.0) / self._speed.get(e, 8.33)
             for e in route_edges
         )
-        mean_density = float(np.mean([
-            min(float(edge_density_fn(e)), 1.0) for e in route_edges
-        ]))
+        densities = []
+        for edge_id in route_edges:
+            try:
+                densities.append(float(np.clip(edge_density_fn(edge_id), 0.0, 1.0)))
+            except Exception:
+                densities.append(0.0)
+        mean_density = float(np.mean(densities)) if densities else 0.0
+        max_density = float(max(densities)) if densities else 0.0
+        first_edge_density = float(densities[1]) if len(densities) > 1 else mean_density
 
         # Jaccard distance from previous route (exploration novelty)
         if prev_set:
@@ -255,8 +397,10 @@ class RouteCandidateGenerator:
             diversity = 0.0
 
         feats[0] = min(total_length / max(self.max_route_length_m, 1.0), 1.0)
-        feats[1] = min(len(route_edges) / _MAX_ROUTE_LEN, 1.0)
+        feats[1] = min(total_eta / 4000.0, 1.0)
         feats[2] = mean_density
-        feats[3] = min(total_eta / 4000.0, 1.0)  # normalized by MAX_SIMULATION_STEPS
-        feats[4] = float(diversity)
+        feats[3] = max_density
+        feats[4] = first_edge_density
+        feats[5] = min(len(route_edges) / _MAX_ROUTE_LEN, 1.0)
+        feats[6] = float(diversity)
         return feats

@@ -14,7 +14,12 @@ from core.mappo import load_mappo_checkpoint, action_mask_from_valid_actions
 from core.junction_decision_engine import JunctionDecisionEngine, VehicleSnapshot
 from core.shared_decision_policy import SharedDecisionPolicy
 from core.route_loop_safety import transition_signal
-from core.route_candidate_generator import RouteCandidateGenerator
+from core.route_candidate_generator import (
+    ROUTE_FEATURE_DIM,
+    RouteCandidateGenerator,
+    filter_candidates_by_first_edges,
+    pack_route_candidate_features,
+)
 
 def parse_sumocfg(sumocfg_path):
     dom = parse(sumocfg_path)
@@ -126,12 +131,13 @@ class MAPPOPolicy(RouteController):
         )
         self.compact_state_size = self.shared_policy.compact_state_size
         self.route_k = 4
-        self.route_feature_dim = 5
-        self.route_obs_dim = self.route_k * self.route_feature_dim  # 20
+        self.route_feature_dim = ROUTE_FEATURE_DIM
+        self.route_obs_dim = self.route_k * self.route_feature_dim
         self.reroute_epoch_edges = 5
         self._vehicle_route_obs: dict = {}
         self._vehicle_edges_since_reroute: dict = {}
         self._vehicle_actor_owned_route: dict = {}   # vid -> actor-committed route tuple for current epoch
+        self._init_route_runtime_metrics()
         self.route_generator = RouteCandidateGenerator(
             connection_info=self.connection_info,
             net=self.net,
@@ -149,6 +155,18 @@ class MAPPOPolicy(RouteController):
                     self.compact_state_size,
                     self.route_obs_dim,
                     self.compact_state_size + self.route_obs_dim,
+                )
+            )
+        checkpoint_route_feature_dim = int(
+            (self.model_checkpoint.get("config") or {}).get("route_candidate_feature_dim", 0)
+        )
+        if checkpoint_route_feature_dim != self.route_feature_dim:
+            raise ValueError(
+                "Checkpoint route_candidate_feature_dim={} is incompatible with the current "
+                "MAPPO controller route_feature_dim={}. Retrain or load a checkpoint produced "
+                "with the shared route-candidate scorer.".format(
+                    checkpoint_route_feature_dim,
+                    self.route_feature_dim,
                 )
             )
         self.density_scale_m = 100.0
@@ -537,17 +555,92 @@ class MAPPOPolicy(RouteController):
         summary["oldest_descriptor"] = oldest_descriptor
         return summary
 
+    def _init_route_runtime_metrics(self):
+        self._metrics.update({
+            "route_decisions_total": 0,
+            "route_candidate_count": 0,
+            "route_feasible_candidate_count": 0,
+            "route_actor_epochs_started": 0,
+            "route_actor_ownership_skips": 0,
+            "route_no_feasible_candidates": 0,
+            "route_apply_failures": 0,
+            "route_choice_nonzero_count": 0,
+            "route_valid_candidate_sum": 0,
+            "route_logit_margin_sum": 0.0,
+            "route_logit_margin_count": 0,
+            "route_chosen_length_norm_sum": 0.0,
+            "route_chosen_eta_norm_sum": 0.0,
+            "route_chosen_density_sum": 0.0,
+            "route_chosen_first_density_sum": 0.0,
+        })
+        for idx in range(self.route_k):
+            self._metrics[f"route_choice_idx_{idx}"] = 0
+        for count in range(1, self.route_k + 1):
+            self._metrics[f"route_valid_candidates_{count}"] = 0
+
+    def _route_logit_margin(self, masked_logits, valid_route_indices):
+        logits = np.asarray(masked_logits, dtype=np.float32).reshape(-1)
+        valid = [idx for idx in valid_route_indices if 0 <= int(idx) < len(logits)]
+        if len(valid) <= 1:
+            return 0.0
+        valid_logits = np.sort(logits[valid])
+        return float(valid_logits[-1] - valid_logits[-2])
+
+    def _record_route_actor_choice(self, feasible_candidates, chosen_idx, masked_logits):
+        valid_count = len(feasible_candidates)
+        self._metrics[f"route_valid_candidates_{valid_count}"] += 1
+        self._metrics["route_valid_candidate_sum"] += valid_count
+        self._metrics[f"route_choice_idx_{chosen_idx}"] += 1
+        if int(chosen_idx) != 0:
+            self._metrics["route_choice_nonzero_count"] += 1
+
+        self._metrics["route_logit_margin_sum"] += self._route_logit_margin(
+            masked_logits,
+            range(valid_count),
+        )
+        self._metrics["route_logit_margin_count"] += 1
+
+        features = np.asarray(feasible_candidates[int(chosen_idx)].features, dtype=np.float32)
+        if features.size >= ROUTE_FEATURE_DIM:
+            self._metrics["route_chosen_length_norm_sum"] += float(features[0])
+            self._metrics["route_chosen_eta_norm_sum"] += float(features[1])
+            self._metrics["route_chosen_density_sum"] += float(features[2])
+            self._metrics["route_chosen_first_density_sum"] += float(features[4])
+
     def get_runtime_metrics(self):
         metrics = dict(self._metrics)
         decisions = float(max(metrics.get("decisions", 0), 1))
         fallback_total = float(max(metrics.get("fallback_selected_total", 0), 1))
         committed_total = float(max(metrics.get("committed_cyclic_revisit_events", 0), 1))
+        route_decisions = float(max(metrics.get("route_decisions_total", 0), 1))
+        route_logit_margin_count = float(max(metrics.get("route_logit_margin_count", 0), 1))
         metrics["override_ratio"] = float(metrics.get("overrides", 0)) / decisions
         metrics["fallback_lane_now_ratio"] = (
             float(metrics.get("fallback_selected_lane_now", 0)) / fallback_total
         )
         metrics["committed_cyclic_revisit_after_fallback_ratio"] = (
             float(metrics.get("committed_cyclic_revisit_after_fallback_events", 0)) / committed_total
+        )
+        metrics["route_choice_nonzero_rate"] = (
+            float(metrics.get("route_choice_nonzero_count", 0)) / route_decisions
+        )
+        metrics["route_mean_valid_candidates"] = (
+            float(metrics.get("route_valid_candidate_sum", 0)) / route_decisions
+        )
+        metrics["route_mean_logit_margin"] = (
+            float(metrics.get("route_logit_margin_sum", 0.0)) / route_logit_margin_count
+        )
+        metrics["route_mean_chosen_length_norm"] = (
+            float(metrics.get("route_chosen_length_norm_sum", 0.0)) / route_decisions
+        )
+        metrics["route_mean_chosen_eta_norm"] = (
+            float(metrics.get("route_chosen_eta_norm_sum", 0.0)) / route_decisions
+        )
+        metrics["route_mean_chosen_density"] = (
+            float(metrics.get("route_chosen_density_sum", 0.0)) / route_decisions
+        )
+        metrics["route_mean_chosen_first_density"] = (
+            float(metrics.get("route_chosen_first_density_sum", 0.0)) / route_decisions
         )
         return metrics
 
@@ -564,6 +657,22 @@ class MAPPOPolicy(RouteController):
                 float(metrics["override_ratio"]),
                 int(metrics["fallback_selected_total"]),
                 int(metrics["fallback_selected_lane_now"]),
+            ),
+            (
+                "[RL-INFER] route_actor decisions={} epochs={} choices=[{},{},{},{}] nonzero={:.1%} "
+                "valid_mean={:.2f} margin={:.3f} no_feasible={} apply_fail={}"
+            ).format(
+                int(metrics["route_decisions_total"]),
+                int(metrics["route_actor_epochs_started"]),
+                int(metrics["route_choice_idx_0"]),
+                int(metrics["route_choice_idx_1"]),
+                int(metrics["route_choice_idx_2"]),
+                int(metrics["route_choice_idx_3"]),
+                float(metrics["route_choice_nonzero_rate"]),
+                float(metrics["route_mean_valid_candidates"]),
+                float(metrics["route_mean_logit_margin"]),
+                int(metrics["route_no_feasible_candidates"]),
+                int(metrics["route_apply_failures"]),
             ),
             (
                 "[RL-INFER] loops total={} short={} aba={} dead_end={} long={} revisit_no_progress={}"
@@ -1150,38 +1259,47 @@ class MAPPOPolicy(RouteController):
             # Reroute epoch: every reroute_epoch_edges completed edges, pick a new route.
             edges_done = self._vehicle_edges_since_reroute.get(vid, self.reroute_epoch_edges)
             if edges_done >= self.reroute_epoch_edges:
-                # Clear previous ownership; will be set again only if a new route is successfully applied.
-                self._vehicle_actor_owned_route.pop(vid, None)
+                previous_actor_route = self._vehicle_actor_owned_route.pop(vid, None)
                 candidates = self.route_generator.get_candidates(
                     start_edge,
                     vehicle.destination,
                     self._edge_density,
+                    prev_route_edges=(
+                        list(previous_actor_route)
+                        if previous_actor_route is not None else None
+                    ),
                 )
-                # Filter to candidates whose first step is reachable from available_actions.
+                self._metrics["route_candidate_count"] += len(candidates)
                 allowed_first_edges = {
                     self.decision_engine.get_next_edge(start_edge, action)
                     for action in context.available_actions
                 }
                 allowed_first_edges.discard(None)
-                feasible_candidates = [
-                    c for c in candidates
-                    if len(c.route_edges) > 1 and c.route_edges[1] in allowed_first_edges
-                ]
+                feasible_candidates = filter_candidates_by_first_edges(
+                    candidates,
+                    allowed_first_edges,
+                )
+                self._metrics["route_feasible_candidate_count"] += len(feasible_candidates)
+                self._vehicle_edges_since_reroute[vid] = 0
                 if feasible_candidates:
-                    route_obs_parts = []
-                    for i in range(self.route_k):
-                        if i < len(feasible_candidates):
-                            route_obs_parts.append(feasible_candidates[i].features)
-                        else:
-                            route_obs_parts.append(np.zeros(self.route_feature_dim, dtype=np.float32))
-                    self._vehicle_route_obs[vid] = np.concatenate(route_obs_parts)
+                    self._vehicle_route_obs[vid] = pack_route_candidate_features(
+                        feasible_candidates,
+                        self.route_k,
+                        self.route_feature_dim,
+                    )
                     route_state = self.getState(
                         vid, start_edge, vehicle.destination,
                         context=context, coordination_state=step_coordination_state,
                     )
                     valid_route_indices = list(range(len(feasible_candidates)))
-                    chosen_filtered_idx = self._act_route(route_state, valid_route_indices)
+                    chosen_filtered_idx, masked_logits = self._act_route(route_state, valid_route_indices)
                     chosen_route = feasible_candidates[chosen_filtered_idx].route_edges
+                    self._record_route_actor_choice(
+                        feasible_candidates,
+                        chosen_filtered_idx,
+                        masked_logits,
+                    )
+                    self._metrics["route_decisions_total"] += 1
                     route_applied = False
                     if len(chosen_route) > 1:
                         try:
@@ -1189,21 +1307,24 @@ class MAPPOPolicy(RouteController):
                             self._vehicle_actor_owned_route[vid] = tuple(chosen_route)
                             route_applied = True
                         except Exception:
-                            pass
-                    self._vehicle_edges_since_reroute[vid] = 0
+                            self._metrics["route_apply_failures"] += 1
                     if route_applied:
+                        self._metrics["route_actor_epochs_started"] += 1
                         continue  # authority barrier: actor owns this route for the epoch
 
                     # No feasible route applied; fall through to junction handling with fresh context.
+                    self._vehicle_route_obs.pop(vid, None)
                     self._step_context_cache.pop((str(vid), start_edge, vehicle.destination, step), None)
                     context = self._get_step_context(str(vid), start_edge, vehicle.destination, step, snapshot=snapshot)
                 else:
-                    self._vehicle_edges_since_reroute[vid] = 0
+                    self._metrics["route_no_feasible_candidates"] += 1
+                    self._vehicle_route_obs.pop(vid, None)
                     self._step_context_cache.pop((str(vid), start_edge, vehicle.destination, step), None)
                     context = self._get_step_context(str(vid), start_edge, vehicle.destination, step, snapshot=snapshot)
 
             # Ownership guard: while actor owns the route for this epoch skip all junction handling.
             if vid in self._vehicle_actor_owned_route:
+                self._metrics["route_actor_ownership_skips"] += 1
                 continue
 
             decision_mode = self.shared_policy.classify_decision(context)
@@ -1347,39 +1468,11 @@ class MAPPOPolicy(RouteController):
         logits = self._predict_action_logits(state)[0]
         available = list(valid_route_indices)
         if not available:
-            return 0
+            return 0, logits
         action_mask = action_mask_from_valid_actions(self.route_k, available)
         masked = np.where(action_mask > 0.5, logits, -1.0e9)
-        return int(np.argmax(masked))
+        return int(np.argmax(masked)), masked
 
-    # This uses the shared MAPPO actor in greedy inference mode.
-    def act(self, state, available_actions=None):
-        logits = self._predict_action_logits(state)[0]
-        if available_actions is None:
-            available = list(range(self.shared_policy.action_count))
-        else:
-            available = list(available_actions)
-        if not available:
-            return int(np.argmax(logits))
-        action_mask = action_mask_from_valid_actions(self.shared_policy.action_count, available)
-        masked = np.where(action_mask > 0.5, logits, -1.0e9)
-        return int(np.argmax(masked))
-
-    def act_batch(self, states, available_actions_batch):
-        if not states:
-            return []
-        state_batch = np.array([state[0] for state in states], dtype=np.float32)
-        logits_batch = self._predict_action_logits(state_batch)
-        results = []
-        for logits, available_actions in zip(logits_batch, available_actions_batch):
-            available = list(available_actions) if available_actions is not None else []
-            if not available:
-                results.append(int(np.argmax(logits)))
-                continue
-            action_mask = action_mask_from_valid_actions(self.shared_policy.action_count, available)
-            masked = np.where(action_mask > 0.5, logits, -1.0e9)
-            results.append(int(np.argmax(masked)))
-        return results
     # this function gives the current state of the vehicle based on the state size
     def getState(self, vehicle_id, edge_now, destination_edge, context=None, coordination_state=None):
         en = edge_now
