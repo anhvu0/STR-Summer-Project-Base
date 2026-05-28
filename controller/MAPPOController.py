@@ -131,6 +131,7 @@ class MAPPOPolicy(RouteController):
         self.reroute_epoch_edges = 5
         self._vehicle_route_obs: dict = {}
         self._vehicle_edges_since_reroute: dict = {}
+        self._vehicle_actor_owned_route: dict = {}   # vid -> actor-committed route tuple for current epoch
         self.route_generator = RouteCandidateGenerator(
             connection_info=self.connection_info,
             net=self.net,
@@ -355,6 +356,7 @@ class MAPPOPolicy(RouteController):
             self._stale_lane_now_replan_targets.pop(key, None)
         self._vehicle_route_obs.pop(vid, None)
         self._vehicle_edges_since_reroute.pop(vid, None)
+        self._vehicle_actor_owned_route.pop(vid, None)
 
     #-----------------------DEBUGGING-------------------------------------
     def _dist_to_dest(self, edge_id, dest_id):
@@ -1148,16 +1150,28 @@ class MAPPOPolicy(RouteController):
             # Reroute epoch: every reroute_epoch_edges completed edges, pick a new route.
             edges_done = self._vehicle_edges_since_reroute.get(vid, self.reroute_epoch_edges)
             if edges_done >= self.reroute_epoch_edges:
+                # Clear previous ownership; will be set again only if a new route is successfully applied.
+                self._vehicle_actor_owned_route.pop(vid, None)
                 candidates = self.route_generator.get_candidates(
                     start_edge,
                     vehicle.destination,
                     self._edge_density,
                 )
-                if candidates:
+                # Filter to candidates whose first step is reachable from available_actions.
+                allowed_first_edges = {
+                    self.decision_engine.get_next_edge(start_edge, action)
+                    for action in context.available_actions
+                }
+                allowed_first_edges.discard(None)
+                feasible_candidates = [
+                    c for c in candidates
+                    if len(c.route_edges) > 1 and c.route_edges[1] in allowed_first_edges
+                ]
+                if feasible_candidates:
                     route_obs_parts = []
                     for i in range(self.route_k):
-                        if i < len(candidates):
-                            route_obs_parts.append(candidates[i].features)
+                        if i < len(feasible_candidates):
+                            route_obs_parts.append(feasible_candidates[i].features)
                         else:
                             route_obs_parts.append(np.zeros(self.route_feature_dim, dtype=np.float32))
                     self._vehicle_route_obs[vid] = np.concatenate(route_obs_parts)
@@ -1165,18 +1179,32 @@ class MAPPOPolicy(RouteController):
                         vid, start_edge, vehicle.destination,
                         context=context, coordination_state=step_coordination_state,
                     )
-                    valid_route_indices = list(range(len(candidates)))
-                    chosen_idx = self._act_route(route_state, valid_route_indices)
-                    chosen_route = candidates[chosen_idx].route_edges
+                    valid_route_indices = list(range(len(feasible_candidates)))
+                    chosen_filtered_idx = self._act_route(route_state, valid_route_indices)
+                    chosen_route = feasible_candidates[chosen_filtered_idx].route_edges
+                    route_applied = False
                     if len(chosen_route) > 1:
                         try:
                             traci.vehicle.setRoute(vid, chosen_route)
+                            self._vehicle_actor_owned_route[vid] = tuple(chosen_route)
+                            route_applied = True
                         except Exception:
                             pass
                     self._vehicle_edges_since_reroute[vid] = 0
-                    # Rebuild context after route commit so classify_decision sees updated state.
+                    if route_applied:
+                        continue  # authority barrier: actor owns this route for the epoch
+
+                    # No feasible route applied; fall through to junction handling with fresh context.
                     self._step_context_cache.pop((str(vid), start_edge, vehicle.destination, step), None)
                     context = self._get_step_context(str(vid), start_edge, vehicle.destination, step, snapshot=snapshot)
+                else:
+                    self._vehicle_edges_since_reroute[vid] = 0
+                    self._step_context_cache.pop((str(vid), start_edge, vehicle.destination, step), None)
+                    context = self._get_step_context(str(vid), start_edge, vehicle.destination, step, snapshot=snapshot)
+
+            # Ownership guard: while actor owns the route for this epoch skip all junction handling.
+            if vid in self._vehicle_actor_owned_route:
+                continue
 
             decision_mode = self.shared_policy.classify_decision(context)
             if decision_mode.mode == "forced":

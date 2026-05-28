@@ -1793,7 +1793,7 @@ class RLTrainingPipeline:
         return model_output_path + ".best"
 
     def _default_frozen_eval_seeds(self):
-        return [6000, 6001, 6002, 6003, 6004, 6005]
+        return list(range(6000, 6030))
 
     def _frozen_eval_csv_fields(self):
         return [
@@ -1857,8 +1857,11 @@ class RLTrainingPipeline:
         )
 
     def _frozen_eval_score_key(self, summary):
+        # Primary: timeout/completion rate (lower delta = fewer timeouts than baseline).
+        # Secondary: avg travel time delta (lower = faster than baseline).
+        # win_rate is intentionally excluded from primary ranking — at 30 seeds it is
+        # 1/30-resolution and still quantized; travel-time delta is a continuous signal.
         return (
-            1.0 - float(np.clip(summary.get("win_rate", 0.0), 0.0, 1.0)),
             self._safe_eval_metric(summary.get("timeout_rate_delta_mean", 1.0)),
             self._safe_eval_metric(summary.get("avg_travel_time_delta_mean", float("inf"))),
             self._safe_eval_metric(summary.get("p90_travel_time_delta_mean", float("inf"))),
@@ -2202,6 +2205,7 @@ class RLTrainingPipeline:
             self._episode_route_obs = {}
             vehicle_edges_since_reroute: dict = {}   # vehicle_id -> edges completed since last route decision
             vehicle_route_trace: dict = {}            # vehicle_id -> route-epoch MAPPO trace
+            vehicle_actor_owned_route: dict = {}      # vehicle_id -> actor-committed route tuple for current epoch
             recent_edge_history = defaultdict(lambda: deque(maxlen=self.loop_window))
             prev_edge_by_vehicle = {}
             decision_metrics = defaultdict(float)
@@ -3314,35 +3318,58 @@ class RLTrainingPipeline:
                         # Route-epoch trigger: when enough edges have been completed, select a new macro route.
                         edges_done = vehicle_edges_since_reroute.get(vehicle_id, self.reroute_epoch_edges)
                         if edges_done >= self.reroute_epoch_edges:
+                            # Clear previous ownership; will be set again only if a new route is successfully applied.
+                            vehicle_actor_owned_route.pop(vehicle_id, None)
                             candidates = self.route_generator.get_candidates(
                                 current_edge,
                                 vehicle.destination,
                                 self._edge_density,
                             )
-                            if candidates:
-                                # Build and cache updated route observation for this vehicle
+                            decision_metrics["route_candidate_count"] += len(candidates)
+                            # Filter to candidates whose first step is reachable from available_actions.
+                            allowed_first_edges = {
+                                self.decision_engine.get_next_edge(current_edge, action)
+                                for action in context.available_actions
+                            }
+                            allowed_first_edges.discard(None)
+                            feasible_candidates = [
+                                c for c in candidates
+                                if len(c.route_edges) > 1 and c.route_edges[1] in allowed_first_edges
+                            ]
+                            decision_metrics["route_feasible_candidate_count"] += len(feasible_candidates)
+                            if feasible_candidates:
+                                # Build route observation using only feasible candidates, padded to route_k.
                                 route_obs = np.concatenate(
-                                    [c.features for c in candidates[:self.route_k]] +
-                                    ([np.zeros((self.route_k - len(candidates)) * self.route_feature_dim, dtype=np.float32)]
-                                     if len(candidates) < self.route_k else [])
+                                    [c.features for c in feasible_candidates[:self.route_k]] +
+                                    ([np.zeros((self.route_k - len(feasible_candidates)) * self.route_feature_dim, dtype=np.float32)]
+                                     if len(feasible_candidates) < self.route_k else [])
                                 )
                                 self._episode_route_obs[vehicle_id] = route_obs
-                                # Invalidate the per-step state cache for this vehicle so encode_state uses new route obs
                                 for k in [k for k in step_state_cache if k[0] == vehicle_id]:
                                     del step_state_cache[k]
                                 state = self._get_or_encode_step_state(
                                     step_state_cache, step_context_cache, vehicle_id, vehicle,
                                     step, snapshot, context=context, coordination_state=step_coordination_state,
                                 )
-                                valid_route_indices = list(range(len(candidates)))
+                                valid_route_indices = list(range(len(feasible_candidates)))
                                 route_selection = self.trainer.select_action(
                                     state, valid_route_indices,
                                     step_transition_central_observation, deterministic=False,
                                 )
-                                chosen_route = candidates[route_selection.action].route_edges
+                                chosen_filtered_idx = route_selection.action
+                                chosen_route = feasible_candidates[chosen_filtered_idx].route_edges
+                                original_idx = next(
+                                    (i for i, c in enumerate(candidates) if c is feasible_candidates[chosen_filtered_idx]),
+                                    chosen_filtered_idx,
+                                )
+                                decision_metrics[f"route_chosen_filtered_idx_{chosen_filtered_idx}"] += 1
+                                decision_metrics[f"route_chosen_original_idx_{original_idx}"] += 1
+                                route_applied = False
                                 if len(chosen_route) > 1:
                                     try:
                                         traci.vehicle.setRoute(vehicle_id, chosen_route)
+                                        vehicle_actor_owned_route[vehicle_id] = tuple(chosen_route)
+                                        route_applied = True
                                     except Exception:
                                         pass
 
@@ -3364,11 +3391,22 @@ class RLTrainingPipeline:
                                     state, step_transition_central_observation, route_selection
                                 )
                                 new_trace["vehicle_id"] = vehicle_id
-                                new_trace["route_action"] = int(route_selection.action)
+                                new_trace["route_action"] = int(chosen_filtered_idx)
                                 vehicle_route_trace[vehicle_id] = new_trace
                                 vehicle_edges_since_reroute[vehicle_id] = 0
                                 decision_metrics["route_decisions_total"] += 1
                                 decision_metrics["policy_actions"] += 1
+                                decision_metrics["route_actor_epochs_started"] += 1
+
+                                if route_applied:
+                                    prev_edge_by_vehicle[vehicle_id] = current_edge
+                                    continue  # authority barrier: actor owns this route for the epoch
+
+                        # Ownership guard: while actor owns the route for this epoch skip all junction handling.
+                        if vehicle_id in vehicle_actor_owned_route:
+                            decision_metrics["route_actor_ownership_skips"] += 1
+                            prev_edge_by_vehicle[vehicle_id] = current_edge
+                            continue
 
                         decision_mode = self.shared_policy.classify_decision(context)
                         action_source = "forced" if decision_mode.mode == "forced" else ""
@@ -3641,6 +3679,7 @@ class RLTrainingPipeline:
                             )
                         vehicle_route_trace.pop(removed_id, None)
                         vehicle_edges_since_reroute.pop(removed_id, None)
+                        vehicle_actor_owned_route.pop(removed_id, None)
                         self.cleanup_vehicle_state(
                             removed_id,
                             pending_decisions,
@@ -3722,6 +3761,7 @@ class RLTrainingPipeline:
                                 done=True,
                                 discount_steps=max(int(vehicle_edges_since_reroute.get(vid, 1)), 1),
                             )
+                        vehicle_actor_owned_route.pop(vid, None)
                 global_arrival_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "global_arrival")
                 terminal_teleport_count = sum(1 for outcome in final_outcome_by_vehicle.values() if outcome == "teleport")
                 controlled_ever_teleported = len(ever_teleported_controlled_ids)
