@@ -69,6 +69,7 @@ Useful options:
 python3 train_rl.py   --sumocfg ./configurations/myconfig.sumocfg   --model-output ./configurations/model/mappo_policy_map.pt   --episodes 500   --spawn-interval 2.0   --eval-every 25   --eval-seeds 1001,1002,1003   --eval-spawn-interval 2.0
 ```
 
+For Arm C results (mentioned in 4.0 in selfless_routing_analysis.md)
 training for greedy inference (results might not be great due to the nature of MAPPO):
 ```bash
 python train_rl.py \

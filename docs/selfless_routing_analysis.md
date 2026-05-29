@@ -63,6 +63,19 @@ requires an arbitrary conversion coefficient with no principled value, so the
 trade-off was never well-defined. The quantity that should have been used — the
 travel time saved for other vehicles, in seconds — was never computed.
 
+**What "route_balance" is**
+It's the legacy, hand-crafted selfless-routing reward — the one that predates the team-reward term and that §2.2 of the doc critiques as "the wrong quantity in the wrong units." It lives in _route_candidate_balance_components. Each time a vehicle picks a route at a reroute point, this function computes a one-shot reward by comparing the chosen route to the shortest (baseline) route using two route features:
+
+density relief (features[9]/[10]) — is the chosen route less congested than the baseline?
+eta-delta (features[7]) — how much slower is the chosen route for this vehicle?
+It then rewards a detour if its congestion relief clears a threshold, and penalizes it otherwise. This is the older, ad-hoc mechanism for nudging selflessness — the unit-less "relief" proxy, separate from the principled team-reward term.
+
+**What --disable-route-balance does**
+It sets route_balance_reward_scale = 0.0. Looking at the function, that zeroes the positive relief incentives:
+
+the "faster route" bonus (line 449)
+the "accepted selfless detour" relief bonus (line 454)
+
 Technical detail:
 - The reward rewarded **dimensionless "density relief"** (~0.01–0.28) and traded
   it against an **ETA sacrifice measured in seconds**. Bridging the two requires
@@ -235,6 +248,16 @@ objective to a strongly team-oriented one:
   incentive full authority by also removing the legacy terms that opposed it.** The
   A→B→C progression varies how strongly, and how cleanly, the objective values the
   fleet relative to the individual.
+
+  **For arm C, route_balance is disabled — that's part of what makes it "full authority."**
+
+  To be precise across the three arms as I ran them:
+
+  arm	                        route_balance	          tail-delay penalty	        team term
+  A (selfish control)	        enabled (default)	        enabled (default)	        off (α=0)
+  B (team)	                  enabled (default)	        enabled (default)	        on (α=1, scale 0.12)
+  C (full authority)	        disabled	                disabled	                on (α=1, scale 0.30)
+
 
 **Metrics used in the tables below:**
 - **fleet avg TT** — average travel time across all vehicles in the episode

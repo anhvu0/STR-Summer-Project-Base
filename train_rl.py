@@ -36,19 +36,19 @@ def build_parser():
     parser.add_argument(
         "--episodes",
         type=int,
-        default=300,
+        default=100,
         help="Number of training episodes.",
     )
     parser.add_argument(
         "--spawn-interval",
         type=float,
-        default=2.0,
+        default=0.5,
         help="Interval between vehicle spawns.",
     )
     parser.add_argument(
         "--num-target-vehicles",
         type=int,
-        default=150,
+        default=350,
         help="Number of controlled (RL) vehicles per episode.",
     )
     parser.add_argument(
@@ -60,7 +60,7 @@ def build_parser():
     parser.add_argument(
         "--target-pattern",
         type=int,
-        default=3,
+        default=2,
         choices=[1, 2, 3],
         help="Demand pattern: 1=one O/D, 2=ranged origins -> one shared destination "
              "(creates corridor congestion; use this for the selfless-routing study), "
@@ -69,7 +69,7 @@ def build_parser():
     parser.add_argument(
         "--team-reward-alpha",
         type=float,
-        default=0.0,
+        default=1.0,
         help="Weight in [0,1] on the shared fleet-congestion cost internalized by each "
              "agent. 0 = purely individual (selfish) objective; >0 rewards relieving "
              "congestion for the whole fleet (selfless routing). Recommended: 1.0.",
@@ -77,14 +77,14 @@ def build_parser():
     parser.add_argument(
         "--team-reward-scale",
         type=float,
-        default=0.12,
+        default=0.30,
         help="Per-step magnitude (travel-time units) of the shared fleet-congestion cost "
              "before scaling by --team-reward-alpha.",
     )
     parser.add_argument(
         "--eval-every",
         type=int,
-        default=25,
+        default=20,
         help="Run frozen held-out inference evaluation every N episodes. 0 disables frozen evaluation.",
     )
     parser.add_argument(
@@ -95,13 +95,13 @@ def build_parser():
     parser.add_argument(
         "--eval-spawn-interval",
         type=float,
-        default=2.0,
+        default=0.5,
         help="Optional spawn interval override for held-out frozen inference evaluation.",
     )
     parser.add_argument(
         "--eval-policy",
         choices=["greedy", "stochastic"],
-        default="greedy",
+        default="stochastic",
         help="Deployment / frozen-eval route selection mode. greedy=argmax (reproducible); "
              "stochastic=sample from the policy so the fleet spreads across alternative routes "
              "(option (b) in docs/selfless_routing_analysis.md).",
@@ -110,14 +110,17 @@ def build_parser():
         "--disable-tail-delay-penalty",
         action="store_true",
         help="Zero the tail-delay penalty, which otherwise escalates exactly when a vehicle "
-             "detours (structurally anti-selfless). Part of the arm-C 'full authority' config.",
+             "detours (structurally anti-selfless). Part of the arm-C 'full authority' config."
+             "Include it in the cli to turn it to True. True is better because False actually add selfish noises.",
     )
     parser.add_argument(
         "--disable-route-balance",
         action="store_true",
         help="Zero the legacy hand-crafted route_balance reward so the principled team-reward "
-             "term is the sole selfless driver. Part of the arm-C 'full authority' config.",
+             "term is the sole selfless driver. Part of the arm-C 'full authority' config."
+             "Include it in the cli to turn it to True. True is better because False actually add selfish noises.",
     )
+    
     parser.add_argument(
         "--fast-mode",
         dest="fast_mode",

@@ -1,0 +1,1179 @@
+Inference scenario: controlled=350, uncontrolled=150, pattern=2, spawn_interval=0.5, seeds=4001,4002,4003,4004,4005,4006,4007,4008,4009,4010,4011,4012,4013,4014,4015,4016,4017,4018,4019,4020,4021,4022,4023,4024,4025,4026,4027,4028,4029,4030,4031,4032,4033,4034,4035,4036,4037,4038,4039,4040,4041,4042,4043,4044,4045,4046,4047,4048,4049
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+148
+Scenario seed: 4001
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 470.18, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=439.50, p90=918.00, tail_gap=518.50, p95/p50=2.17, timeout_rate=0.000
+157 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=765 overrides=55 override_ratio=7.2% fallbacks(total/lane_now)=42/42
+[RL-INFER] route_actor decisions=626 epochs=626 choices=[525,61,33,7] nonzero=16.1% valid_mean=2.82 margin=1.273 eta_delta=1.0s relief=0.017 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=1 short=0 aba=1 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=127 release(no_prog/stall/hard)=16/0/127 lane_now_rescue(release/forced/blocked)=16/16/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=51/35/16/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=33465 pressure_filtered=40/40
+Average timespan: 312.09714285714284, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=286.50, p90=606.00, tail_gap=351.14, p95/p50=2.20, timeout_rate=0.000
+84 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+148
+Scenario seed: 4002
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 254.16857142857143, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=236.50, p90=495.00, tail_gap=285.47, p95/p50=2.21, timeout_rate=0.000
+68 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=682 overrides=172 override_ratio=25.2% fallbacks(total/lane_now)=88/88
+[RL-INFER] route_actor decisions=585 epochs=585 choices=[560,14,10,1] nonzero=4.3% valid_mean=2.50 margin=1.203 eta_delta=1.9s relief=0.014 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=86 release(no_prog/stall/hard)=0/0/86 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=52/37/14/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=28114 pressure_filtered=8/8
+Average timespan: 246.9142857142857, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=242.00, p90=466.30, tail_gap=278.57, p95/p50=2.16, timeout_rate=0.000
+63 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+147
+Scenario seed: 4003
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 430.36, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=376.50, p90=864.10, tail_gap=540.44, p95/p50=2.45, timeout_rate=0.000
+145 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=976 overrides=42 override_ratio=4.3% fallbacks(total/lane_now)=28/28
+[RL-INFER] route_actor decisions=829 epochs=829 choices=[777,25,24,3] nonzero=6.3% valid_mean=2.73 margin=0.917 eta_delta=1.9s relief=0.017 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=2 short=0 aba=0 dead_end=0 long=2 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=275 release(no_prog/stall/hard)=3/0/275 lane_now_rescue(release/forced/blocked)=3/3/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=39/27/11/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=42755 pressure_filtered=12/12
+Average timespan: 394.69714285714286, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=352.00, p90=791.10, tail_gap=499.71, p95/p50=2.40, timeout_rate=0.000
+125 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+148
+Scenario seed: 4004
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 551.5371428571428, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=566.00, p90=1026.30, tail_gap=510.40, p95/p50=1.88, timeout_rate=0.000
+181 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=1100 overrides=528 override_ratio=48.0% fallbacks(total/lane_now)=281/281
+[RL-INFER] route_actor decisions=727 epochs=727 choices=[717,5,5,0] nonzero=1.4% valid_mean=2.80 margin=1.044 eta_delta=0.6s relief=0.002 no_feasible=2 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=393 release(no_prog/stall/hard)=1/0/393 lane_now_rescue(release/forced/blocked)=1/1/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=39/26/13/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=49715 pressure_filtered=10/10
+Average timespan: 515.9542857142857, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=507.50, p90=980.10, tail_gap=511.50, p95/p50=2.00, timeout_rate=0.000
+163 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+143
+Scenario seed: 4005
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 270.25714285714287, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=255.50, p90=527.30, tail_gap=321.24, p95/p50=2.29, timeout_rate=0.000
+67 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=683 overrides=95 override_ratio=13.9% fallbacks(total/lane_now)=58/58
+[RL-INFER] route_actor decisions=627 epochs=627 choices=[595,12,15,5] nonzero=5.1% valid_mean=2.62 margin=1.027 eta_delta=2.2s relief=0.016 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=80 release(no_prog/stall/hard)=0/0/80 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=55/36/17/1/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=28498 pressure_filtered=2/2
+Average timespan: 260.1514285714286, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=256.00, p90=493.50, tail_gap=307.17, p95/p50=2.17, timeout_rate=0.000
+68 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+144
+Scenario seed: 4006
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 258.6714285714286, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=257.50, p90=439.10, tail_gap=203.99, p95/p50=1.79, timeout_rate=0.000
+75 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=739 overrides=52 override_ratio=7.0% fallbacks(total/lane_now)=30/30
+[RL-INFER] route_actor decisions=532 epochs=532 choices=[519,11,1,1] nonzero=2.4% valid_mean=2.75 margin=1.247 eta_delta=0.6s relief=0.004 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=1 short=0 aba=1 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=1 unique<=3=0 unique=4=1 committed_cyclic=1 after_fallback=0
+[RL-INFER] pending_timeouts=14 release(no_prog/stall/hard)=2/0/14 lane_now_rescue(release/forced/blocked)=2/2/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=37/25/12/0/0 cooldown_blocked=1
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=25212 pressure_filtered=10/10
+Average timespan: 186.69142857142856, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=189.00, p90=314.20, tail_gap=151.89, p95/p50=1.79, timeout_rate=0.000
+31 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+145
+Scenario seed: 4007
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 449.8828571428571, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=393.50, p90=912.10, tail_gap=594.64, p95/p50=2.50, timeout_rate=0.000
+147 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=631 overrides=33 override_ratio=5.2% fallbacks(total/lane_now)=22/22
+[RL-INFER] route_actor decisions=651 epochs=651 choices=[563,56,24,8] nonzero=13.5% valid_mean=2.45 margin=0.682 eta_delta=1.5s relief=0.019 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=3 short=0 aba=0 dead_end=0 long=3 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=99 release(no_prog/stall/hard)=12/0/99 lane_now_rescue(release/forced/blocked)=12/12/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=54/45/8/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=32806 pressure_filtered=27/27
+Average timespan: 343.5628571428571, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=308.00, p90=669.00, tail_gap=425.86, p95/p50=2.38, timeout_rate=0.000
+99 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+147
+Scenario seed: 4008
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 331.15714285714284, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=321.50, p90=631.40, tail_gap=362.99, p95/p50=2.10, timeout_rate=0.000
+101 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=628 overrides=168 override_ratio=26.8% fallbacks(total/lane_now)=85/85
+[RL-INFER] route_actor decisions=774 epochs=774 choices=[715,31,23,5] nonzero=7.6% valid_mean=2.45 margin=0.915 eta_delta=2.0s relief=0.018 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=1 short=0 aba=0 dead_end=0 long=1 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=71 release(no_prog/stall/hard)=1/0/71 lane_now_rescue(release/forced/blocked)=1/1/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=52/36/16/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=28139 pressure_filtered=6/6
+Average timespan: 306.90285714285716, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=313.50, p90=553.50, tail_gap=305.10, p95/p50=1.95, timeout_rate=0.000
+84 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+146
+Scenario seed: 4009
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 558.4714285714285, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=552.00, p90=1012.40, tail_gap=522.63, p95/p50=1.94, timeout_rate=0.000
+187 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=817 overrides=35 override_ratio=4.3% fallbacks(total/lane_now)=25/25
+[RL-INFER] route_actor decisions=596 epochs=596 choices=[522,48,19,7] nonzero=12.4% valid_mean=2.87 margin=1.123 eta_delta=1.1s relief=0.016 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=2 short=0 aba=2 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=1 after_fallback=0
+[RL-INFER] pending_timeouts=190 release(no_prog/stall/hard)=10/0/190 lane_now_rescue(release/forced/blocked)=10/10/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=45/25/19/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=38588 pressure_filtered=36/36
+Average timespan: 515.56, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=509.50, p90=935.80, tail_gap=488.90, p95/p50=1.93, timeout_rate=0.000
+164 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+147
+Scenario seed: 4010
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 588.4114285714286, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=582.50, p90=1050.00, tail_gap=518.81, p95/p50=1.89, timeout_rate=0.000
+199 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=858 overrides=137 override_ratio=16.0% fallbacks(total/lane_now)=75/75
+[RL-INFER] route_actor decisions=670 epochs=670 choices=[572,39,47,12] nonzero=14.6% valid_mean=2.61 margin=1.036 eta_delta=1.6s relief=0.013 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=1 short=0 aba=0 dead_end=0 long=1 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=477 release(no_prog/stall/hard)=8/0/477 lane_now_rescue(release/forced/blocked)=8/7/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=57/37/19/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=56014 pressure_filtered=19/19
+Average timespan: 862.9428571428572, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=907.00, p90=1335.20, tail_gap=503.43, p95/p50=1.54, timeout_rate=0.000
+281 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+150
+Scenario seed: 4011
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 621.5028571428571, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=622.00, p90=1138.20, tail_gap=582.80, p95/p50=1.95, timeout_rate=0.000
+209 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=964 overrides=93 override_ratio=9.6% fallbacks(total/lane_now)=64/64
+[RL-INFER] route_actor decisions=1020 epochs=1020 choices=[1002,7,11,0] nonzero=1.8% valid_mean=2.32 margin=0.814 eta_delta=0.4s relief=0.003 no_feasible=2 apply_fail=0
+[RL-INFER] loops total=1 short=0 aba=0 dead_end=0 long=1 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=254 release(no_prog/stall/hard)=1/0/254 lane_now_rescue(release/forced/blocked)=1/1/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=45/35/10/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=42483 pressure_filtered=6/6
+Average timespan: 597.8428571428572, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=592.00, p90=1106.80, tail_gap=593.60, p95/p50=1.98, timeout_rate=0.000
+198 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+148
+Scenario seed: 4012
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 442.78, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=415.00, p90=832.10, tail_gap=448.43, p95/p50=2.08, timeout_rate=0.000
+149 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=963 overrides=79 override_ratio=8.2% fallbacks(total/lane_now)=52/52
+[RL-INFER] route_actor decisions=479 epochs=479 choices=[456,10,12,1] nonzero=4.8% valid_mean=3.00 margin=0.975 eta_delta=1.7s relief=0.013 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=2 short=0 aba=0 dead_end=0 long=2 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=366 release(no_prog/stall/hard)=2/0/366 lane_now_rescue(release/forced/blocked)=2/2/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=47/21/24/0/2 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=46942 pressure_filtered=3/3
+Average timespan: 456.2142857142857, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=426.00, p90=858.10, tail_gap=480.17, p95/p50=2.12, timeout_rate=0.000
+157 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+144
+Scenario seed: 4013
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 463.2085714285714, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=417.50, p90=871.00, tail_gap=512.33, p95/p50=2.23, timeout_rate=0.000
+166 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=1166 overrides=72 override_ratio=6.2% fallbacks(total/lane_now)=49/49
+[RL-INFER] route_actor decisions=545 epochs=545 choices=[533,10,0,2] nonzero=2.2% valid_mean=2.86 margin=1.014 eta_delta=1.3s relief=0.006 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=5 short=0 aba=0 dead_end=0 long=5 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=437 release(no_prog/stall/hard)=2/0/437 lane_now_rescue(release/forced/blocked)=2/2/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=57/37/20/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=53619 pressure_filtered=23/23
+Average timespan: 490.2457142857143, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=497.50, p90=928.10, tail_gap=482.84, p95/p50=1.97, timeout_rate=0.000
+175 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+147
+Scenario seed: 4014
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 255.81142857142856, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=274.50, p90=421.30, tail_gap=176.99, p95/p50=1.60, timeout_rate=0.000
+57 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=711 overrides=122 override_ratio=17.2% fallbacks(total/lane_now)=73/73
+[RL-INFER] route_actor decisions=558 epochs=558 choices=[493,30,24,11] nonzero=11.6% valid_mean=3.02 margin=1.309 eta_delta=2.6s relief=0.020 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=3 short=0 aba=0 dead_end=0 long=3 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=54 release(no_prog/stall/hard)=2/0/54 lane_now_rescue(release/forced/blocked)=2/2/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=69/49/19/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=27290 pressure_filtered=20/20
+Average timespan: 261.41714285714284, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=283.00, p90=444.20, tail_gap=202.51, p95/p50=1.69, timeout_rate=0.000
+64 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+147
+Scenario seed: 4015
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 456.62, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=451.00, p90=870.20, tail_gap=457.54, p95/p50=2.02, timeout_rate=0.000
+160 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=723 overrides=54 override_ratio=7.5% fallbacks(total/lane_now)=35/35
+[RL-INFER] route_actor decisions=618 epochs=618 choices=[549,45,21,3] nonzero=11.2% valid_mean=2.80 margin=0.881 eta_delta=3.8s relief=0.034 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=278 release(no_prog/stall/hard)=1/0/278 lane_now_rescue(release/forced/blocked)=1/1/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=31/17/14/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=40922 pressure_filtered=1/1
+Average timespan: 523.4942857142858, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=534.00, p90=927.40, tail_gap=443.14, p95/p50=1.83, timeout_rate=0.000
+205 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+148
+Scenario seed: 4016
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 181.70285714285714, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=183.50, p90=285.20, tail_gap=125.16, p95/p50=1.66, timeout_rate=0.000
+20 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=738 overrides=97 override_ratio=13.1% fallbacks(total/lane_now)=60/60
+[RL-INFER] route_actor decisions=647 epochs=647 choices=[630,11,6,0] nonzero=2.6% valid_mean=2.94 margin=1.332 eta_delta=1.3s relief=0.005 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=12 release(no_prog/stall/hard)=0/0/12 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=37/26/11/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=24268 pressure_filtered=12/12
+Average timespan: 183.55142857142857, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=178.00, p90=313.10, tail_gap=168.51, p95/p50=1.89, timeout_rate=0.000
+23 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+149
+Scenario seed: 4017
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 450.7114285714286, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=419.50, p90=896.10, tail_gap=528.73, p95/p50=2.24, timeout_rate=0.000
+156 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=735 overrides=97 override_ratio=13.2% fallbacks(total/lane_now)=57/57
+[RL-INFER] route_actor decisions=498 epochs=498 choices=[422,36,30,10] nonzero=15.3% valid_mean=2.93 margin=1.123 eta_delta=1.3s relief=0.018 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=5 short=2 aba=4 dead_end=0 long=1 revisit_no_progress=0
+[RL-INFER] small_set_loops total=2 unique<=3=2 unique=4=0 committed_cyclic=3 after_fallback=2
+[RL-INFER] pending_timeouts=139 release(no_prog/stall/hard)=16/0/139 lane_now_rescue(release/forced/blocked)=16/15/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=50/36/13/1/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=33591 pressure_filtered=28/28
+Average timespan: 291.6771428571429, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=251.00, p90=604.10, tail_gap=393.26, p95/p50=2.54, timeout_rate=0.000
+74 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+147
+Scenario seed: 4018
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 347.10571428571427, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=253.50, p90=731.10, tail_gap=538.73, p95/p50=3.09, timeout_rate=0.000
+114 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=793 overrides=65 override_ratio=8.2% fallbacks(total/lane_now)=38/38
+[RL-INFER] route_actor decisions=605 epochs=605 choices=[560,38,6,1] nonzero=7.4% valid_mean=2.88 margin=1.222 eta_delta=3.5s relief=0.028 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=1 short=0 aba=0 dead_end=0 long=1 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=118 release(no_prog/stall/hard)=0/0/118 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=25/17/8/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=32387 pressure_filtered=6/6
+Average timespan: 297.01142857142855, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=235.00, p90=636.70, tail_gap=451.17, p95/p50=2.89, timeout_rate=0.000
+81 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+146
+Scenario seed: 4019
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 300.19142857142856, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=294.50, p90=564.20, tail_gap=301.73, p95/p50=1.99, timeout_rate=0.000
+100 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=715 overrides=89 override_ratio=12.4% fallbacks(total/lane_now)=52/52
+[RL-INFER] route_actor decisions=502 epochs=502 choices=[467,21,11,3] nonzero=7.0% valid_mean=2.71 margin=0.940 eta_delta=2.2s relief=0.015 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=5 short=0 aba=0 dead_end=0 long=5 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=78 release(no_prog/stall/hard)=0/0/78 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=48/32/15/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=29587 pressure_filtered=0/0
+Average timespan: 275.26, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=270.00, p90=481.60, tail_gap=260.40, p95/p50=1.95, timeout_rate=0.000
+86 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+148
+Scenario seed: 4020
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 211.04285714285714, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=198.00, p90=343.40, tail_gap=168.11, p95/p50=1.84, timeout_rate=0.000
+53 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=781 overrides=57 override_ratio=7.3% fallbacks(total/lane_now)=33/33
+[RL-INFER] route_actor decisions=540 epochs=540 choices=[508,22,6,4] nonzero=5.9% valid_mean=2.97 margin=1.156 eta_delta=3.5s relief=0.017 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=11 release(no_prog/stall/hard)=0/0/11 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=30/21/9/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=25554 pressure_filtered=4/4
+Average timespan: 191.46571428571428, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=180.50, p90=315.30, tail_gap=166.47, p95/p50=1.88, timeout_rate=0.000
+37 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+146
+Scenario seed: 4021
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 431.13428571428574, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=392.00, p90=842.00, tail_gap=501.39, p95/p50=2.29, timeout_rate=0.000
+136 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=931 overrides=58 override_ratio=6.2% fallbacks(total/lane_now)=41/41
+[RL-INFER] route_actor decisions=723 epochs=723 choices=[655,28,33,7] nonzero=9.4% valid_mean=2.81 margin=0.773 eta_delta=2.8s relief=0.028 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=252 release(no_prog/stall/hard)=1/0/252 lane_now_rescue(release/forced/blocked)=1/1/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=60/48/11/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=40787 pressure_filtered=16/16
+Average timespan: 373.68857142857144, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=334.00, p90=747.40, tail_gap=464.69, p95/p50=2.37, timeout_rate=0.000
+119 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+150
+Scenario seed: 4022
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 470.8485714285714, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=437.50, p90=897.00, tail_gap=536.93, p95/p50=2.19, timeout_rate=0.000
+179 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=816 overrides=169 override_ratio=20.7% fallbacks(total/lane_now)=88/88
+[RL-INFER] route_actor decisions=482 epochs=482 choices=[440,28,12,2] nonzero=8.7% valid_mean=2.67 margin=0.965 eta_delta=1.9s relief=0.015 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=282 release(no_prog/stall/hard)=2/0/282 lane_now_rescue(release/forced/blocked)=2/2/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=46/38/8/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=44326 pressure_filtered=14/14
+Average timespan: 441.86571428571426, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=406.00, p90=839.00, tail_gap=516.44, p95/p50=2.27, timeout_rate=0.000
+172 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+147
+Scenario seed: 4023
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 460.22, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=402.50, p90=879.10, tail_gap=511.24, p95/p50=2.24, timeout_rate=0.000
+163 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=1106 overrides=73 override_ratio=6.6% fallbacks(total/lane_now)=52/52
+[RL-INFER] route_actor decisions=484 epochs=484 choices=[459,15,8,2] nonzero=5.2% valid_mean=3.13 margin=1.179 eta_delta=1.8s relief=0.012 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=417 release(no_prog/stall/hard)=0/0/417 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=33/23/9/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=50430 pressure_filtered=11/11
+Average timespan: 452.75714285714287, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=434.50, p90=848.10, tail_gap=473.56, p95/p50=2.09, timeout_rate=0.000
+163 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+143
+Scenario seed: 4024
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 646.0885714285714, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=603.50, p90=1173.10, tail_gap=621.99, p95/p50=2.02, timeout_rate=0.000
+197 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=855 overrides=98 override_ratio=11.5% fallbacks(total/lane_now)=63/63
+[RL-INFER] route_actor decisions=662 epochs=662 choices=[540,49,57,16] nonzero=18.4% valid_mean=2.69 margin=0.926 eta_delta=4.1s relief=0.028 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=4 short=0 aba=0 dead_end=0 long=4 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=304 release(no_prog/stall/hard)=6/0/304 lane_now_rescue(release/forced/blocked)=6/5/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=47/22/25/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=45943 pressure_filtered=8/8
+Average timespan: 539.9542857142857, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=527.50, p90=975.20, tail_gap=519.10, p95/p50=1.99, timeout_rate=0.000
+160 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+147
+Scenario seed: 4025
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 509.60571428571427, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=487.50, p90=936.60, tail_gap=552.76, p95/p50=2.11, timeout_rate=0.000
+151 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=752 overrides=131 override_ratio=17.4% fallbacks(total/lane_now)=70/70
+[RL-INFER] route_actor decisions=898 epochs=898 choices=[884,10,4,0] nonzero=1.6% valid_mean=2.54 margin=0.831 eta_delta=0.6s relief=0.006 no_feasible=1 apply_fail=0
+[RL-INFER] loops total=3 short=1 aba=2 dead_end=0 long=1 revisit_no_progress=0
+[RL-INFER] small_set_loops total=1 unique<=3=1 unique=4=0 committed_cyclic=2 after_fallback=1
+[RL-INFER] pending_timeouts=55 release(no_prog/stall/hard)=0/0/55 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=36/20/16/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=28535 pressure_filtered=2/2
+Average timespan: 490.5628571428571, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=451.00, p90=925.10, tail_gap=548.14, p95/p50=2.20, timeout_rate=0.000
+139 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+147
+Scenario seed: 4026
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 425.07714285714286, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=375.50, p90=851.70, tail_gap=538.36, p95/p50=2.42, timeout_rate=0.000
+154 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=867 overrides=59 override_ratio=6.8% fallbacks(total/lane_now)=37/37
+[RL-INFER] route_actor decisions=722 epochs=722 choices=[646,36,29,11] nonzero=10.5% valid_mean=2.89 margin=0.855 eta_delta=3.0s relief=0.034 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=219 release(no_prog/stall/hard)=0/0/219 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=24/16/8/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=37672 pressure_filtered=10/10
+Average timespan: 374.39428571428573, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=345.00, p90=751.50, tail_gap=468.40, p95/p50=2.35, timeout_rate=0.000
+130 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+146
+Scenario seed: 4027
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 581.3971428571429, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=545.50, p90=1158.40, tail_gap=711.27, p95/p50=2.32, timeout_rate=0.000
+192 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=1105 overrides=57 override_ratio=5.2% fallbacks(total/lane_now)=39/39
+[RL-INFER] route_actor decisions=607 epochs=607 choices=[476,78,32,21] nonzero=21.6% valid_mean=2.86 margin=0.832 eta_delta=4.8s relief=0.066 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=446 release(no_prog/stall/hard)=4/0/446 lane_now_rescue(release/forced/blocked)=4/4/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=60/42/18/0/0 cooldown_blocked=1
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=53686 pressure_filtered=13/13
+Average timespan: 483.9742857142857, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=455.00, p90=940.20, tail_gap=564.60, p95/p50=2.21, timeout_rate=0.000
+173 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+148
+Scenario seed: 4028
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 804.8971428571429, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=801.50, p90=1339.20, tail_gap=615.16, p95/p50=1.76, timeout_rate=0.000
+260 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=735 overrides=120 override_ratio=16.3% fallbacks(total/lane_now)=69/69
+[RL-INFER] route_actor decisions=761 epochs=761 choices=[711,25,20,5] nonzero=6.6% valid_mean=2.17 margin=0.806 eta_delta=1.5s relief=0.014 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=2 short=0 aba=0 dead_end=0 long=2 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=220 release(no_prog/stall/hard)=5/0/220 lane_now_rescue(release/forced/blocked)=5/5/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=57/36/21/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=42743 pressure_filtered=19/19
+Average timespan: 580.3857142857142, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=530.00, p90=1094.50, tail_gap=655.91, p95/p50=2.23, timeout_rate=0.000
+193 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+148
+Scenario seed: 4029
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 230.42857142857142, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=230.00, p90=400.40, tail_gap=202.37, p95/p50=1.85, timeout_rate=0.000
+31 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=698 overrides=73 override_ratio=10.5% fallbacks(total/lane_now)=40/40
+[RL-INFER] route_actor decisions=721 epochs=721 choices=[689,19,11,2] nonzero=4.4% valid_mean=2.38 margin=1.186 eta_delta=0.9s relief=0.008 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=12 release(no_prog/stall/hard)=5/0/12 lane_now_rescue(release/forced/blocked)=5/5/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=63/49/14/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=23673 pressure_filtered=25/25
+Average timespan: 208.94285714285715, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=195.00, p90=386.00, tail_gap=223.92, p95/p50=2.12, timeout_rate=0.000
+26 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+146
+Scenario seed: 4030
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 298.9942857142857, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=265.50, p90=632.10, tail_gap=404.19, p95/p50=2.50, timeout_rate=0.000
+96 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=688 overrides=113 override_ratio=16.4% fallbacks(total/lane_now)=67/67
+[RL-INFER] route_actor decisions=544 epochs=544 choices=[526,11,7,0] nonzero=3.3% valid_mean=2.63 margin=1.194 eta_delta=1.5s relief=0.016 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=110 release(no_prog/stall/hard)=0/0/110 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=44/29/14/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=30296 pressure_filtered=1/1
+Average timespan: 263.36857142857144, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=246.00, p90=563.00, tail_gap=355.64, p95/p50=2.45, timeout_rate=0.000
+80 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+145
+Scenario seed: 4031
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 260.0628571428571, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=206.50, p90=537.20, tail_gap=404.30, p95/p50=2.84, timeout_rate=0.000
+60 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=850 overrides=77 override_ratio=9.1% fallbacks(total/lane_now)=52/52
+[RL-INFER] route_actor decisions=567 epochs=567 choices=[519,30,8,10] nonzero=8.5% valid_mean=2.59 margin=0.755 eta_delta=1.5s relief=0.016 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=5 short=0 aba=0 dead_end=0 long=5 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=149 release(no_prog/stall/hard)=0/0/149 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=66/45/21/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=36082 pressure_filtered=8/8
+Average timespan: 259.59714285714284, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=213.00, p90=531.30, tail_gap=380.63, p95/p50=2.75, timeout_rate=0.000
+55 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+146
+Scenario seed: 4032
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 425.72285714285715, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=365.50, p90=881.20, tail_gap=552.13, p95/p50=2.51, timeout_rate=0.000
+129 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=982 overrides=85 override_ratio=8.7% fallbacks(total/lane_now)=52/52
+[RL-INFER] route_actor decisions=819 epochs=819 choices=[774,15,29,1] nonzero=5.5% valid_mean=2.70 margin=0.903 eta_delta=1.7s relief=0.014 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=1 short=0 aba=0 dead_end=0 long=1 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=285 release(no_prog/stall/hard)=0/0/285 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=37/25/11/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=43512 pressure_filtered=14/14
+Average timespan: 379.7657142857143, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=352.50, p90=762.20, tail_gap=474.99, p95/p50=2.36, timeout_rate=0.000
+111 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+150
+Scenario seed: 4033
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 555.7028571428572, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=516.00, p90=1028.10, tail_gap=574.23, p95/p50=2.08, timeout_rate=0.000
+197 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=783 overrides=78 override_ratio=10.0% fallbacks(total/lane_now)=54/54
+[RL-INFER] route_actor decisions=607 epochs=607 choices=[516,54,29,8] nonzero=15.0% valid_mean=2.59 margin=1.030 eta_delta=2.5s relief=0.019 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=220 release(no_prog/stall/hard)=0/0/220 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=58/33/23/1/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=41158 pressure_filtered=12/12
+Average timespan: 391.12285714285713, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=338.00, p90=758.10, tail_gap=467.31, p95/p50=2.36, timeout_rate=0.000
+131 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+145
+Scenario seed: 4034
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 270.4085714285714, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=260.50, p90=463.00, tail_gap=232.64, p95/p50=1.87, timeout_rate=0.000
+91 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=678 overrides=71 override_ratio=10.5% fallbacks(total/lane_now)=49/49
+[RL-INFER] route_actor decisions=476 epochs=476 choices=[428,24,16,8] nonzero=10.1% valid_mean=2.59 margin=0.943 eta_delta=1.5s relief=0.021 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=5 short=0 aba=0 dead_end=0 long=5 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=65 release(no_prog/stall/hard)=2/0/65 lane_now_rescue(release/forced/blocked)=2/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=58/35/22/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=30466 pressure_filtered=9/9
+Average timespan: 240.43428571428572, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=237.50, p90=431.40, tail_gap=241.90, p95/p50=1.98, timeout_rate=0.000
+66 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+147
+Scenario seed: 4035
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 523.9657142857143, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=526.00, p90=910.20, tail_gap=442.69, p95/p50=1.82, timeout_rate=0.000
+201 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=743 overrides=78 override_ratio=10.5% fallbacks(total/lane_now)=49/49
+[RL-INFER] route_actor decisions=646 epochs=646 choices=[604,27,15,0] nonzero=6.5% valid_mean=2.36 margin=1.002 eta_delta=0.7s relief=0.009 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=145 release(no_prog/stall/hard)=1/0/145 lane_now_rescue(release/forced/blocked)=1/1/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=45/19/25/1/0 cooldown_blocked=2
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=35426 pressure_filtered=6/6
+Average timespan: 467.1457142857143, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=426.50, p90=862.30, tail_gap=498.99, p95/p50=2.15, timeout_rate=0.000
+173 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+145
+Scenario seed: 4036
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 591.4028571428571, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=586.50, p90=1094.00, tail_gap=561.58, p95/p50=1.94, timeout_rate=0.000
+191 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=939 overrides=100 override_ratio=10.6% fallbacks(total/lane_now)=71/71
+[RL-INFER] route_actor decisions=929 epochs=929 choices=[918,6,5,0] nonzero=1.2% valid_mean=2.22 margin=0.776 eta_delta=0.2s relief=0.002 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=235 release(no_prog/stall/hard)=1/0/235 lane_now_rescue(release/forced/blocked)=1/1/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=63/43/20/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=39701 pressure_filtered=8/8
+Average timespan: 549.0257142857142, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=567.50, p90=1040.00, tail_gap=529.86, p95/p50=1.94, timeout_rate=0.000
+177 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+145
+Scenario seed: 4037
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 207.45714285714286, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=201.50, p90=359.30, tail_gap=188.90, p95/p50=1.90, timeout_rate=0.000
+46 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=760 overrides=59 override_ratio=7.8% fallbacks(total/lane_now)=38/38
+[RL-INFER] route_actor decisions=460 epochs=460 choices=[433,16,11,0] nonzero=5.9% valid_mean=3.05 margin=1.344 eta_delta=2.3s relief=0.013 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=2 short=0 aba=1 dead_end=0 long=1 revisit_no_progress=0
+[RL-INFER] small_set_loops total=2 unique<=3=0 unique=4=2 committed_cyclic=1 after_fallback=0
+[RL-INFER] pending_timeouts=26 release(no_prog/stall/hard)=1/0/26 lane_now_rescue(release/forced/blocked)=1/1/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=39/27/11/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=25486 pressure_filtered=5/5
+Average timespan: 190.66857142857143, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=189.00, p90=325.20, tail_gap=160.89, p95/p50=1.83, timeout_rate=0.000
+30 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+149
+Scenario seed: 4038
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 521.3371428571429, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=495.50, p90=989.00, tail_gap=554.69, p95/p50=2.11, timeout_rate=0.000
+172 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=654 overrides=69 override_ratio=10.6% fallbacks(total/lane_now)=44/44
+[RL-INFER] route_actor decisions=706 epochs=706 choices=[626,44,19,17] nonzero=11.3% valid_mean=2.31 margin=0.610 eta_delta=1.7s relief=0.017 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=2 short=0 aba=0 dead_end=0 long=2 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=128 release(no_prog/stall/hard)=18/0/128 lane_now_rescue(release/forced/blocked)=18/18/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=47/31/16/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=35873 pressure_filtered=26/26
+Average timespan: 460.7628571428571, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=429.00, p90=848.50, tail_gap=489.11, p95/p50=2.11, timeout_rate=0.000
+147 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+148
+Scenario seed: 4039
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 537.4514285714286, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=528.00, p90=1002.20, tail_gap=538.74, p95/p50=2.00, timeout_rate=0.000
+187 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=854 overrides=90 override_ratio=10.5% fallbacks(total/lane_now)=59/59
+[RL-INFER] route_actor decisions=611 epochs=611 choices=[551,39,21,0] nonzero=9.8% valid_mean=2.56 margin=1.031 eta_delta=1.3s relief=0.017 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=1 unique<=3=0 unique=4=1 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=307 release(no_prog/stall/hard)=3/0/307 lane_now_rescue(release/forced/blocked)=3/3/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=53/34/19/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=44380 pressure_filtered=3/3
+Average timespan: 502.7885714285714, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=461.00, p90=961.00, tail_gap=554.03, p95/p50=2.16, timeout_rate=0.000
+174 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+147
+Scenario seed: 4040
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 410.34285714285716, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=362.50, p90=815.00, tail_gap=529.97, p95/p50=2.48, timeout_rate=0.000
+106 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=743 overrides=185 override_ratio=24.9% fallbacks(total/lane_now)=101/101
+[RL-INFER] route_actor decisions=837 epochs=837 choices=[820,13,2,2] nonzero=2.0% valid_mean=2.30 margin=0.853 eta_delta=0.8s relief=0.004 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=2 short=0 aba=0 dead_end=0 long=2 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=101 release(no_prog/stall/hard)=3/0/101 lane_now_rescue(release/forced/blocked)=3/2/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=34/25/9/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=32791 pressure_filtered=1/1
+Average timespan: 411.9371428571429, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=380.00, p90=796.10, tail_gap=473.83, p95/p50=2.21, timeout_rate=0.000
+117 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+147
+Scenario seed: 4041
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 282.04, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=287.00, p90=474.00, tail_gap=212.08, p95/p50=1.72, timeout_rate=0.000
+82 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=670 overrides=70 override_ratio=10.4% fallbacks(total/lane_now)=49/49
+[RL-INFER] route_actor decisions=471 epochs=471 choices=[446,11,12,2] nonzero=5.3% valid_mean=3.03 margin=1.250 eta_delta=1.6s relief=0.012 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=41 release(no_prog/stall/hard)=0/0/41 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=45/32/13/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=25244 pressure_filtered=3/3
+Average timespan: 229.68, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=231.00, p90=398.20, tail_gap=206.54, p95/p50=1.87, timeout_rate=0.000
+63 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+144
+Scenario seed: 4042
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 245.9742857142857, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=226.50, p90=432.10, tail_gap=228.27, p95/p50=1.98, timeout_rate=0.000
+73 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=682 overrides=90 override_ratio=13.2% fallbacks(total/lane_now)=61/61
+[RL-INFER] route_actor decisions=482 epochs=482 choices=[462,12,7,1] nonzero=4.1% valid_mean=2.95 margin=1.205 eta_delta=1.8s relief=0.008 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=6 short=2 aba=3 dead_end=0 long=2 revisit_no_progress=0
+[RL-INFER] small_set_loops total=7 unique<=3=0 unique=4=7 committed_cyclic=1 after_fallback=1
+[RL-INFER] pending_timeouts=34 release(no_prog/stall/hard)=2/0/34 lane_now_rescue(release/forced/blocked)=2/2/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=39/26/13/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=25171 pressure_filtered=2/2
+Average timespan: 224.49428571428572, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=237.00, p90=382.20, tail_gap=181.40, p95/p50=1.72, timeout_rate=0.000
+59 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+145
+Scenario seed: 4043
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 367.9685714285714, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=305.00, p90=757.50, tail_gap=501.29, p95/p50=2.62, timeout_rate=0.000
+111 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=663 overrides=54 override_ratio=8.1% fallbacks(total/lane_now)=27/27
+[RL-INFER] route_actor decisions=530 epochs=530 choices=[407,66,43,14] nonzero=23.2% valid_mean=2.83 margin=0.809 eta_delta=1.5s relief=0.019 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=15 release(no_prog/stall/hard)=1/0/15 lane_now_rescue(release/forced/blocked)=1/1/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=29/18/10/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=27183 pressure_filtered=14/14
+Average timespan: 237.03428571428572, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=228.00, p90=424.40, tail_gap=246.11, p95/p50=2.05, timeout_rate=0.000
+43 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+148
+Scenario seed: 4044
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 475.3885714285714, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=467.50, p90=818.70, tail_gap=398.19, p95/p50=1.85, timeout_rate=0.000
+153 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=752 overrides=88 override_ratio=11.7% fallbacks(total/lane_now)=53/53
+[RL-INFER] route_actor decisions=777 epochs=777 choices=[777,0,0,0] nonzero=0.0% valid_mean=2.08 margin=0.921 eta_delta=0.0s relief=0.000 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=208 release(no_prog/stall/hard)=0/0/208 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=66/38/28/0/0 cooldown_blocked=3
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=37001 pressure_filtered=3/3
+Average timespan: 450.27142857142854, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=438.50, p90=806.00, tail_gap=387.08, p95/p50=1.87, timeout_rate=0.000
+137 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+146
+Scenario seed: 4045
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 324.66, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=310.00, p90=585.20, tail_gap=322.89, p95/p50=2.02, timeout_rate=0.000
+103 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=701 overrides=192 override_ratio=27.4% fallbacks(total/lane_now)=105/105
+[RL-INFER] route_actor decisions=671 epochs=671 choices=[605,32,29,5] nonzero=9.8% valid_mean=2.69 margin=0.858 eta_delta=2.5s relief=0.024 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=4 short=0 aba=0 dead_end=0 long=4 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=71 release(no_prog/stall/hard)=0/0/71 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=53/25/28/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=29574 pressure_filtered=0/0
+Average timespan: 294.0314285714286, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=290.00, p90=527.00, tail_gap=267.75, p95/p50=1.92, timeout_rate=0.000
+92 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+144
+Scenario seed: 4046
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 257.18857142857144, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=236.00, p90=442.20, tail_gap=223.86, p95/p50=1.93, timeout_rate=0.000
+71 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=782 overrides=63 override_ratio=8.1% fallbacks(total/lane_now)=36/36
+[RL-INFER] route_actor decisions=431 epochs=431 choices=[412,7,10,2] nonzero=4.4% valid_mean=3.12 margin=1.412 eta_delta=2.4s relief=0.012 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=2 short=0 aba=0 dead_end=0 long=2 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=32 release(no_prog/stall/hard)=2/0/32 lane_now_rescue(release/forced/blocked)=2/2/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=40/33/7/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=27468 pressure_filtered=9/9
+Average timespan: 210.9, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=204.00, p90=358.30, tail_gap=199.86, p95/p50=1.90, timeout_rate=0.000
+46 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+145
+Scenario seed: 4047
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 545.5428571428571, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=498.50, p90=1053.20, tail_gap=628.39, p95/p50=2.25, timeout_rate=0.000
+181 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=890 overrides=14 override_ratio=1.6% fallbacks(total/lane_now)=12/12
+[RL-INFER] route_actor decisions=738 epochs=738 choices=[656,41,37,4] nonzero=11.1% valid_mean=3.01 margin=0.864 eta_delta=5.7s relief=0.043 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=234 release(no_prog/stall/hard)=0/0/234 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=48/44/3/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=42523 pressure_filtered=5/5
+Average timespan: 523.8371428571429, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=500.50, p90=938.90, tail_gap=488.64, p95/p50=1.97, timeout_rate=0.000
+189 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+145
+Scenario seed: 4048
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 226.62571428571428, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=221.50, p90=374.20, tail_gap=185.64, p95/p50=1.82, timeout_rate=0.000
+46 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=754 overrides=55 override_ratio=7.3% fallbacks(total/lane_now)=36/36
+[RL-INFER] route_actor decisions=442 epochs=442 choices=[426,10,5,1] nonzero=3.6% valid_mean=3.09 margin=1.337 eta_delta=1.1s relief=0.007 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=2 short=1 aba=2 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=5 unique<=3=0 unique=4=5 committed_cyclic=1 after_fallback=1
+[RL-INFER] pending_timeouts=22 release(no_prog/stall/hard)=4/0/22 lane_now_rescue(release/forced/blocked)=4/4/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=47/31/15/0/1 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=25444 pressure_filtered=18/18
+Average timespan: 240.96571428571428, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=235.00, p90=414.10, tail_gap=204.89, p95/p50=1.85, timeout_rate=0.000
+57 deadlines missed.
+./configurations/./maps/simple_nyc.net.xml
+calling /home/anh/Code/STR/STR-Summer-Project-Base/.venv/lib/python3.14/site-packages/sumo/bin/duarouter -n ./configurations/./maps/simple_nyc.net.xml -r trips.trips.xml --ignore-errors --begin 0 --end 175.0 --no-step-log --no-warnings -o ./configurations/./rou/str_sumo_nyc.rou.xml
+Success.
+147
+Scenario seed: 4049
+Testing Dijkstra's Algorithm Route Controller
+ Retrying in 1 seconds
+Average timespan: 257.8228571428571, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=230.50, p90=515.10, tail_gap=341.79, p95/p50=2.45, timeout_rate=0.000
+53 deadlines missed.
+Using MAPPO checkpoint: ./configurations/model/mappo_policy_nyc.best.pt
+Testing MAPPO Route Controller (greedy inference)
+ Retrying in 1 seconds
+[RL-INFER] decisions=664 overrides=103 override_ratio=15.5% fallbacks(total/lane_now)=62/62
+[RL-INFER] route_actor decisions=629 epochs=629 choices=[599,12,16,2] nonzero=4.8% valid_mean=2.63 margin=1.231 eta_delta=2.0s relief=0.015 no_feasible=0 apply_fail=0
+[RL-INFER] loops total=0 short=0 aba=0 dead_end=0 long=0 revisit_no_progress=0
+[RL-INFER] small_set_loops total=0 unique<=3=0 unique=4=0 committed_cyclic=0 after_fallback=0
+[RL-INFER] pending_timeouts=45 release(no_prog/stall/hard)=0/0/45 lane_now_rescue(release/forced/blocked)=0/0/0
+[RL-INFER] observe(start/success/abort_np/abort_ls/abort_cw)=61/42/19/0/0 cooldown_blocked=0
+[RL-INFER] pending_end total=0 observe/route=0/0 lane_now/proactive=0/0 active_monitor=0 oldest=none
+[RL-INFER] coordination pending_seeded=26257 pressure_filtered=3/3
+Average timespan: 270.13714285714286, total vehicle number: 350, total vehicles reached destination: 350
+Travel summary: completion=1.000, p50=253.00, p90=504.70, tail_gap=321.43, p95/p50=2.26, timeout_rate=0.000
+68 deadlines missed.
+Dijkstra summary over 49 run(s): completion=1.000, avg=408.97, p50=385.35, p90=764.68, tail_gap=429.34, p95/p50=2.12, timeout=0.000
+MAPPO summary over 49 run(s): completion=1.000, avg=372.62, p50=356.18, p90=691.84, tail_gap=388.39, p95/p50=2.10, timeout=0.000

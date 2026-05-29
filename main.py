@@ -47,7 +47,7 @@ def build_parser():
     parser.add_argument(
         "--spawn-interval",
         type=float,
-        default=2.0,
+        default=0.5,
         help="Release spacing for generated controlled vehicles. Defaults to frozen-eval training value.",
     )
     parser.add_argument(
@@ -64,19 +64,19 @@ def build_parser():
     parser.add_argument(
         "--controlled-vehicles",
         type=int,
-        default=140,
+        default=350,
         help="Number of controlled vehicles. Defaults to the frozen-eval training value.",
     )
     parser.add_argument(
         "--uncontrolled-vehicles",
         type=int,
-        default=140,
+        default=150,
         help="Number of uncontrolled background vehicles. Defaults to the frozen-eval training value.",
     )
     parser.add_argument(
         "--pattern",
         type=int,
-        default=3,
+        default=2,
         help="Vehicle generation pattern. Defaults to the training/frozen-eval pattern.",
     )
     parser.add_argument(
@@ -84,6 +84,14 @@ def build_parser():
         type=int,
         default=8873,
         help="TraCI port for SUMO inference runs. Use a different value if the port is busy.",
+    )
+    parser.add_argument(
+        "--eval-policy",
+        choices=["greedy", "stochastic"],
+        default="stochastic",
+        help="MAPPO route selection at inference. greedy=argmax (reproducible); "
+             "stochastic=sample from the policy so the fleet spreads across alternative "
+             "routes. See docs/selfless_routing_analysis.md (§5).",
     )
     parser.add_argument(
         "--fast-mode",
@@ -165,9 +173,9 @@ def test_dijkstra_policy(vehicles, fast_mode=False, traci_port=8873):
     return run_simulation(scheduler, vehicles, fast_mode=fast_mode, traci_port=traci_port)
 
 
-def test_mappo(vehicles, model_path, fast_mode=False, traci_port=8873):
-    print("Testing MAPPO Route Controller")
-    scheduler = MAPPOPolicy(vehicles, init_connection_info, model_path)
+def test_mappo(vehicles, model_path, fast_mode=False, traci_port=8873, deterministic=True):
+    print("Testing MAPPO Route Controller ({} inference)".format("greedy" if deterministic else "stochastic"))
+    scheduler = MAPPOPolicy(vehicles, init_connection_info, model_path, deterministic=deterministic)
     return run_simulation(scheduler, vehicles, fast_mode=fast_mode, traci_port=traci_port)
 
 
@@ -295,7 +303,10 @@ if __name__ == "__main__":
         )
         print("Using MAPPO checkpoint:", model_path)
         rl_results.append(
-            test_mappo(copy.deepcopy(vehicles), model_path, fast_mode=args.fast_mode, traci_port=args.traci_port)
+            test_mappo(
+                copy.deepcopy(vehicles), model_path, fast_mode=args.fast_mode,
+                traci_port=args.traci_port, deterministic=(args.eval_policy == "greedy"),
+            )
         )
     summarize_runs("Dijkstra", dijkstra_results)
     summarize_runs("MAPPO", rl_results)
