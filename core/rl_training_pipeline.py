@@ -88,6 +88,11 @@ class RLTrainingPipeline:
         mappo_config=None,
         rolling_window=100,
         target_pattern=3,
+        num_target_vehicles=150,
+        num_random_vehicles=150,
+        team_reward_alpha=0.0,
+        team_reward_scale=0.12,
+        team_reward_speed_norm=13.89,
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
         step_log_every=100,
@@ -136,6 +141,14 @@ class RLTrainingPipeline:
         self.mappo_config = mappo_config or MAPPOConfig()
         self.rolling_window = rolling_window
         self.target_pattern = target_pattern
+        self.num_target_vehicles = int(num_target_vehicles)
+        self.num_random_vehicles = int(num_random_vehicles)
+        # Team / fleet-level reward blend. alpha=0 reproduces the legacy purely-individual
+        # objective; alpha>0 mixes in a shared fleet-delay term (in travel-time units) so
+        # relieving congestion for the whole fleet is directly rewarded. See _fleet_delay_rate.
+        self.team_reward_alpha = float(np.clip(team_reward_alpha, 0.0, 1.0))
+        self.team_reward_speed_norm = max(float(team_reward_speed_norm), 1.0)
+        self._fleet_delay_rate = 0.0
         self.debug_exit_diagnostics = debug_exit_diagnostics
         self.debug_exit_diagnostics_limit = max(int(debug_exit_diagnostics_limit), 0)
         self.step_log_every = max(int(step_log_every), 1)
@@ -181,6 +194,10 @@ class RLTrainingPipeline:
         # 2) congestion externality (secondary)
         # 3) shortest-path distance as tie-breaker
         self.travel_time_penalty = 0.07
+        # Per-step magnitude of the shared fleet-congestion cost (scaled by team_reward_alpha).
+        # ~1.7x the individual time rate so a fully jammed fleet (delay_rate~0.6) costs each
+        # agent ~0.07/step of shared pain that detouring to relieve the jam can reduce.
+        self.team_reward_scale = float(team_reward_scale)
         self.eta_progress_scale = 0.30
         self.distance_tiebreak_scale = 0.02
         self.coordination_pressure_penalty = 0.35
@@ -605,6 +622,7 @@ class RLTrainingPipeline:
         self._density_std = 0.0
         self._density_p95 = 0.0
         self._last_density_step = -10**9
+        self._fleet_delay_rate = 0.0
 
     def _record_immediate_mappo_transition(
         self,
@@ -1836,6 +1854,24 @@ class RLTrainingPipeline:
         penalty = self.tail_arrival_penalty_per_25_steps * (overflow / 25.0)
         return float(min(penalty, self.tail_arrival_penalty_cap))
     
+    def _team_congestion_cost(self, elapsed):
+        """Shared fleet-congestion cost internalized by every controlled agent.
+
+        Scales with team_reward_alpha (0 => legacy purely-individual objective) and the
+        current fleet-wide delay rate. Because the same global signal is paid by every
+        agent and reduced when any agent relieves congestion, parameter-shared MAPPO can
+        learn cooperative (selfless) routing from it. Measured in travel-time-equivalent
+        units so it trades off directly against the per-step own-time cost.
+        """
+        if self.team_reward_alpha <= 0.0:
+            return 0.0
+        return (
+            float(self.team_reward_alpha)
+            * float(self.team_reward_scale)
+            * float(self._fleet_delay_rate)
+            * float(max(elapsed, 0.0))
+        )
+
     def compute_reward(
         self,
         vehicle,
@@ -1887,6 +1923,7 @@ class RLTrainingPipeline:
             0.0,
         )
         reward -= float(self.externality_pressure_scale) * externality_pressure * elapsed
+        reward -= self._team_congestion_cost(elapsed)
         reward += self.selfless_reward_scale * float(
             np.clip(selfless_delta, -self.selfless_reward_clip, self.selfless_reward_clip)
         )
@@ -1973,6 +2010,7 @@ class RLTrainingPipeline:
             0.0,
         )
         reward -= float(self.externality_pressure_scale) * externality_pressure * elapsed
+        reward -= self._team_congestion_cost(elapsed)
         reward -= self.pending_coordination_penalty * float(np.clip(coordination_pressure, 0.0, 6.0)) * elapsed
         reward -= self.pending_latency_penalty_per_step * float(max(pending_age, 0))
         reward -= 0.02 * float(max(lane_change_deferrals, 0))
@@ -2281,8 +2319,8 @@ class RLTrainingPipeline:
         route_path = os.path.join(self.sumocfg_dir, self.route_file)
         spawn_interval_value = self.spawn_interval if spawn_interval_override is None else float(spawn_interval_override)
         vehicle_list = generator.generate_vehicles(
-            num_target_vehicles=150,
-            num_random_vehicles=150,
+            num_target_vehicles=self.num_target_vehicles,
+            num_random_vehicles=self.num_random_vehicles,
             pattern=self.target_pattern,
             target_xml_file=route_path,
             net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
@@ -2920,11 +2958,24 @@ class RLTrainingPipeline:
                         mean_controlled_edge_density = float(
                             np.mean([self._edge_density(snapshot.edge_id) for snapshot in step_snapshots.values()])
                         )
+                        # Fleet-delay rate in [0,1]: mean normalized slowness across the live
+                        # controlled fleet. Free-flow -> ~0, gridlock -> ~1. This is the shared
+                        # congestion signal the team-reward term internalizes (see compute_reward).
+                        self._fleet_delay_rate = float(np.clip(
+                            np.mean([
+                                1.0 - min(float(snap.speed) / self.team_reward_speed_norm, 1.0)
+                                for snap in step_snapshots.values()
+                            ]),
+                            0.0,
+                            1.0,
+                        ))
                         if (
                             mean_controlled_edge_density >= self.congestion_density_threshold
                             and mean_controlled_speed <= self.congestion_low_speed_threshold
                         ):
                             congestion_high_pressure_steps += 1
+                    else:
+                        self._fleet_delay_rate = 0.0
 
                     step_transition_central_observation = self._build_central_observation(
                         step=step,

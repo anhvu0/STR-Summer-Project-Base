@@ -46,6 +46,42 @@ def build_parser():
         help="Interval between vehicle spawns.",
     )
     parser.add_argument(
+        "--num-target-vehicles",
+        type=int,
+        default=150,
+        help="Number of controlled (RL) vehicles per episode.",
+    )
+    parser.add_argument(
+        "--num-random-vehicles",
+        type=int,
+        default=150,
+        help="Number of uncontrolled background vehicles per episode.",
+    )
+    parser.add_argument(
+        "--target-pattern",
+        type=int,
+        default=3,
+        choices=[1, 2, 3],
+        help="Demand pattern: 1=one O/D, 2=ranged origins -> one shared destination "
+             "(creates corridor congestion; use this for the selfless-routing study), "
+             "3=ranged origins -> ranged destinations (dispersed, ~no congestion).",
+    )
+    parser.add_argument(
+        "--team-reward-alpha",
+        type=float,
+        default=0.0,
+        help="Weight in [0,1] on the shared fleet-congestion cost internalized by each "
+             "agent. 0 = purely individual (selfish) objective; >0 rewards relieving "
+             "congestion for the whole fleet (selfless routing). Recommended: 1.0.",
+    )
+    parser.add_argument(
+        "--team-reward-scale",
+        type=float,
+        default=0.12,
+        help="Per-step magnitude (travel-time units) of the shared fleet-congestion cost "
+             "before scaling by --team-reward-alpha.",
+    )
+    parser.add_argument(
         "--eval-every",
         type=int,
         default=25,
@@ -132,6 +168,11 @@ def main():
         frozen_eval_seeds=parse_eval_seeds(args.eval_seeds),
         eval_spawn_interval=args.eval_spawn_interval,
         fast_training_profile=args.fast_mode,
+        target_pattern=args.target_pattern,
+        num_target_vehicles=args.num_target_vehicles,
+        num_random_vehicles=args.num_random_vehicles,
+        team_reward_alpha=args.team_reward_alpha,
+        team_reward_scale=args.team_reward_scale,
     )
     pipeline.run()
 
