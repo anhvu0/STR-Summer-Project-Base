@@ -460,6 +460,56 @@ Which one is "the answer" depends on what the project is ultimately claiming.
 - This is training-rollout + single-checkpoint frozen eval, not a multi-seed
   multi-checkpoint study. Treat the numbers as directionally strong, not final.
 
+### 5.5 Greedy vs. stochastic deployment — the exact mechanism, and an eval-variance caveat (2026-05-29)
+
+Both modes run the **same actor and the same scores**; they differ in one line of
+[`MAPPOController._act_route`](../controller/MAPPOController.py#L1489-L1510). The actor
+emits a score (logit) for each of up to `route_k=4` candidate routes; invalid
+candidates are masked to −1e9. **Index 0 is the baseline route** (shortest-path /
+current); indices 1–3 are detour alternatives. `route_choice_nonzero_rate` is the
+fraction of decisions that chose a *non-0* index.
+
+- **Greedy (`deterministic=True`):** `argmax(masked)` — pick the single
+  highest-scoring valid candidate. This is **not** "always route 0"; it is route 0
+  only when route 0 outscores the alternatives, and an alternative otherwise. It is
+  fully deterministic: same observation → same route, no RNG. The route variety seen
+  across an episode (e.g. `final.greedy` non-baseline rate ≈ 0.39) comes from the
+  *observations* differing per vehicle/time/density, not from randomness.
+- **Stochastic (`deterministic=False`):** `softmax(masked)` → a probability per
+  candidate, then `np.random.choice(p=probs)` — sample. With probs `[0.70,0.20,0.08,0.02]`
+  route 0 is taken ~70 % of the time, etc. Each vehicle rolls independently, so the
+  *fleet* spreads across candidates in proportion to the policy's confidence.
+
+When the policy is confident (one logit ≫ others) the softmax is peaked and
+**stochastic ≈ greedy**; when scores are close, stochastic spreads much more.
+
+**Eval-variance caveat (important).** [`_run_frozen_inference_eval`](../core/rl_training_pipeline.py#L2150-L2204)
+defaults to `--eval-policy stochastic` and takes **one rollout per seed with no
+`torch`/`np` seed reset**, then selects `best.pt` from that single draw. The
+`np.random.choice` at line 1510 uses the global, unseeded RNG. A multi-checkpoint
+re-eval (best=ep39, frozen_eval_current=ep59, final=ep73) on the 11 held-out seeds
+showed:
+
+| checkpoint | greedy Δ vs Dijkstra | stochastic Δ (single draw) |
+|---|---|---|
+| ep39 (best.pt)  | −40.5 s · 9/11 | −46.5 s |
+| ep59 (cur)      | **−50.4 s · 9/11** | **+28.3 s · 7/11** |
+| ep73 (final.pt) | **−49.9 s · 10/11** | −44.8 s |
+
+Under **greedy the policy improves monotonically** (ep73 is the best checkpoint).
+The apparent "regression after ep39" in `rl_frozen_eval_metrics.csv` is an artifact:
+two stochastic single-draws blew up (seed 6003 → 1100 s, seed 6001 → 719 s) while
+their greedy runs were 478 s / 497 s. Redrawing ep59-stochastic on seed 6003 six
+times gave 1100, 512, 489, 475, 476, 492 (median 490) — the 1100 is a ~1/6 tail
+event. Stochastic deployment is genuinely **fat-tailed on congested seeds**
+(350 vehicles sampling independently with no coordination occasionally over-commit a
+corridor → congestion collapse); it hits every checkpoint, ep73 included.
+
+**Recommendation:** select/deploy **greedy** (better mean, zero run-to-run variance,
+no corridor-collapse tail here), or if stochastic spreading is wanted, **average
+≥3–5 seeded rollouts per seed** and `torch.manual_seed` the eval so checkpoint
+selection is not decided by a lucky/unlucky single sample.
+
 ---
 
 ## 6. Pointers
@@ -472,3 +522,55 @@ Which one is "the answer" depends on what the project is ultimately claiming.
 - Related prior docs: [training-improvement-playbook.md](training-improvement-playbook.md)
   (travel-time tuning; predates the cooperation objective),
   [rl_training_pipeline_fix_notes.md](rl_training_pipeline_fix_notes.md).
+
+---
+
+## 7. Implemented fixes — value normalization + difference team reward (2026-05-29)
+
+The §5.5 re-eval showed the policy was not regressing, but it also surfaced *why it
+stops improving*: the learning signal had collapsed. Over the 37 PPO updates of the
+arm-C run, `policy_loss ≈ −0.007` and `approx_kl ≈ 0.002` (target 0.015, never trips)
+— the normalized advantages carried no consistent signal — while `value_loss` ran
+1.2k–121k on un-normalized returns spanning 25× (−20k…−517k), and per-episode
+`avg_travel_time` correlated **+0.90** with congestion/teleports but only **+0.20**
+with the policy's own route choices. Two structural fixes address the two causes.
+
+### 7.1 Value-target normalization (the critic could not fit the return scale)
+The critic regressed on raw returns whose scale is set by exogenous demand, so the
+value loss exploded and the resulting advantages were noisy.
+[`core/mappo.py`](../core/mappo.py) now keeps a running `RunningMeanStd` of returns
+(`MAPPOConfig.normalize_value_targets`, **default on**; CLI `--no-value-normalization`).
+The critic predicts in normalized space; stored values and the GAE bootstrap are
+**denormalized** to real reward units so advantages/GAE are unchanged, while the
+regression *target* is `normalize(returns)`. Effect: `value_loss` drops from
+1e3–1e5 to **~1.0**, decoupling critic conditioning from the absolute return scale.
+The normalizer is saved in the checkpoint; inference is unaffected (deployment uses
+only the actor).
+
+### 7.2 Difference (counterfactual) team reward (the team term was common-mode noise)
+The old team term subtracted the **global** fleet-delay level from every agent
+identically (`scale·fleet_delay_rate`, ≈1.7× the agent's own 0.07/step time cost).
+That level is dominated by the demand seed and ~uncontrollable by the individual, so
+it mostly injected variance and buried the per-action signal.
+[`core/rl_training_pipeline.py`](../core/rl_training_pipeline.py) now supports
+`team_reward_mode` (CLI `--team-reward-mode`, **default `difference`**):
+
+- `difference`: a leave-one-out difference reward — each agent pays
+  `α·scale·(own_slowness − fleet_mean_slowness)·elapsed`. The exogenous fleet-wide
+  level **cancels** (the fleet-mean of the signal is 0), so the term tracks only what
+  the agent's route choice controls: an agent stuck on a congested route pays more,
+  one that routed onto a free-flowing alternative is rewarded.
+- `shared`: the legacy global level, retained for A/B.
+
+Per-vehicle slowness is cached at the speed-aggregation point (`_fleet_slowness_by_vehicle`)
+and consumed by `_team_congestion_cost(elapsed, vehicle)`.
+
+**Interaction.** The difference reward removes the large shared negative offset, so raw
+return magnitudes shrink; value normalization (7.1) absorbs the new scale automatically.
+The two are designed to ship together (both default-on).
+
+**Still open (fix (a)).** The frozen eval still takes a single unseeded stochastic
+rollout per seed and selects `best.pt` from it (§5.5). Recommended next: deploy/select
+**greedy**, or seed the sampling and average ≥3–5 stochastic rollouts, so checkpoint
+selection is not decided by a lucky draw. Validating that 7.1+7.2 actually raise fleet
+TT over many episodes requires a full training run evaluated under that protocol.

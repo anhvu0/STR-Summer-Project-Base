@@ -8,6 +8,59 @@ from torch import nn
 from torch.distributions import Categorical
 
 
+class RunningMeanStd:
+    """Streaming mean/variance (Welford, batched) for value-target normalization.
+
+    The critic regresses on returns whose raw scale swings ~25x across episodes
+    (driven by exogenous demand, not the policy), which makes the value loss
+    explode (1e3-1e5) and the resulting advantages noisy. Normalizing the value
+    *target* to ~unit variance keeps the critic well-conditioned regardless of the
+    absolute return scale. Advantages/returns are still computed in real reward
+    units for GAE; only the regression target the critic sees is normalized.
+    """
+
+    def __init__(self, epsilon: float = 1.0e-4):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = float(epsilon)
+
+    def update(self, x: np.ndarray) -> None:
+        x = np.asarray(x, dtype=np.float64).reshape(-1)
+        if x.size == 0:
+            return
+        batch_mean = float(x.mean())
+        batch_var = float(x.var())
+        batch_count = float(x.size)
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        self.mean += delta * batch_count / total
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + (delta ** 2) * self.count * batch_count / total
+        self.var = m2 / total
+        self.count = total
+
+    @property
+    def std(self) -> float:
+        return float(np.sqrt(self.var) + 1.0e-8)
+
+    def normalize(self, x: np.ndarray) -> np.ndarray:
+        return (np.asarray(x, dtype=np.float32) - self.mean) / self.std
+
+    def denormalize(self, x):
+        return x * self.std + self.mean
+
+    def state_dict(self) -> Dict[str, float]:
+        return {"mean": float(self.mean), "var": float(self.var), "count": float(self.count)}
+
+    def load_state_dict(self, state: Dict[str, float]) -> None:
+        if not state:
+            return
+        self.mean = float(state.get("mean", 0.0))
+        self.var = float(state.get("var", 1.0))
+        self.count = float(state.get("count", 1.0e-4))
+
+
 def _build_mlp(input_size: int, hidden_sizes: Sequence[int], output_size: int) -> nn.Sequential:
     layers: List[nn.Module] = []
     previous = int(input_size)
@@ -56,6 +109,10 @@ class MAPPOConfig:
     update_epochs: int = 6
     minibatch_size: int = 512
     normalize_advantages: bool = True
+    # Normalize the critic's regression target with running return statistics so the
+    # value loss stays well-conditioned despite the ~25x episode-to-episode swing in
+    # raw return scale. Advantages/GAE remain in real reward units.
+    normalize_value_targets: bool = True
     min_transitions_per_update: int = 64
     target_kl: Optional[float] = 0.015
     actor_hidden_sizes: Tuple[int, ...] = (256, 128)
@@ -190,6 +247,10 @@ class MAPPOTrainer:
             lr=float(self.config.critic_learning_rate),
         )
 
+        self.value_normalizer = (
+            RunningMeanStd() if bool(self.config.normalize_value_targets) else None
+        )
+
         self.buffer: List[MAPPOTransition] = []
         self.buffer_generation: int = 0
         self.update_steps = 0
@@ -312,10 +373,17 @@ class MAPPOTrainer:
             entropy_tensor = distribution.entropy()
             value_tensor = self.critic(observation_tensor, central_tensor)
 
+        # The critic predicts in normalized space when value normalization is on;
+        # store the value in real reward units so GAE (which mixes it with raw
+        # rewards) stays correct.
+        value = float(value_tensor.item())
+        if self.value_normalizer is not None:
+            value = float(self.value_normalizer.denormalize(value))
+
         return ActionSelection(
             action=int(action_tensor.item()),
             log_prob=float(log_prob_tensor.item()),
-            value=float(value_tensor.item()),
+            value=value,
             entropy=float(entropy_tensor.item()),
             action_mask=action_mask.reshape(-1).copy(),
             masked_logits=masked_logits.detach().cpu().numpy().reshape(-1).copy(),
@@ -447,8 +515,20 @@ class MAPPOTrainer:
             next_obs_tensor = self._to_tensor(next_observations)
             next_central_tensor = self._to_tensor(next_central_observations)
             next_values = self.critic(next_obs_tensor, next_central_tensor).cpu().numpy()
+        # Bring bootstrapped values back to real reward units before GAE.
+        if self.value_normalizer is not None:
+            next_values = self.value_normalizer.denormalize(next_values)
 
         advantages, returns = self._compute_gae(rewards, old_values, next_values, dones, discount_steps)
+
+        # Value-target normalization: refresh running return stats, then regress the
+        # critic on normalized returns. GAE/advantages above stay in real units.
+        if self.value_normalizer is not None:
+            self.value_normalizer.update(returns)
+            value_targets = self.value_normalizer.normalize(returns)
+        else:
+            value_targets = returns
+
         if self.config.normalize_advantages and transition_count > 1:
             policy_mask = ~critic_only_flags
             if policy_mask.sum() > 1:
@@ -463,7 +543,9 @@ class MAPPOTrainer:
         actions_tensor = torch.as_tensor(actions, dtype=torch.int64, device=self.device)
         action_mask_tensor = self._to_tensor(action_masks)
         old_log_prob_tensor = self._to_tensor(old_log_probs)
-        returns_tensor = self._to_tensor(returns)
+        # Critic regresses on normalized targets (predicted_values are in the same
+        # normalized space); advantages remain in real units for the policy loss.
+        returns_tensor = self._to_tensor(value_targets)
         advantage_tensor = self._to_tensor(advantages)
 
         minibatch_size = max(1, min(int(self.config.minibatch_size), transition_count))
@@ -579,6 +661,9 @@ class MAPPOTrainer:
             "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
             "update_steps": int(self.update_steps),
             "transitions_collected": int(self.transitions_collected),
+            "value_normalizer": (
+                self.value_normalizer.state_dict() if self.value_normalizer is not None else None
+            ),
         }
         torch.save(checkpoint, path)
 

@@ -154,7 +154,26 @@ def build_parser():
         default=2048,
         help="Skip policy updates until at least this many decision transitions are collected.",
     )
-    parser.set_defaults(fast_mode=True)
+    parser.add_argument(
+        "--no-value-normalization",
+        dest="normalize_value_targets",
+        action="store_false",
+        help="Disable running-statistics normalization of the critic's value target. "
+             "Normalization is ON by default and keeps the value loss well-conditioned "
+             "despite the large episode-to-episode swing in raw return scale.",
+    )
+    parser.add_argument(
+        "--team-reward-mode",
+        choices=["difference", "shared"],
+        default="difference",
+        help="How the fleet-congestion term is credited to each agent. "
+             "difference=leave-one-out (each agent internalizes its slowness relative to "
+             "the live fleet; the exogenous demand-driven common level cancels -> far higher "
+             "learning signal-to-noise). shared=legacy global fleet-delay level paid identically "
+             "by every agent. Recommended: difference."
+             "Needs team_reward_alpha > 0 to have any effect.",
+    )
+    parser.set_defaults(fast_mode=True, normalize_value_targets=True)
     return parser
 
 
@@ -179,6 +198,7 @@ def main():
         minibatch_size=args.minibatch_size,
         min_transitions_per_update=args.min_transitions_per_update,
         target_kl=args.target_kl if args.target_kl > 0 else None,
+        normalize_value_targets=args.normalize_value_targets,
     )
     pipeline = RLTrainingPipeline(
         sumocfg_path=args.sumocfg,
@@ -196,6 +216,7 @@ def main():
         num_random_vehicles=args.num_random_vehicles,
         team_reward_alpha=args.team_reward_alpha,
         team_reward_scale=args.team_reward_scale,
+        team_reward_mode=args.team_reward_mode,
         eval_deterministic=(args.eval_policy == "greedy"),
     )
     if args.disable_tail_delay_penalty:

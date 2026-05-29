@@ -93,6 +93,7 @@ class RLTrainingPipeline:
         team_reward_alpha=0.0,
         team_reward_scale=0.12,
         team_reward_speed_norm=13.89,
+        team_reward_mode="difference",
         eval_deterministic=True,
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
@@ -148,10 +149,24 @@ class RLTrainingPipeline:
         # objective; alpha>0 mixes in a shared fleet-delay term (in travel-time units) so
         # relieving congestion for the whole fleet is directly rewarded. See _fleet_delay_rate.
         self.team_reward_alpha = float(np.clip(team_reward_alpha, 0.0, 1.0))
+        # Credit-assignment mode for the team term:
+        #   "shared"     -> legacy global fleet-delay level paid identically by every agent
+        #                   (common-mode: ~uncontrollable by the individual, dominated by the
+        #                   exogenous demand seed, so it buries the per-action signal).
+        #   "difference" -> leave-one-out difference reward: each agent internalizes its OWN
+        #                   slowness relative to the live-fleet mean. The exogenous common
+        #                   level cancels, so the term has near-zero mean and tracks what the
+        #                   agent's route choice actually controls (high signal-to-noise).
+        self.team_reward_mode = str(team_reward_mode or "difference").lower()
+        # Bound for the per-agent (own - fleet_mean) slowness difference (both terms are in [0,1]).
+        self.team_reward_diff_clip = 1.0
         # Frozen-eval / deployment mode: True = greedy route argmax, False = sampled.
         self.eval_deterministic = bool(eval_deterministic)
         self.team_reward_speed_norm = max(float(team_reward_speed_norm), 1.0)
         self._fleet_delay_rate = 0.0
+        # Per-vehicle normalized slowness for the current step (filled at the speed
+        # aggregation point); used by the "difference" team-reward mode.
+        self._fleet_slowness_by_vehicle = {}
         self.debug_exit_diagnostics = debug_exit_diagnostics
         self.debug_exit_diagnostics_limit = max(int(debug_exit_diagnostics_limit), 0)
         self.step_log_every = max(int(step_log_every), 1)
@@ -626,6 +641,7 @@ class RLTrainingPipeline:
         self._density_p95 = 0.0
         self._last_density_step = -10**9
         self._fleet_delay_rate = 0.0
+        self._fleet_slowness_by_vehicle = {}
 
     def _record_immediate_mappo_transition(
         self,
@@ -1857,21 +1873,43 @@ class RLTrainingPipeline:
         penalty = self.tail_arrival_penalty_per_25_steps * (overflow / 25.0)
         return float(min(penalty, self.tail_arrival_penalty_cap))
     
-    def _team_congestion_cost(self, elapsed):
-        """Shared fleet-congestion cost internalized by every controlled agent.
+    def _team_congestion_cost(self, elapsed, vehicle=None):
+        """Fleet-congestion cost internalized by a controlled agent (travel-time units).
 
         Scales with team_reward_alpha (0 => legacy purely-individual objective) and the
-        current fleet-wide delay rate. Because the same global signal is paid by every
-        agent and reduced when any agent relieves congestion, parameter-shared MAPPO can
-        learn cooperative (selfless) routing from it. Measured in travel-time-equivalent
-        units so it trades off directly against the per-step own-time cost.
+        team-reward signal selected by ``team_reward_mode``:
+
+        - "shared": the global fleet-delay level, paid identically by every agent. This is
+          common-mode — dominated by the exogenous demand seed and ~uncontrollable by the
+          individual — so under parameter-shared MAPPO it mostly injects variance and
+          buries the per-action signal (see selfless-routing diagnosis).
+
+        - "difference" (default): a leave-one-out *difference reward*. Each agent pays its
+          OWN normalized slowness relative to the live-fleet mean
+          (own_slowness - fleet_mean_slowness). The fleet-wide common level cancels, so the
+          term has ~zero mean across the fleet and tracks only what the agent's route choice
+          actually controls (its realized congestion relative to peers). An agent stuck on a
+          congested route pays more; one that routed onto a free-flowing alternative is
+          rewarded. This is the canonical cheap difference reward and dramatically improves
+          the learning signal-to-noise vs. the shared level.
         """
         if self.team_reward_alpha <= 0.0:
             return 0.0
+        if self.team_reward_mode == "difference":
+            own = self._fleet_slowness_by_vehicle.get(
+                getattr(vehicle, "vehicle_id", None), self._fleet_delay_rate
+            )
+            signal = float(np.clip(
+                own - self._fleet_delay_rate,
+                -self.team_reward_diff_clip,
+                self.team_reward_diff_clip,
+            ))
+        else:
+            signal = float(self._fleet_delay_rate)
         return (
             float(self.team_reward_alpha)
             * float(self.team_reward_scale)
-            * float(self._fleet_delay_rate)
+            * signal
             * float(max(elapsed, 0.0))
         )
 
@@ -1926,7 +1964,7 @@ class RLTrainingPipeline:
             0.0,
         )
         reward -= float(self.externality_pressure_scale) * externality_pressure * elapsed
-        reward -= self._team_congestion_cost(elapsed)
+        reward -= self._team_congestion_cost(elapsed, vehicle)
         reward += self.selfless_reward_scale * float(
             np.clip(selfless_delta, -self.selfless_reward_clip, self.selfless_reward_clip)
         )
@@ -2013,7 +2051,7 @@ class RLTrainingPipeline:
             0.0,
         )
         reward -= float(self.externality_pressure_scale) * externality_pressure * elapsed
-        reward -= self._team_congestion_cost(elapsed)
+        reward -= self._team_congestion_cost(elapsed, vehicle)
         reward -= self.pending_coordination_penalty * float(np.clip(coordination_pressure, 0.0, 6.0)) * elapsed
         reward -= self.pending_latency_penalty_per_step * float(max(pending_age, 0))
         reward -= 0.02 * float(max(lane_change_deferrals, 0))
@@ -2968,11 +3006,18 @@ class RLTrainingPipeline:
                         # Fleet-delay rate in [0,1]: mean normalized slowness across the live
                         # controlled fleet. Free-flow -> ~0, gridlock -> ~1. This is the shared
                         # congestion signal the team-reward term internalizes (see compute_reward).
+                        # Also cache per-vehicle slowness so the "difference" team-reward mode can
+                        # credit each agent its own slowness relative to this fleet mean.
+                        self._fleet_slowness_by_vehicle = {
+                            vid: float(np.clip(
+                                1.0 - min(float(snap.speed) / self.team_reward_speed_norm, 1.0),
+                                0.0,
+                                1.0,
+                            ))
+                            for vid, snap in step_snapshots.items()
+                        }
                         self._fleet_delay_rate = float(np.clip(
-                            np.mean([
-                                1.0 - min(float(snap.speed) / self.team_reward_speed_norm, 1.0)
-                                for snap in step_snapshots.values()
-                            ]),
+                            np.mean(list(self._fleet_slowness_by_vehicle.values())),
                             0.0,
                             1.0,
                         ))
@@ -2983,6 +3028,7 @@ class RLTrainingPipeline:
                             congestion_high_pressure_steps += 1
                     else:
                         self._fleet_delay_rate = 0.0
+                        self._fleet_slowness_by_vehicle = {}
 
                     step_transition_central_observation = self._build_central_observation(
                         step=step,
