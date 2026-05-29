@@ -160,14 +160,19 @@ class RLTrainingPipeline:
         # Selfless routing should tolerate small traffic noise. Detours are only
         # rewarded when density relief clears a deadband and scales with the
         # travel-time sacrifice being asked of the routed vehicle.
-        self.externality_density_deadband = 0.05
+        # Deadband and slope are calibrated to the actual density differences
+        # observable in light NYC traffic (~150 vehicles): route-to-route density
+        # deltas are typically 0.002–0.02, so the old values (0.035 / 0.55) placed
+        # the threshold 10–100x above the achievable signal and made selfless detours
+        # structurally unreachable. New values allow ~0.019 threshold for a 30s detour.
+        self.externality_density_deadband = 0.005
         self.externality_pressure_scale = 0.015
-        self.route_balance_density_deadband = 0.035
-        self.route_balance_detour_relief_slope = 0.55
+        self.route_balance_density_deadband = 0.004
+        self.route_balance_detour_relief_slope = 0.06
         self.route_balance_reward_scale = 3.0
-        self.route_balance_detour_penalty_scale = 2.0
+        self.route_balance_detour_penalty_scale = 1.0
         self.route_balance_congestion_penalty_scale = 1.5
-        self.route_balance_reward_clip = 2.0
+        self.route_balance_reward_clip = 5.0
         self.route_eta_delta_feature_scale_s = 120.0
         self.loop_window = 12
         self.loop_repeat_penalty = 1.5
@@ -410,14 +415,27 @@ class RLTrainingPipeline:
             + float(self.route_balance_detour_relief_slope) * detour_norm
         )
 
+        # When the baseline route is itself congested, diverting to any alternative
+        # helps other vehicles regardless of whether the alternative is less dense.
+        # Give credit proportional to how congested the baseline is.
+        baseline_density = float(feasible_candidates[0].features[2]) if feasible_candidates else 0.0
+        congestion_diversion_credit = max(
+            baseline_density - float(self.route_balance_density_deadband), 0.0
+        )
+        effective_relief = density_relief + 0.5 * congestion_diversion_credit if detour_norm > 0.0 else density_relief
+
         reward = 0.0
         if faster_norm > 0.0:
             reward += float(self.route_balance_reward_scale) * min(faster_norm, 0.25)
 
-        accepted_detour = bool(detour_norm > 0.0 and density_relief > required_relief)
+        accepted_detour = bool(detour_norm > 0.0 and effective_relief > required_relief)
         penalized_detour = bool(detour_norm > 0.0 and not accepted_detour)
         if accepted_detour:
-            reward += float(self.route_balance_reward_scale) * (density_relief - required_relief)
+            reward += float(self.route_balance_reward_scale) * (effective_relief - required_relief)
+            # Refund the per-step time-cost the vehicle will pay for this detour so that
+            # a worthwhile selfless detour is approximately zero-sum in the advantage
+            # estimate (rather than structurally losing by 0.5–2 units).
+            reward += float(self.travel_time_penalty) * float(eta_delta_steps)
         elif penalized_detour:
             reward -= float(self.route_balance_detour_penalty_scale) * detour_norm
 

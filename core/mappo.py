@@ -48,10 +48,9 @@ class MAPPOConfig:
     gamma: float = 0.995
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.20
-    entropy_coef: float = 0.030
+    entropy_coef: float = 0.15
     # If set, entropy_coef is linearly annealed toward entropy_coef_end over training.
-    # Set higher than entropy_coef initially: e.g. entropy_coef=0.15, entropy_coef_end=0.01
-    entropy_coef_end: Optional[float] = None
+    entropy_coef_end: Optional[float] = 0.05
     value_coef: float = 0.50
     max_grad_norm: float = 10.0
     update_epochs: int = 6
