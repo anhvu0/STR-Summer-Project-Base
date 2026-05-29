@@ -88,7 +88,7 @@ def build_parser():
     parser.add_argument(
         "--eval-policy",
         choices=["greedy", "stochastic"],
-        default="stochastic",
+        default="greedy",
         help="MAPPO route selection at inference. greedy=argmax (reproducible); "
              "stochastic=sample from the policy so the fleet spreads across alternative "
              "routes. See docs/selfless_routing_analysis.md (§5).",
