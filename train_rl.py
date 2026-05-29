@@ -36,7 +36,7 @@ def build_parser():
     parser.add_argument(
         "--episodes",
         type=int,
-        default=100,
+        default=200,
         help="Number of training episodes.",
     )
     parser.add_argument(
@@ -101,7 +101,7 @@ def build_parser():
     parser.add_argument(
         "--eval-policy",
         choices=["greedy", "stochastic"],
-        default="stochastic",
+        default="greedy",
         help="Deployment / frozen-eval route selection mode. greedy=argmax (reproducible); "
              "stochastic=sample from the policy so the fleet spreads across alternative routes "
              "(option (b) in docs/selfless_routing_analysis.md).",
