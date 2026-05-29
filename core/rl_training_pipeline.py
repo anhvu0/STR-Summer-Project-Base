@@ -93,6 +93,7 @@ class RLTrainingPipeline:
         team_reward_alpha=0.0,
         team_reward_scale=0.12,
         team_reward_speed_norm=13.89,
+        eval_deterministic=True,
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
         step_log_every=100,
@@ -147,6 +148,8 @@ class RLTrainingPipeline:
         # objective; alpha>0 mixes in a shared fleet-delay term (in travel-time units) so
         # relieving congestion for the whole fleet is directly rewarded. See _fleet_delay_rate.
         self.team_reward_alpha = float(np.clip(team_reward_alpha, 0.0, 1.0))
+        # Frozen-eval / deployment mode: True = greedy route argmax, False = sampled.
+        self.eval_deterministic = bool(eval_deterministic)
         self.team_reward_speed_norm = max(float(team_reward_speed_norm), 1.0)
         self._fleet_delay_rate = 0.0
         self.debug_exit_diagnostics = debug_exit_diagnostics
@@ -2196,6 +2199,7 @@ class RLTrainingPipeline:
                 self.connection_info,
                 self._frozen_eval_model_path,
                 net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
+                deterministic=self.eval_deterministic,
             )
             stats = run_eval_controller(policy, rl_vehicles)
             runtime_metrics = stats.get("controller_runtime_metrics") or {}
@@ -2236,6 +2240,9 @@ class RLTrainingPipeline:
                 "route_mean_eta_delta_steps": float(runtime_metrics.get("route_mean_eta_delta_steps", 0.0)),
                 "route_mean_density_relief": float(runtime_metrics.get("route_mean_density_relief", 0.0)),
             })
+
+        # Expose per-seed rows so callers can compute confidence intervals / paired stats.
+        self._last_frozen_eval_per_seed = list(per_seed_rows)
 
         def mean_metric(key, default=0.0):
             values = [float(row[key]) for row in per_seed_rows]

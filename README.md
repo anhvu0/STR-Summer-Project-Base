@@ -69,6 +69,31 @@ Useful options:
 python3 train_rl.py   --sumocfg ./configurations/myconfig.sumocfg   --model-output ./configurations/model/mappo_policy_map.pt   --episodes 500   --spawn-interval 2.0   --eval-every 25   --eval-seeds 1001,1002,1003   --eval-spawn-interval 2.0
 ```
 
+training for greedy inference (results might not be great due to the nature of MAPPO):
+```bash
+python train_rl.py \
+  --target-pattern 2 --num-target-vehicles 350 --num-random-vehicles 150 \
+  --spawn-interval 0.5 --eval-spawn-interval 0.5 \
+  --team-reward-alpha 1.0 --team-reward-scale 0.30 \
+  --disable-tail-delay-penalty --disable-route-balance \
+  --eval-policy greedy \
+  --episodes 24 --eval-every 24 \
+  --eval-seeds 7000,7001,7002,7003,7004,7005,7006,7007,7008,7009,7010,7011,7012,7013,7014,7015
+```
+
+training for stochastic deployment:
+```bash
+python train_rl.py \
+  --target-pattern 2 --num-target-vehicles 350 --num-random-vehicles 150 \
+  --spawn-interval 0.5 --eval-spawn-interval 0.5 \
+  --team-reward-alpha 1.0 --team-reward-scale 0.30 \
+  --disable-tail-delay-penalty --disable-route-balance \
+  --eval-policy stochastic \
+  --episodes 24 --eval-every 24 \
+  --eval-seeds 7000,7001,7002,7003,7004,7005,7006,7007,7008,7009,7010,7011,7012,7013,7014,7015
+  ```
+
+
 What the outputs mean:
 - `rl_episode_metrics.csv`: training-rollout metrics. The MAPPO policy stays fixed during each episode and updates after the rollout is collected.
 - `rl_frozen_eval_metrics.csv`: held-out frozen evaluation metrics. These runs use the saved checkpoint with no online learning and average results across held-out seeds.

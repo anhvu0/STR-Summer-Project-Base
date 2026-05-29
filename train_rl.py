@@ -99,6 +99,26 @@ def build_parser():
         help="Optional spawn interval override for held-out frozen inference evaluation.",
     )
     parser.add_argument(
+        "--eval-policy",
+        choices=["greedy", "stochastic"],
+        default="greedy",
+        help="Deployment / frozen-eval route selection mode. greedy=argmax (reproducible); "
+             "stochastic=sample from the policy so the fleet spreads across alternative routes "
+             "(option (b) in docs/selfless_routing_analysis.md).",
+    )
+    parser.add_argument(
+        "--disable-tail-delay-penalty",
+        action="store_true",
+        help="Zero the tail-delay penalty, which otherwise escalates exactly when a vehicle "
+             "detours (structurally anti-selfless). Part of the arm-C 'full authority' config.",
+    )
+    parser.add_argument(
+        "--disable-route-balance",
+        action="store_true",
+        help="Zero the legacy hand-crafted route_balance reward so the principled team-reward "
+             "term is the sole selfless driver. Part of the arm-C 'full authority' config.",
+    )
+    parser.add_argument(
         "--fast-mode",
         dest="fast_mode",
         action="store_true",
@@ -173,7 +193,13 @@ def main():
         num_random_vehicles=args.num_random_vehicles,
         team_reward_alpha=args.team_reward_alpha,
         team_reward_scale=args.team_reward_scale,
+        eval_deterministic=(args.eval_policy == "greedy"),
     )
+    if args.disable_tail_delay_penalty:
+        pipeline.tail_delay_linear_penalty = 0.0
+        pipeline.tail_delay_quadratic_penalty = 0.0
+    if args.disable_route_balance:
+        pipeline.route_balance_reward_scale = 0.0
     pipeline.run()
 
 

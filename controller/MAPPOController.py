@@ -29,9 +29,13 @@ net_path = parse_sumocfg("./configurations/myconfig.sumocfg")
 
 
 class MAPPOPolicy(RouteController):
-    def __init__(self, vehicles, connection_info, model_file, net_xml_file=net_path):
+    def __init__(self, vehicles, connection_info, model_file, net_xml_file=net_path, deterministic=True):
         super().__init__(connection_info)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Deployment mode for route selection: True = greedy (argmax, reproducible);
+        # False = stochastic (sample from the masked policy), which naturally spreads
+        # the fleet across alternative routes instead of herding onto one "best" route.
+        self.deterministic = bool(deterministic)
         self.actor, _, self.model_checkpoint = load_mappo_checkpoint(model_file, device=self.device)
         self.model_state_size = int(self.actor.observation_size)
         self.vehicles = vehicles
@@ -1483,14 +1487,27 @@ class MAPPOPolicy(RouteController):
 
 
     def _act_route(self, state, valid_route_indices):
-        """Greedy route selection using the actor (route_k outputs)."""
+        """Route selection using the actor (route_k outputs).
+
+        Greedy (argmax) when self.deterministic, else sampled from the masked
+        softmax so the fleet distributes across alternative routes.
+        """
         logits = self._predict_action_logits(state)[0]
         available = list(valid_route_indices)
         if not available:
             return 0, logits
         action_mask = action_mask_from_valid_actions(self.route_k, available)
         masked = np.where(action_mask > 0.5, logits, -1.0e9)
-        return int(np.argmax(masked)), masked
+        if self.deterministic:
+            return int(np.argmax(masked)), masked
+        # Stochastic: softmax over valid (masked) logits, then sample.
+        shifted = masked - np.max(masked)
+        probs = np.exp(shifted)
+        total = probs.sum()
+        if not np.isfinite(total) or total <= 0.0:
+            return int(np.argmax(masked)), masked
+        probs = probs / total
+        return int(np.random.choice(len(probs), p=probs)), masked
 
     # this function gives the current state of the vehicle based on the state size
     def getState(self, vehicle_id, edge_now, destination_edge, context=None, coordination_state=None):
