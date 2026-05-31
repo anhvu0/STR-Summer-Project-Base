@@ -25,7 +25,7 @@ import traci
 
 
 DEFAULT_EVAL_SEEDS = ""
-for i in range(1,50):
+for i in range(10,20):
     DEFAULT_EVAL_SEEDS += str(4000+i) + ","
 DEFAULT_EVAL_SEEDS = DEFAULT_EVAL_SEEDS[:-1]  # Remove trailing comma
 
