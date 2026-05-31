@@ -1,5 +1,23 @@
 """Entry point for training the MAPPO routing policy."""
 import argparse
+import sys
+
+# --- Use libsumo as a drop-in TraCI backend for training only ----------------
+# libsumo runs SUMO in-process and skips the per-call TraCI socket round-trips
+# that dominate the step loop. It is API- and value-compatible with traci (same
+# functions, same constants, same returned values), so this changes no logic or
+# metrics -- only the transport. We register it in sys.modules *before* importing
+# the pipeline/controller so their top-level `import traci` and
+# `from traci import constants` transparently resolve to libsumo in THIS process
+# only. main.py is a separate process that never runs this file, so its GUI traci
+# is untouched. If libsumo is unavailable we silently fall back to real traci.
+try:
+    import libsumo as _libsumo
+    sys.modules["traci"] = _libsumo
+    sys.modules["traci.constants"] = _libsumo.constants
+except ImportError:
+    pass
+# -----------------------------------------------------------------------------
 
 from core.mappo import MAPPOConfig
 from core.rl_training_pipeline import RLTrainingPipeline
@@ -36,7 +54,7 @@ def build_parser():
     parser.add_argument(
         "--episodes",
         type=int,
-        default=200,
+        default=300,
         help="Number of training episodes.",
     )
     parser.add_argument(
@@ -84,7 +102,7 @@ def build_parser():
     parser.add_argument(
         "--eval-every",
         type=int,
-        default=20,
+        default=50,
         help="Run frozen held-out inference evaluation every N episodes. 0 disables frozen evaluation.",
     )
     parser.add_argument(
@@ -173,6 +191,14 @@ def build_parser():
              "by every agent. Recommended: difference."
              "Needs team_reward_alpha > 0 to have any effect.",
     )
+    parser.add_argument(
+        "--disable-route-reservations",
+        action="store_true",
+        help="Disable the Layer B anticipatory reservation field. When ON (default), a "
+             "committed route books its leading edges in a decaying field so the route-"
+             "candidate generator scores against effective (live + reserved) density, "
+             "damping the simultaneous detour pile-on. See docs/coordination_throttle.md.",
+    )
     parser.set_defaults(fast_mode=True, normalize_value_targets=True)
     return parser
 
@@ -218,6 +244,7 @@ def main():
         team_reward_scale=args.team_reward_scale,
         team_reward_mode=args.team_reward_mode,
         eval_deterministic=(args.eval_policy == "greedy"),
+        route_reservations=not args.disable_route_reservations,
     )
     if args.disable_tail_delay_penalty:
         pipeline.tail_delay_linear_penalty = 0.0

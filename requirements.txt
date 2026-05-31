@@ -5,6 +5,7 @@ numpy==2.4.6
 # SUMO Python client libraries. Keep these aligned with the installed SUMO binary.
 traci==1.27.0
 sumolib==1.27.0
+libsumo==1.27.0
 
 # Test runner for the bundled tests.
 pytest==9.0.3

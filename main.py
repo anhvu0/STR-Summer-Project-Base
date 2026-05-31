@@ -105,6 +105,20 @@ def build_parser():
         action="store_false",
         help="Disable fast mode and keep the heavier debug outputs.",
     )
+    parser.add_argument(
+        "--disable-detour-throttle",
+        action="store_true",
+        help="Disable the Layer A saturation-aware detour veto. When ON (default), a "
+             "detour onto a near-capacity alternative falls back to the shortest-path "
+             "baseline at network saturation. See docs/coordination_throttle.md.",
+    )
+    parser.add_argument(
+        "--disable-route-reservations",
+        action="store_true",
+        help="Disable the Layer B anticipatory reservation field at inference. When ON "
+             "(default), committed routes book their leading edges so later deciders score "
+             "against effective (live + reserved) density. See docs/coordination_throttle.md.",
+    )
     parser.set_defaults(fast_mode=True)
     return parser
 
@@ -173,9 +187,13 @@ def test_dijkstra_policy(vehicles, fast_mode=False, traci_port=8873):
     return run_simulation(scheduler, vehicles, fast_mode=fast_mode, traci_port=traci_port)
 
 
-def test_mappo(vehicles, model_path, fast_mode=False, traci_port=8873, deterministic=True):
+def test_mappo(vehicles, model_path, fast_mode=False, traci_port=8873, deterministic=True,
+               detour_throttle=True, route_reservations=True):
     print("Testing MAPPO Route Controller ({} inference)".format("greedy" if deterministic else "stochastic"))
-    scheduler = MAPPOPolicy(vehicles, init_connection_info, model_path, deterministic=deterministic)
+    scheduler = MAPPOPolicy(
+        vehicles, init_connection_info, model_path, deterministic=deterministic,
+        detour_throttle=detour_throttle, route_reservations=route_reservations,
+    )
     return run_simulation(scheduler, vehicles, fast_mode=fast_mode, traci_port=traci_port)
 
 
@@ -306,6 +324,8 @@ if __name__ == "__main__":
             test_mappo(
                 copy.deepcopy(vehicles), model_path, fast_mode=args.fast_mode,
                 traci_port=args.traci_port, deterministic=(args.eval_policy == "greedy"),
+                detour_throttle=not args.disable_detour_throttle,
+                route_reservations=not args.disable_route_reservations,
             )
         )
     summarize_runs("Dijkstra", dijkstra_results)

@@ -574,3 +574,30 @@ rollout per seed and selects `best.pt` from it (§5.5). Recommended next: deploy
 **greedy**, or seed the sampling and average ≥3–5 stochastic rollouts, so checkpoint
 selection is not decided by a lucky draw. Validating that 7.1+7.2 actually raise fleet
 TT over many episodes requires a full training run evaluated under that protocol.
+
+## 8. Saturation-aware detour coordination (Layers A + B) — 2026-05-30
+
+§5.5 isolated the remaining loss: at saturation the policy's "selfless" detours pile onto
+near-capacity alternatives and end up worse than shortest-path (a price-of-anarchy
+failure). Two cooperating fixes address it, both in
+[`core/coordination_throttle.py`](../core/coordination_throttle.py):
+
+- **Layer A — spare-capacity veto (inference guardrail).** After the policy picks a
+  route, a detour onto a near-capacity alternative is reverted to the shortest-path
+  baseline when the network is saturated or the claimed relief is within noise. It reads
+  the alternative's **absolute** density (candidate features 3/4), not the relative
+  relief the policy reacted to — because at saturation a positive relief can still sit on
+  a near-capacity alternative whose headroom vanishes once the fleet piles on.
+  Deterministic, deployment-only, needs **no retraining**; toggle with
+  `--disable-detour-throttle`.
+- **Layer B — anticipatory reservation field (training + inference).** A committed route
+  books its leading edges in a decaying field; the candidate generator scores against the
+  **effective** (live + reserved) density, so later deciders in a window see an
+  alternative's relief already eroded by earlier commitments → damped best-response
+  instead of a simultaneous pile-on. Rewards/observations keep true density. Toggle with
+  `--disable-route-reservations`.
+
+These are a **robustness fix** (recover the saturated-seed losses; "never worse than
+shortest-path"), not a fleet-TT unlock — the NYC grid's low PoA still caps the headroom
+(§4.3). Full design, gate logic, knobs, and the seed-4010 A/B protocol:
+[`coordination_throttle.md`](coordination_throttle.md).

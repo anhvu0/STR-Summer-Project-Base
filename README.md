@@ -106,6 +106,25 @@ This workflow is the recommended way to choose a deployment checkpoint.
 Inference itself does not learn; it only applies the checkpoint you trained.
 `main.py` now prefers the best frozen-eval checkpoint automatically and falls back to the final checkpoint if no best checkpoint exists yet.
 
+***Faster training: libsumo backend***
+
+The TraCI socket round-trips (one per SUMO call, many per simulation step) are the
+dominant cost of the training loop. To remove that overhead, `train_rl.py` runs SUMO
+through **libsumo** instead of socket TraCI.
+
+- libsumo runs SUMO in-process, so it skips the socket serialization on every call.
+  It is API- and value-compatible with `traci` (same functions, constants, and returned
+  values), so this changes **no training logic or metrics** — only the transport.
+- The switch is scoped to the training process only. `train_rl.py` registers libsumo as
+  the `traci` module in `sys.modules` *before* importing the pipeline/controller, so their
+  `import traci` resolves to libsumo. `main.py` is a separate process that never runs this,
+  so inference keeps standard socket TraCI and full `sumo-gui` support.
+- **Prerequisite:** install a libsumo build matching your SUMO version, e.g.
+  `pip install libsumo==1.27.0` (match your `eclipse-sumo` version). If libsumo is not
+  importable, `train_rl.py` silently falls back to real `traci`, so training still runs.
+- To debug a *training* run with `sumo-gui`, comment out the libsumo block at the top of
+  `train_rl.py` so that process falls back to socket TraCI.
+
 ***Recent stability fixes reflected in the codebase***
 
 Loop and dead-end mitigation:

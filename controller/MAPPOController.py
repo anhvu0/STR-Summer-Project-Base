@@ -20,6 +20,12 @@ from core.route_candidate_generator import (
     filter_candidates_by_first_edges,
     pack_route_candidate_features,
 )
+from core.coordination_throttle import (
+    DetourThrottleConfig,
+    ReservationField,
+    ReservationFieldConfig,
+    detour_should_fallback,
+)
 
 def parse_sumocfg(sumocfg_path):
     dom = parse(sumocfg_path)
@@ -29,9 +35,17 @@ net_path = parse_sumocfg("./configurations/myconfig.sumocfg")
 
 
 class MAPPOPolicy(RouteController):
-    def __init__(self, vehicles, connection_info, model_file, net_xml_file=net_path, deterministic=True):
+    def __init__(self, vehicles, connection_info, model_file, net_xml_file=net_path, deterministic=True,
+                 detour_throttle=True, route_reservations=True):
         super().__init__(connection_info)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Saturation-aware detour coordination (see core/coordination_throttle.py).
+        # Layer A: deterministic spare-capacity veto on the policy's route choice.
+        # Layer B: anticipatory reservation field feeding effective density to candidates.
+        self._throttle_config = DetourThrottleConfig(enabled=bool(detour_throttle))
+        self._reservation_field = ReservationField(
+            ReservationFieldConfig(enabled=bool(route_reservations))
+        )
         # Deployment mode for route selection: True = greedy (argmax, reproducible);
         # False = stochastic (sample from the masked policy), which naturally spreads
         # the fleet across alternative routes instead of herding onto one "best" route.
@@ -117,6 +131,8 @@ class MAPPOPolicy(RouteController):
             "step_control_pending": 0,
             "step_control_near_junction": 0,
             "step_control_lane_change_candidate": 0,
+            "detour_throttle_fallbacks": 0,
+            "route_reservations_seeded": 0,
         }
         self._last_metrics_snapshot = None
         # Cache for shortest-path distances (edge_id, dest_id) -> cost
@@ -300,6 +316,20 @@ class MAPPOPolicy(RouteController):
         if cached_count is None:
             cached_count = traci.edge.getLastStepVehicleNumber(edge_id)
         return (float(cached_count) * float(self.density_scale_m)) / max(self._edge_lane_meters(edge_id), 5.0)
+
+    def _effective_edge_density(self, edge_id):
+        """Live edge density plus the Layer B anticipatory reservation bonus.
+
+        Fed only to the route-candidate generator so the relief signal a vehicle scores
+        reflects detours that earlier vehicles already committed to this window. All other
+        consumers (rewards, base state, central obs) keep the true live density.
+        """
+        base = self._edge_density(edge_id)
+        if self._reservation_field is None or not self._reservation_field.enabled:
+            return base
+        return base + self._reservation_field.density_bonus(
+            edge_id, self._edge_lane_meters(edge_id), self.density_scale_m
+        )
 
     def _occupied_density_p95(self, density_vec):
         occupied = density_vec[density_vec > 0.0]
@@ -999,6 +1029,8 @@ class MAPPOPolicy(RouteController):
         step = int(traci.simulation.getTime())
         self._prepare_step_cache(step)
         self._refresh_density_stats(step)
+        # Layer B: fade last step's route bookings before this step's decisions accrue.
+        self._reservation_field.decay()
         open_decision_batch = []
         step_coordination_state = self.shared_policy.empty_coordination_state()
         self._metrics["coordination_pending_reservations_seeded"] += (
@@ -1290,7 +1322,7 @@ class MAPPOPolicy(RouteController):
                 candidates = self.route_generator.get_candidates(
                     start_edge,
                     vehicle.destination,
-                    self._edge_density,
+                    self._effective_edge_density,
                     prev_route_edges=(
                         list(previous_actor_route)
                         if previous_actor_route is not None else None
@@ -1316,6 +1348,16 @@ class MAPPOPolicy(RouteController):
                     )
                     valid_route_indices = list(range(len(feasible_candidates)))
                     chosen_filtered_idx, masked_logits = self._act_route(route_state, valid_route_indices)
+                    # Layer A: veto a detour onto a near-capacity alternative and fall
+                    # back to the shortest-path baseline (candidate 0), optimal at PoA~=1.
+                    if detour_should_fallback(
+                        chosen_filtered_idx,
+                        [candidate.features for candidate in feasible_candidates],
+                        float(getattr(self, "_density_p95", 0.0)),
+                        self._throttle_config,
+                    ):
+                        self._metrics["detour_throttle_fallbacks"] += 1
+                        chosen_filtered_idx = 0
                     chosen_route = feasible_candidates[chosen_filtered_idx].route_edges
                     self._record_route_actor_choice(
                         feasible_candidates,
@@ -1329,6 +1371,10 @@ class MAPPOPolicy(RouteController):
                             traci.vehicle.setRoute(vid, chosen_route)
                             self._vehicle_actor_owned_route[vid] = tuple(chosen_route)
                             route_applied = True
+                            # Layer B: book this committed route for later deciders.
+                            self._metrics["route_reservations_seeded"] += (
+                                self._reservation_field.seed_route(chosen_route)
+                            )
                         except Exception:
                             self._metrics["route_apply_failures"] += 1
                     if route_applied:

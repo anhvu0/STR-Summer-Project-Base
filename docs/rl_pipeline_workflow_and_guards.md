@@ -146,6 +146,24 @@ Inference:
 
 A late training episode can look better than the same checkpoint behaves later in deployment because the training rollout is not the same thing as a fully frozen evaluation.
 
+### SUMO backend (libsumo vs TraCI)
+
+Training and inference also differ in how they talk to SUMO:
+
+- `train_rl.py` runs SUMO through **libsumo** (in-process, no socket round-trips) for speed.
+  It registers libsumo as the `traci` module in `sys.modules` before importing the
+  pipeline and controller, so this is transparent to the rest of the code. libsumo is
+  API- and value-compatible with `traci`, so this is a transport optimization only — it
+  does not change decisions, rewards, or metrics. If libsumo is not installed, training
+  silently falls back to socket `traci`.
+- `main.py` (inference/benchmark) is a separate process that does not run that swap, so it
+  uses standard socket `traci` and keeps full `sumo-gui` support.
+- Frozen evaluation runs inside the training process, so it uses the same libsumo backend
+  (sequential `start`/`close`, which libsumo supports).
+
+See the "Faster training: libsumo backend" section of `README.md` for the install
+prerequisite and how to disable it for GUI debugging.
+
 ## Frozen evaluation workflow
 
 To close that gap, `RLTrainingPipeline` now supports held-out frozen evaluation.

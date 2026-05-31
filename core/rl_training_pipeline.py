@@ -26,6 +26,7 @@ from core.route_candidate_generator import (
     filter_candidates_by_first_edges,
     pack_route_candidate_features,
 )
+from core.coordination_throttle import ReservationField, ReservationFieldConfig
 
 if 'SUMO_HOME' in os.environ:
     tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
@@ -108,6 +109,7 @@ class RLTrainingPipeline:
         eval_every=0,
         frozen_eval_seeds=None,
         eval_spawn_interval=None,
+        route_reservations=True,
     ):
         """
         Args:
@@ -319,6 +321,14 @@ class RLTrainingPipeline:
         # Density is now vehicles per 100m per lane; feature scale changed, retraining is required.
         self.density_scale_m = 100.0
         self._last_density_step = -10**9
+        # Layer B anticipatory reservation field (see core/coordination_throttle.py).
+        # Only the route-candidate generator scores against the effective (live +
+        # reservation) density; rewards and base/central observations keep true density.
+        # The Layer A veto is a deployment-time guardrail (controller only) and is not
+        # applied during training to keep the on-policy action/log-prob consistent.
+        self._reservation_field = ReservationField(
+            ReservationFieldConfig(enabled=bool(route_reservations))
+        )
         self._lane_length_cache = {}
         self._passenger_edge_set = set(self.connection_info.edge_list)
         self._vehicle_subscription_vars = (
@@ -642,6 +652,9 @@ class RLTrainingPipeline:
         self._last_density_step = -10**9
         self._fleet_delay_rate = 0.0
         self._fleet_slowness_by_vehicle = {}
+        reservation_field = getattr(self, "_reservation_field", None)
+        if reservation_field is not None:
+            reservation_field.clear()
 
     def _record_immediate_mappo_transition(
         self,
@@ -1103,6 +1116,19 @@ class RLTrainingPipeline:
         if count is None:
             count = self.connection_info.edge_vehicle_count.get(edge_id, 0)
         return (float(count) * float(self.density_scale_m)) / max(self._edge_lane_meters(edge_id), 5.0)
+
+    def _effective_edge_density(self, edge_id):
+        """Live edge density plus the Layer B anticipatory reservation bonus.
+
+        Fed only to the route-candidate generator so a vehicle's relief signal reflects
+        detours that earlier vehicles committed to this step. Reward/state keep true density.
+        """
+        base = self._edge_density(edge_id)
+        if self._reservation_field is None or not self._reservation_field.enabled:
+            return base
+        return base + self._reservation_field.density_bonus(
+            edge_id, self._edge_lane_meters(edge_id), self.density_scale_m
+        )
 
     def _occupied_density_p95(self, density_vec):
         occupied = density_vec[density_vec > 0.0]
@@ -2964,6 +2990,8 @@ class RLTrainingPipeline:
                         every=self.density_refresh_every,
                         edge_results=edge_subscription_results,
                     )
+                    # Layer B: fade last step's route bookings before this step decides.
+                    self._reservation_field.decay()
                     vehicle_ids = list(vehicle_get_ids())
                     controlled_live_ids = [vid for vid in vehicle_ids if vid in vehicles]
                     for _uid in vehicle_ids:
@@ -3687,7 +3715,7 @@ class RLTrainingPipeline:
                             candidates = self.route_generator.get_candidates(
                                 current_edge,
                                 vehicle.destination,
-                                self._edge_density,
+                                self._effective_edge_density,
                                 prev_route_edges=(
                                     list(previous_actor_route)
                                     if previous_actor_route is not None else None
@@ -3782,6 +3810,10 @@ class RLTrainingPipeline:
                                         traci.vehicle.setRoute(vehicle_id, chosen_route)
                                         vehicle_actor_owned_route[vehicle_id] = tuple(chosen_route)
                                         route_applied = True
+                                        # Layer B: book the committed route for later deciders.
+                                        decision_metrics["route_reservations_seeded"] += (
+                                            self._reservation_field.seed_route(chosen_route)
+                                        )
                                     except Exception:
                                         decision_metrics["route_apply_failures"] += 1
 
