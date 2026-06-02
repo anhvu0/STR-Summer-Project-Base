@@ -66,19 +66,19 @@ def build_parser():
     parser.add_argument(
         "--num-target-vehicles",
         type=int,
-        default=650,
+        default=450,
         help="Number of controlled (RL) vehicles per episode.",
     )
     parser.add_argument(
         "--num-random-vehicles",
         type=int,
-        default=550,
+        default=150,
         help="Number of uncontrolled background vehicles per episode.",
     )
     parser.add_argument(
         "--target-pattern",
         type=int,
-        default=3,
+        default=2,
         choices=[1, 2, 3],
         help="Demand pattern: 1=one O/D, 2=ranged origins -> one shared destination "
              "(creates corridor congestion; use this for the selfless-routing study), "
