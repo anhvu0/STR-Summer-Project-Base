@@ -363,6 +363,30 @@ The team reward is an effective, controllable **parameter governing how much
 vehicles sacrifice**, but on this network that sacrifice is fleet-neutral rather
 than fleet-improving.
 
+**In plain terms — why creating congestion didn't help.** Congestion only gives
+selfless routing something to fix if it is *lopsided* — a jammed road sitting next
+to an emptier one. Rerouting helps by moving vehicles off the full road onto the
+underused one; with no imbalance, there is no opportunity to capture.
+
+On a grid that imbalance never forms. Because there are many equal-length parallel
+routes, selfish drivers already steer away from whichever road is filling up and
+slide onto the next one, so when demand rises **every parallel road fills at roughly
+the same rate** — the network jams *evenly*, not lopsidedly. Once every road is
+uniformly full there is nothing left to rebalance: a central planner has no
+underused road to divert anyone to, and a detour merely moves a vehicle from one
+full road to another, relocating the jam rather than shrinking it. This is exactly
+the saturated-seed behavior documented in §8 — forced detours raised total delay
+instead of reducing it.
+
+The intuition is a checkout line: telling a shopper to let someone go ahead only
+helps if one line is empty while another is backed up. On the grid the shoppers
+already balance the lines themselves — every line is the same length — so no act of
+courtesy speeds anyone up. More demand simply made every line longer; it never
+produced the *imbalance* that selflessness needs. Creating that imbalance requires a
+network that *forces* traffic onto one scarce road (a bottleneck), so that a jammed
+road and an underused alternative can coexist — the high-price-of-anarchy regime
+recommended in §5.
+
 ---
 
 ## 5. The split (the key open issue)

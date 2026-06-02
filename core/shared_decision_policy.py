@@ -181,7 +181,7 @@ class SharedDecisionPolicy:
 
     def _normalize_coordination_value(self, value: float, cap: float) -> float:
         cap = max(float(cap), 1.0)
-        return float(np.clip(float(value) / cap, 0.0, 1.0))
+        return min(max(float(value) / cap, 0.0), 1.0)
 
     def coordination_features(
         self,
@@ -494,7 +494,7 @@ class SharedDecisionPolicy:
                 weights=np.array(weights, dtype=np.float32),
             )
         )
-        max_density = float(np.max(densities))
+        max_density = float(max(densities))
         congested_edges = int(
             sum(1 for density in densities if density >= self.corridor_congestion_density_threshold)
         )
@@ -556,22 +556,17 @@ class SharedDecisionPolicy:
         )
 
     def _normalize_wait_time(self, wait_time_s: float) -> float:
-        return float(
-            np.clip(
-                float(max(wait_time_s, 0.0)) / max(float(self.vehicle_wait_time_clip_s), 1.0),
-                0.0,
-                1.0,
-            )
-        )
+        normalized = float(max(wait_time_s, 0.0)) / max(float(self.vehicle_wait_time_clip_s), 1.0)
+        return min(max(normalized, 0.0), 1.0)
 
     def _normalize_lane_occupancy(self, occupancy_value: float) -> float:
         occupancy = max(float(occupancy_value), 0.0)
         if occupancy > 1.0:
             occupancy /= 100.0
-        return float(np.clip(occupancy, 0.0, 1.0))
+        return min(max(occupancy, 0.0), 1.0)
 
     def _normalize_halting_density(self, halting_density: float) -> float:
-        return float(np.clip(max(float(halting_density), 0.0), 0.0, 1.0))
+        return min(max(float(halting_density), 0.0), 1.0)
 
     def _next_edge_spillback_features(
         self,

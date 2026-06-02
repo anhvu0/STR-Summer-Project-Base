@@ -54,7 +54,7 @@ def build_parser():
     parser.add_argument(
         "--episodes",
         type=int,
-        default=200,
+        default=100,
         help="Number of training episodes.",
     )
     parser.add_argument(
@@ -66,19 +66,19 @@ def build_parser():
     parser.add_argument(
         "--num-target-vehicles",
         type=int,
-        default=350,
+        default=650,
         help="Number of controlled (RL) vehicles per episode.",
     )
     parser.add_argument(
         "--num-random-vehicles",
         type=int,
-        default=150,
+        default=550,
         help="Number of uncontrolled background vehicles per episode.",
     )
     parser.add_argument(
         "--target-pattern",
         type=int,
-        default=2,
+        default=3,
         choices=[1, 2, 3],
         help="Demand pattern: 1=one O/D, 2=ranged origins -> one shared destination "
              "(creates corridor congestion; use this for the selfless-routing study), "
@@ -102,7 +102,7 @@ def build_parser():
     parser.add_argument(
         "--eval-every",
         type=int,
-        default=50,
+        default=25,
         help="Run frozen held-out inference evaluation every N episodes. 0 disables frozen evaluation.",
     )
     parser.add_argument(
@@ -156,7 +156,7 @@ def build_parser():
     parser.add_argument("--gamma", type=float, default=0.995,
                         help="Discount factor for simulation-step returns. Higher default preserves delayed selfless-routing effects.")
     parser.add_argument("--gae-lambda", type=float, default=0.95, help="GAE lambda for advantage estimation.")
-    parser.add_argument("--clip-epsilon", type=float, default=0.15, help="PPO clipping coefficient.")
+    parser.add_argument("--clip-epsilon", type=float, default=0.05, help="PPO clipping coefficient.")
     parser.add_argument("--entropy-coef", type=float, default=0.15,
                         help="Initial entropy bonus coefficient. Raised from 0.03 to combat entropy collapse (see diagnosis).")
     parser.add_argument("--entropy-coef-end", type=float, default=0.05,

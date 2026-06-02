@@ -29,6 +29,10 @@ ROUTE_FEATURE_DIM = 11
 _ETA_DELTA_SCALE_S = 120.0
 _LENGTH_DELTA_SCALE_M = 600.0
 
+# Sentinel for the per-call density memo (see get_candidates). A bare ``None``
+# default would be ambiguous because a density of ``0.0`` is a legitimate value.
+_DENSITY_MISSING = object()
+
 
 def pack_route_candidate_features(
     candidates: Sequence[RouteCandidate],
@@ -119,6 +123,22 @@ class RouteCandidateGenerator:
         allowed_first_edges: Optional[Set[str]] = None,
     ) -> List[RouteCandidate]:
         """Return up to k_routes diverse candidates, including congestion-aware routes."""
+        # Per-call density memo. Within a single call the live edge density is frozen
+        # (the reservation field is seeded only *after* the action is chosen), yet the
+        # same edge is read many times: the density-aware Dijkstra cost functions touch
+        # it on every relaxation, and route metrics + the greedy diversity selection
+        # re-score the same paths repeatedly. Caching the raw lookup is bit-identical to
+        # calling ``edge_density_fn`` every time -- it only removes redundant work.
+        _raw_density_fn = edge_density_fn
+        _density_memo: Dict[str, float] = {}
+
+        def edge_density_fn(edge_id):
+            value = _density_memo.get(edge_id, _DENSITY_MISSING)
+            if value is _DENSITY_MISSING:
+                value = _raw_density_fn(edge_id)
+                _density_memo[edge_id] = value
+            return value
+
         structural_paths = self._get_raw_paths_cached(current_edge_id, destination_edge_id)
         density_paths = self._compute_density_aware_paths(
             current_edge_id,
@@ -217,7 +237,7 @@ class RouteCandidateGenerator:
 
         def effective_density(edge_id: str) -> float:
             try:
-                density = float(np.clip(edge_density_fn(edge_id), 0.0, 2.0))
+                density = min(max(float(edge_density_fn(edge_id)), 0.0), 2.0)
             except Exception:
                 density = 0.0
             return self._effective_density(density)
@@ -301,7 +321,7 @@ class RouteCandidateGenerator:
 
         def density(edge_id: str) -> float:
             try:
-                raw = float(np.clip(edge_density_fn(edge_id), 0.0, 2.0))
+                raw = min(max(float(edge_density_fn(edge_id)), 0.0), 2.0)
             except Exception:
                 raw = 0.0
             return self._effective_density(raw)
@@ -361,7 +381,7 @@ class RouteCandidateGenerator:
         densities = []
         for edge_id in path:
             try:
-                raw_density = float(np.clip(edge_density_fn(edge_id), 0.0, 2.0))
+                raw_density = min(max(float(edge_density_fn(edge_id)), 0.0), 2.0)
             except Exception:
                 raw_density = 0.0
             densities.append(self._effective_density(raw_density))
@@ -450,7 +470,7 @@ class RouteCandidateGenerator:
         densities = []
         for edge_id in route_edges:
             try:
-                densities.append(float(np.clip(edge_density_fn(edge_id), 0.0, 1.0)))
+                densities.append(min(max(float(edge_density_fn(edge_id)), 0.0), 1.0))
             except Exception:
                 densities.append(0.0)
         mean_density = float(np.mean(densities)) if densities else 0.0
@@ -500,24 +520,20 @@ class RouteCandidateGenerator:
         feats[4] = first_edge_density
         feats[5] = min(len(route_edges) / _MAX_ROUTE_LEN, 1.0)
         feats[6] = float(diversity)
-        feats[7] = float(np.clip(
+        feats[7] = min(max(
             (total_eta - float(baseline["total_eta"])) / _ETA_DELTA_SCALE_S,
             -1.0,
-            1.0,
-        ))
-        feats[8] = float(np.clip(
+        ), 1.0)
+        feats[8] = min(max(
             (total_length - float(baseline["total_length"])) / _LENGTH_DELTA_SCALE_M,
             -1.0,
-            1.0,
-        ))
-        feats[9] = float(np.clip(
+        ), 1.0)
+        feats[9] = min(max(
             float(baseline["mean_density"]) - mean_density,
             -1.0,
-            1.0,
-        ))
-        feats[10] = float(np.clip(
+        ), 1.0)
+        feats[10] = min(max(
             float(baseline["first_edge_density"]) - first_edge_density,
             -1.0,
-            1.0,
-        ))
+        ), 1.0)
         return feats

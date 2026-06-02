@@ -111,6 +111,31 @@ are given a hugely negative score so they're never picked —
 [`_masked_logits`](../core/mappo.py#L88). This "score then mask" step is how the guardrails
 hand their filtered list to the policy.)
 
+(Performance aside, skippable: building the 4 candidates is the single most expensive
+per-decision step — it runs several Dijkstra searches and re-scores each candidate against
+live density. Two **behavior-preserving** optimizations keep it cheap, both inside
+[`get_candidates`](../core/route_candidate_generator.py#L113):
+
+- **Per-call density memo.** Within one call the live edge density is frozen — the Layer B
+  reservation field is seeded only *after* the route is chosen — yet the same edge is read
+  hundreds of times (by the density-aware Dijkstra cost functions on every relaxation, and
+  again when route metrics and the diversity selection re-score paths). The raw density
+  lookup is therefore cached for the duration of the call. Because it caches a value that is
+  constant during the call, the scorecards come out **bit-for-bit identical**; it only drops
+  redundant reads (~8× fewer density lookups in practice).
+- **Scalar clamps.** The per-edge `np.clip(...)` / `np.max(...)` on tiny (1–40 element)
+  lists are now Python `min` / `max`. For finite scalars these are identical to the NumPy
+  versions but skip array-dispatch overhead. The `np.mean` and weighted `np.average`
+  reductions are deliberately **left as NumPy** — its pairwise (and float32) summation is
+  not reproduced by a naive Python sum, so swapping them would shift low-order bits and is
+  *not* a safe no-op.
+
+Together these cut `get_candidates` to roughly a quarter of its former wall-cost with
+outputs verified bit-identical via a feature-hash check. The same scalar-clamp substitution
+is applied to the corridor/guardrail density stats in
+[`action_corridor_stats`](../core/shared_decision_policy.py#L452) and the per-step feature
+normalizers, again only where it is provably exact.)
+
 ---
 
 ## 3. The reward: how a decision is graded, and why each number
