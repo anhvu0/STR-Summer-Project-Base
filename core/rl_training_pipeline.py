@@ -110,6 +110,7 @@ class RLTrainingPipeline:
         frozen_eval_seeds=None,
         eval_spawn_interval=None,
         route_reservations=True,
+        reroute_epoch_edges=5,
     ):
         """
         Args:
@@ -291,7 +292,11 @@ class RLTrainingPipeline:
         self.route_k = 4                           # number of candidate routes offered to policy
         self.route_feature_dim = ROUTE_FEATURE_DIM
         self.route_obs_dim = self.route_k * self.route_feature_dim
-        self.reroute_epoch_edges = 5               # re-query policy every N completed edges
+        # Re-query the route policy every N completed edges. The edge counter starts
+        # at 1 on the spawn edge, so the FIRST route decision fires on the Nth edge of
+        # the trip: on short-trip corridor maps (bottleneck: in->stage->path->out) it
+        # must be <=2 or the policy never sees the fork; the NYC-grid study used 5.
+        self.reroute_epoch_edges = int(reroute_epoch_edges)
         self.state_size = self.shared_policy.compact_state_size + self.route_obs_dim
         self.central_observation_size = 18
         self.action_size = self.route_k            # policy picks a route index, not a direction
@@ -2264,6 +2269,7 @@ class RLTrainingPipeline:
                 self._frozen_eval_model_path,
                 net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
                 deterministic=self.eval_deterministic,
+                reroute_epoch_edges=self.reroute_epoch_edges,
             )
             stats = run_eval_controller(policy, rl_vehicles)
             runtime_metrics = stats.get("controller_runtime_metrics") or {}

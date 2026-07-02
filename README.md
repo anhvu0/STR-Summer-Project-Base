@@ -143,6 +143,16 @@ Inference parity improvements:
 - `MAPPOController.should_control_vehicle(...)` now wakes the inference controller on the same structural `forced` and `open` decision cases that training evaluates, instead of relying on an extra near-junction heuristic gate.
 - Training now supports held-out frozen evaluation so checkpoint selection is based on deployment-style behavior instead of optimistic in-training rollouts.
 
+Saturation-aware coordination guardrails (deployment-only, no retraining; see `docs/coordination_throttle.md`):
+- Layer A (`--disable-detour-throttle`) vetoes a detour onto a near-capacity alternative at network saturation.
+- Layer B (`--disable-route-reservations`) books committed routes so later deciders score against effective (live + reserved) density.
+- Layer C (`--disable-lane-control-throttle`) shortens the forced lane-change hold (70→55) and skips it while stalled. This addresses the main driver of the mid-congestion inference losses: on those seeds MAPPO picks the *same route* as Dijkstra but runs it ~20% slower because a forced lane change that can't complete stalls flow. Layer C recovers those seeds (incl. the saturated 4010) and keeps the wins; on a loss-heavy 14-seed set it moves the mean from +25.7s (losing) to −18.5s (beating Dijkstra). One seed (4012) regresses — it needs the longer hold — so the value is tunable and the layer is toggleable (see `docs/coordination_throttle.md` §9).
+
+Bottleneck map — the default selfless-routing experiment (see `docs/bottleneck_map_design.md`):
+- The NYC grid has a price of anarchy ≈ 1 (selfish congestion-aware routing ≈ system optimum), so selfless detours could never improve fleet travel time there. `configurations/maps/bottleneck.net.xml` is a Pigou-style fork (1-lane fast bottleneck vs two 2-lane detours) with a measured PoA ≥ 1.49: ~95s/vehicle available to coordination at the default demand (probe: `diag_bottleneck_poa.py`).
+- Defaults in `train_rl.py`/`main.py` now target this map: `--sumocfg ./configurations/bottleneck.sumocfg`, demand pattern 4 (all sources → the sink), 300 controlled + 100 background @ 1.0s spawn, arm-C objective on by default (team reward α=1, tail-delay penalty and route_balance proxy zeroed), `--reroute-epoch-edges 2` so the route decision fires at the fork, checkpoints at `configurations/model/mappo_policy_bottleneck*`.
+- Legacy NYC-grid workflow: `--sumocfg ./configurations/myconfig.sumocfg --pattern 2 --reroute-epoch-edges 5` with the `mappo_policy_nyc*` checkpoints (its training CSVs are preserved under `configurations/model/nyc_legacy_rl/`).
+
 ***Contribution guidance***
 
 Code:

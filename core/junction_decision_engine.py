@@ -115,6 +115,15 @@ class JunctionDecisionEngine:
         self.proactive_safety_margin_m = 8.0
         self.cooldown_after_abort_extra_steps = 2
         self.cooldown_after_timeout_extra_steps = 4
+        # Layer C (saturation/stall-aware lane-control throttle, see
+        # docs/coordination_throttle.md §9). Defaults reproduce legacy behavior so
+        # training is unaffected; the inference controller lowers the hold and enables
+        # the stall-skip. A forced changeLane() that can't complete under congestion
+        # otherwise stalls this vehicle (and its followers) for the full hold window.
+        self.lane_change_hold_steps = 70             # forced changeLane() hold duration (s)
+        self.lane_change_skip_when_stalled_mps = 0.0  # >0: skip forcing a change while slower than this
+        self.lc_hold_throttled = 0                    # telemetry: forced changes issued with the shortened hold
+        self.lc_stalled_skips = 0                     # telemetry: forced changes skipped because stalled
         self._edge_allows_passenger_cache = {}
         self._shortest_path_suffix_cache = {}
         self._edge_valid_actions_by_edge = {}
@@ -625,7 +634,7 @@ class JunctionDecisionEngine:
         details["recent_revisit_low_progress"] = recent_revisit_low_progress
         return (not blocked), details
 
-    def try_request_lane_change(self, context: DecisionContext, action_idx: int, duration: int = 70) -> Tuple[bool, bool]:
+    def try_request_lane_change(self, context: DecisionContext, action_idx: int, duration: Optional[int] = None) -> Tuple[bool, bool]:
         direction = self.direction_choices[action_idx]
         lane_now_map = self.connection_info.lane_outgoing_edges_dict.get(context.lane_id, {})
         if direction in lane_now_map:
@@ -641,8 +650,20 @@ class JunctionDecisionEngine:
         if target_lane is None:
             return False, False
 
+        # Layer C: don't fight for a lane while stalled in congestion. A forced hold
+        # here keeps this vehicle (and its followers) waiting for a gap that won't open,
+        # which is exactly the flow turbulence that loses mid-congestion seeds. Defer to
+        # SUMO's native lane-change model instead (no command, treated as feasible).
+        skip_mps = float(self.lane_change_skip_when_stalled_mps)
+        if skip_mps > 0.0 and float(context.speed) < skip_mps:
+            self.lc_stalled_skips += 1
+            return False, True
+
+        hold = int(self.lane_change_hold_steps if duration is None else duration)
+        if hold < 70:
+            self.lc_hold_throttled += 1
         try:
-            traci.vehicle.changeLane(context.vehicle_id, target_lane, duration)
+            traci.vehicle.changeLane(context.vehicle_id, target_lane, hold)
             return True, True
         except traci.TraCIException:
             return True, False

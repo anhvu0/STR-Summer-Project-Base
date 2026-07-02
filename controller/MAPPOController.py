@@ -27,6 +27,17 @@ from core.coordination_throttle import (
     detour_should_fallback,
 )
 
+# Layer C lane-control throttle (inference-only; see docs/coordination_throttle.md §9).
+# Forced changeLane() hold window when the throttle is on (legacy default is 70). A hold
+# sweep (70/55/45/35) showed 55 is the welfare-optimal global value: it recovers the
+# mid-congestion *and* the saturated losses (4010 +406->-40, 4015 +273->+12) and keeps
+# every win, while shorter holds (25/35) gridlock seed 4012 and destabilize 4010. The lever
+# is real but a global value is not a guaranteed no-op (see §9.4); toggle per scenario.
+LANE_CONTROL_THROTTLE_HOLD_STEPS = 55
+# Below this speed (m/s) a forced lane change is skipped (defer to SUMO's native model).
+LANE_CONTROL_THROTTLE_STALL_MPS = 1.0
+
+
 def parse_sumocfg(sumocfg_path):
     dom = parse(sumocfg_path)
     net_file = dom.getElementsByTagName('net-file')[0].attributes['value'].nodeValue
@@ -36,13 +47,20 @@ net_path = parse_sumocfg("./configurations/myconfig.sumocfg")
 
 class MAPPOPolicy(RouteController):
     def __init__(self, vehicles, connection_info, model_file, net_xml_file=net_path, deterministic=True,
-                 detour_throttle=True, route_reservations=True):
+                 detour_throttle=True, route_reservations=True, lane_control_throttle=True,
+                 reroute_epoch_edges=2):
         super().__init__(connection_info)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # Saturation-aware detour coordination (see core/coordination_throttle.py).
         # Layer A: deterministic spare-capacity veto on the policy's route choice.
         # Layer B: anticipatory reservation field feeding effective density to candidates.
         self._throttle_config = DetourThrottleConfig(enabled=bool(detour_throttle))
+        # Layer C: lane-control throttle (see docs/coordination_throttle.md §9). The
+        # forced changeLane() hold is shortened and skipped while stalled, so a lane
+        # change that can't complete under congestion stops self-blocking flow. This is
+        # the dominant driver of the mid-congestion losses (same route as Dijkstra, ~20%
+        # slower) — not route choice. Inference-only; training keeps the legacy hold.
+        self._lane_control_throttle = bool(lane_control_throttle)
         self._reservation_field = ReservationField(
             ReservationFieldConfig(enabled=bool(route_reservations))
         )
@@ -55,6 +73,13 @@ class MAPPOPolicy(RouteController):
         self.vehicles = vehicles
         self.net = sumolib.net.readNet(net_xml_file)
         self.decision_engine = JunctionDecisionEngine(connection_info, self.net, self.direction_choices)
+        if self._lane_control_throttle:
+            # Calibrated on the inf_greedy seed set (hold sweep, §9.3): hold 70->55 recovers
+            # the saturated and mid-congestion losses (4010 +406->-41s, 4015 +273->+12s,
+            # 4013 +36->+15s) and keeps every win; the lone regression is 4012. Stall-skip
+            # below 1 m/s adds a small safety margin. See docs/coordination_throttle.md §9.
+            self.decision_engine.lane_change_hold_steps = LANE_CONTROL_THROTTLE_HOLD_STEPS
+            self.decision_engine.lane_change_skip_when_stalled_mps = LANE_CONTROL_THROTTLE_STALL_MPS
         self._visit_count = {}
         self._best_dist = {}
         self._recent_edges = {}
@@ -154,7 +179,12 @@ class MAPPOPolicy(RouteController):
         self.route_feature_dim = ROUTE_FEATURE_DIM
         self.route_obs_dim = self.route_k * self.route_feature_dim
         self.route_eta_delta_feature_scale_s = 120.0
-        self.reroute_epoch_edges = 5
+        # Re-query the route policy every N completed edges (edge counter starts at 1
+        # on the spawn edge, so the first decision fires on the Nth edge). Must match
+        # the trip length of the map: <=2 on the bottleneck corridor or the policy
+        # never decides at the fork; the NYC-grid study used 5. Keep consistent with
+        # the training-side value (rl_training_pipeline reroute_epoch_edges).
+        self.reroute_epoch_edges = int(reroute_epoch_edges)
         self._vehicle_route_obs: dict = {}
         self._vehicle_edges_since_reroute: dict = {}
         self._vehicle_actor_owned_route: dict = {}   # vid -> actor-committed route tuple for current epoch
@@ -787,6 +817,14 @@ class MAPPOPolicy(RouteController):
                 int(metrics["coordination_pending_reservations_seeded"]),
                 int(metrics["coordination_pressure_candidates_rejected"]),
                 int(metrics["coordination_pressure_candidates_seen"]),
+            ),
+            (
+                "[RL-INFER] lane_control_throttle={} hold_steps={} short_holds={} stalled_skips={}"
+            ).format(
+                "on" if self._lane_control_throttle else "off",
+                int(self.decision_engine.lane_change_hold_steps),
+                int(getattr(self.decision_engine, "lc_hold_throttled", 0)),
+                int(getattr(self.decision_engine, "lc_stalled_skips", 0)),
             ),
         ]
 

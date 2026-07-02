@@ -452,6 +452,8 @@ class target_vehicles_generator:
                 #1. one start point, one destination for all target vehicles
                 #2. ranged start point, one destination for all target vehicles
                 #3. ranged start points, ranged destination for all target vehicles
+                #4. corridor: all topological source edges -> the single sink edge
+                    (for directed bottleneck maps; see configurations/maps/bottleneck)
             -- CASES ENDS --
 
             Returns the list of target vehicles if succeeds.
@@ -501,6 +503,11 @@ class target_vehicles_generator:
             "-e", str(latest_release_time),
             "-p", str(density),
             "-r", target_xml_file,
+            # Resample O/D pairs with no connecting path instead of letting duarouter
+            # drop them. On strongly connected nets (NYC grid) this is a no-op; on
+            # directed corridor/bottleneck maps most random pairs are unreachable, so
+            # without it the background-vehicle count silently collapses.
+            "--validate",
         ]
         if seed is not None:
             cmd += ["-s", str(int(seed))]
@@ -555,6 +562,40 @@ class target_vehicles_generator:
                 param_start.append(param_start_temp)
                 param_dest.append(param_dest_temp)
                 x += 1
+            result_dict = self.generate_target_vehicles(num_target_vehicles, target_xml_file, (param_start, param_dest))
+        elif pattern == 4:
+            # Corridor pattern for bottleneck/high-price-of-anarchy maps: every source
+            # edge (no incoming connections) feeds the single sink edge (no outgoing
+            # connections), so the whole controlled fleet crosses the same fork and the
+            # bottleneck-vs-detour dilemma is faced by every vehicle. Derived purely
+            # from topology - no hardcoded edge IDs - so it works on any map built as a
+            # directed funnel; it errors out on strongly connected nets (e.g. the NYC
+            # grid), which have no sources/sinks.
+            source_edges = [
+                e for e in spawn_edges
+                if self.incoming_count_dict.get(e.getID(), 0) == 0
+            ]
+            sink_edges = [
+                e for e in dest_edges
+                if len(self.out_dict.get(e.getID(), {})) == 0
+            ]
+            if not source_edges or not sink_edges:
+                print("ERROR: Pattern 4 needs source and sink edges (a directed corridor "
+                      "map such as configurations/maps/bottleneck.net.xml). Use patterns "
+                      "1-3 on strongly connected maps.")
+                return None
+            param_dest = None
+            param_start = None
+            for candidate_dest in sorted(sink_edges, key=lambda e: e.getID()):
+                valid_sources = [s for s in source_edges if validate_path(self.net, s, candidate_dest)]
+                if not valid_sources:
+                    continue
+                param_dest = candidate_dest
+                param_start = __random_choices_with_rp__(valid_sources, num_target_vehicles)
+                break
+            if param_dest is None or param_start is None:
+                print("ERROR: Pattern 4 found no sink reachable from any source edge.")
+                return None
             result_dict = self.generate_target_vehicles(num_target_vehicles, target_xml_file, (param_start, param_dest))
         else:
             print("ERROR: Unknown pattern type.")

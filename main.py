@@ -40,6 +40,13 @@ def parse_seed_list(raw_value):
 def build_parser():
     parser = argparse.ArgumentParser(description="Run inference-time routing controllers in SUMO.")
     parser.add_argument(
+        "--sumocfg",
+        default="./configurations/bottleneck.sumocfg",
+        help="Path to the SUMO .sumocfg file. Default is the bottleneck map used for the "
+             "selfless-routing study; use ./configurations/myconfig.sumocfg for the legacy "
+             "NYC grid. Must match the map the checkpoint was trained on.",
+    )
+    parser.add_argument(
         "--model-path",
         default=None,
         help="Optional model checkpoint path. Defaults to the best frozen-eval checkpoint when present, otherwise the final checkpoint.",
@@ -47,7 +54,7 @@ def build_parser():
     parser.add_argument(
         "--spawn-interval",
         type=float,
-        default=0.5,
+        default=1.0,
         help="Release spacing for generated controlled vehicles. Defaults to frozen-eval training value.",
     )
     parser.add_argument(
@@ -64,26 +71,37 @@ def build_parser():
     parser.add_argument(
         "--controlled-vehicles",
         type=int,
-        default=450,
+        default=300,
         help="Number of controlled vehicles. Defaults to the frozen-eval training value.",
     )
     parser.add_argument(
         "--uncontrolled-vehicles",
         type=int,
-        default=150,
+        default=100,
         help="Number of uncontrolled background vehicles. Defaults to the frozen-eval training value.",
     )
     parser.add_argument(
         "--pattern",
         type=int,
-        default=2,
-        help="Vehicle generation pattern. Defaults to the training/frozen-eval pattern.",
+        default=4,
+        choices=[1, 2, 3, 4],
+        help="Vehicle generation pattern (4=corridor sources->sink, for bottleneck maps; "
+             "2=ranged origins -> shared destination, for grid maps). Defaults to the "
+             "training/frozen-eval pattern.",
     )
     parser.add_argument(
         "--traci-port",
         type=int,
         default=8873,
         help="TraCI port for SUMO inference runs. Use a different value if the port is busy.",
+    )
+    parser.add_argument(
+        "--reroute-epoch-edges",
+        type=int,
+        default=2,
+        help="Re-query the route policy every N completed edges (first decision fires "
+             "on the Nth edge). Keep <=2 on the bottleneck map so the policy decides "
+             "at the fork; the NYC-grid study used 5. Must match training.",
     )
     parser.add_argument(
         "--eval-policy",
@@ -119,17 +137,34 @@ def build_parser():
              "(default), committed routes book their leading edges so later deciders score "
              "against effective (live + reserved) density. See docs/coordination_throttle.md.",
     )
+    parser.add_argument(
+        "--disable-lane-control-throttle",
+        action="store_true",
+        help="Disable the Layer C lane-control throttle. When ON (default), the forced "
+             "lane-change hold is shortened (70->55) and skipped while stalled, so a lane "
+             "change that can't complete under congestion stops self-blocking flow. This "
+             "drives the mid-congestion losses (same route as Dijkstra, ~20%% slower). "
+             "See docs/coordination_throttle.md.",
+    )
     parser.set_defaults(fast_mode=True)
     return parser
 
 
-def resolve_model_path(raw_model_path=None):
+def resolve_model_path(raw_model_path=None, sumocfg_path=None):
     if raw_model_path:
         return raw_model_path
-    best_model_path = "./configurations/model/mappo_policy_nyc.best.pt"
-    final_model_path = "./configurations/model/mappo_policy_nyc.pt"
+    # Checkpoints are map-specific; pick the family matching the active sumocfg
+    # (bottleneck by default, mappo_policy_nyc for the legacy NYC grid).
+    prefix = "mappo_policy_bottleneck"
+    if sumocfg_path and "bottleneck" not in os.path.basename(sumocfg_path):
+        prefix = "mappo_policy_nyc"
+    best_model_path = "./configurations/model/{}.best.pt".format(prefix)
+    final_model_path = "./configurations/model/{}.pt".format(prefix)
     if os.path.exists(best_model_path):
         return best_model_path
+    if not os.path.exists(final_model_path):
+        print("WARNING: no {} checkpoint found; train one with train_rl.py "
+              "(its defaults match this map) or pass --model-path.".format(prefix))
     return final_model_path
 
 
@@ -188,19 +223,28 @@ def test_dijkstra_policy(vehicles, fast_mode=False, traci_port=8873):
 
 
 def test_mappo(vehicles, model_path, fast_mode=False, traci_port=8873, deterministic=True,
-               detour_throttle=True, route_reservations=True):
+               detour_throttle=True, route_reservations=True, lane_control_throttle=True,
+               reroute_epoch_edges=2):
     print("Testing MAPPO Route Controller ({} inference)".format("greedy" if deterministic else "stochastic"))
     scheduler = MAPPOPolicy(
-        vehicles, init_connection_info, model_path, deterministic=deterministic,
+        vehicles, init_connection_info, model_path,
+        net_xml_file=init_connection_info.net_filename,
+        deterministic=deterministic,
         detour_throttle=detour_throttle, route_reservations=route_reservations,
+        lane_control_throttle=lane_control_throttle,
+        reroute_epoch_edges=reroute_epoch_edges,
     )
     return run_simulation(scheduler, vehicles, fast_mode=fast_mode, traci_port=traci_port)
+
+
+# Overwritten in __main__ from --sumocfg; module-level default keeps imports harmless.
+active_sumocfg_path = "./configurations/bottleneck.sumocfg"
 
 
 def run_simulation(scheduler, vehicles, fast_mode=False, traci_port=8873):
 
     simulation = StrSumo(scheduler, init_connection_info, vehicles)
-    runtime_sumocfg = build_runtime_sumocfg("./configurations/myconfig.sumocfg", fast_mode=fast_mode)
+    runtime_sumocfg = build_runtime_sumocfg(active_sumocfg_path, fast_mode=fast_mode)
 
     """
     The traci start below use sumocfg files from configurations, which match with the one you use in train_rl.py. If you change in either place, you need to change in the other one too.
@@ -272,22 +316,24 @@ def summarize_runs(label, rows):
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    model_path = resolve_model_path(args.model_path)
+    active_sumocfg_path = args.sumocfg
+    sumocfg_dir = os.path.dirname(active_sumocfg_path)
+    model_path = resolve_model_path(args.model_path, sumocfg_path=active_sumocfg_path)
     sumo_binary = checkBinary('sumo')
     # sumo_binary = checkBinary('sumo')#use this line if you do not want the UI of SUMO
 
     # parse config file for map file name
-    dom = parse("./configurations/myconfig.sumocfg")
+    dom = parse(active_sumocfg_path)
 
     net_file_node = dom.getElementsByTagName('net-file')
     net_file_attr = net_file_node[0].attributes
 
     net_file = net_file_attr['value'].nodeValue
-    init_connection_info = ConnectionInfo("./configurations/"+net_file)
+    init_connection_info = ConnectionInfo(os.path.join(sumocfg_dir, net_file))
 
     route_file_node = dom.getElementsByTagName('route-files')
     route_file_attr = route_file_node[0].attributes
-    route_file = "./configurations/"+route_file_attr['value'].nodeValue
+    route_file = os.path.join(sumocfg_dir, route_file_attr['value'].nodeValue)
     run_seeds = resolve_run_seeds(args.seed, args.seeds)
     print(
         "Inference scenario: controlled={}, uncontrolled={}, pattern={}, spawn_interval={}, seeds={}".format(
@@ -326,6 +372,8 @@ if __name__ == "__main__":
                 traci_port=args.traci_port, deterministic=(args.eval_policy == "greedy"),
                 detour_throttle=not args.disable_detour_throttle,
                 route_reservations=not args.disable_route_reservations,
+                lane_control_throttle=not args.disable_lane_control_throttle,
+                reroute_epoch_edges=args.reroute_epoch_edges,
             )
         )
     summarize_runs("Dijkstra", dijkstra_results)

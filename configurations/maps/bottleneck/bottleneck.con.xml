@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Explicit lane-to-lane connections so both merges are conflict-free:
+     - nS: each spawn ramp owns one stage lane (no entry merging).
+     - nM: a2 -> out_2, b3 -> out_3/4, c3 -> out_0/1 (disjoint target lanes).
+     Without this netconvert fans a2 across all five out lanes as a minor link
+     that yields to both detours, which throttles the bottleneck path at the
+     merge and masks the lane-drop bottleneck the experiment depends on. -->
+<connections>
+    <connection from="in1" to="stage" fromLane="0" toLane="2"/>
+    <connection from="in2" to="stage" fromLane="0" toLane="1"/>
+    <connection from="in3" to="stage" fromLane="0" toLane="0"/>
+
+    <connection from="stage" to="b1" fromLane="2" toLane="0"/>
+    <connection from="stage" to="b1" fromLane="2" toLane="1"/>
+    <connection from="stage" to="a1" fromLane="1" toLane="0"/>
+    <connection from="stage" to="c1" fromLane="0" toLane="0"/>
+    <connection from="stage" to="c1" fromLane="0" toLane="1"/>
+
+    <connection from="a2" to="out" fromLane="0" toLane="2"/>
+    <connection from="b3" to="out" fromLane="0" toLane="3"/>
+    <connection from="b3" to="out" fromLane="1" toLane="4"/>
+    <connection from="c3" to="out" fromLane="0" toLane="0"/>
+    <connection from="c3" to="out" fromLane="1" toLane="1"/>
+</connections>

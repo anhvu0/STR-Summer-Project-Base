@@ -37,18 +37,21 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Train a routing policy with MAPPO.")
     parser.add_argument(
         "--sumocfg",
-        default="./configurations/myconfig.sumocfg",
-        help="Path to SUMO .sumocfg file.",
+        default="./configurations/bottleneck.sumocfg",
+        help="Path to SUMO .sumocfg file. Default is the high-price-of-anarchy bottleneck "
+             "map built for the selfless-routing study (docs/bottleneck_map_design.md); "
+             "use ./configurations/myconfig.sumocfg for the legacy NYC grid.",
     )       #If you change the sumocfg file, you need to retrain the model so it will reflect new files in there. At least for now until we can generalize routes and net
 
     parser.add_argument(
         "--model-output",
-        default="./configurations/model/mappo_policy_nyc.pt",
-        help="Path to save the trained model.",
+        default="./configurations/model/mappo_policy_bottleneck.pt",
+        help="Path to save the trained model. NYC-grid checkpoints live at "
+             "./configurations/model/mappo_policy_nyc.pt; keep map and checkpoint paired.",
     )
     parser.add_argument(
         "--best-model-output",
-        default="./configurations/model/mappo_policy_nyc.best.pt",
+        default="./configurations/model/mappo_policy_bottleneck.best.pt",
         help="Optional path for the best held-out frozen-eval checkpoint. Defaults to <model-output>.best.pt.",
     )
     parser.add_argument(
@@ -60,29 +63,43 @@ def build_parser():
     parser.add_argument(
         "--spawn-interval",
         type=float,
-        default=0.5,
-        help="Interval between vehicle spawns.",
+        default=1.0,
+        help="Interval between vehicle spawns. 1.0 on the bottleneck map ~= 1 veh/s "
+             "controlled demand: ~2x the bottleneck's capacity (selfish herding jams it) "
+             "while total network capacity has slack (detours can absorb the excess).",
     )
     parser.add_argument(
         "--num-target-vehicles",
         type=int,
-        default=450,
-        help="Number of controlled (RL) vehicles per episode.",
+        default=300,
+        help="Number of controlled (RL) vehicles per episode. Calibrated for the "
+             "bottleneck map (see docs/bottleneck_map_design.md); the NYC-grid study "
+             "used 350-450.",
     )
     parser.add_argument(
         "--num-random-vehicles",
         type=int,
-        default=150,
+        default=100,
         help="Number of uncontrolled background vehicles per episode.",
     )
     parser.add_argument(
         "--target-pattern",
         type=int,
-        default=2,
-        choices=[1, 2, 3],
+        default=4,
+        choices=[1, 2, 3, 4],
         help="Demand pattern: 1=one O/D, 2=ranged origins -> one shared destination "
-             "(creates corridor congestion; use this for the selfless-routing study), "
-             "3=ranged origins -> ranged destinations (dispersed, ~no congestion).",
+             "(corridor congestion on grid maps), 3=ranged origins -> ranged destinations "
+             "(dispersed, ~no congestion), 4=corridor: all source edges -> the sink edge "
+             "(bottleneck maps; every vehicle faces the bottleneck-vs-detour dilemma).",
+    )
+    parser.add_argument(
+        "--reroute-epoch-edges",
+        type=int,
+        default=2,
+        help="Re-query the route policy every N completed edges. The first decision "
+             "fires on the Nth edge of a trip, so on the bottleneck map this must be "
+             "<=2 for the policy to decide at the fork (2 = decide exactly on the "
+             "staging edge). The NYC-grid study used 5.",
     )
     parser.add_argument(
         "--team-reward-alpha",
@@ -113,8 +130,9 @@ def build_parser():
     parser.add_argument(
         "--eval-spawn-interval",
         type=float,
-        default=0.5,
-        help="Optional spawn interval override for held-out frozen inference evaluation.",
+        default=1.0,
+        help="Optional spawn interval override for held-out frozen inference evaluation. "
+             "Keep equal to --spawn-interval so eval demand matches training demand.",
     )
     parser.add_argument(
         "--eval-policy",
@@ -126,19 +144,35 @@ def build_parser():
     )
     parser.add_argument(
         "--disable-tail-delay-penalty",
+        dest="disable_tail_delay_penalty",
         action="store_true",
         help="Zero the tail-delay penalty, which otherwise escalates exactly when a vehicle "
-             "detours (structurally anti-selfless). Part of the arm-C 'full authority' config."
-             "Include it in the cli to turn it to True. True is better because False actually add selfish noises.",
+             "detours (structurally anti-selfless). DEFAULT ON (arm-C 'full authority'); "
+             "use --enable-tail-delay-penalty to restore the legacy term.",
+    )
+    parser.add_argument(
+        "--enable-tail-delay-penalty",
+        dest="disable_tail_delay_penalty",
+        action="store_false",
+        help="Restore the legacy tail-delay penalty (anti-selfless; for A/B against the "
+             "legacy objective only).",
     )
     parser.add_argument(
         "--disable-route-balance",
+        dest="disable_route_balance",
         action="store_true",
         help="Zero the legacy hand-crafted route_balance reward so the principled team-reward "
-             "term is the sole selfless driver. Part of the arm-C 'full authority' config."
-             "Include it in the cli to turn it to True. True is better because False actually add selfish noises.",
+             "term is the sole selfless driver. DEFAULT ON (arm-C 'full authority'); "
+             "use --enable-route-balance to restore the legacy term.",
     )
-    
+    parser.add_argument(
+        "--enable-route-balance",
+        dest="disable_route_balance",
+        action="store_false",
+        help="Restore the legacy route_balance proxy reward (for A/B against the legacy "
+             "objective only).",
+    )
+
     parser.add_argument(
         "--fast-mode",
         dest="fast_mode",
@@ -169,8 +203,10 @@ def build_parser():
     parser.add_argument(
         "--min-transitions-per-update",
         type=int,
-        default=2048,
-        help="Skip policy updates until at least this many decision transitions are collected.",
+        default=768,
+        help="Skip policy updates until at least this many decision transitions are collected. "
+             "The bottleneck map yields ~2-3 decisions/vehicle (~900/episode at defaults), so "
+             "768 keeps roughly one PPO update per episode; the NYC grid collected ~2500/episode.",
     )
     parser.add_argument(
         "--no-value-normalization",
@@ -199,7 +235,16 @@ def build_parser():
              "candidate generator scores against effective (live + reserved) density, "
              "damping the simultaneous detour pile-on. See docs/coordination_throttle.md.",
     )
-    parser.set_defaults(fast_mode=True, normalize_value_targets=True)
+    # Arm-C "full authority" objective is the default: the two legacy reward terms
+    # that structurally oppose selfless detours are zeroed unless explicitly re-enabled
+    # (docs/selfless_routing_analysis.md §4.0/§4.3 - the config that made the greedy
+    # policy genuinely selfless: 14.1s ETA sacrifice, 27% non-baseline, CIs clear).
+    parser.set_defaults(
+        fast_mode=True,
+        normalize_value_targets=True,
+        disable_tail_delay_penalty=True,
+        disable_route_balance=True,
+    )
     return parser
 
 
@@ -245,6 +290,7 @@ def main():
         team_reward_mode=args.team_reward_mode,
         eval_deterministic=(args.eval_policy == "greedy"),
         route_reservations=not args.disable_route_reservations,
+        reroute_epoch_edges=args.reroute_epoch_edges,
     )
     if args.disable_tail_delay_penalty:
         pipeline.tail_delay_linear_penalty = 0.0

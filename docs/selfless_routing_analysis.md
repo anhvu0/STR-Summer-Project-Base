@@ -625,3 +625,37 @@ These are a **robustness fix** (recover the saturated-seed losses; "never worse 
 shortest-path"), not a fleet-TT unlock — the NYC grid's low PoA still caps the headroom
 (§4.3). Full design, gate logic, knobs, and the seed-4010 A/B protocol:
 [`coordination_throttle.md`](coordination_throttle.md).
+
+## 9. The losses are mostly the lane-control layer, not routing (Layer C) — 2026-06-10
+
+A per-seed inference audit of `inf_greedy_team_mode_on.txt` (49 seeds, greedy) found that the
+remaining losses are **not a routing problem at all**. On the mid-congestion losers the greedy
+policy picks the shortest-path baseline on **100%** of decisions (`nonzero=0.0%`) and drives the
+**same routes** as Dijkstra (per-vehicle `routeLength` within ±1.4%), yet still loses — because
+it runs the same routes ~20% **slower**. The only motion command the controller issues that
+Dijkstra does not is a forced `changeLane(target, 70)`; that 70 s hold stalls a vehicle (and its
+followers) whenever the lane change can't complete under congestion. The same maneuver *helps*
+the wins (better lane discipline → ~20% faster), so it is a double-edged sword, not pure harm.
+
+**Layer C** shortens the forced lane-change hold (70→55) and skips it while stalled (<1 m/s),
+inference-only, no retraining. It recovers the mid-congestion *and* the saturated losses
+(seed 4015 +273 s → +12 s; seed 4010 +406 s → −41 s; seed 4013 +36 s → +15 s) while keeping
+every win. The hold value is the welfare-optimal point of a sweep — shorter holds help those
+seeds more but gridlock seed 4012, which needs the long hold (its one regression). Full design,
+the hold sweep, and the A/B table: [`coordination_throttle.md`](coordination_throttle.md) §9.
+
+> Takeaway for the project framing: on this low-PoA grid, MAPPO's measured edge over Dijkstra is
+> driven by **congestion-aware shortest-path + lane discipline**, not selfless detours — and the
+> losses are the lane-discipline mechanism misfiring, not the routing objective.
+
+## 10. The regime fix shipped: bottleneck map (2026-07-01)
+
+The §5.0 recommendation is now implemented. A Pigou-style bottleneck network
+([configurations/maps/bottleneck.net.xml](../configurations/maps/bottleneck.net.xml))
+with a measured **price of anarchy ≥ 1.49** (selfish herding 287s vs coordinated
+split 192s at the default demand) is the default experiment: default sumocfg,
+demand pattern 4 (sources → sink), arm-C objective on by default, and a
+`--reroute-epoch-edges` fix so the policy actually decides at the fork. Design,
+capacity math, probe results, training recipe, and success criteria:
+[bottleneck_map_design.md](bottleneck_map_design.md). The NYC-grid setup remains
+available via `--sumocfg ./configurations/myconfig.sumocfg`.
