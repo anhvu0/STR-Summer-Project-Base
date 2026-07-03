@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2026-07-01T19:34:48.179402-06:00 by Eclipse SUMO duarouter 1.27.0
+<!-- generated on 2026-07-02T00:26:40.759706-06:00 by Eclipse SUMO duarouter 1.27.0
 <duarouterConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/duarouterConfiguration.xsd">
 
     <input>
@@ -27,104 +27,109 @@
 -->
 
 <routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
-    <vehicle id="0" depart="0.00">
+    <vehicle id="1" depart="3.00">
         <routeDistribution last="0">
-            <route cost="151.24" probability="1.00000000" edges="in3 stage c1 c2 c3"/>
+            <route cost="35.27" probability="1.00000000" edges="a2"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="3" depart="9.00">
-        <routeDistribution last="0">
-            <route cost="107.11" probability="1.00000000" edges="in2 stage b1 b2"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="4" depart="12.00">
-        <routeDistribution last="0">
-            <route cost="33.27" probability="1.00000000" edges="c1"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="5" depart="15.00">
-        <routeDistribution last="0">
-            <route cost="80.97" probability="1.00000000" edges="in3 stage c1"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="8" depart="24.00">
-        <routeDistribution last="0">
-            <route cost="46.72" probability="1.00000000" edges="in3 stage"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="9" depart="27.00">
-        <routeDistribution last="0">
-            <route cost="39.39" probability="1.00000000" edges="in2 stage"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="11" depart="33.00">
-        <routeDistribution last="0">
-            <route cost="117.74" probability="1.00000000" edges="in3 stage c1 c2"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="13" depart="39.00">
-        <routeDistribution last="0">
-            <route cost="70.04" probability="1.00000000" edges="c1 c2"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="14" depart="42.00">
-        <routeDistribution last="0">
-            <route cost="46.72" probability="1.00000000" edges="in3 stage"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="15" depart="45.00">
-        <routeDistribution last="0">
-            <route cost="126.18" probability="1.00000000" edges="c1 c2 c3 out"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="16" depart="48.00">
-        <routeDistribution last="0">
-            <route cost="89.17" probability="1.00000000" edges="b2 b3 out"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="18" depart="54.00">
-        <routeDistribution last="0">
-            <route cost="114.87" probability="1.00000000" edges="in1 stage b1 b2"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="19" depart="57.00">
+    <vehicle id="2" depart="6.00">
         <routeDistribution last="0">
             <route cost="110.41" probability="1.00000000" edges="in2 stage c1 c2"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="21" depart="63.00">
+    <vehicle id="5" depart="15.00">
         <routeDistribution last="0">
-            <route cost="78.20" probability="1.00000000" edges="in3 stage b1"/>
+            <route cost="126.18" probability="1.00000000" edges="c1 c2 c3 out"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="22" depart="66.00">
+    <vehicle id="7" depart="21.00">
         <routeDistribution last="0">
-            <route cost="89.17" probability="1.00000000" edges="b2 b3 out"/>
+            <route cost="47.15" probability="1.00000000" edges="in1 stage"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="11" depart="33.00">
+        <routeDistribution last="0">
+            <route cost="110.41" probability="1.00000000" edges="in2 stage c1 c2"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="12" depart="36.00">
+        <routeDistribution last="0">
+            <route cost="92.79" probability="1.00000000" edges="stage a1 a2"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="13" depart="39.00">
+        <routeDistribution last="0">
+            <route cost="114.44" probability="1.00000000" edges="in3 stage b1 b2"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="18" depart="54.00">
+        <routeDistribution last="0">
+            <route cost="57.51" probability="1.00000000" edges="stage a1"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="19" depart="57.00">
+        <routeDistribution last="0">
+            <route cost="145.82" probability="1.00000000" edges="in1 stage b1 b2 b3"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="21" depart="63.00">
+        <routeDistribution last="0">
+            <route cost="133.43" probability="1.00000000" edges="in2 stage a1 a2 out"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="23" depart="69.00">
+        <routeDistribution last="0">
+            <route cost="75.69" probability="1.00000000" edges="in2 stage a1"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="24" depart="72.00">
+        <routeDistribution last="0">
+            <route cost="70.55" probability="1.00000000" edges="a1 a2"/>
         </routeDistribution>
     </vehicle>
     <vehicle id="25" depart="75.00">
         <routeDistribution last="0">
-            <route cost="138.06" probability="1.00000000" edges="in2 stage b1 b2 b3"/>
+            <route cost="143.90" probability="1.00000000" edges="in2 stage c1 c2 c3"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="29" depart="87.00">
+    <vehicle id="26" depart="78.00">
         <routeDistribution last="0">
-            <route cost="81.40" probability="1.00000000" edges="in1 stage c1"/>
+            <route cost="143.90" probability="1.00000000" edges="in2 stage c1 c2 c3"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="27" depart="81.00">
+        <routeDistribution last="0">
+            <route cost="92.14" probability="1.00000000" edges="c2 c3 out"/>
         </routeDistribution>
     </vehicle>
     <vehicle id="30" depart="90.00">
         <routeDistribution last="0">
-            <route cost="73.64" probability="1.00000000" edges="in2 stage c1"/>
+            <route cost="92.79" probability="1.00000000" edges="stage a1 a2"/>
         </routeDistribution>
     </vehicle>
     <vehicle id="31" depart="93.00">
         <routeDistribution last="0">
-            <route cost="92.23" probability="1.00000000" edges="stage c1 c2"/>
+            <route cost="36.00" probability="1.00000000" edges="c2"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="32" depart="96.00">
+        <routeDistribution last="0">
+            <route cost="81.40" probability="1.00000000" edges="in1 stage c1"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="34" depart="102.00">
+        <routeDistribution last="0">
+            <route cost="35.27" probability="1.00000000" edges="a1"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="36" depart="108.00">
+        <routeDistribution last="0">
+            <route cost="140.76" probability="1.00000000" edges="in3 stage a1 a2 out"/>
         </routeDistribution>
     </vehicle>
     <vehicle id="38" depart="114.00">
         <routeDistribution last="0">
-            <route cost="133.43" probability="1.00000000" edges="in2 stage a1 a2 out"/>
+            <route cost="117.74" probability="1.00000000" edges="in3 stage c1 c2"/>
         </routeDistribution>
     </vehicle>
     <vehicle id="39" depart="117.00">
@@ -132,149 +137,174 @@
             <route cost="115.25" probability="1.00000000" edges="stage a1 a2 out"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="40" depart="120.00">
+    <vehicle id="42" depart="126.00">
         <routeDistribution last="0">
             <route cost="46.72" probability="1.00000000" edges="in3 stage"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="42" depart="126.00">
-        <routeDistribution last="0">
-            <route cost="78.63" probability="1.00000000" edges="in1 stage b1"/>
-        </routeDistribution>
-    </vehicle>
     <vehicle id="43" depart="129.00">
         <routeDistribution last="0">
-            <route cost="133.43" probability="1.00000000" edges="in2 stage a1 a2 out"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="44" depart="132.00">
-        <routeDistribution last="0">
-            <route cost="80.97" probability="1.00000000" edges="in3 stage c1"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="45" depart="135.00">
-        <routeDistribution last="0">
-            <route cost="55.46" probability="1.00000000" edges="stage c1"/>
+            <route cost="46.72" probability="1.00000000" edges="in3 stage"/>
         </routeDistribution>
     </vehicle>
     <vehicle id="46" depart="138.00">
         <routeDistribution last="0">
-            <route cost="70.04" probability="1.00000000" edges="c1 c2"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="47" depart="141.00">
-        <routeDistribution last="0">
-            <route cost="21.21" probability="1.00000000" edges="stage"/>
+            <route cost="52.93" probability="1.00000000" edges="b3 out"/>
         </routeDistribution>
     </vehicle>
     <vehicle id="48" depart="144.00">
         <routeDistribution last="0">
-            <route cost="75.69" probability="1.00000000" edges="in2 stage a1"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="50" depart="150.00">
-        <routeDistribution last="0">
             <route cost="55.37" probability="1.00000000" edges="c3 out"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="53" depart="159.00">
-        <routeDistribution last="0">
-            <route cost="107.11" probability="1.00000000" edges="in2 stage b1 b2"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="54" depart="162.00">
-        <routeDistribution last="0">
-            <route cost="110.96" probability="1.00000000" edges="in2 stage a1 a2"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="57" depart="171.00">
-        <routeDistribution last="0">
-            <route cost="80.97" probability="1.00000000" edges="in3 stage c1"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="58" depart="174.00">
-        <routeDistribution last="0">
-            <route cost="83.45" probability="1.00000000" edges="in1 stage a1"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="62" depart="186.00">
-        <routeDistribution last="0">
-            <route cost="35.27" probability="1.00000000" edges="a1"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="63" depart="189.00">
-        <routeDistribution last="0">
-            <route cost="92.79" probability="1.00000000" edges="stage a1 a2"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="65" depart="195.00">
+    <vehicle id="51" depart="153.00">
         <routeDistribution last="0">
             <route cost="39.39" probability="1.00000000" edges="in2 stage"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="72" depart="216.00">
+    <vehicle id="52" depart="156.00">
         <routeDistribution last="0">
-            <route cost="66.48" probability="1.00000000" edges="b1 b2"/>
+            <route cost="57.73" probability="1.00000000" edges="a2 out"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="73" depart="219.00">
+    <vehicle id="56" depart="168.00">
         <routeDistribution last="0">
-            <route cost="141.19" probability="1.00000000" edges="in1 stage a1 a2 out"/>
+            <route cost="39.39" probability="1.00000000" edges="in2 stage"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="74" depart="222.00">
+    <vehicle id="57" depart="171.00">
         <routeDistribution last="0">
-            <route cost="92.79" probability="1.00000000" edges="stage a1 a2"/>
+            <route cost="32.73" probability="1.00000000" edges="c3"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="75" depart="225.00">
+    <vehicle id="58" depart="174.00">
         <routeDistribution last="0">
-            <route cost="47.15" probability="1.00000000" edges="in1 stage"/>
+            <route cost="133.43" probability="1.00000000" edges="in2 stage a1 a2 out"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="77" depart="231.00">
+    <vehicle id="59" depart="177.00">
         <routeDistribution last="0">
-            <route cost="114.44" probability="1.00000000" edges="in3 stage b1 b2"/>
+            <route cost="52.69" probability="1.00000000" edges="stage b1"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="82" depart="246.00">
+    <vehicle id="61" depart="183.00">
         <routeDistribution last="0">
-            <route cost="35.52" probability="1.00000000" edges="b2"/>
+            <route cost="120.12" probability="1.00000000" edges="b1 b2 b3 out"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="83" depart="249.00">
+    <vehicle id="62" depart="186.00">
+        <routeDistribution last="0">
+            <route cost="118.17" probability="1.00000000" edges="in1 stage c1 c2"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="64" depart="192.00">
+        <routeDistribution last="0">
+            <route cost="81.40" probability="1.00000000" edges="in1 stage c1"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="65" depart="195.00">
+        <routeDistribution last="0">
+            <route cost="21.21" probability="1.00000000" edges="stage"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="66" depart="198.00">
+        <routeDistribution last="0">
+            <route cost="81.40" probability="1.00000000" edges="in1 stage c1"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="67" depart="201.00">
+        <routeDistribution last="0">
+            <route cost="120.12" probability="1.00000000" edges="b1 b2 b3 out"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="68" depart="204.00">
         <routeDistribution last="0">
             <route cost="78.20" probability="1.00000000" edges="in3 stage b1"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="85" depart="255.00">
+    <vehicle id="72" depart="216.00">
         <routeDistribution last="0">
-            <route cost="114.87" probability="1.00000000" edges="in1 stage b1 b2"/>
+            <route cost="35.27" probability="1.00000000" edges="a2"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="91" depart="273.00">
+    <vehicle id="73" depart="219.00">
         <routeDistribution last="0">
-            <route cost="114.87" probability="1.00000000" edges="in1 stage b1 b2"/>
+            <route cost="78.63" probability="1.00000000" edges="in1 stage b1"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="93" depart="279.00">
+    <vehicle id="74" depart="222.00">
+        <routeDistribution last="0">
+            <route cost="83.45" probability="1.00000000" edges="in1 stage a1"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="75" depart="225.00">
+        <routeDistribution last="0">
+            <route cost="73.64" probability="1.00000000" edges="in2 stage c1"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="76" depart="228.00">
+        <routeDistribution last="0">
+            <route cost="133.43" probability="1.00000000" edges="in2 stage a1 a2 out"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="78" depart="234.00">
+        <routeDistribution last="0">
+            <route cost="21.21" probability="1.00000000" edges="stage"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="79" depart="237.00">
+        <routeDistribution last="0">
+            <route cost="70.04" probability="1.00000000" edges="c1 c2"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="80" depart="240.00">
+        <routeDistribution last="0">
+            <route cost="70.04" probability="1.00000000" edges="c1 c2"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="81" depart="243.00">
+        <routeDistribution last="0">
+            <route cost="47.15" probability="1.00000000" edges="in1 stage"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="83" depart="249.00">
+        <routeDistribution last="0">
+            <route cost="145.82" probability="1.00000000" edges="in1 stage b1 b2 b3"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="86" depart="258.00">
+        <routeDistribution last="0">
+            <route cost="141.19" probability="1.00000000" edges="in1 stage a1 a2 out"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="90" depart="270.00">
+        <routeDistribution last="0">
+            <route cost="57.51" probability="1.00000000" edges="stage a1"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="92" depart="276.00">
         <routeDistribution last="0">
             <route cost="70.55" probability="1.00000000" edges="a1 a2"/>
         </routeDistribution>
     </vehicle>
+    <vehicle id="93" depart="279.00">
+        <routeDistribution last="0">
+            <route cost="107.11" probability="1.00000000" edges="in2 stage b1 b2"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="94" depart="282.00">
+        <routeDistribution last="0">
+            <route cost="73.64" probability="1.00000000" edges="in2 stage c1"/>
+        </routeDistribution>
+    </vehicle>
     <vehicle id="96" depart="288.00">
         <routeDistribution last="0">
-            <route cost="80.97" probability="1.00000000" edges="in3 stage c1"/>
+            <route cost="92.14" probability="1.00000000" edges="c2 c3 out"/>
         </routeDistribution>
     </vehicle>
     <vehicle id="97" depart="291.00">
         <routeDistribution last="0">
-            <route cost="30.24" probability="1.00000000" edges="b3"/>
-        </routeDistribution>
-    </vehicle>
-    <vehicle id="98" depart="294.00">
-        <routeDistribution last="0">
-            <route cost="145.82" probability="1.00000000" edges="in1 stage b1 b2 b3"/>
+            <route cost="145.39" probability="1.00000000" edges="in3 stage b1 b2 b3"/>
         </routeDistribution>
     </vehicle>
 </routes>
