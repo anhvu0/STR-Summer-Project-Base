@@ -1,1 +1,0 @@
-<configuration><input><net-file value="/home/anh/Code/STR/STR-Summer-Project-Base/configurations/maps/simple_nyc.net.xml" /><route-files value="/home/anh/Code/STR/STR-Summer-Project-Base/Selfless_routing/reproduce/results/routes/rou_s4011_p075.rou.xml" /></input><time><begin value="0" /><end value="200000" /></time></configuration>
