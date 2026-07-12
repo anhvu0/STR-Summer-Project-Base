@@ -1,0 +1,12 @@
+# Ignore specific files
+
+# Ignore specific directories (and everything inside them)
+Selfless_routing/
+
+# Ignore all files of a specific extension
+*.log
+*.env
+*.md
+
+# Ignore system/editor files
+.DS_Store
