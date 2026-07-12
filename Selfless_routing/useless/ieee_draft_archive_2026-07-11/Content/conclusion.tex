@@ -1,0 +1,29 @@
+\section{Conclusion and Future Work}
+We studied selfless traffic routing with a cooperative MAPPO policy in SUMO, using a
+centralized critic, a shared per-candidate route actor, and a difference-reward team
+objective expressed in seconds of travel time. On a congested New York City corridor, the
+learned policy is a genuine improvement over shortest-path routing: deployed greedily on
+20 held-out scenarios, it completes every vehicle and cuts mean fleet travel time by 6.3\%
+(16/20 wins), with a lower tail and fewer deadline misses, and its advantage grows with
+congestion.
+
+The more interesting finding is conditional. The policy learns to take non-shortest routes
+almost half the time, and whether executing those routes helps depends on the traffic
+regime: in heavy congestion the detours relieve real bottlenecks and lower fleet travel
+time to 11.2\% below Dijkstra, but in light traffic they only add distance. Selfless
+routing pays in proportion to the network's price of anarchy---the very quantity that
+traffic theory uses to bound the cost of selfishness. The detour guard turns this insight
+into a deployment knob that trades peak fleet gains for per-scenario robustness.
+
+Several directions follow. First, and most directly motivated by our data, is evaluation
+on high-price-of-anarchy networks---Pigou- or Braess-style bottlenecks where the selfish
+equilibrium is provably far from optimal---so that selfless routing has a large and
+persistent margin to capture rather than the intermittent one a dense grid offers. Second,
+the weak per-update learning signal invites stronger credit assignment, such as a
+counterfactual critic~\cite{foerster2018coma} or explicit marginal-cost congestion
+pricing, to make the fleet externality visible to each agent's advantage. Third, the
+single gridlock failure (seed~4012) shows the coordination guardrails need an adaptive,
+rather than fixed-threshold, congestion response. Finally, replacing the per-edge state
+encoding with a graph neural network would let a policy trained on one network transfer to
+others, moving selfless routing from a single-map demonstration toward a deployable
+controller.

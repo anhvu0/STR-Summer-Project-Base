@@ -40,7 +40,7 @@ Supporting experiments:
 
 ---
 
-## Changes made (3 code files, uncommitted in working tree)
+## Changes made (3 code files — committed in `63cc669`)
 
 ### `core/coordination_throttle.py` — Layer A recalibration
 `detour_should_fallback` now vetoes a near-capacity detour **only when its blended relief vs the

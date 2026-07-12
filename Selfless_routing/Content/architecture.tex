@@ -1,0 +1,229 @@
+\section{Method}
+
+\subsection{Problem Formulation}
+We control a fleet of $N$ vehicles on a fixed SUMO road network while a background
+population of uncontrolled vehicles shares the roads. Each controlled vehicle $i$ is an
+agent that, at a set of route-decision points along its trip, chooses a complete route to
+its destination. SUMO handles all low-level dynamics (car-following, lane changing,
+junctions, and signals), so the policy only sets high-level route intent. The fleet
+objective is to minimize average travel time,
+\begin{equation}
+  J(\pi) = \frac{1}{N}\sum_{i=1}^{N} T_i,
+\end{equation}
+where $T_i$ is the realized travel time of vehicle $i$ under the shared policy $\pi$.
+This is a cooperative, partially observed problem: each agent sees only a local view of
+the network but its route choice affects the congestion that other agents experience.
+We treat it as a decentralized POMDP and solve it with CTDE MAPPO, so that a fleet-wide
+signal can guide learning while deployment stays per-vehicle.
+
+The tension the policy must resolve is precisely the price-of-anarchy gap of
+Section~\ref{sec:related}: the route that minimizes $T_i$ for one vehicle need not minimize $J$ for the
+fleet. A useful policy learns when to keep a vehicle on its shortest feasible path
+(most of the time) and when to route it away from a forming bottleneck for the group's
+benefit.
+
+\begin{figure}[!t]
+\centering
+\resizebox{\columnwidth}{!}{%
+\begin{tikzpicture}[
+    node distance=0.72cm,
+    box/.style={rectangle, draw, rounded corners, align=center, minimum width=3.0cm, minimum height=0.62cm, font=\footnotesize},
+    arrow/.style={->, thick}
+]
+    \node[box] (sumo) {SUMO microsimulation\\(local + fleet state)};
+    \node[box, below=of sumo] (cand) {Route-candidate generator\\(up to 4 routes, guardrail filters)};
+    \node[box, below=of cand] (actor) {MAPPO actor\\score \& mask candidates};
+    \node[box, below=of actor] (throttle) {Coordination guardrails\\(detour guard, reservations)};
+    \node[box, below=of throttle] (exec) {Route commit\\+ SUMO execution};
+    \node[box, below=of exec] (learn) {Reward + centralized critic\\GAE / PPO update \emph{(training only)}};
+    \draw[arrow] (sumo) -- (cand);
+    \draw[arrow] (cand) -- (actor);
+    \draw[arrow] (actor) -- (throttle);
+    \draw[arrow] (throttle) -- (exec);
+    \draw[arrow] (exec) -- (learn);
+    \draw[arrow] (learn.east) to[out=0,in=0,looseness=1.7] node[right, font=\scriptsize]{next step} (sumo.east);
+\end{tikzpicture}%
+}
+\caption{The STR-SUMO learning and deployment pipeline. Every stage speaks a common
+travel-time / density vocabulary. The dashed portion (reward and critic) runs only during
+training; at deployment the actor and guardrails alone drive each vehicle.}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{Route-Candidate Action Space}
+Rather than asking the policy to pick a turn (``left/right'') at each junction, a
+route-candidate generator proposes up to $K{=}4$ \emph{complete} routes from the vehicle's
+current edge to its destination. Index~0 is always the congestion-aware shortest route;
+indices 1--3 are diverse detours produced by density-penalized Dijkstra searches. The
+actor's job is to choose one of these routes, so a ``selfless detour'' simply means
+choosing an index other than~0. Each candidate carries an 11-dimensional feature
+``scorecard'' describing, among other things, its average and worst-case congestion, its
+first-edge congestion, the extra seconds it costs relative to the shortest route (the
+ETA sacrifice), and how much less congested it is than the shortest route (the relief).
+Because the reward, the actor, and the guardrails all read the same scorecard, a
+trade-off assessed by one component is understood identically by the others.
+
+\subsection{CTDE Actor and Critic}
+The \textbf{actor} is a shared per-candidate
+scorer: a small multilayer perceptron (two hidden layers of 256 and 128 units, ReLU)
+takes the vehicle's local observation concatenated with one candidate's features and
+emits a scalar score; the same sub-network scores all $K$ candidates, and invalid
+candidates are masked to $-10^{9}$ before a softmax over scores. This weight-sharing lets
+the actor generalize across a variable, unordered candidate set and keeps deployment
+per-vehicle. The local observation encodes the current and destination edges, feasibility
+masks, lane and commit-window state, route-difficulty estimates, local density summaries,
+and the per-candidate features.
+
+The \textbf{critic} is used only during training. It concatenates the local observation
+with an 18-dimensional \emph{central} observation summarizing the whole fleet's state
+(aggregate densities, completion, congestion pressure) and predicts a scalar value. This
+is the CTDE split~\citep{lowe2017maddpg}: the critic ``peeks'' at global information to
+give lower-variance value estimates, while the actor never does, so the trained policy
+runs decentralized. The critic changes learning stability, not the objective; the
+cooperative incentive must come from the reward.
+
+\subsection{Learning Algorithm}
+The policy is trained with MAPPO~\citep{yu2022mappo}: a clipped PPO surrogate for the
+actor~\citep{schulman2017ppo} and a squared-error value loss for the critic, with an
+entropy bonus for exploration and separate Adam optimizers~\citep{kingma2015adam} for the
+two networks. Advantages are computed per vehicle trajectory with
+GAE~\citep{schulman2016gae} ($\gamma{=}0.995$, $\lambda{=}0.95$); the high discount is
+needed because trips span roughly two thousand simulation steps and a route choice must
+be credited for congestion it causes far downstream. Two practical components proved
+important. First, because episode returns swing by more than an order of magnitude with the
+demand seed, the critic regresses on \emph{normalized} value targets (running mean/variance)
+while advantages stay in real reward units, keeping the value loss well-conditioned. Second,
+entropy is annealed from 0.15 to 0.10 so the policy explores detours early and settles later,
+with PPO updates stopped early when the approximate KL exceeds 0.015. Key hyperparameters
+are in Table~\ref{tab:hyper}.
+
+\begin{table}[!t]
+\caption{MAPPO Training Configuration}
+\label{tab:hyper}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3.2pt}
+\begin{tabular}{lll}
+\toprule
+Group & Parameter & Value \\
+\midrule
+Actor/critic & hidden layers & $[256,128]$, ReLU \\
+             & candidate routes $K$ & 4 \\
+             & central obs dim & 18 \\
+Optimization & actor / critic LR & $3\times10^{-4}$ / $1\times10^{-3}$ \\
+             & $\gamma$ / GAE $\lambda$ & 0.995 / 0.95 \\
+             & PPO clip $\epsilon$ & 0.05 \\
+             & epochs / minibatch & 4 / 512 \\
+             & target KL & 0.015 \\
+             & value-target norm. & on \\
+Exploration  & entropy coef.\ (start$\to$end) & $0.15 \to 0.10$ \\
+Objective    & team-reward $\alpha$ & 1.0 \\
+             & team-reward mode & difference \\
+             & detour refund fraction & 0.6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Reward: Cooperation in Travel-Time Units}
+Every term of the reward is measured in seconds so trade-offs need no arbitrary
+conversion factor. Each simulation step charges a small base time cost (0.07 per step),
+plus deliberately smaller costs for occupying above-average-density roads and for the
+congestion a vehicle imposes on others; reaching the destination pays $+50$ and a
+teleport (SUMO's last resort for a stuck vehicle) costs $-40$. The cooperative term is
+the key addition. Let $\rho_i$ be vehicle $i$'s normalized slowness (0 at free flow, 1 at
+standstill) and $\bar\rho$ the live-fleet mean. With weight $\alpha\in[0,1]$ and scale
+$\kappa$, agent $i$ pays over an elapsed interval $\Delta t$
+\begin{equation}
+  c^{\text{team}}_i = \alpha\,\kappa\,(\rho_i - \bar\rho)\,\Delta t .
+\end{equation}
+This is a leave-one-out difference reward~\citep{wolpert2001collectives}: because the
+fleet-mean of $(\rho_i-\bar\rho)$ is zero, the external, demand-driven congestion level
+cancels, and each agent is credited only for how its own route choice fares relative to
+the fleet: a vehicle that routed onto a free-flowing alternative is rewarded, one that
+piled into a jam pays. We use $\alpha{=}1$ (fleet delay counts as much as personal delay)
+with the difference mode throughout; $\alpha{=}0$ recovers a purely selfish objective.
+
+\paragraph{Congestion-gated detour credit.} A worthwhile detour still costs the extra
+seconds it adds, so without a counterweight a mean objective drives the policy back to the
+shortest path. We therefore add a small detour-shaping term, read from the same scorecard
+and \emph{gated by congestion}: a gate $g=\max(\bar d-\delta,0)$ on the baseline density
+$\bar d$ is near zero in light traffic (so the policy is never paid to detour for nothing)
+and grows with congestion, where it lowers the relief bar a detour must clear and boosts
+\emph{genuine} measured relief (a lateral move onto an equally dense road earns nothing). A
+partial (60\%) time refund leaves a residual cost, so only clearly relieving detours pay:
+the per-decision value is positive under congestion and negative in light traffic, as the
+deployment results confirm.
+
+\subsection{Guardrails and the Saturation Veto}
+Hand-written guardrails keep the reward focused on travel time by removing obviously bad
+options rather than teaching basic safety through penalties. Pre-decision filters prune
+candidate routes that would loop, re-enter a dead end, or drive straight into a known jam;
+a ``pending'' state machine distinguishes healthy queueing (e.g.\ at a red light) from a
+genuine stall so the reward is not charged for normal waiting. Two coordination guardrails
+address a specific failure in heavy congestion, where independently chosen detours can pile
+onto the same alternative and make it worse:
+\begin{itemize}
+  \item The \textbf{detour guard} (deployment only): after the actor picks a detour, if the
+  alternative is itself near capacity \emph{and} the relief it claims is within measurement
+  noise, the choice is reverted to the shortest route---so the guard blocks only
+  \emph{pointless pile-on} detours that add distance without relieving anything, while a
+  near-capacity detour showing \emph{genuine} relief is allowed through. It judges
+  crowdedness in \emph{absolute} terms, not the relief the policy reacted to, because when
+  everything is busy a road can look like relief yet have no room left. (A blanket veto
+  whenever the whole network is saturated, which we tried first, instead reverts essentially
+  every detour and hides the learned policy, so we do not use it.) It runs only at
+  deployment, since overriding an executed route during training would break the on-policy
+  assumption.
+  \item The \textbf{route reservation} (training and deployment): a committed route books
+  its leading edges in a decaying field, so the candidate generator scores later deciders
+  against effective (live~+~reserved) density and a simultaneous rush becomes an orderly
+  one-at-a-time spread. It affects only what candidates look like, never the reward or the
+  true measurements.
+\end{itemize}
+The detour guard is the subject of our ablation in Section~\ref{ssec:ablation}: because it
+now reverts only the pile-on subset of detours, it costs a few percent of mean fleet gain
+in exchange for a small robustness margin on the worst gridlock scenario.
+
+\section{Experimental Setup}\label{sec:setup}
+
+\subsection{Network and Demand}
+Experiments use a corner of the New York City street grid, cut from
+OpenStreetMap~\citep{osm} and converted to a SUMO network with SUMO's OSM import
+tooling~\citep{lopez2018sumo}: 132 drivable edges, 360 lanes, 90 junctions (53
+signalized), and roughly 27{,}000 lane-meters. To create genuine
+congestion (a precondition for selfless routing to have anything to gain), we use a
+shared-destination demand pattern (ranged origins routed to one common destination edge)
+with 450 controlled and 150 background vehicles released at a 0.5\,s interval. This
+concentrates flow into a corridor and produces sustained congestion (frequent teleports,
+fleet travel times from a few hundred to over 1500\,s across seeds) without permanent
+gridlock. A dispersed origin--destination pattern leaves the grid at a few percent of
+capacity, where routing cannot matter.
+
+\subsection{Protocol, Baselines, and Metrics}
+The policy is trained for 150 episodes. Every 25 episodes it is evaluated frozen (no
+learning) on 30 seeds (6000--6029) against a Dijkstra baseline generated from the
+identical demand; the best checkpoint is selected on the \emph{greedy} deployment tail
+(p90 first, then mean), which is the configuration actually shipped. Because a single
+greedy argmax pass can hide a still-improving policy, the frozen eval also runs a seeded,
+averaged stochastic pass as a learning-detectability diagnostic (it does not drive
+selection). We then \emph{deploy} the selected checkpoint on a \emph{separate, disjoint}
+block of 20 held-out scenarios (seeds 4010--4029)---never seen during training or
+selection---and compare it head-to-head with Dijkstra on the same generated vehicles. We
+report mean fleet travel time, median (p50) and p90 travel time, tail-completion gap, the
+p95/p50 ratio, deadline misses, completion rate, and per-scenario win rate. Unless noted,
+the MAPPO policy is deployed \emph{greedily} (argmax over candidate scores), which is
+deterministic and, as Section~\ref{ssec:greedy} shows, outperforms stochastic sampling in
+this regime. Each controller is run in a fresh simulation with independent network state,
+so no traffic leaks between runs.
+
+Finally, we sweep the \emph{controlled-vehicle penetration}: holding the demand of every
+scenario fixed, the controller routes only a nested random subset (10\%, 25\%, 50\%,
+75\%, or 100\%) of the 450 corridor vehicles, while the remainder follow a fixed
+free-flow shortest path to the shared destination, emulating unequipped traffic.
+Dijkstra and MAPPO route the same subset, and fleet metrics are computed over all 450
+corridor vehicles, so results are comparable across penetration levels; the 100\% level
+is exactly the deployment configuration above.
+
+\paragraph{Reproducibility.}
+Code, checkpoints, logs, and scripts regenerating every number and figure accompany
+this submission anonymized, and will be released publicly at camera-ready.

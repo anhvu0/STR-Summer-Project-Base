@@ -205,13 +205,33 @@ route scorecard from §2: number 7 (the extra seconds you'd sacrifice) and the "
 (numbers 9 and 10, how much congestion you'd relieve). If a detour relieves enough congestion
 to be worthwhile, it gets a bonus.
 
-Its cleverest detail is the **refund** ([code](../core/rl_training_pipeline.py#L480)): a car
+Its cleverest detail is the **refund** ([code](../core/rl_training_pipeline.py#L536)): a car
 that takes a *worthwhile* selfless detour would normally still lose points for the extra time
-the detour costs. So the reward **adds those points back** — it refunds the detour's time cost
-— making a good selfless detour roughly break-even instead of a guaranteed loss. This only
-works because the refund uses the *same* `0.07`/step in the *same* seconds unit as the time
-cost it's cancelling. (The "arm C" experiment turns this older reward off so the cleaner §3.3
-dial is the only driver.)
+the detour costs. So the reward **adds part of those points back** — since the Phase 2
+recalibration (2026-07-12) it refunds **60%** of the detour's estimated time cost
+(`route_balance_detour_refund_fraction = 0.6`), so the car still pays ~40% and only detours
+whose relief clearly outweighs that residual cost are worth taking. (A *full* refund was tried
+first and made any marginal-relief detour net-positive → the policy drifted to over-detouring;
+a flat *no* refund left a genuinely relieving congested detour net-negative, EV ≈ −0.35, which
+is one of the two mechanisms that had collapsed the policy to shortest-path.) The refund works
+because it uses the *same* `0.07`/step in the *same* seconds unit as the time cost it's
+cancelling.
+
+The Phase 2 recalibration also made the whole term **congestion-gated**: a gate
+`g = max(baseline_density − deadband, 0)` is ~0 in light traffic (light-seed behaviour is
+unchanged, the policy is not paid to detour for no reason) and grows with how congested the
+shortest-path baseline is. Under a congested baseline, `g` lowers the relief bar a detour must
+clear (`route_balance_congestion_relax = 0.75`, floored at
+`route_balance_required_relief_floor = 0.60`), adds a small diversion credit
+(`route_balance_diversion_weight = 0.15`), and multiplicatively boosts *genuine* measured
+relief (`route_balance_congestion_relief_bonus = 0.4` — it scales realized relief, so a
+lateral detour onto an equally-dense road still earns ~0). Calibrated per-decision economics:
+congested relieving detour EV ≈ +2.95 (net ≈ +0.85 after time cost), light-traffic detour
+EV ≈ −0.4. **Known limitation:** even at these softened values the fleet's detour *rate*
+drifts upward over training (bounded at ~44% in the phase 2b run, not divergent) because each
+agent's credit is settled on decision-time estimates; best-checkpoint early-stopping on the
+greedy p90 captures the good policy. (The "arm C" experiment turns this older reward off so
+the cleaner §3.3 dial is the only driver.)
 
 ### 3.5 The big, rare rewards: reaching the goal, and disasters
 
@@ -329,16 +349,19 @@ specific failure: at very high congestion, the policy's "selfless" detours can a
 the *same* alternative road and make things worse. (Full design:
 [coordination_throttle.md](coordination_throttle.md).)
 
-- **Layer A — the veto** ([`detour_should_fallback`](../core/coordination_throttle.py#L74)):
+- **Layer A — the veto** ([`detour_should_fallback`](../core/coordination_throttle.py#L84)):
   *after* the policy picks a detour, if that detour's alternative road is itself near capacity
-  **and** the whole network is saturated, the choice is reverted to the normal shortest route
-  (#0). The clever part: it judges the alternative by its **absolute crowdedness** (scorecard
-  numbers 3 and 4), *not* by the "relief" number the policy reacted to — because when
-  everything is jammed, a road can look like "relief" (slightly less jammed than the baseline)
-  while still having no actual room left. Layer A catches exactly the blind spot the relief
-  signal has. It runs **only at deployment**, because overriding the car's route during
-  training would confuse the learning math (it would grade one route while the policy thought
-  it chose another).
+  **and** the claimed relief is within measurement noise, the choice is reverted to the normal
+  shortest route (#0) — it only blocks *pointless pile-on* detours that buy nothing but
+  distance. It judges the alternative first by its **absolute crowdedness** (scorecard numbers
+  3 and 4), because when everything is jammed a road can look like "relief" (slightly less
+  jammed than the baseline) while having no actual room left — but a near-capacity detour with
+  *genuine* measured relief is let through. (An earlier version also vetoed whenever the whole
+  network was saturated; at 450/150 that blocked ~100% of all detours and completely hid the
+  learned policy, so the saturation trigger was retired on 2026-07-12 — see
+  [coordination_throttle.md §2](coordination_throttle.md).) It runs **only at deployment**,
+  because overriding the car's route during training would confuse the learning math (it would
+  grade one route while the policy thought it chose another).
 - **Layer B — the reservation field** ([`ReservationField`](../core/coordination_throttle.py#L121)):
   when a car commits to a route, its upcoming roads are "booked" in a quietly fading ledger.
   The candidate generator then treats a booked road as *slightly more crowded than it currently
@@ -351,8 +374,8 @@ the *same* alternative road and make things worse. (Full design:
 How they reinforce each other: Layer A catches *"that road is already full,"* and Layer B
 prevents *"that road is about to be full because we're all about to choose it."* The
 thresholds are set conservatively so the throttle does **nothing** in normal congestion (where
-the policy's detours genuinely help) and only steps in at true saturation, where the plain
-shortest route is the right answer anyway.
+the policy's detours genuinely help) and only steps in when a near-capacity detour buys no
+measurable relief — a pile-on that adds distance without helping anyone.
 
 ---
 
@@ -368,8 +391,9 @@ The value is in these hand-offs, not in any single part:
    from. *(§4, §5.1)*
 4. **Reward backs up the guardrails.** Where a filter can't cleanly decide, a matching penalty
    discourages the same behavior. *(§5.1, §5.2)*
-5. **Layer A sees what the reward can't.** Absolute crowdedness catches the saturated-road case
-   the relief-based signal misses. *(§3.4 vs. §5.3)*
+5. **Layer A sees what the reward can't.** Absolute crowdedness catches the full-road case the
+   relief-based signal misses — a road can read as "relief" while having no room left. *(§3.4
+   vs. §5.3)*
 6. **Layer B keeps learning honest.** It nudges only the candidate scorecards, never the reward
    or the real measurements. *(§5.3)*
 7. **The rescaler protects the small signals.** Without it, the subtle selflessness signal
@@ -394,7 +418,8 @@ The value is in these hand-offs, not in any single part:
 | stale-stall penalty | −18 | worse than normal driving, milder than a teleport |
 | reward cap | ±20 (goal: +55) | keep the learning math bounded; widened so +50 isn't chopped |
 | "alternative is full" threshold (Layer A) | 0.50 | absolute near-capacity; below it the veto never fires |
-| "network is saturated" threshold | 0.30 | the congestion level where the plain shortest route is already best |
+| "network is saturated" threshold | 0.30 | **deprecated/unused** — the retired saturation veto (see §5.3); kept only for signature compatibility |
+| detour refund fraction | 0.6 | partial time-refund for an accepted detour; full refund over-detours, none under-detours (§3.4) |
 | how far ahead the policy cares (`gamma`) | 0.995 | trips are ~2000 steps; delay must trace back ~70+ steps |
 | explore-vs-exploit (`entropy`) | 0.15 → 0.05 | try detours early, settle later |
 

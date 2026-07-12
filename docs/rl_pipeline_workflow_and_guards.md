@@ -172,23 +172,35 @@ CLI flags:
 - `--eval-every`
 - `--eval-seeds`
 - `--eval-spawn-interval`
+- `--eval-policy` (greedy argmax by default; `stochastic` samples the policy)
+- `--eval-stochastic-samples` (extra sampled diagnostic rollouts per seed, default 3)
 - `--best-model-output`
 
 What happens during frozen evaluation:
 1. the current training checkpoint is saved to a temporary eval model,
 2. held-out seeds are generated with the chosen evaluation spawn interval,
-3. the real inference controller (`MAPPOController`) is run through `STR_SUMO`,
-4. aggregate metrics are written to `rl_frozen_eval_metrics.csv`,
-5. the best checkpoint is updated if the new frozen-eval score is better.
+3. the real inference controller (`MAPPOController`) is run through `STR_SUMO` in the
+   deployment configuration (greedy argmax + Layer A on),
+4. per seed, `--eval-stochastic-samples` extra *diagnostic* rollouts are run with sampled
+   routing and Layer A **off** — a greedy argmax on fixed seeds is bit-identical across
+   checkpoints until the argmax flips, so this pass is what makes sub-argmax learning
+   visible (`stochastic_*` CSV columns); it must **not** be used for checkpoint selection,
+5. aggregate metrics are written to `rl_frozen_eval_metrics.csv`,
+6. the best checkpoint is updated if the new frozen-eval score is better.
 
-Checkpoint ranking priority:
+Checkpoint ranking priority (tail-first since the Phase 2 fix — the routing gain is
+concentrated in the congested tail, and a mean-first key rates a collapsed shortest-path
+policy as near-optimal):
 1. completion rate,
 2. timeout rate,
-3. average travel time,
-4. `p90` travel time,
+3. `p90` travel time,
+4. average travel time,
 5. tail completion gap,
 6. `p95`/`p50` travel ratio,
 7. deadline misses.
+
+Selection uses the **greedy deployment pass only**. Selecting on the stochastic diagnostic
+once picked an over-detoured checkpoint whose greedy deployment was the worst of the run.
 
 This is the deployment-quality metric path.
 

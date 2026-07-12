@@ -154,16 +154,36 @@ Current fields:
 - `best_checkpoint_updated`
 - `score_key`
 
-Checkpoint ranking priority:
+Added by the Phase 2 eval-detectability fix (2026-07-12):
+- `stochastic_samples` — number of sampled diagnostic rollouts per seed (`--eval-stochastic-samples`, default 3),
+- `stochastic_avg_travel_time_mean` / `stochastic_p90_travel_time_mean` /
+  `stochastic_completion_rate_mean` / `stochastic_route_choice_nonzero_rate_mean` —
+  seeded, per-seed-averaged results of the **sampled, Layer-A-off** diagnostic pass. A
+  greedy argmax on fixed seeds is bit-identical across checkpoints until the argmax flips,
+  so these columns are what make sub-argmax learning visible. Diagnostic only — never used
+  for checkpoint selection,
+- `greedy_route_choice_nonzero_rate_delta_vs_prev` — change in the greedy detour rate vs
+  the previous eval; a nonzero value means the deterministic policy actually moved,
+- `route_detour_reward_congested_mean` / `route_detour_reward_light_mean` (+ matching
+  `_count` columns) — per-decision detour-reward economics split by baseline-congestion
+  regime. Health check for the congestion-gated reward: the congested mean should be ≥ 0
+  (a relieving detour is net-positive under congestion) while the light mean stays ≤ ~0
+  (the policy is not paid to detour without congestion).
+
+Checkpoint ranking priority (tail-first since the Phase 2 fix; computed on the **greedy
+deployment pass only**):
 1. higher completion rate,
 2. lower timeout rate,
-3. lower average travel time,
-4. lower `p90` travel time,
+3. lower `p90` travel time,
+4. lower average travel time,
 5. lower tail completion gap,
 6. lower `p95`/`p50` travel ratio,
 7. lower deadline misses.
 
-This ranking is intentionally deployment-oriented.
+This ranking is intentionally deployment-oriented. `p90` outranks the mean because the
+routing gain is concentrated in the congested tail (Phase 0 probe): a mean-first key rates
+a collapsed always-shortest-path policy as near-optimal and cannot distinguish it from a
+policy that actually routes.
 
 ## 9) Practical reading order
 

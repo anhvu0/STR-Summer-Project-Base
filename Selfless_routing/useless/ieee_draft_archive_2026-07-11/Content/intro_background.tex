@@ -1,0 +1,67 @@
+\section{Introduction}
+Traffic congestion is a system-level phenomenon, yet most routing systems attack it as
+a collection of independent shortest-path problems: each vehicle is guided along the
+route that is fastest for itself, taking the current network as fixed. When a large
+number of vehicles make that same locally optimal choice, the roads they share fill up,
+and the locally optimal path becomes a bottleneck that raises travel time for everyone.
+Classical traffic theory formalizes this as the gap between the \emph{selfish} routing
+outcome---the Wardrop user equilibrium, in which no driver can improve their own time by
+switching routes~\cite{wardrop1952}---and the \emph{system optimum} that minimizes total
+travel time. The ratio between them is the \emph{price of anarchy}, and it can be
+strictly greater than one~\cite{roughgarden2002selfish}; the Braess paradox is the
+extreme case, where adding capacity under selfish routing makes everyone slower~\cite{braess2005paradox}.
+
+The \emph{selfless traffic routing} (STR) model of Dai et al.~\cite{dai2019str} proposes
+the constructive alternative: allow some controlled vehicles to accept a slightly longer
+route when that choice reduces the average travel time of the fleet, subject to
+individual constraints. This reframes routing as a cooperative decision problem rather
+than a per-vehicle optimization. The open question is whether a learned policy can
+discover \emph{when} such sacrifices pay off---and by how much---in a realistic traffic
+environment rather than an idealized graph.
+
+This paper studies that question with a cooperative multi-agent reinforcement-learning
+(MARL) controller in the Eclipse SUMO microscopic simulator~\cite{lopez2018sumo}. We model
+each controlled vehicle as an agent that periodically chooses among a small set of complete
+candidate routes to its destination, and we train the shared policy with Multi-Agent
+Proximal Policy Optimization (MAPPO)~\cite{yu2022mappo}, a centralized-training /
+decentralized-execution (CTDE) actor--critic method. Crucially, cooperation is not left to
+emerge on its own: each agent's reward internalizes a share of the fleet's congestion,
+expressed \emph{in seconds of travel time}, so that the policy can trade its own delay
+against fleet delay on a common scale. We compare the learned controller against a Dijkstra
+shortest-path baseline~\cite{dijkstra1959note} on the same generated demand.
+
+Although this study is carried out in simulation, the ultimate application is on actual
+vehicles, and the information the deployed controller consumes---local observations,
+shared congestion summaries, and committed route intents---must travel over a vehicular
+network. Emerging vehicle-to-everything (V2X) communication makes this practical:
+IEEE~802.11bd, the next-generation V2X amendment~\cite{ieee80211bd}, provides the
+connectivity and bandwidth required by intelligent transportation systems of the kind
+described here~\cite{iliopoulos2025bd}.
+
+\subsection{Research Question}
+\begin{quote}
+\emph{Can a cooperative MAPPO routing policy reduce fleet travel time relative to
+shortest-path routing, and under what traffic conditions do selfless (non-shortest)
+route choices actually help?}
+\end{quote}
+The second half of the question is as important as the first: our results show that the
+answer depends sharply on how congested the scenario is.
+
+\subsection{Contributions}
+\begin{itemize}
+  \item We formulate selfless routing as a cooperative Dec-POMDP over route choices and
+  solve it with a CTDE MAPPO policy whose actor scores complete candidate routes and
+  whose reward---including a \emph{difference-reward} team term~\cite{wolpert2001collectives}---is
+  expressed entirely in travel-time units, avoiding an arbitrary congestion-vs-time
+  exchange rate.
+  \item We evaluate the trained policy against Dijkstra on 20 held-out congested scenarios,
+  reporting an honest, reproducible outcome: the deployed policy reduces mean fleet travel
+  time by 6.3\% (16/20 wins) at 100\% completion, with gains that grow with congestion.
+  \item Through a guardrail ablation we show that the policy learns substantial selfless
+  behavior (48\% non-shortest route choices) and that executing those detours \emph{helps}
+  in heavy congestion but \emph{hurts} in light traffic---a direct empirical link between
+  the benefit of selflessness and the network's price of anarchy.
+  \item We document the failure modes that remain (a rare gridlock scenario, a weak
+  learning signal on a low-price-of-anarchy grid) and the role of a congestion-aware
+  coordination guardrail in trading peak gains for robustness.
+\end{itemize}

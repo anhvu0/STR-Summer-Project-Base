@@ -16,9 +16,14 @@ coordination failure**:
 - At saturation the alternatives are themselves near capacity, so the detouring fleet
   just spreads the jam onto them → **more** total congestion. Detouring adds distance
   *and* amplifies delay (4010: routeLength +39%, timeLoss +81s).
-- When nothing has slack, shortest-path is optimal (PoA ≈ 1) — which is exactly what
-  Dijkstra does. So miscoordinated "selfless" detours at saturation are worse than
-  everyone taking the shortest path.
+- The conclusion originally drawn from this — "when nothing has slack, shortest-path is
+  optimal (PoA ≈ 1), so veto detours whenever the network is saturated" — turned out to be
+  **regime-specific and is retired** (2026-07-12). At 450/150 target-pattern 2 (the current
+  default regime) the Phase 0 forced-detour probe measured the opposite: relieving detours
+  help **most** under saturation (a catastrophic-congestion seed went 1236s → 636s once
+  detours were allowed). What holds in every regime is the *pile-on* failure above — a
+  detour onto an alternative that is itself full and buys no measurable relief. The gate in
+  §2 was recalibrated to key on exactly that, not on network-wide saturation.
 
 Root cause in code: both `get_candidates(...)` call sites scored candidates against the
 raw instantaneous `_edge_density`, and the existing reservation state (`reserved_agents`)
@@ -36,31 +41,43 @@ Two cooperating fixes were added, both in
 ≠ 0) onto an alternative that is itself near capacity, revert to the shortest-path
 **baseline** (candidate index 0).
 
-**The key idea — read absolute density, not the relative relief.** The signal that pulls
-the policy into a detour is the *relief* features (feature 9 = `baseline_mean_density −
-alt_mean_density`, feature 10 = the first-edge version). At saturation the baseline is
-jammed **and** the alternative is jammed, so relief can read positive (the alt is
-*slightly* less jammed) even though the alternative has **zero real headroom**. The gate
-therefore reads the alternative's **absolute** density (feature 3 = `max_density`,
-feature 4 = `first_edge_density`), not the relief.
+**The key idea — absolute density as the precondition, illusory relief as the trigger.**
+The signal that pulls the policy into a detour is the *relief* features (feature 9 =
+`baseline_mean_density − alt_mean_density`, feature 10 = the first-edge version). At
+saturation the baseline is jammed **and** the alternative is jammed, so relief can read
+positive (the alt is *slightly* less jammed) even though the alternative has **zero real
+headroom**. The gate therefore first checks the alternative's **absolute** density
+(feature 3 = `max_density`, feature 4 = `first_edge_density`); only for a near-capacity
+alternative does it then ask whether the claimed relief is real. A near-capacity detour
+with genuine measured relief is **allowed through** — the Phase 0 probe showed those are
+precisely the detours that pay off under congestion.
 
-**Gate logic** (`detour_should_fallback`):
+**Gate logic** (`detour_should_fallback`, recalibrated 2026-07-12):
 
 ```
 veto a detour  ⇔  idx != 0
                  AND (alt.max_density >= JAM  OR  alt.first_edge_density >= JAM)
-                 AND (network_p95 >= NET_TRIGGER  OR  blended_relief < RELIEF_DEADBAND)
+                 AND blended_relief < RELIEF_DEADBAND
 ```
 
 The first conjunct makes it a no-op on the baseline; the second requires the alternative
-to lack absolute headroom; the third fires only when the network is genuinely saturated
-(the regime where shortest-path is optimal) **or** the claimed relief is within snapshot
-noise (so the detour buys nothing but distance).
+to lack absolute headroom; the third fires only when the claimed relief is within
+snapshot noise — a *pointless / pile-on* detour that buys nothing but distance.
 
-**Why it is safe — a no-op on the wins.** The failure is a U-shape in traffic level. At
-moderate congestion (where MAPPO wins) the alternatives have slack → `max_density` /
-`first_edge_density` sit below `JAM` → the gate never fires → the useful detour is kept.
-It can only ever revert to the baseline, and only at saturation.
+**History — the retired saturation trigger.** The original gate had a third disjunct,
+`network_p95 >= NET_TRIGGER` ("network saturated → veto"), built on the PoA ≈ 1 premise
+of §1. At 450/150 it vetoed essentially **100% of detours** (on one measured seed the
+policy wanted to detour 382 times; all were vetoed; `route_choice_nonzero_rate` = 0.000),
+which made greedy and stochastic eval byte-identical and completely hid the learned
+routing. Removing it (while keeping the relief-noise test) was validated on the existing
+checkpoint with **no retraining**: −58s mean vs the old gate, wins 9/11 held-out seeds,
+and beats blanket Layer-A-off. `network_p95_trigger` is retained in the config/signature
+for compatibility but is **deprecated and unused**.
+
+**Why it is safe — a no-op on the wins.** At moderate congestion (where MAPPO wins) the
+alternatives have slack → `max_density` / `first_edge_density` sit below `JAM` → the gate
+never fires → the useful detour is kept. It can only ever revert to the baseline, and
+only when the chosen near-capacity detour shows no measurable relief.
 
 **Where.** Inference path only, at the route-selection point in
 [`controller/MAPPOController.py`](../controller/MAPPOController.py) (right after
@@ -130,7 +147,7 @@ Defaults live in `DetourThrottleConfig` and `ReservationFieldConfig`
 |---|---|---|
 | `jam_density` | 0.50 | alt near capacity if max/first-edge density ≥ this |
 | `relief_deadband` | 0.01 | blended relief below this is treated as noise |
-| `network_p95_trigger` | 0.30 | network "saturated" when occupied-edge p95 ≥ this |
+| `network_p95_trigger` | 0.30 | **deprecated, unused** — the retired saturation trigger (§2); kept for signature compatibility only |
 | `route_horizon` | 4 | leading edges of a committed route to book |
 | `route_decay` | 0.7 | weight of booked edge *i* = `route_decay ** i` |
 | `time_decay` | 0.85 | per-step decay of every reservation |
@@ -167,12 +184,14 @@ and produces bogus deltas.
 
 ## 7. Limitations / honest framing
 
-- On the NYC grid the price of anarchy stays low even when congested (many near-equal
-  alternatives → selfish load-balancing ≈ system optimum). The 16-seed frozen eval
-  showed extra selflessness gives ~0 fleet-TT benefit there. So these layers are a
-  **robustness fix** — "never worse than shortest-path, sometimes better," recovering the
-  saturated-seed losses — **not** a performance unlock. Demonstrating that selflessness
-  *adds value* still needs a high-PoA (Braess/Pigou) bottleneck regime.
+- The original "robustness fix, not a performance unlock" framing was measured at the
+  earlier 350/150 regime (16-seed frozen eval, ~0 fleet-TT benefit) and **does not carry
+  over to 450/150 target-pattern 2**: there, the recalibrated Layer A plus the Phase 2
+  congestion-gated-reward retrain measured **−27% avg / −24% p90 vs Dijkstra on 30
+  held-out seeds** (phase 2b), and the gain is concentrated in the congested tail exactly
+  as the Phase 0 probe predicted. What remains true is that the *saturation-veto* variant
+  of Layer A nullifies the policy (§2 history) — the layers help only in their
+  recalibrated form.
 - Layer B seeds in vehicle-iteration order within a step (the route-epoch decisions are
   not priority-sorted), so the best-response is approximate. A future refinement could
   order route decisions by a coordination priority before seeding.

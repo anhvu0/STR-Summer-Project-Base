@@ -1,0 +1,61 @@
+\section{Related Work}
+
+\subsection{Selfish routing and the price of anarchy}
+The study of routing as a game predates learning-based methods. Wardrop's principles
+distinguish the user equilibrium, where every used route between an origin and
+destination has equal and minimal cost to the individual, from the system optimum that
+minimizes total cost~\cite{wardrop1952}. Roughgarden and Tardos quantified how far apart
+these can be, proving bounds on the price of anarchy for selfish
+routing~\cite{roughgarden2002selfish}, and the Braess paradox shows the equilibrium can
+be counter-intuitively bad~\cite{braess2005paradox}. The gap is not merely theoretical:
+Zhang et al.~\cite{zhang2018poa} estimated the price of anarchy from real traffic data on
+the Eastern-Massachusetts road network and proposed data-driven strategies for reducing
+it, confirming that deployed networks operate measurably above the system optimum. These
+results motivate selfless routing directly: the potential benefit of asking vehicles to sacrifice is exactly the
+price-of-anarchy gap, which is large only when the network forces contention onto scarce
+links. Our experiments make this dependence concrete---selfless detours help precisely
+in the saturated scenarios where the gap is wide, and not otherwise.
+
+\subsection{The selfless traffic routing model}
+Dai et al.~\cite{dai2019str} introduced the selfless driving model and argued that
+vehicular routing should be evaluated by network-level average travel time rather than
+individual shortest paths. Their formulation permits a controlled vehicle to take a locally
+suboptimal route when doing so benefits the group. We adopt this objective but replace
+their heuristic controller with a learned cooperative policy, and we ground the trade-off
+in a common travel-time unit so the sacrifice decision is made on principled terms.
+
+\subsection{Reinforcement learning and MAPPO}
+Reinforcement learning is a natural fit for sequential routing, where actions change the
+state that later actions face~\cite{mnih2015human}. Proximal Policy Optimization (PPO)
+provides a stable on-policy actor--critic update via a clipped surrogate
+objective~\cite{schulman2017ppo}, and Generalized Advantage Estimation (GAE) reduces the
+variance of the advantage signal it optimizes~\cite{schulman2016gae}. In the multi-agent
+setting, the environment becomes non-stationary from any single agent's view. The
+centralized-training / decentralized-execution paradigm addresses this by giving the
+critic access to global information during training while the actor remains
+local~\cite{lowe2017maddpg}. MAPPO applies PPO under CTDE with a centralized value
+function and has proven surprisingly strong on cooperative
+benchmarks~\cite{yu2022mappo}; we use it here because our reward is cooperative and our
+deployment must be decentralized (each vehicle routes from its own view).
+
+\subsection{Credit assignment in cooperative MARL}
+A cooperative reward shared identically by all agents makes it hard to tell which agent's
+action helped, because each agent's contribution is buried in a large common signal.
+Difference rewards address this by crediting each agent with its marginal effect on the
+global objective~\cite{wolpert2001collectives}, and counterfactual multi-agent policy
+gradients (COMA) estimate that marginal effect with a centralized
+critic~\cite{foerster2018coma}. Our team-reward term is a leave-one-out difference reward
+in travel-time units: each agent pays for its own slowness relative to the live fleet
+average, so the exogenous, demand-driven congestion level---which no single vehicle
+controls---cancels out and the learnable signal is sharpened.
+
+\subsection{Simulation substrate}
+We use Eclipse SUMO as the microscopic traffic environment~\cite{lopez2018sumo,krajzewicz2012recent}.
+SUMO models car-following, lane changing, junctions, and traffic lights, which makes the
+evaluation considerably more realistic than routing on a static weighted graph, but also
+makes control harder: a route that looks good at the graph level is only useful if the
+vehicle can physically execute it under lane-feasibility, route-continuity, and
+commit-window constraints. Dijkstra's algorithm~\cite{dijkstra1959note} remains the
+appropriate baseline---not as a weak straw man, but as a strong, deterministic controller
+that respects the road graph and never over-commits, which is why it is competitive in
+exactly the low-congestion regime where selfless routing has nothing to gain.

@@ -1,0 +1,78 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{graphicx}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning,fit,backgrounds}
+\usepackage{url}
+
+\graphicspath{{Images/}}
+\hyphenation{op-tical net-works semi-conduc-tor}
+
+\begin{document}
+
+\title{Selfless Traffic Routing with Multi-Agent PPO\\in SUMO: When Does Sacrificing Help?}
+
+\author{\IEEEauthorblockN{Anh Vu}
+\IEEEauthorblockA{Department of Computer Science\\
+University of Houston}}
+
+\maketitle
+
+\begin{abstract}
+Most navigation systems route each vehicle independently along its own shortest
+path. When many vehicles make that same locally optimal choice, the shared roads
+they converge on become bottlenecks and total travel time rises---the gap between
+the selfish (Wardrop) equilibrium and the system optimum that traffic theory calls
+the price of anarchy. \emph{Selfless routing} asks a subset of vehicles to accept a
+longer personal route when doing so lowers travel time for the whole fleet. We study
+whether a cooperative multi-agent reinforcement-learning policy can learn this
+behavior in a realistic simulator. We implement Multi-Agent Proximal Policy
+Optimization (MAPPO) with centralized training and decentralized execution: a shared
+per-candidate route actor chooses among up to four complete routes, and a centralized
+critic that sees a fleet-wide summary stabilizes learning. Cooperation is induced by
+a difference-reward team term measured directly in seconds of travel time, so the
+policy can weigh personal delay against fleet delay without an arbitrary conversion.
+We train the policy on a congested New York City corridor (450 controlled and 150
+background vehicles routed to a shared destination) and evaluate it against a Dijkstra
+shortest-path baseline. On 20 held-out scenarios, the deployed greedy policy completes
+100\% of vehicles and reduces mean fleet travel time from 596.6\,s to 559.2\,s
+($-6.3\%$, winning 16/20 scenarios), with lower 90th-percentile travel time and fewer
+deadline misses; the improvement grows with congestion ($r=-0.48$). An ablation of a
+congestion-aware detour guard reveals that the learned policy in fact prefers a
+non-shortest route 48\% of the time: executing those detours lowers mean travel time
+further ($-11.2\%$) by rescuing the most congested scenarios, yet hurts light-traffic
+scenarios where shortest paths are already near-optimal. The result is a concrete
+demonstration that the value of selfless routing tracks the network's price of anarchy,
+and that a simple coordination guardrail trades peak fleet gains for robustness.
+\end{abstract}
+
+\begin{IEEEkeywords}
+selfless traffic routing, multi-agent reinforcement learning, MAPPO, price of anarchy, SUMO, intelligent transportation systems
+\end{IEEEkeywords}
+
+\IEEEpeerreviewmaketitle
+
+\input{Content/intro_background}
+\input{Content/related_works}
+\input{Content/architecture}
+\input{Content/discussion}
+\input{Content/conclusion}
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\section*{Appendix: Reproducibility}
+The SUMO network, demand-generation code, MAPPO implementation, trained checkpoints,
+and the training and evaluation CSV logs used in this paper are available at:
+
+\url{https://github.com/anhvu0/STR-Summer-Project-Base/tree/test_branch_mappo}
+
+\noindent Training logs are in \texttt{configurations/rl\_episode\_metrics.csv} and
+\texttt{configurations/rl\_frozen\_eval\_metrics.csv}; the deployment comparison is
+reproduced with \texttt{main.py} on seeds 4010--4029.
+
+\end{document}

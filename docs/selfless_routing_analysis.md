@@ -507,9 +507,10 @@ fraction of decisions that chose a *non-0* index.
 When the policy is confident (one logit ≫ others) the softmax is peaked and
 **stochastic ≈ greedy**; when scores are close, stochastic spreads much more.
 
-**Eval-variance caveat (important).** [`_run_frozen_inference_eval`](../core/rl_training_pipeline.py#L2150-L2204)
-defaults to `--eval-policy stochastic` and takes **one rollout per seed with no
-`torch`/`np` seed reset**, then selects `best.pt` from that single draw. The
+**Eval-variance caveat (historical — resolved, see update below).**
+[`_run_frozen_inference_eval`](../core/rl_training_pipeline.py#L2314) at the time
+defaulted to `--eval-policy stochastic` and took **one rollout per seed with no
+`torch`/`np` seed reset**, then selected `best.pt` from that single draw. The
 `np.random.choice` at line 1510 uses the global, unseeded RNG. A multi-checkpoint
 re-eval (best=ep39, frozen_eval_current=ep59, final=ep73) on the 11 held-out seeds
 showed:
@@ -533,6 +534,21 @@ corridor → congestion collapse); it hits every checkpoint, ep73 included.
 no corridor-collapse tail here), or if stochastic spreading is wanted, **average
 ≥3–5 seeded rollouts per seed** and `torch.manual_seed` the eval so checkpoint
 selection is not decided by a lucky/unlucky single sample.
+
+> **Update (2026-07-12): implemented.** `--eval-policy` now defaults to **greedy**; the
+> frozen eval additionally runs `--eval-stochastic-samples` (default 3) *seeded* sampled
+> rollouts per seed (`np.random.seed(seed·1000+i)`, averaged into `stochastic_*` columns)
+> as a learning-detectability diagnostic only. Best-checkpoint selection uses the greedy
+> deployment pass, tail-first (p90 before avg). Note the phase 2b twist: at late
+> checkpoints of the 150-episode retrain, the *averaged* stochastic pass beat the greedy
+> deployment (449.5 vs 469.2 avg at ep149) — which prompted a proper deployment test
+> (phase 2c: sampled + Layer A ON, 30 seeds × 3 seeded samples,
+> `phase2c_stochastic_deploy.py`). Result: **greedy stays the right deployment.** At the
+> *best* checkpoint, stochastic loses decisively (477.5 vs 440.2 avg, paired +37.3s,
+> sign-test p=0.001); it only beats greedy at the drifted *final* checkpoint whose argmax
+> had churned into a bad spot (461.0 vs 469.2). Sampling softens a bad argmax; it does not
+> beat a good one — exactly this section's original conclusion, now with the seeded
+> multi-sample protocol. Use the stochastic-vs-greedy gap as an argmax-churn indicator.
 
 ---
 
@@ -593,11 +609,10 @@ and consumed by `_team_congestion_cost(elapsed, vehicle)`.
 return magnitudes shrink; value normalization (7.1) absorbs the new scale automatically.
 The two are designed to ship together (both default-on).
 
-**Still open (fix (a)).** The frozen eval still takes a single unseeded stochastic
-rollout per seed and selects `best.pt` from it (§5.5). Recommended next: deploy/select
-**greedy**, or seed the sampling and average ≥3–5 stochastic rollouts, so checkpoint
-selection is not decided by a lucky draw. Validating that 7.1+7.2 actually raise fleet
-TT over many episodes requires a full training run evaluated under that protocol.
+**~~Still open~~ Fixed (2026-07-12, fix (a)).** The frozen eval now defaults to a
+**greedy** deployment pass for `best.pt` selection (tail-first: p90 before avg) plus
+seeded, averaged stochastic diagnostic rollouts (`--eval-stochastic-samples`, default 3)
+— checkpoint selection is no longer decided by a lucky draw. See the §5.5 update box.
 
 ## 8. Saturation-aware detour coordination (Layers A + B) — 2026-05-30
 
@@ -608,12 +623,14 @@ failure). Two cooperating fixes address it, both in
 
 - **Layer A — spare-capacity veto (inference guardrail).** After the policy picks a
   route, a detour onto a near-capacity alternative is reverted to the shortest-path
-  baseline when the network is saturated or the claimed relief is within noise. It reads
-  the alternative's **absolute** density (candidate features 3/4), not the relative
-  relief the policy reacted to — because at saturation a positive relief can still sit on
-  a near-capacity alternative whose headroom vanishes once the fleet piles on.
-  Deterministic, deployment-only, needs **no retraining**; toggle with
-  `--disable-detour-throttle`.
+  baseline when the claimed relief is within noise. It first reads the alternative's
+  **absolute** density (candidate features 3/4) — because at saturation a positive relief
+  can still sit on a near-capacity alternative whose headroom vanishes once the fleet
+  piles on — then vetoes only if the relief is illusory. *(Recalibrated 2026-07-12: the
+  original "network saturated → veto" trigger blocked ~100% of detours at 450/150 and hid
+  the learned policy; it is retired — see
+  [coordination_throttle.md §2](coordination_throttle.md).)* Deterministic,
+  deployment-only, needs **no retraining**; toggle with `--disable-detour-throttle`.
 - **Layer B — anticipatory reservation field (training + inference).** A committed route
   books its leading edges in a decaying field; the candidate generator scores against the
   **effective** (live + reserved) density, so later deciders in a window see an
@@ -621,7 +638,10 @@ failure). Two cooperating fixes address it, both in
   instead of a simultaneous pile-on. Rewards/observations keep true density. Toggle with
   `--disable-route-reservations`.
 
-These are a **robustness fix** (recover the saturated-seed losses; "never worse than
-shortest-path"), not a fleet-TT unlock — the NYC grid's low PoA still caps the headroom
-(§4.3). Full design, gate logic, knobs, and the seed-4010 A/B protocol:
-[`coordination_throttle.md`](coordination_throttle.md).
+At the 350/150 regime these measured as a **robustness fix** (recover the saturated-seed
+losses; "never worse than shortest-path") rather than a fleet-TT unlock — the NYC grid's
+low PoA capped the headroom there (§4.3). **At 450/150 target-pattern 2 that ceiling does
+not hold:** with the recalibrated Layer A and the Phase 2 congestion-gated reward retrain,
+deployment measured **−27% avg / −24% p90 vs Dijkstra on 30 held-out seeds** (phase 2b),
+with the gain concentrated in the congested tail. Full design, gate logic, knobs, and the
+seed-4010 A/B protocol: [`coordination_throttle.md`](coordination_throttle.md).
