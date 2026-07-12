@@ -125,6 +125,14 @@ def build_parser():
              "(option (b) in docs/selfless_routing_analysis.md).",
     )
     parser.add_argument(
+        "--eval-stochastic-samples",
+        type=int,
+        default=3,
+        help="Extra sampled-policy rollouts per seed in frozen eval. A greedy-argmax eval on "
+             "fixed seeds is bit-identical across checkpoints until the argmax flips, so it "
+             "cannot detect sub-argmax learning; the stochastic pass exposes it. 0 disables.",
+    )
+    parser.add_argument(
         "--disable-tail-delay-penalty",
         action="store_true",
         help="Zero the tail-delay penalty, which otherwise escalates exactly when a vehicle "
@@ -245,6 +253,7 @@ def main():
         team_reward_mode=args.team_reward_mode,
         eval_deterministic=(args.eval_policy == "greedy"),
         route_reservations=not args.disable_route_reservations,
+        eval_stochastic_samples=args.eval_stochastic_samples,
     )
     if args.disable_tail_delay_penalty:
         pipeline.tail_delay_linear_penalty = 0.0

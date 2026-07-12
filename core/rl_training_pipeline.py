@@ -110,6 +110,7 @@ class RLTrainingPipeline:
         frozen_eval_seeds=None,
         eval_spawn_interval=None,
         route_reservations=True,
+        eval_stochastic_samples=3,
     ):
         """
         Args:
@@ -164,6 +165,13 @@ class RLTrainingPipeline:
         self.team_reward_diff_clip = 1.0
         # Frozen-eval / deployment mode: True = greedy route argmax, False = sampled.
         self.eval_deterministic = bool(eval_deterministic)
+        # Number of extra stochastic (sampled) rollouts per seed in frozen eval. A greedy
+        # argmax eval on fixed seeds is bit-identical across checkpoints until the argmax
+        # flips, so it cannot detect sub-argmax policy improvement; the stochastic pass
+        # samples the policy so learning shows up before the argmax moves. 0 disables.
+        self.eval_stochastic_samples = max(int(eval_stochastic_samples), 0)
+        # Previous eval's greedy argmax-nonzero rate, for the flip-detection delta column.
+        self._prev_eval_greedy_nonzero_rate = None
         self.team_reward_speed_norm = max(float(team_reward_speed_norm), 1.0)
         self._fleet_delay_rate = 0.0
         # Per-vehicle normalized slowness for the current step (filled at the speed
@@ -206,6 +214,31 @@ class RLTrainingPipeline:
         self.route_balance_detour_penalty_scale = 1.0
         self.route_balance_congestion_penalty_scale = 1.5
         self.route_balance_reward_clip = 5.0
+        # Congestion-gated detour economics (Phase 2b). All three keys are multiplied by the
+        # baseline-congestion gate g = max(baseline_density - deadband, 0), which is ~0 in light
+        # traffic (so light-seed behaviour is unchanged and the policy is NOT pushed to over-
+        # detour) and grows with congestion. Under a congested baseline the Phase 0 probe showed
+        # detours help most, yet the flat reward left a relieving detour net-negative (realized
+        # time cost ~2.1 vs credit ~1.7). These let a genuinely-relieving detour off a congested
+        # baseline clear the acceptance bar and earn more, WITHOUT rewarding lateral pile-on
+        # (the bonus scales realized relief, so a detour onto an equally-dense road stays ~0).
+        # Calibrated so a GENUINELY-relieving congested detour is net-positive but the policy
+        # must stay SELECTIVE. An earlier, stronger setting (congested-detour EV ~+4.4, near the
+        # +5 clip) drove monotonic over-detouring in the first retrain: greedy eval detour rate
+        # climbed 29%->43% across checkpoints and deployment avg degraded 448->531s. These lower
+        # values keep the bar meaningful even under congestion so only clearly-relieving detours pay.
+        self.route_balance_diversion_weight = 0.15      # additive credit weight on the congestion gate g
+        # (kept small so the detour reward tracks ACTUAL density relief, not merely "baseline is
+        #  congested" -- a large weight rewards any congested detour and erodes selectivity)
+        self.route_balance_congestion_relax = 0.75      # how much a congested baseline lowers required_relief
+        self.route_balance_required_relief_floor = 0.60 # never relax the relief bar below this fraction
+        self.route_balance_congestion_relief_bonus = 0.4  # multiplicative bonus on genuine relief under congestion
+        # Refund only PART of the detour's estimated time cost. A full refund makes an accepted
+        # detour ~free on time, so any marginal-relief detour nets positive -> over-detour. At
+        # 0.6 the vehicle still pays ~40% of its detour time, so the policy detours only when the
+        # relief clearly outweighs that residual cost (restores selectivity; the flat refund was
+        # the dominant term keeping congested-detour EV near the clip).
+        self.route_balance_detour_refund_fraction = 0.6
         self.route_eta_delta_feature_scale_s = 120.0
         self.loop_window = 12
         self.loop_repeat_penalty = 1.5
@@ -448,6 +481,9 @@ class RLTrainingPipeline:
                 "required_relief": self.route_balance_density_deadband,
                 "accepted_detour": False,
                 "penalized_detour": False,
+                "baseline_density": 0.0,
+                "is_detour": bool(int(chosen_idx) != 0),
+                "congested_baseline": False,
             }
 
         eta_delta_norm = float(features[7])
@@ -455,19 +491,31 @@ class RLTrainingPipeline:
         density_relief = (0.65 * float(features[9])) + (0.35 * float(features[10]))
         detour_norm = max(eta_delta_norm, 0.0)
         faster_norm = max(-eta_delta_norm, 0.0)
-        required_relief = (
-            float(self.route_balance_density_deadband)
-            + float(self.route_balance_detour_relief_slope) * detour_norm
-        )
 
         # When the baseline route is itself congested, diverting to any alternative
         # helps other vehicles regardless of whether the alternative is less dense.
-        # Give credit proportional to how congested the baseline is.
+        # The congestion gate g is ~0 in light traffic (light-seed behaviour unchanged)
+        # and grows with how congested the shortest-path baseline is.
         baseline_density = float(feasible_candidates[0].features[2]) if feasible_candidates else 0.0
-        congestion_diversion_credit = max(
+        congestion_gate = max(
             baseline_density - float(self.route_balance_density_deadband), 0.0
         )
-        effective_relief = density_relief + 0.5 * congestion_diversion_credit if detour_norm > 0.0 else density_relief
+
+        # Under a congested baseline, lower the relief bar a relieving detour must clear
+        # (down to a floor) so it reaches the time-refund branch instead of the penalty branch.
+        relief_relax = max(
+            1.0 - float(self.route_balance_congestion_relax) * congestion_gate,
+            float(self.route_balance_required_relief_floor),
+        )
+        required_relief = (
+            float(self.route_balance_density_deadband)
+            + float(self.route_balance_detour_relief_slope) * detour_norm
+        ) * relief_relax
+
+        effective_relief = (
+            density_relief + float(self.route_balance_diversion_weight) * congestion_gate
+            if detour_norm > 0.0 else density_relief
+        )
 
         reward = 0.0
         if faster_norm > 0.0:
@@ -476,11 +524,22 @@ class RLTrainingPipeline:
         accepted_detour = bool(detour_norm > 0.0 and effective_relief > required_relief)
         penalized_detour = bool(detour_norm > 0.0 and not accepted_detour)
         if accepted_detour:
-            reward += float(self.route_balance_reward_scale) * (effective_relief - required_relief)
-            # Refund the per-step time-cost the vehicle will pay for this detour so that
-            # a worthwhile selfless detour is approximately zero-sum in the advantage
-            # estimate (rather than structurally losing by 0.5–2 units).
-            reward += float(self.travel_time_penalty) * float(eta_delta_steps)
+            # Multiplicatively boost GENUINE relief under congestion (scales realized relief,
+            # so a lateral detour onto an equally-dense road still earns ~0 -> no pile-on push).
+            congestion_multiplier = 1.0 + float(self.route_balance_congestion_relief_bonus) * congestion_gate
+            reward += (
+                float(self.route_balance_reward_scale)
+                * (effective_relief - required_relief)
+                * congestion_multiplier
+            )
+            # Partially refund the per-step time-cost the vehicle will pay for this detour so a
+            # worthwhile selfless detour does not structurally lose, while still paying part of
+            # its time so the policy stays selective (see route_balance_detour_refund_fraction).
+            reward += (
+                float(self.route_balance_detour_refund_fraction)
+                * float(self.travel_time_penalty)
+                * float(eta_delta_steps)
+            )
         elif penalized_detour:
             reward -= float(self.route_balance_detour_penalty_scale) * detour_norm
 
@@ -502,6 +561,9 @@ class RLTrainingPipeline:
             "required_relief": float(required_relief),
             "accepted_detour": accepted_detour,
             "penalized_detour": penalized_detour,
+            "baseline_density": float(baseline_density),
+            "is_detour": bool(detour_norm > 0.0),
+            "congested_baseline": bool(congestion_gate > 0.05),
         }
 
     def _record_route_balance_metrics(self, decision_metrics, components):
@@ -514,6 +576,17 @@ class RLTrainingPipeline:
             decision_metrics["route_selfless_detour_accept_count"] += 1
         if bool(components.get("penalized_detour", False)):
             decision_metrics["route_bad_detour_count"] += 1
+        # Phase 2b instrumentation: per-decision detour economics split by baseline-congestion
+        # regime, so the retrain can be watched for "does a relieving detour net-positive when
+        # congested?" (the Phase 0 diagnosis). Reward sums are the balance-reward contribution.
+        if bool(components.get("is_detour", False)):
+            reward = float(components.get("reward", 0.0))
+            if bool(components.get("congested_baseline", False)):
+                decision_metrics["route_detour_reward_congested_sum"] += reward
+                decision_metrics["route_detour_congested_count"] += 1
+            else:
+                decision_metrics["route_detour_reward_light_sum"] += reward
+                decision_metrics["route_detour_light_count"] += 1
 
     def _build_central_observation(
         self,
@@ -2140,6 +2213,17 @@ class RLTrainingPipeline:
             "route_mean_logit_margin_mean",
             "route_mean_eta_delta_steps_mean",
             "route_mean_density_relief_mean",
+            # --- Phase 1 detectability columns (appended; older parsers unaffected) ---
+            # Stochastic (sampled-policy) eval: detects learning before the greedy argmax flips.
+            "stochastic_samples",
+            "stochastic_avg_travel_time_mean",
+            "stochastic_avg_travel_time_std",
+            "stochastic_p90_travel_time_mean",
+            "stochastic_completion_rate_mean",
+            "stochastic_route_choice_nonzero_rate_mean",
+            # Greedy argmax movement vs the previous eval: nonzero-rate is 0 iff argmax==shortest
+            # path everywhere; a change here means the deterministic policy actually moved.
+            "greedy_route_choice_nonzero_rate_delta_vs_prev",
             "best_checkpoint_updated",
             "score_key",
         ]
@@ -2171,13 +2255,29 @@ class RLTrainingPipeline:
         )
 
     def _frozen_eval_score_key(self, summary):
-        # Rank deployment checkpoints by absolute policy quality. Baseline deltas are
-        # useful diagnostics, but the best checkpoint should first avoid tail collapse.
+        # Rank deployment checkpoints by absolute policy quality. Two deliberate choices:
+        #   1) Discriminate on the STOCHASTIC eval metrics when a stochastic pass ran. A
+        #      greedy-argmax eval on fixed seeds is bit-identical across checkpoints until
+        #      the argmax flips, so a greedy-only key cannot tell a learning checkpoint from
+        #      a frozen one (this is why the old best-checkpoint only ever updated once).
+        #   2) Weight the TAIL. The Phase 0 probe showed the routing gain is concentrated on
+        #      congested seeds / the p90 tail, not the mean; a mean-first key rates the
+        #      collapsed shortest-path policy as near-optimal (see phase0-detour-gain-probe).
+        # Select on the GREEDY deployment pass -- that is exactly what ships (argmax + the
+        # recalibrated Layer A). With Layer A recalibrated the greedy pass now moves across
+        # checkpoints (detour rate is non-zero and informative), so it can discriminate; the
+        # stochastic Layer-A-off pass stays in the CSV as a detectability diagnostic but must
+        # NOT drive selection -- doing so once picked an over-detoured checkpoint whose greedy
+        # deployment was the worst of the run. Tail first (p90 before mean) per the Phase 0
+        # finding that the routing gain lives in the congested tail.
+        completion = summary.get("completion_rate_mean", 0.0)
+        avg = summary.get("avg_travel_time_mean", float("inf"))
+        p90 = summary.get("p90_travel_time_mean", float("inf"))
         return (
-            1.0 - float(np.clip(summary.get("completion_rate_mean", 0.0), 0.0, 1.0)),
+            1.0 - float(np.clip(completion, 0.0, 1.0)),
             self._safe_eval_metric(summary.get("timeout_rate_mean", 1.0)),
-            self._safe_eval_metric(summary.get("avg_travel_time_mean", float("inf"))),
-            self._safe_eval_metric(summary.get("p90_travel_time_mean", float("inf"))),
+            self._safe_eval_metric(p90),
+            self._safe_eval_metric(avg),
             self._safe_eval_metric(summary.get("tail_completion_gap_steps_mean", float("inf"))),
             self._safe_eval_metric(summary.get("p95_to_p50_travel_ratio_mean", float("inf"))),
             self._safe_eval_metric(summary.get("deadlines_missed_mean", float("inf"))),
@@ -2268,6 +2368,32 @@ class RLTrainingPipeline:
             stats = run_eval_controller(policy, rl_vehicles)
             runtime_metrics = stats.get("controller_runtime_metrics") or {}
             rl_score = self._travel_score_tuple(stats)
+
+            # Stochastic pass: sample the policy a few times so sub-argmax learning is visible
+            # even while the greedy argmax is still pinned to the shortest-path candidate.
+            # Layer A (the spare-capacity detour veto) is turned OFF here: at 450/150 it vetoes
+            # essentially every detour (every alternative reads as near-capacity), so with it ON
+            # the sampled policy collapses byte-for-byte onto the greedy shortest-path result and
+            # nothing the network learns is observable. Off, the policy's real routing intent and
+            # its fleet-level effect are visible. See phase0/layer-A findings.
+            stoch_avg, stoch_p90, stoch_compl, stoch_nonzero = [], [], [], []
+            for sample_idx in range(self.eval_stochastic_samples):
+                np.random.seed(int(eval_seed) * 1000 + sample_idx)
+                sample_vehicles = copy.deepcopy(vehicles)
+                sample_policy = MAPPOPolicy(
+                    sample_vehicles,
+                    self.connection_info,
+                    self._frozen_eval_model_path,
+                    net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
+                    deterministic=False,
+                    detour_throttle=False,
+                )
+                sample_stats = run_eval_controller(sample_policy, sample_vehicles)
+                sample_runtime = sample_stats.get("controller_runtime_metrics") or {}
+                stoch_avg.append(float(sample_stats["avg_travel_time"]))
+                stoch_p90.append(float(sample_stats["p90_travel_time"]))
+                stoch_compl.append(float(sample_stats["completion_rate"]))
+                stoch_nonzero.append(float(sample_runtime.get("route_choice_nonzero_rate", 0.0)))
             baseline_score = self._travel_score_tuple(baseline_stats)
             win = int(rl_score < baseline_score)
             per_seed_rows.append({
@@ -2303,6 +2429,10 @@ class RLTrainingPipeline:
                 "route_mean_logit_margin": float(runtime_metrics.get("route_mean_logit_margin", 0.0)),
                 "route_mean_eta_delta_steps": float(runtime_metrics.get("route_mean_eta_delta_steps", 0.0)),
                 "route_mean_density_relief": float(runtime_metrics.get("route_mean_density_relief", 0.0)),
+                "stochastic_avg_travel_time": float(np.mean(stoch_avg)) if stoch_avg else float(stats["avg_travel_time"]),
+                "stochastic_p90_travel_time": float(np.mean(stoch_p90)) if stoch_p90 else float(stats["p90_travel_time"]),
+                "stochastic_completion_rate": float(np.mean(stoch_compl)) if stoch_compl else float(stats["completion_rate"]),
+                "stochastic_route_choice_nonzero_rate": float(np.mean(stoch_nonzero)) if stoch_nonzero else 0.0,
             })
 
         # Expose per-seed rows so callers can compute confidence intervals / paired stats.
@@ -2353,7 +2483,24 @@ class RLTrainingPipeline:
             "route_mean_logit_margin_mean": mean_metric("route_mean_logit_margin", 0.0),
             "route_mean_eta_delta_steps_mean": mean_metric("route_mean_eta_delta_steps", 0.0),
             "route_mean_density_relief_mean": mean_metric("route_mean_density_relief", 0.0),
+            "stochastic_samples": int(self.eval_stochastic_samples),
+            "stochastic_avg_travel_time_mean": mean_metric("stochastic_avg_travel_time", float("inf")),
+            "stochastic_avg_travel_time_std": float(
+                np.std([float(r["stochastic_avg_travel_time"]) for r in per_seed_rows])
+            ) if per_seed_rows else 0.0,
+            "stochastic_p90_travel_time_mean": mean_metric("stochastic_p90_travel_time", float("inf")),
+            "stochastic_completion_rate_mean": mean_metric("stochastic_completion_rate", 0.0),
+            "stochastic_route_choice_nonzero_rate_mean": mean_metric("stochastic_route_choice_nonzero_rate", 0.0),
         }
+        # Greedy argmax movement vs the previous eval (0 while argmax stays on shortest path).
+        greedy_nonzero = aggregate_summary["route_choice_nonzero_rate_mean"]
+        if self._prev_eval_greedy_nonzero_rate is None:
+            aggregate_summary["greedy_route_choice_nonzero_rate_delta_vs_prev"] = 0.0
+        else:
+            aggregate_summary["greedy_route_choice_nonzero_rate_delta_vs_prev"] = float(
+                greedy_nonzero - self._prev_eval_greedy_nonzero_rate
+            )
+        self._prev_eval_greedy_nonzero_rate = float(greedy_nonzero)
         improved, score_key = self._save_best_frozen_checkpoint(
             episode,
             aggregate_summary,
@@ -2364,19 +2511,20 @@ class RLTrainingPipeline:
         self._append_frozen_eval_row(aggregate_summary)
         print(
             "[EP {:03d} FROZEN_EVAL] seeds={} spawn_interval={:.2f} win_rate={:.3f} "
-            "completion={:.1%} avg_delta={:.2f} p90_delta={:.2f} "
-            "tail_delta={:.2f} route_nonzero={:.1%} eta_delta={:.1f}s relief={:.3f} best={}".format(
+            "completion={:.1%} greedy_avg={:.1f} greedy_p90={:.1f} "
+            "stoch_avg={:.1f}±{:.1f} stoch_p90={:.1f} greedy_nonzero={:.1%}(Δ{:+.1%}) best={}".format(
                 int(episode),
                 aggregate_summary["seed_list"],
                 float(self.eval_spawn_interval),
                 aggregate_summary["win_rate"],
                 aggregate_summary["completion_rate_mean"],
-                aggregate_summary["avg_travel_time_delta_mean"],
-                aggregate_summary["p90_travel_time_delta_mean"],
-                aggregate_summary["tail_completion_gap_steps_delta_mean"],
+                aggregate_summary["avg_travel_time_mean"],
+                aggregate_summary["p90_travel_time_mean"],
+                aggregate_summary["stochastic_avg_travel_time_mean"],
+                aggregate_summary["stochastic_avg_travel_time_std"],
+                aggregate_summary["stochastic_p90_travel_time_mean"],
                 aggregate_summary["route_choice_nonzero_rate_mean"],
-                aggregate_summary["route_mean_eta_delta_steps_mean"],
-                aggregate_summary["route_mean_density_relief_mean"],
+                aggregate_summary["greedy_route_choice_nonzero_rate_delta_vs_prev"],
                 "yes" if improved else "no",
             )
         )
@@ -2460,6 +2608,12 @@ class RLTrainingPipeline:
             "lane_now_replan_releases", "lane_now_replan_forced_alternative", "same_edge_reopen_after_abort_count",
             "synthetic_terminal_finalizations", "finalized_opened_proactive_ratio", "finalized_opened_lane_now_ratio",
             "noncompletion_rate", "uncontrolled_total_wait_steps", "mean_uncontrolled_wait_per_step",
+            # Phase 2b: per-decision detour economics split by baseline-congestion regime.
+            # The KEY health check for the retrain: route_detour_reward_congested_mean should be
+            # >= 0 (a relieving detour is net-positive when congested), while the light-regime
+            # mean should stay <= ~0 (don't pay the policy to detour when there's no congestion).
+            "route_detour_reward_congested_mean", "route_detour_reward_light_mean",
+            "route_detour_congested_count", "route_detour_light_count",
         ]
         # Rewrite metrics each new training session to avoid schema drift/appending old runs.
         with open(self.metrics_csv_path, "w", newline="") as f:
@@ -4416,6 +4570,16 @@ class RLTrainingPipeline:
                 route_bad_detour_rate = (
                     float(decision_metrics["route_bad_detour_count"]) / route_balance_count
                 )
+                route_detour_congested_count = float(decision_metrics["route_detour_congested_count"])
+                route_detour_light_count = float(decision_metrics["route_detour_light_count"])
+                route_detour_reward_congested_mean = (
+                    float(decision_metrics["route_detour_reward_congested_sum"]) / route_detour_congested_count
+                    if route_detour_congested_count > 0 else 0.0
+                )
+                route_detour_reward_light_mean = (
+                    float(decision_metrics["route_detour_reward_light_sum"]) / route_detour_light_count
+                    if route_detour_light_count > 0 else 0.0
+                )
 
                 rolling_teleport_events.append(float(episode_teleport_events))
                 rolling_teleported_controlled.append(float(len(teleported_controlled_ids)))
@@ -4786,6 +4950,10 @@ class RLTrainingPipeline:
                         "mean_uncontrolled_wait_per_step": (
                             uncontrolled_total_wait_steps / max(last_step_executed, 1)
                         ),
+                        "route_detour_reward_congested_mean": route_detour_reward_congested_mean,
+                        "route_detour_reward_light_mean": route_detour_reward_light_mean,
+                        "route_detour_congested_count": route_detour_congested_count,
+                        "route_detour_light_count": route_detour_light_count,
                     }
                     row = {field: row.get(field, "") for field in csv_fields}
                     if set(row.keys()) != set(csv_fields):

@@ -9,12 +9,19 @@ signals the pipeline already computes.
 Layer A -- spare-capacity veto (``detour_should_fallback``)
     A deterministic guardrail applied AFTER the policy picks a route. If the chosen
     route is a detour (candidate index != 0) onto an alternative that is itself near
-    capacity -- and the network is saturated OR the claimed relief is within noise --
-    the choice is reverted to the shortest-path baseline (candidate index 0), which is
-    optimal when nothing has slack (PoA ~= 1). It reads ABSOLUTE alternative density
-    (features 3=max, 4=first-edge), not the relative relief the policy reacted to,
-    because at saturation a positive relief can still sit on top of a near-capacity
-    alternative whose remaining headroom vanishes once the rest of the fleet piles on.
+    capacity AND that detour does not actually relieve congestion relative to the
+    shortest-path baseline (its blended relief is within snapshot noise), the choice is
+    reverted to the shortest-path baseline (candidate index 0). This catches pointless /
+    pile-on detours onto roads that are already full without buying anything.
+
+    It deliberately does NOT veto merely because the network as a whole is saturated. The
+    original design added a "network saturated -> shortest path is optimal (PoA ~= 1)"
+    trigger, but the Phase 0 forced-detour probe measured the opposite in this regime:
+    relieving detours help MOST under saturation (e.g. a catastrophic-congestion seed went
+    1236s -> 636s once detours were allowed), and that blanket trigger vetoed ~100% of
+    detours at 450/150, nullifying the learned policy (greedy == stochastic byte-for-byte).
+    So the veto now keys on whether THIS detour relieves vs the baseline, not on how busy
+    the network is.
 
 Layer B -- anticipatory reservation field (``ReservationField``)
     When a vehicle commits to a route, its leading edges are "booked" in a decaying
@@ -65,9 +72,12 @@ class DetourThrottleConfig:
     enabled: bool = True
     # Alternative counts as near-capacity when its max OR first-edge density >= this.
     jam_density: float = 0.50
-    # A relief whose magnitude is below this is treated as snapshot noise.
+    # A relief whose magnitude is below this is treated as snapshot noise; a near-capacity
+    # detour whose blended relief vs the baseline is under this is vetoed as pointless.
     relief_deadband: float = 0.01
-    # Network is "saturated" when the occupied-edge density p95 >= this.
+    # DEPRECATED / unused: the old "network saturated -> veto every detour" trigger. Kept
+    # for backward-compatible construction only; the Phase 0 probe showed detours help most
+    # under saturation, so the veto no longer keys on network-wide density. See module docstring.
     network_p95_trigger: float = 0.30
 
 
@@ -80,9 +90,13 @@ def detour_should_fallback(
     """Layer A. True if the chosen detour should revert to the shortest-path baseline.
 
     A no-op unless the choice is a detour (idx != 0) onto an alternative that is itself
-    near capacity. The veto then triggers when the network is saturated (the regime
-    where shortest-path is optimal) or the claimed relief is within noise (so the detour
-    buys nothing but extra distance).
+    near capacity. The veto then triggers only when that near-capacity detour does not
+    actually relieve congestion relative to the shortest-path baseline (its blended relief
+    is within snapshot noise) -- i.e. a pointless / pile-on detour. It no longer triggers
+    on network-wide saturation: the Phase 0 probe showed relieving detours help most under
+    saturation, and the old saturation trigger vetoed essentially every detour, hiding the
+    learned policy. ``network_density_p95`` is retained in the signature for compatibility
+    but no longer gates the veto.
     """
     if not config.enabled or int(chosen_idx) == 0:
         return False
@@ -95,9 +109,8 @@ def detour_should_fallback(
     )
     if not alt_saturated:
         return False
-    network_saturated = float(network_density_p95) >= float(config.network_p95_trigger)
     illusory_relief = route_relief(feats) < float(config.relief_deadband)
-    return bool(network_saturated or illusory_relief)
+    return bool(illusory_relief)
 
 
 @dataclass(frozen=True)
