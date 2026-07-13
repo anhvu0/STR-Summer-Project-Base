@@ -247,5 +247,14 @@
       "stochastic_completion_rate": 1.0,
       "stochastic_route_choice_nonzero_rate": 0.0
     }
-  ]
+  ],
+  "provenance": {
+    "role": "PRODUCTION paper checkpoint: Table 3 'MAPPO (marginal-cost)', sacrifice accounting (R3), ablation reference (R5)",
+    "training": "train_rl.py on chained-Braess map, --team-reward-mode marginal, 50 episodes, WITHOUT --skip-forced-route-epochs (the 'noskip' in the name; skipping hurts diamond-2 learning)",
+    "selection": "held-out greedy frozen eval on seed block 6000-6008, best at episode 9; test block 7000-7019 untouched until final eval",
+    "eval_artifact": "Selfless_routing/reproduce/artifacts/braess_eval_mappo_policy_braess_marginal_noskip.best.csv",
+    "eval_requires": "PYTHONHASHSEED=0 (harness enforces), CPU inference, seed-pinned SUMO",
+    "note": "mappo_policy_braess_marginal_noskip.best.pt.keep and mappo_policy_braess.best.pt are byte-identical copies of this checkpoint (md5 54abcacb6a9084cd75c71e91ebac29b3)",
+    "provenance_updated": "2026-07-13"
+  }
 }

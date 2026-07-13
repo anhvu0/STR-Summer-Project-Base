@@ -1,0 +1,10 @@
+{
+  "provenance": {
+    "role": "Paper checkpoint: Table 3 'MAPPO (difference)' (md5 f476b74ddbbabda67ef924290afce44a)",
+    "training": "train_rl.py on chained-Braess map, difference (mean-baselined) team reward, 50 episodes; backup taken before the base filename was reused by later runs",
+    "note": "Original frozen-eval meta was overwritten when the base name was reused; held-out result on the unified metric: mean 345.0 s, beats Dijkstra-dynamic 20/20, within noise of the marginal-cost production model (two-sided p=0.23)",
+    "eval_artifact": "Selfless_routing/reproduce/artifacts/braess_eval_mappo_policy_braess.best.pt.csv",
+    "eval_requires": "PYTHONHASHSEED=0 (harness enforces), CPU inference, seed-pinned SUMO",
+    "provenance_updated": "2026-07-13"
+  }
+}

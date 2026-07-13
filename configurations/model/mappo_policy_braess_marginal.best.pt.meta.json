@@ -247,5 +247,10 @@
       "stochastic_completion_rate": 1.0,
       "stochastic_route_choice_nonzero_rate": 0.0
     }
-  ]
+  ],
+  "provenance": {
+    "role": "NOT used in the paper. Earlier marginal-reward run trained WITH --skip-forced-route-epochs; weaker than the noskip production run",
+    "note": "REVISION_PLAN_2026-07-13.md cited this file for Table 3 before the 2026-07-13 correction; the actual Table 3 checkpoint is mappo_policy_braess_marginal_noskip.best.pt",
+    "provenance_updated": "2026-07-13"
+  }
 }
