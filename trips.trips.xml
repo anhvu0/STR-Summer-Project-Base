@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2026-07-13T06:13:21.037925-06:00 by Eclipse SUMO duarouter 1.27.0
+<!-- generated on 2026-07-13T07:30:18.220875-06:00 by Eclipse SUMO duarouter 1.27.0
 <duarouterConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/duarouterConfiguration.xsd">
 
     <input>
@@ -28,7 +28,7 @@
 -->
 
 <routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
-    <trip id="1" depart="72.00" from="f_up1" to="out"/>
-    <trip id="2" depart="144.00" from="g_dn1" to="g_up2"/>
-    <trip id="4" depart="288.00" from="in2" to="g_dn1"/>
+    <trip id="0" depart="0.00" from="in2" to="f_dn2"/>
+    <trip id="3" depart="216.00" from="f_up2" to="out"/>
+    <trip id="4" depart="288.00" from="link1" to="link1"/>
 </routes>

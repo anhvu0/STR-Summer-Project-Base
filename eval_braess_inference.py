@@ -119,6 +119,15 @@ def run_ctrl(controller, vehicles, sumo_seed, tripinfo_path):
     # previous arm left -> the same (model, seed) pair drifts run-to-run. An explicit --seed
     # (derived from the held-out episode seed) resets it, making every arm reproducible and
     # the paired comparison exact.
+    # Also pin the Python-side RNGs so the STOCHASTIC arm reproduces run-to-run
+    # (verified 2026-07-13: without this, artifact CSVs differ only on MAPPO-stoch rows).
+    import random as _random
+
+    import numpy as _np
+    import torch as _torch
+    _random.seed(int(sumo_seed))
+    _np.random.seed(int(sumo_seed))
+    _torch.manual_seed(int(sumo_seed))
     sim = StrSumo(controller, pipe.connection_info, vehicles)
     traci.start([SUMO, "-c", pipe.runtime_sumocfg_path, "--quit-on-end",
                  "--no-step-log", "--no-warnings", "--seed", str(int(sumo_seed)),

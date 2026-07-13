@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2026-07-13T06:13:20.986498-06:00 by Eclipse SUMO duarouter 1.27.0
+<!-- generated on 2026-07-13T07:30:18.170323-06:00 by Eclipse SUMO duarouter 1.27.0
 <duarouterConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/duarouterConfiguration.xsd">
 
     <input>
@@ -27,19 +27,19 @@
 -->
 
 <routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
-    <vehicle id="1" depart="72.00">
+    <vehicle id="0" depart="0.00">
         <routeDistribution last="0">
-            <route cost="181.74" probability="1.00000000" edges="f_up1 cross1 g_dn1 link1 f_up2 cross2 g_dn2 out"/>
+            <route cost="176.98" probability="1.00000000" edges="in2 stage f_up1 cross1 g_dn1 link1 f_dn2"/>
         </routeDistribution>
     </vehicle>
-    <vehicle id="2" depart="144.00">
+    <vehicle id="3" depart="216.00">
         <routeDistribution last="0">
-            <route cost="138.87" probability="1.00000000" edges="g_dn1 link1 f_up2 g_up2"/>
+            <route cost="89.55" probability="1.00000000" edges="f_up2 cross2 g_dn2 out"/>
         </routeDistribution>
     </vehicle>
     <vehicle id="4" depart="288.00">
         <routeDistribution last="0">
-            <route cost="106.64" probability="1.00000000" edges="in2 stage f_up1 cross1 g_dn1"/>
+            <route cost="14.40" probability="1.00000000" edges="link1"/>
         </routeDistribution>
     </vehicle>
 </routes>

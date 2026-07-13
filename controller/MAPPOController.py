@@ -642,7 +642,28 @@ class MAPPOPolicy(RouteController):
         valid_logits = np.sort(logits[valid])
         return float(valid_logits[-1] - valid_logits[-2])
 
-    def _record_route_actor_choice(self, feasible_candidates, chosen_idx, masked_logits):
+    def _record_route_actor_choice(self, feasible_candidates, chosen_idx, masked_logits,
+                                   vehicle_id=None):
+        # R3 sacrifice accounting: opt-in per-decision log. Set STR_DECISION_LOG
+        # to a CSV path to record, per finalized route decision, the chosen index
+        # and the predicted private sacrifice (ETA delta vs candidate 0, seconds)
+        # plus the predicted density relief. Off (no overhead) unless the env var
+        # is set.
+        log_path = os.environ.get("STR_DECISION_LOG")
+        if log_path and vehicle_id is not None:
+            chosen_features = np.asarray(
+                feasible_candidates[int(chosen_idx)].features, dtype=np.float32)
+            eta_delta_s = (float(chosen_features[7]) * float(self.route_eta_delta_feature_scale_s)
+                           if chosen_features.size > 7 else float("nan"))
+            relief = (0.65 * float(chosen_features[9]) + 0.35 * float(chosen_features[10])
+                      if chosen_features.size > 10 else float("nan"))
+            write_header = not os.path.exists(log_path)
+            with open(log_path, "a") as fh:
+                if write_header:
+                    fh.write("vehicle_id,chosen_idx,n_candidates,pred_eta_delta_s,pred_relief\n")
+                fh.write(f"{vehicle_id},{int(chosen_idx)},{len(feasible_candidates)},"
+                         f"{eta_delta_s:.3f},{relief:.4f}\n")
+
         valid_count = len(feasible_candidates)
         self._metrics[f"route_valid_candidates_{valid_count}"] += 1
         self._metrics["route_valid_candidate_sum"] += valid_count
@@ -1387,6 +1408,7 @@ class MAPPOPolicy(RouteController):
                         feasible_candidates,
                         chosen_filtered_idx,
                         masked_logits,
+                        vehicle_id=vid,
                     )
                     self._metrics["route_decisions_total"] += 1
                     route_applied = False
