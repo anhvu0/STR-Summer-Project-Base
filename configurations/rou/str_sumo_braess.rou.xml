@@ -1,5 +1,5 @@
 <?xml version="1.0" ?>
-<!-- generated on 2026-07-13T03:20:35.249339-06:00 by Eclipse SUMO duarouter 1.27.0
+<!-- generated on 2026-07-13T06:13:20.986404-06:00 by Eclipse SUMO duarouter 1.27.0
 <duarouterConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/duarouterConfiguration.xsd">
 
     <input>
@@ -33,27 +33,20 @@
     
 	
 
-	<vehicle id="0" depart="0.00">
-		
-        
-		<route edges="in2 stage f_up1 cross1 g_dn1 link1 f_dn2"/>
-		
-    
-	</vehicle>
 	<vehicle depart="0" id="5">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="1.5" id="6">
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="3.0" id="7">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="4.5" id="8">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="6.0" id="9">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="7.5" id="10">
 		<route edges="in1"/>
@@ -62,34 +55,34 @@
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="10.5" id="12">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="12.0" id="13">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="13.5" id="14">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="15.0" id="15">
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="16.5" id="16">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="18.0" id="17">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="19.5" id="18">
-		<route edges="in1"/>
-	</vehicle>
-	<vehicle depart="21.0" id="19">
 		<route edges="in2"/>
 	</vehicle>
-	<vehicle depart="22.5" id="20">
+	<vehicle depart="21.0" id="19">
 		<route edges="in1"/>
 	</vehicle>
+	<vehicle depart="22.5" id="20">
+		<route edges="in2"/>
+	</vehicle>
 	<vehicle depart="24.0" id="21">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="25.5" id="22">
 		<route edges="in1"/>
@@ -98,7 +91,7 @@
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="28.5" id="24">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="30.0" id="25">
 		<route edges="in1"/>
@@ -110,22 +103,22 @@
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="34.5" id="28">
-		<route edges="in1"/>
-	</vehicle>
-	<vehicle depart="36.0" id="29">
 		<route edges="in2"/>
 	</vehicle>
-	<vehicle depart="37.5" id="30">
+	<vehicle depart="36.0" id="29">
 		<route edges="in1"/>
+	</vehicle>
+	<vehicle depart="37.5" id="30">
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="39.0" id="31">
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="40.5" id="32">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="42.0" id="33">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="43.5" id="34">
 		<route edges="in1"/>
@@ -134,7 +127,7 @@
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="46.5" id="36">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="48.0" id="37">
 		<route edges="in2"/>
@@ -143,25 +136,25 @@
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="51.0" id="39">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="52.5" id="40">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="54.0" id="41">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="55.5" id="42">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="57.0" id="43">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="58.5" id="44">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="60.0" id="45">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="61.5" id="46">
 		<route edges="in2"/>
@@ -173,7 +166,7 @@
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="66.0" id="49">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="67.5" id="50">
 		<route edges="in1"/>
@@ -182,43 +175,50 @@
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="70.5" id="52">
-		<route edges="in2"/>
+		<route edges="in1"/>
+	</vehicle>
+	<vehicle id="1" depart="72.00">
+		
+        
+		<route edges="f_up1 cross1 g_dn1 link1 f_up2 cross2 g_dn2 out"/>
+		
+    
 	</vehicle>
 	<vehicle depart="72.0" id="53">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="73.5" id="54">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="75.0" id="55">
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="76.5" id="56">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="78.0" id="57">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="79.5" id="58">
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="81.0" id="59">
-		<route edges="in1"/>
-	</vehicle>
-	<vehicle depart="82.5" id="60">
 		<route edges="in2"/>
 	</vehicle>
-	<vehicle depart="84.0" id="61">
+	<vehicle depart="82.5" id="60">
 		<route edges="in1"/>
 	</vehicle>
+	<vehicle depart="84.0" id="61">
+		<route edges="in2"/>
+	</vehicle>
 	<vehicle depart="85.5" id="62">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="87.0" id="63">
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="88.5" id="64">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="90.0" id="65">
 		<route edges="in2"/>
@@ -227,7 +227,7 @@
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="93.0" id="67">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="94.5" id="68">
 		<route edges="in1"/>
@@ -242,7 +242,7 @@
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="100.5" id="72">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="102.0" id="73">
 		<route edges="in2"/>
@@ -254,22 +254,22 @@
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="106.5" id="76">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="108.0" id="77">
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="109.5" id="78">
-		<route edges="in2"/>
-	</vehicle>
-	<vehicle depart="111.0" id="79">
-		<route edges="in2"/>
-	</vehicle>
-	<vehicle depart="112.5" id="80">
 		<route edges="in1"/>
 	</vehicle>
-	<vehicle depart="114.0" id="81">
+	<vehicle depart="111.0" id="79">
+		<route edges="in1"/>
+	</vehicle>
+	<vehicle depart="112.5" id="80">
 		<route edges="in2"/>
+	</vehicle>
+	<vehicle depart="114.0" id="81">
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="115.5" id="82">
 		<route edges="in1"/>
@@ -278,16 +278,16 @@
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="118.5" id="84">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="120.0" id="85">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="121.5" id="86">
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="123.0" id="87">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="124.5" id="88">
 		<route edges="in2"/>
@@ -296,7 +296,7 @@
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="127.5" id="90">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="129.0" id="91">
 		<route edges="in1"/>
@@ -320,43 +320,50 @@
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="139.5" id="98">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="141.0" id="99">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="142.5" id="100">
-		<route edges="in1"/>
+		<route edges="in2"/>
+	</vehicle>
+	<vehicle id="2" depart="144.00">
+		
+        
+		<route edges="g_dn1 link1 f_up2 g_up2"/>
+		
+    
 	</vehicle>
 	<vehicle depart="144.0" id="101">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="145.5" id="102">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="147.0" id="103">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="148.5" id="104">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="150.0" id="105">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="151.5" id="106">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="153.0" id="107">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="154.5" id="108">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="156.0" id="109">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="157.5" id="110">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="159.0" id="111">
 		<route edges="in2"/>
@@ -368,73 +375,73 @@
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="163.5" id="114">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="165.0" id="115">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="166.5" id="116">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="168.0" id="117">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="169.5" id="118">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="171.0" id="119">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="172.5" id="120">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="174.0" id="121">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="175.5" id="122">
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="177.0" id="123">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="178.5" id="124">
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="180.0" id="125">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="181.5" id="126">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="183.0" id="127">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="184.5" id="128">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="186.0" id="129">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="187.5" id="130">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="189.0" id="131">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="190.5" id="132">
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="192.0" id="133">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="193.5" id="134">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="195.0" id="135">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="196.5" id="136">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="198.0" id="137">
 		<route edges="in1"/>
@@ -446,25 +453,25 @@
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="202.5" id="140">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="204.0" id="141">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="205.5" id="142">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="207.0" id="143">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="208.5" id="144">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="210.0" id="145">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="211.5" id="146">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="213.0" id="147">
 		<route edges="in2"/>
@@ -472,18 +479,11 @@
 	<vehicle depart="214.5" id="148">
 		<route edges="in1"/>
 	</vehicle>
-	<vehicle id="3" depart="216.00">
-		
-        
-		<route edges="f_up2 cross2 g_dn2 out"/>
-		
-    
-	</vehicle>
 	<vehicle depart="216.0" id="149">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="217.5" id="150">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="219.0" id="151">
 		<route edges="in2"/>
@@ -498,13 +498,13 @@
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="225.0" id="155">
-		<route edges="in2"/>
-	</vehicle>
-	<vehicle depart="226.5" id="156">
 		<route edges="in1"/>
 	</vehicle>
-	<vehicle depart="228.0" id="157">
+	<vehicle depart="226.5" id="156">
 		<route edges="in2"/>
+	</vehicle>
+	<vehicle depart="228.0" id="157">
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="229.5" id="158">
 		<route edges="in2"/>
@@ -516,61 +516,61 @@
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="234.0" id="161">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="235.5" id="162">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="237.0" id="163">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="238.5" id="164">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="240.0" id="165">
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="241.5" id="166">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="243.0" id="167">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="244.5" id="168">
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="246.0" id="169">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="247.5" id="170">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="249.0" id="171">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="250.5" id="172">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="252.0" id="173">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="253.5" id="174">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="255.0" id="175">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="256.5" id="176">
-		<route edges="in2"/>
-	</vehicle>
-	<vehicle depart="258.0" id="177">
 		<route edges="in1"/>
 	</vehicle>
-	<vehicle depart="259.5" id="178">
+	<vehicle depart="258.0" id="177">
 		<route edges="in2"/>
 	</vehicle>
+	<vehicle depart="259.5" id="178">
+		<route edges="in1"/>
+	</vehicle>
 	<vehicle depart="261.0" id="179">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="262.5" id="180">
 		<route edges="in1"/>
@@ -591,25 +591,25 @@
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="271.5" id="186">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="273.0" id="187">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="274.5" id="188">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="276.0" id="189">
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="277.5" id="190">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="279.0" id="191">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="280.5" id="192">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="282.0" id="193">
 		<route edges="in2"/>
@@ -618,23 +618,23 @@
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="285.0" id="195">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="286.5" id="196">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle id="4" depart="288.00">
 		
         
-		<route edges="link1"/>
+		<route edges="in2 stage f_up1 cross1 g_dn1"/>
 		
     
 	</vehicle>
 	<vehicle depart="288.0" id="197">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="289.5" id="198">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="291.0" id="199">
 		<route edges="in2"/>
@@ -643,7 +643,7 @@
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="294.0" id="201">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="295.5" id="202">
 		<route edges="in1"/>
@@ -652,25 +652,25 @@
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="298.5" id="204">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="300.0" id="205">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="301.5" id="206">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="303.0" id="207">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="304.5" id="208">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="306.0" id="209">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="307.5" id="210">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="309.0" id="211">
 		<route edges="in1"/>
@@ -679,7 +679,7 @@
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="312.0" id="213">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="313.5" id="214">
 		<route edges="in1"/>
@@ -700,13 +700,13 @@
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="322.5" id="220">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="324.0" id="221">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="325.5" id="222">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="327.0" id="223">
 		<route edges="in1"/>
@@ -715,7 +715,7 @@
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="330.0" id="225">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="331.5" id="226">
 		<route edges="in1"/>
@@ -736,7 +736,7 @@
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="340.5" id="232">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="342.0" id="233">
 		<route edges="in1"/>
@@ -745,33 +745,33 @@
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="345.0" id="235">
-		<route edges="in1"/>
-	</vehicle>
-	<vehicle depart="346.5" id="236">
 		<route edges="in2"/>
 	</vehicle>
-	<vehicle depart="348.0" id="237">
+	<vehicle depart="346.5" id="236">
 		<route edges="in1"/>
 	</vehicle>
+	<vehicle depart="348.0" id="237">
+		<route edges="in2"/>
+	</vehicle>
 	<vehicle depart="349.5" id="238">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="351.0" id="239">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="352.5" id="240">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="354.0" id="241">
 		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="355.5" id="242">
-		<route edges="in1"/>
+		<route edges="in2"/>
 	</vehicle>
 	<vehicle depart="357.0" id="243">
 		<route edges="in1"/>
 	</vehicle>
 	<vehicle depart="358.5" id="244">
-		<route edges="in2"/>
+		<route edges="in1"/>
 	</vehicle>
 </routes>

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2026-07-13T05:30:00.702948-06:00 by Eclipse SUMO duarouter 1.27.0
+-->
+
+<duarouterConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/duarouterConfiguration.xsd">
+
+    <input>
+        <net-file value="/home/anh/Code/STR/STR-Summer-Project-Base/configurations/maps/braess.net.xml"/>
+        <route-files value="../021/braess_trips_021.rou.alt.xml.gz"/>
+        <weight-files value="../021/dump_900.xml.gz"/>
+    </input>
+
+    <output>
+        <output-file value="braess_trips_022.rou.xml.gz"/>
+        <exit-times value="False"/>
+    </output>
+
+    <processing>
+        <max-alternatives value="5"/>
+        <with-taz value="False"/>
+        <routing-algorithm value="dijkstra"/>
+        <weights.expand value="true"/>
+        <gawron.beta value="0.9"/>
+        <gawron.a value="0.5"/>
+        <keep-all-routes value="False"/>
+        <logit.beta value="0.15"/>
+        <logit.gamma value="1.0"/>
+    </processing>
+
+    <time>
+        <begin value="0"/>
+    </time>
+
+    <report>
+        <verbose value="False"/>
+        <no-warnings value="False"/>
+        <ignore-errors value="False"/>
+        <no-step-log value="true"/>
+    </report>
+
+    <random_number>
+        <random value="False"/>
+        <seed value="1"/>
+    </random_number>
+
+</duarouterConfiguration>

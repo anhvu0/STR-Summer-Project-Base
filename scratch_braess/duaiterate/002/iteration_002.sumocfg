@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2026-07-13T05:29:52.619690-06:00 by Eclipse SUMO sumo 1.27.0
+-->
+
+<sumoConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/sumoConfiguration.xsd">
+
+    <input>
+        <net-file value="/home/anh/Code/STR/STR-Summer-Project-Base/configurations/maps/braess.net.xml"/>
+        <route-files value="braess_trips_002.rou.xml.gz"/>
+        <additional-files value="../edgedata.add.xml"/>
+    </input>
+
+    <output>
+        <output-prefix value="002/"/>
+        <summary-output value="../summary_002.xml"/>
+        <tripinfo-output value="../tripinfo_002.xml"/>
+    </output>
+
+    <time>
+        <begin value="0"/>
+    </time>
+
+    <processing>
+        <route-steps value="200"/>
+        <no-internal-links value="False"/>
+        <time-to-teleport value="300"/>
+        <time-to-teleport.highways value="0"/>
+        <eager-insert value="False"/>
+    </processing>
+
+    <report>
+        <verbose value="true"/>
+        <no-warnings value="False"/>
+        <log value="../iteration_002.sumo.log"/>
+        <no-step-log value="true"/>
+    </report>
+
+    <random_number>
+        <random value="False"/>
+        <seed value="1"/>
+    </random_number>
+
+</sumoConfiguration>

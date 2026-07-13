@@ -101,6 +101,14 @@ def build_parser():
              "before scaling by --team-reward-alpha.",
     )
     parser.add_argument(
+        "--torch-seed",
+        type=int,
+        default=None,
+        help="Seed torch/numpy/random RNGs before model construction (R6 reliability runs: "
+             "makes weight init and rollout sampling reproducible per run; episode demand "
+             "is already seeded by episode number). None keeps legacy unseeded behavior.",
+    )
+    parser.add_argument(
         "--eval-every",
         type=int,
         default=25,
@@ -252,6 +260,16 @@ def main():
     """
     parser = build_parser()
     args = parser.parse_args()
+    if args.torch_seed is not None:
+        import random as _random
+
+        import numpy as _np
+        import torch as _torch
+
+        _random.seed(args.torch_seed)
+        _np.random.seed(args.torch_seed)
+        _torch.manual_seed(args.torch_seed)
+
     mappo_config = MAPPOConfig(
         actor_learning_rate=args.actor_lr,
         critic_learning_rate=args.critic_lr,
