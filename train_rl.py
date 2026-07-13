@@ -79,10 +79,11 @@ def build_parser():
         "--target-pattern",
         type=int,
         default=2,
-        choices=[1, 2, 3],
+        choices=[1, 2, 3, 4],
         help="Demand pattern: 1=one O/D, 2=ranged origins -> one shared destination "
-             "(creates corridor congestion; use this for the selfless-routing study), "
-             "3=ranged origins -> ranged destinations (dispersed, ~no congestion).",
+             "(creates corridor congestion; use this for the NYC selfless-routing study), "
+             "3=ranged origins -> ranged destinations (dispersed, ~no congestion), "
+             "4=all topological sources -> single sink (directed bottleneck/braess funnel).",
     )
     parser.add_argument(
         "--team-reward-alpha",
@@ -200,6 +201,15 @@ def build_parser():
              "Needs team_reward_alpha > 0 to have any effect.",
     )
     parser.add_argument(
+        "--reroute-epoch-edges",
+        type=int,
+        default=5,
+        help="Re-query the route policy every N completed edges (counter starts at N so "
+             "the first decision fires on the 1st edge). NYC grid uses 5; the chained-"
+             "Braess funnel needs 1 so the policy re-decides at every edge and hits both "
+             "forks (on `stage` before diamond 1, on `link1` before diamond 2).",
+    )
+    parser.add_argument(
         "--disable-route-reservations",
         action="store_true",
         help="Disable the Layer B anticipatory reservation field. When ON (default), a "
@@ -254,6 +264,7 @@ def main():
         eval_deterministic=(args.eval_policy == "greedy"),
         route_reservations=not args.disable_route_reservations,
         eval_stochastic_samples=args.eval_stochastic_samples,
+        reroute_epoch_edges=args.reroute_epoch_edges,
     )
     if args.disable_tail_delay_penalty:
         pipeline.tail_delay_linear_penalty = 0.0

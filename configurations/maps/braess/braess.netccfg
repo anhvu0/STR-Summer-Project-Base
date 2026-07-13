@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <input>
+        <node-files value="braess.nod.xml"/>
+        <edge-files value="braess.edg.xml"/>
+        <connection-files value="braess.con.xml"/>
+    </input>
+    <output>
+        <output-file value="../braess.net.xml"/>
+    </output>
+    <processing>
+        <!-- one-way funnel: no U-turns; keep the explicit edge lengths -->
+        <no-turnarounds value="true"/>
+        <no-internal-links value="false"/>
+    </processing>
+</configuration>

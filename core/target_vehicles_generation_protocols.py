@@ -452,6 +452,8 @@ class target_vehicles_generator:
                 #1. one start point, one destination for all target vehicles
                 #2. ranged start point, one destination for all target vehicles
                 #3. ranged start points, ranged destination for all target vehicles
+                #4. corridor: all topological source edges -> the single sink edge
+                    (for directed bottleneck/braess funnel maps; see configurations/maps/braess)
             -- CASES ENDS --
 
             Returns the list of target vehicles if succeeds.
@@ -501,6 +503,11 @@ class target_vehicles_generator:
             "-e", str(latest_release_time),
             "-p", str(density),
             "-r", target_xml_file,
+            # Resample O/D pairs with no connecting path instead of letting duarouter
+            # drop them. On strongly connected nets (NYC grid) this is a no-op; on
+            # directed corridor/Braess funnel maps most random pairs are unreachable, so
+            # without it the background-vehicle count silently collapses.
+            "--validate",
         ]
         if seed is not None:
             cmd += ["-s", str(int(seed))]
@@ -556,6 +563,40 @@ class target_vehicles_generator:
                 param_dest.append(param_dest_temp)
                 x += 1
             result_dict = self.generate_target_vehicles(num_target_vehicles, target_xml_file, (param_start, param_dest))
+        elif pattern == 4:
+            # Corridor / Braess-funnel pattern: every source edge (no incoming
+            # connections) feeds the single sink edge (no outgoing connections), so the
+            # whole controlled fleet crosses the same forks and every vehicle faces the
+            # bottleneck-vs-detour dilemma. Derived purely from topology (no hardcoded
+            # edge IDs), so it works on any directed funnel map (bottleneck / braess);
+            # it errors out on strongly connected nets (e.g. the NYC grid), which have
+            # no topological sources/sinks -- use patterns 1-3 there.
+            source_edges = [
+                e for e in spawn_edges
+                if self.incoming_count_dict.get(e.getID(), 0) == 0
+            ]
+            sink_edges = [
+                e for e in dest_edges
+                if len(self.out_dict.get(e.getID(), {})) == 0
+            ]
+            if not source_edges or not sink_edges:
+                print("ERROR: Pattern 4 needs source and sink edges (a directed corridor "
+                      "map such as configurations/maps/braess.net.xml). Use patterns "
+                      "1-3 on strongly connected maps.")
+                return None
+            param_dest = None
+            param_start = None
+            for candidate_dest in sorted(sink_edges, key=lambda e: e.getID()):
+                valid_sources = [s for s in source_edges if validate_path(self.net, s, candidate_dest)]
+                if not valid_sources:
+                    continue
+                param_dest = candidate_dest
+                param_start = __random_choices_with_rp__(valid_sources, num_target_vehicles)
+                break
+            if param_dest is None or param_start is None:
+                print("ERROR: Pattern 4 found no sink reachable from any source edge.")
+                return None
+            result_dict = self.generate_target_vehicles(num_target_vehicles, target_xml_file, (param_start, param_dest))
         else:
             print("ERROR: Unknown pattern type.")
             return None
@@ -576,8 +617,10 @@ class target_vehicles_generator:
         root = doc.documentElement
         vs = root.getElementsByTagName("vehicle")
         index = 0
-        print(len(vs))
-        id_now = int(vs.item(len(vs) - 1).getAttribute('id')) + 1
+        # Next controlled-vehicle id continues past any background vehicles. On directed
+        # funnel maps (bottleneck / braess) randomTrips can yield ZERO valid background
+        # trips, leaving `vs` empty; start ids at 0 then instead of crashing on item(-1).
+        id_now = int(vs.item(len(vs) - 1).getAttribute('id')) + 1 if len(vs) > 0 else 0
         # Estimate deadline from route difficulty rather than a fixed random range.
         for r in result_lst:
             #find the vehicle slot based on the depart time (departure time must be sorted in xml)
@@ -595,7 +638,9 @@ class target_vehicles_generator:
             temp_r = doc.createElement('route')
             temp_r.setAttribute('edges', r[1][0].getID()) #set the start edge as the route
             temp_v.appendChild(temp_r)
-            if index == len(vs) - 1:
+            if index >= len(vs) - 1:
+                # append when at/past the last background vehicle (also covers an EMPTY
+                # background set on directed funnel maps); final re-sort fixes ordering.
                 root.appendChild(temp_v)
             else:
                 root.insertBefore(temp_v, vs[index+1])

@@ -111,6 +111,7 @@ class RLTrainingPipeline:
         eval_spawn_interval=None,
         route_reservations=True,
         eval_stochastic_samples=3,
+        reroute_epoch_edges=5,
     ):
         """
         Args:
@@ -324,7 +325,12 @@ class RLTrainingPipeline:
         self.route_k = 4                           # number of candidate routes offered to policy
         self.route_feature_dim = ROUTE_FEATURE_DIM
         self.route_obs_dim = self.route_k * self.route_feature_dim
-        self.reroute_epoch_edges = 5               # re-query policy every N completed edges
+        # re-query policy every N completed edges (counter starts at N so the first
+        # decision fires on the 1st edge). Must suit the map's trip length: the NYC
+        # grid used 5; the chained-Braess funnel needs 1 so the policy re-decides at
+        # every edge and so hits BOTH forks (on `stage` before diamond 1 and on
+        # `link1` before diamond 2) with the freshest state. See braess sumocfg.
+        self.reroute_epoch_edges = int(reroute_epoch_edges)
         self.state_size = self.shared_policy.compact_state_size + self.route_obs_dim
         self.central_observation_size = 18
         self.action_size = self.route_k            # policy picks a route index, not a direction
@@ -2364,6 +2370,7 @@ class RLTrainingPipeline:
                 self._frozen_eval_model_path,
                 net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
                 deterministic=self.eval_deterministic,
+                reroute_epoch_edges=self.reroute_epoch_edges,
             )
             stats = run_eval_controller(policy, rl_vehicles)
             runtime_metrics = stats.get("controller_runtime_metrics") or {}
@@ -2387,6 +2394,7 @@ class RLTrainingPipeline:
                     net_xml_file=os.path.join(self.sumocfg_dir, self.net_file),
                     deterministic=False,
                     detour_throttle=False,
+                    reroute_epoch_edges=self.reroute_epoch_edges,
                 )
                 sample_stats = run_eval_controller(sample_policy, sample_vehicles)
                 sample_runtime = sample_stats.get("controller_runtime_metrics") or {}

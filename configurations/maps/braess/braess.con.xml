@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ============================================================================
+     Explicit lane-to-lane connections. Purpose: make every MERGE conflict-free
+     (disjoint target lanes, no yielding) EXCEPT the two designed VAR bottlenecks
+     (the merges INTO g_dn1 / g_dn2). Without this, netconvert makes the single-
+     lane VAR exit edge yield to the 2-lane FIX edge at each exit node, so the
+     coordinated up/down split crawls at the merge (~2 m/s at 3% occupancy) and
+     the parallel-path merge (not the Braess structure) becomes the
+     bottleneck, hiding the paradox. (Same failure mode documented for the
+     Pigou map in docs/bottleneck_map_design.md.)
+============================================================================ -->
+<connections>
+    <!-- nS: two 2-lane sources -> 4-lane stage (disjoint, lane-preserving) -->
+    <connection from="in2" to="stage" fromLane="0" toLane="0"/>
+    <connection from="in2" to="stage" fromLane="1" toLane="1"/>
+    <connection from="in1" to="stage" fromLane="0" toLane="2"/>
+    <connection from="in1" to="stage" fromLane="1" toLane="3"/>
+
+    <!-- ===== diamond 1 ===== -->
+    <!-- nE1 diverge: stage(4) -> f_up1(1, VAR up/braess) + f_dn1(2, FIX down).
+         Overlapping lane assignments so a vehicle from either source can reach
+         either leg with at most one lane change over the 200m stage. -->
+    <connection from="stage" to="f_dn1" fromLane="0" toLane="0"/>
+    <connection from="stage" to="f_dn1" fromLane="1" toLane="1"/>
+    <connection from="stage" to="f_dn1" fromLane="2" toLane="0"/>
+    <connection from="stage" to="f_up1" fromLane="1" toLane="0"/>
+    <connection from="stage" to="f_up1" fromLane="2" toLane="0"/>
+    <connection from="stage" to="f_up1" fromLane="3" toLane="0"/>
+
+    <!-- nU1 diverge: f_up1(1) -> g_up1(2, FIX up) + cross1(1, braess) -->
+    <connection from="f_up1" to="g_up1" fromLane="0" toLane="0"/>
+    <connection from="f_up1" to="g_up1" fromLane="0" toLane="1"/>
+    <connection from="f_up1" to="cross1" fromLane="0" toLane="0"/>
+
+    <!-- nD1 merge INTO the VAR bottleneck g_dn1(1): f_dn1(2, down) + cross1(1,
+         braess) compete for the single lane. This IS the designed capacity
+         constraint, so a conflict here is intended. -->
+    <connection from="f_dn1" to="g_dn1" fromLane="0" toLane="0"/>
+    <connection from="f_dn1" to="g_dn1" fromLane="1" toLane="0"/>
+    <connection from="cross1" to="g_dn1" fromLane="0" toLane="0"/>
+
+    <!-- nX1 merge: g_up1(2, FIX) + g_dn1(1, VAR) -> link1(3). Disjoint target
+         lanes -> no yield: g_dn1 owns lane 0, g_up1 owns lanes 1,2. -->
+    <connection from="g_dn1" to="link1" fromLane="0" toLane="0"/>
+    <connection from="g_up1" to="link1" fromLane="0" toLane="1"/>
+    <connection from="g_up1" to="link1" fromLane="1" toLane="2"/>
+
+    <!-- ===== diamond 2 ===== -->
+    <!-- nE2 diverge: link1(3) -> f_up2(1, VAR up/braess) + f_dn2(2, FIX down) -->
+    <connection from="link1" to="f_up2" fromLane="0" toLane="0"/>
+    <connection from="link1" to="f_up2" fromLane="1" toLane="0"/>
+    <connection from="link1" to="f_dn2" fromLane="0" toLane="0"/>
+    <connection from="link1" to="f_dn2" fromLane="1" toLane="1"/>
+    <connection from="link1" to="f_dn2" fromLane="2" toLane="1"/>
+
+    <!-- nU2 diverge -->
+    <connection from="f_up2" to="g_up2" fromLane="0" toLane="0"/>
+    <connection from="f_up2" to="g_up2" fromLane="0" toLane="1"/>
+    <connection from="f_up2" to="cross2" fromLane="0" toLane="0"/>
+
+    <!-- nD2 merge INTO VAR bottleneck g_dn2(1) -->
+    <connection from="f_dn2" to="g_dn2" fromLane="0" toLane="0"/>
+    <connection from="f_dn2" to="g_dn2" fromLane="1" toLane="0"/>
+    <connection from="cross2" to="g_dn2" fromLane="0" toLane="0"/>
+
+    <!-- nX2 merge: g_up2(2) + g_dn2(1) -> out(3), disjoint -->
+    <connection from="g_dn2" to="out" fromLane="0" toLane="0"/>
+    <connection from="g_up2" to="out" fromLane="0" toLane="1"/>
+    <connection from="g_up2" to="out" fromLane="1" toLane="2"/>
+</connections>

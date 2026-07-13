@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ============================================================================
+     Medium-size CHAINED BRAESS network for the selfless-routing study.
+     Authored (not sourced online) from the classic Braess paradox; see
+     docs/braess_map_design.md for the topology rationale and references
+     (Braess 1968; Roughgarden & Tardos 2002; Roughgarden 2006).
+
+     Two Braess "diamonds" in series (west -> east, one-way). Per diamond the
+     entry E diverges to an upper node U (near the entry) and a lower node D
+     (near the exit); U and D are joined by a cheap CROSS link and both reach
+     the exit X:
+
+           in1 \                    (diamond 1)                 (diamond 2)
+                 nS -stage- nE1 == U1 ==cross1== D1 == X1 -link- nE2 == U2 ==cross2== D2 == X2 -out- nOUT
+           in2 /                  \\           //                        \\           //
+                                   (VAR/FIX edges realise the paradox; see .edg.xml)
+
+     The individually-fastest path at low flow is the "Braess" route that uses
+     BOTH single-lane variable edges (E->U->cross->D->X); when the fleet herds
+     onto it those two edges saturate. The system optimum avoids the cross link
+     and splits the fleet up/down. This coordination gap survives a congestion-
+     aware selfish equilibrium (DUE), which a disjoint parallel-path (Pigou)
+     network does NOT, and that is the whole point of using Braess here.
+
+     Node coordinates are for a readable diagram only; every edge sets an
+     explicit `length` in braess.edg.xml, so travel time is decoupled from
+     geometry. Build:
+       netconvert -c configurations/maps/braess/braess.netccfg
+============================================================================ -->
+<nodes>
+    <!-- sources (no incoming edges -> pattern-4 origins) and shared staging -->
+    <node id="nIN1" x="-150" y="120"  type="priority"/>
+    <node id="nIN2" x="-150" y="-120" type="priority"/>
+    <node id="nS"   x="0"    y="0"     type="priority"/>
+    <node id="nE1"  x="150"  y="0"     type="priority"/>
+
+    <!-- diamond 1: U near entry (short E->U), D near exit (short D->X) -->
+    <node id="nU1"  x="300"  y="220"   type="priority"/>
+    <node id="nD1"  x="900"  y="-220"  type="priority"/>
+    <node id="nX1"  x="1050" y="0"     type="priority"/>
+
+    <!-- diamond 2 -->
+    <node id="nE2"  x="1200" y="0"     type="priority"/>
+    <node id="nU2"  x="1350" y="220"   type="priority"/>
+    <node id="nD2"  x="1950" y="-220"  type="priority"/>
+    <node id="nX2"  x="2100" y="0"     type="priority"/>
+
+    <!-- sink (no outgoing edges -> pattern-4 destination) -->
+    <node id="nOUT" x="2300" y="0"     type="priority"/>
+</nodes>

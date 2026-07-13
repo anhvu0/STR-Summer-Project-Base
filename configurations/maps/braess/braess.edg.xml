@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ============================================================================
+     Edge latency classes realise the Braess paradox in SUMO. Travel time is
+     decoupled from geometry via explicit `length` (nodes are for the diagram).
+     All speeds 13.89 m/s (50 km/h).
+
+       VAR  (variable / bottleneck): 1 lane, length 450m (free flow ~32s). Long
+             enough to hold a real queue ON the edge, so under load its travel
+             time rises sharply (convex latency) instead of only backing up at
+             insertion. Two per diamond (the E to U and D to X legs); the Braess
+             route uses BOTH, so herding onto it doubles the exposure.
+       FIX  (fixed / high capacity): 2 lanes, length 750m (free flow ~54s). Stays
+             near free flow at fleet load; the constant latency edges of the
+             classic construction.
+       CROSS(cheap connector): 1 lane, length 50m (free flow ~3.6s).
+
+     Per-diamond free flow route times:
+       Braess (VAR + CROSS + VAR) ~= 32.4+3.6+32.4 = 68.4s   (selfishly best)
+       Up     (VAR + FIX)         ~= 32.4+54.0      = 86.4s
+       Down   (FIX + VAR)         ~= 54.0+32.4      = 86.4s
+     Braess is tempting at low flow (68 < 86); under fleet load its two VAR edges
+     queue and it becomes the worst. The system optimum avoids the cross link and
+     splits the fleet up/down so each VAR edge carries only ~half the fleet.
+
+     Sources are 2 lanes and stage 4 lanes so vehicle intake is NOT a shared
+     limiter (that would add common insertion delay to every route and shrink the
+     coordination gap). The only capacity constraints are the VAR edges.
+============================================================================ -->
+<edges>
+    <!-- sources (2 lanes each) and 4-lane staging: high intake capacity -->
+    <edge id="in1"   from="nIN1" to="nS"  numLanes="2" speed="13.89" length="200"/>
+    <edge id="in2"   from="nIN2" to="nS"  numLanes="2" speed="13.89" length="200"/>
+    <edge id="stage" from="nS"   to="nE1" numLanes="4" speed="13.89" length="200"/>
+
+    <!-- ===== diamond 1 ===== -->
+    <edge id="f_up1" from="nE1" to="nU1" numLanes="1" speed="13.89" length="450"/>  <!-- VAR -->
+    <edge id="g_up1" from="nU1" to="nX1" numLanes="2" speed="13.89" length="750"/>  <!-- FIX -->
+    <edge id="f_dn1" from="nE1" to="nD1" numLanes="2" speed="13.89" length="750"/>  <!-- FIX -->
+    <edge id="g_dn1" from="nD1" to="nX1" numLanes="1" speed="13.89" length="450"/>  <!-- VAR -->
+    <edge id="cross1" from="nU1" to="nD1" numLanes="1" speed="13.89" length="50"/>  <!-- CROSS -->
+
+    <!-- inter-diamond link. 3 lanes so the nX1 merge (g_up1 2L + g_dn1 1L) is
+         conflict-free (disjoint target lanes, see braess.con.xml); otherwise the
+         VAR exit edge yields to the FIX edge and the merge, not the design,
+         becomes the bottleneck (cf. docs/bottleneck_map_design.md). -->
+    <edge id="link1" from="nX1" to="nE2" numLanes="3" speed="13.89" length="200"/>
+
+    <!-- ===== diamond 2 ===== -->
+    <edge id="f_up2" from="nE2" to="nU2" numLanes="1" speed="13.89" length="450"/>  <!-- VAR -->
+    <edge id="g_up2" from="nU2" to="nX2" numLanes="2" speed="13.89" length="750"/>  <!-- FIX -->
+    <edge id="f_dn2" from="nE2" to="nD2" numLanes="2" speed="13.89" length="750"/>  <!-- FIX -->
+    <edge id="g_dn2" from="nD2" to="nX2" numLanes="1" speed="13.89" length="450"/>  <!-- VAR -->
+    <edge id="cross2" from="nU2" to="nD2" numLanes="1" speed="13.89" length="50"/>  <!-- CROSS -->
+
+    <!-- sink. 3 lanes so the nX2 merge (g_up2 2L + g_dn2 1L) is conflict-free. -->
+    <edge id="out" from="nX2" to="nOUT" numLanes="3" speed="13.89" length="200"/>
+</edges>

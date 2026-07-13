@@ -37,7 +37,7 @@ net_path = parse_sumocfg("./configurations/myconfig.sumocfg")
 class MAPPOPolicy(RouteController):
     def __init__(self, vehicles, connection_info, model_file, net_xml_file=net_path, deterministic=True,
                  detour_throttle=True, route_reservations=True, force_index0=False,
-                 randomize_actor=False, randomize_seed=0):
+                 randomize_actor=False, randomize_seed=0, reroute_epoch_edges=5):
         super().__init__(connection_info)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # Saturation-aware detour coordination (see core/coordination_throttle.py).
@@ -170,7 +170,10 @@ class MAPPOPolicy(RouteController):
         self.route_feature_dim = ROUTE_FEATURE_DIM
         self.route_obs_dim = self.route_k * self.route_feature_dim
         self.route_eta_delta_feature_scale_s = 120.0
-        self.reroute_epoch_edges = 5
+        # Re-query the route policy every N completed edges (must match the training
+        # pipeline's value). NYC grid used 5; the chained-Braess funnel uses 1 so the
+        # policy re-decides at every edge and hits both forks (`stage`, `link1`).
+        self.reroute_epoch_edges = int(reroute_epoch_edges)
         self._vehicle_route_obs: dict = {}
         self._vehicle_edges_since_reroute: dict = {}
         self._vehicle_actor_owned_route: dict = {}   # vid -> actor-committed route tuple for current epoch
