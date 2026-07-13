@@ -8,8 +8,28 @@ import copy
 
 class DijkstraPolicy(RouteController):
 
-    def __init__(self, connection_info):
+    def __init__(self, connection_info, weight_mode="distance"):
         super().__init__(connection_info)
+        # "distance": free-flow shortest path (static baseline, T_static).
+        # "traveltime": shortest path on live per-edge travel time, replanned at
+        # the same per-edge-change cadence as the fleet's decision points, so it
+        # sees exactly the congestion information the MAPPO controller does
+        # (information-parity dynamic baseline, an instantaneous DUE proxy).
+        self.weight_mode = weight_mode
+
+    def _edge_weight(self, edge_id):
+        length = self.connection_info.edge_length_dict[edge_id]
+        if self.weight_mode == "distance":
+            return length
+        # Live travel time = length / current mean speed, floored so an empty or
+        # jammed edge stays finite; falls back to free-flow if the query fails.
+        try:
+            tt = float(traci.edge.getTraveltime(edge_id))
+            if not math.isfinite(tt) or tt <= 0.0:
+                raise ValueError
+            return tt
+        except Exception:
+            return length
 
     def make_decisions(self, vehicles, connection_info):
         """
@@ -25,7 +45,7 @@ class DijkstraPolicy(RouteController):
             visited = {} # map of visited edges
             current_edge = vehicle.current_edge
 
-            current_distance = self.connection_info.edge_length_dict[current_edge]
+            current_distance = self._edge_weight(current_edge)
             unvisited[current_edge] = current_distance
             path_lists = {edge: [] for edge in self.connection_info.edge_list} #stores shortest path to each edge using directions
             while True:
@@ -34,7 +54,7 @@ class DijkstraPolicy(RouteController):
                 for direction, outgoing_edge in self.connection_info.outgoing_edges_dict[current_edge].items():
                     if outgoing_edge not in unvisited:
                         continue
-                    edge_length = self.connection_info.edge_length_dict[outgoing_edge]
+                    edge_length = self._edge_weight(outgoing_edge)
                     new_distance = current_distance + edge_length
                     if new_distance < unvisited[outgoing_edge]:
                         unvisited[outgoing_edge] = new_distance

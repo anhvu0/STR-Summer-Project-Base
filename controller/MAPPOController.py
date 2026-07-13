@@ -36,7 +36,8 @@ net_path = parse_sumocfg("./configurations/myconfig.sumocfg")
 
 class MAPPOPolicy(RouteController):
     def __init__(self, vehicles, connection_info, model_file, net_xml_file=net_path, deterministic=True,
-                 detour_throttle=True, route_reservations=True):
+                 detour_throttle=True, route_reservations=True, force_index0=False,
+                 randomize_actor=False, randomize_seed=0):
         super().__init__(connection_info)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # Saturation-aware detour coordination (see core/coordination_throttle.py).
@@ -50,7 +51,22 @@ class MAPPOPolicy(RouteController):
         # False = stochastic (sample from the masked policy), which naturally spreads
         # the fleet across alternative routes instead of herding onto one "best" route.
         self.deterministic = bool(deterministic)
+        # Attribution baselines (paper ablations, not deployment):
+        # force_index0 always selects candidate 0 (congestion-aware shortest route),
+        #   isolating the engineered stack (candidate generator + reservations +
+        #   replanning cadence) from the learned policy.
+        # randomize_actor re-initializes the actor scorer to random weights,
+        #   isolating training from architecture (an untrained route scorer).
+        self._force_index0 = bool(force_index0)
         self.actor, _, self.model_checkpoint = load_mappo_checkpoint(model_file, device=self.device)
+        if randomize_actor:
+            torch.manual_seed(int(randomize_seed))
+            scorer = getattr(self.actor, "candidate_scorer", None) or getattr(self.actor, "network", None)
+            for module in scorer.modules():
+                if isinstance(module, torch.nn.Linear):
+                    torch.nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
+                    if module.bias is not None:
+                        torch.nn.init.zeros_(module.bias)
         self.model_state_size = int(self.actor.observation_size)
         self.vehicles = vehicles
         self.net = sumolib.net.readNet(net_xml_file)
@@ -1348,6 +1364,11 @@ class MAPPOPolicy(RouteController):
                     )
                     valid_route_indices = list(range(len(feasible_candidates)))
                     chosen_filtered_idx, masked_logits = self._act_route(route_state, valid_route_indices)
+                    # Attribution baseline: pin to candidate 0 (congestion-aware
+                    # shortest route) to measure the engineered stack without the
+                    # learned route preference.
+                    if self._force_index0:
+                        chosen_filtered_idx = 0
                     # Layer A: veto a detour onto a near-capacity alternative and fall
                     # back to the shortest-path baseline (candidate 0), optimal at PoA~=1.
                     if detour_should_fallback(
