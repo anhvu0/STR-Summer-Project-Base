@@ -191,14 +191,37 @@ def build_parser():
     )
     parser.add_argument(
         "--team-reward-mode",
-        choices=["difference", "shared"],
+        choices=["difference", "shared", "marginal"],
         default="difference",
         help="How the fleet-congestion term is credited to each agent. "
              "difference=leave-one-out (each agent internalizes its slowness relative to "
              "the live fleet; the exogenous demand-driven common level cancels -> far higher "
              "learning signal-to-noise). shared=legacy global fleet-delay level paid identically "
-             "by every agent. Recommended: difference."
-             "Needs team_reward_alpha > 0 to have any effect.",
+             "by every agent. marginal=Pigovian marginal-cost/externality pricing: while on a "
+             "congestible (single-lane VAR) edge an agent pays per step for the vehicles queued "
+             "BEHIND it (scaled by its own slowness, 0 at free flow) -- the delay it imposes on "
+             "followers. Unlike difference (which credits a selfless deviator negatively), the "
+             "marginal charge is non-negative, per-agent attributable, and largest exactly when "
+             "the fleet herds onto the Braess route, so it prices the coordination externality "
+             "directly (EXPERIMENT_PLAN E5). Needs team_reward_alpha > 0 to have any effect.",
+    )
+    parser.add_argument(
+        "--marginal-cost-scale",
+        type=float,
+        default=0.015,
+        help="Per-step charge (travel-time units) per queued-follower for --team-reward-mode "
+             "marginal, before scaling by --team-reward-alpha. The step charge is "
+             "alpha * scale * min(vehicles_behind, 30) * own_slowness, capped at 0.6/step.",
+    )
+    parser.add_argument(
+        "--skip-forced-route-epochs",
+        action="store_true",
+        help="Skip route-actor epochs that reach a decision point with <=1 distinct immediate "
+             "next edge (a forced continuation, no real fork). Such epochs otherwise record "
+             "near-deterministic single-fork policy transitions that dilute mean approx_kl and "
+             "pad the batch; skipping concentrates the gradient on the genuine forks. Off by "
+             "default (legacy NYC training unchanged); recommended ON for the Braess funnel with "
+             "--reroute-epoch-edges 1.",
     )
     parser.add_argument(
         "--reroute-epoch-edges",
@@ -261,6 +284,8 @@ def main():
         team_reward_alpha=args.team_reward_alpha,
         team_reward_scale=args.team_reward_scale,
         team_reward_mode=args.team_reward_mode,
+        marginal_cost_scale=args.marginal_cost_scale,
+        skip_forced_route_epochs=args.skip_forced_route_epochs,
         eval_deterministic=(args.eval_policy == "greedy"),
         route_reservations=not args.disable_route_reservations,
         eval_stochastic_samples=args.eval_stochastic_samples,

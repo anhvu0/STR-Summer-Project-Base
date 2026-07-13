@@ -95,6 +95,8 @@ class RLTrainingPipeline:
         team_reward_scale=0.12,
         team_reward_speed_norm=13.89,
         team_reward_mode="difference",
+        marginal_cost_scale=0.015,
+        skip_forced_route_epochs=False,
         eval_deterministic=True,
         debug_exit_diagnostics=False,
         debug_exit_diagnostics_limit=20,
@@ -161,9 +163,33 @@ class RLTrainingPipeline:
         #                   slowness relative to the live-fleet mean. The exogenous common
         #                   level cancels, so the term has near-zero mean and tracks what the
         #                   agent's route choice actually controls (high signal-to-noise).
+        #   "marginal"   -> Pigovian marginal-cost (externality) pricing (EXPERIMENT_PLAN E5).
+        #                   While on a congestible bottleneck (VAR) edge an agent pays a per-step
+        #                   charge proportional to the number of vehicles queued BEHIND it on that
+        #                   edge, scaled by its own slowness (0 at free flow). This is the delay
+        #                   the agent imposes on its followers -- the true externality of taking a
+        #                   route that congests a single-lane edge. Unlike difference mode (which
+        #                   credits a selfless deviator NEGATIVELY because it is slower than the
+        #                   fleet mean), the marginal charge is a non-negative, per-agent-
+        #                   attributable cost that is LARGEST precisely when the fleet herds onto
+        #                   the Braess route (both VAR edges jam), so it directly prices the
+        #                   coordination externality and gives a cleaner routing gradient.
         self.team_reward_mode = str(team_reward_mode or "difference").lower()
         # Bound for the per-agent (own - fleet_mean) slowness difference (both terms are in [0,1]).
         self.team_reward_diff_clip = 1.0
+        # Marginal-cost ("marginal") mode parameters. The per-step charge is
+        #   alpha * marginal_cost_scale * min(vehicles_behind, cap) * own_slowness * elapsed
+        # bounded to marginal_cost_per_step_cap per step. VAR/bottleneck edges are the
+        # congestible single-lane edges long enough to hold an on-edge queue (identified
+        # topologically below as 1-lane edges of length >= marginal_cost_min_edge_length,
+        # which selects f_up*/g_dn* on the Braess map and excludes the 50m CROSS connectors).
+        self.marginal_cost_scale = float(marginal_cost_scale)
+        self.marginal_cost_min_edge_length = 150.0
+        self.marginal_cost_behind_cap = 30
+        self.marginal_cost_per_step_cap = 0.6
+        # Per-step, per-vehicle count of vehicles queued behind on a VAR edge (filled at the
+        # speed-aggregation point when team_reward_mode == "marginal"; empty otherwise).
+        self._var_edge_behind_count = {}
         # Frozen-eval / deployment mode: True = greedy route argmax, False = sampled.
         self.eval_deterministic = bool(eval_deterministic)
         # Number of extra stochastic (sampled) rollouts per seed in frozen eval. A greedy
@@ -298,6 +324,17 @@ class RLTrainingPipeline:
             [self._edge_lane_meters_cache[edge_id] for edge_id in self._edge_list],
             dtype=np.float32,
         )
+        # Congestible ("VAR") edges for marginal-cost pricing: single-lane edges long enough
+        # to hold a real on-edge queue (convex latency). Derived topologically, no hardcoded
+        # IDs -- on the Braess map this is exactly {f_up1, g_dn1, f_up2, g_dn2} and excludes
+        # the 50m single-lane CROSS connectors and all 2-4 lane FIX/source/link edges.
+        self._congestible_edges = frozenset(
+            edge_id
+            for edge_id in self._edge_list
+            if max(len(self.connection_info.edge_lane_ids.get(edge_id, [])), 1) == 1
+            and float(self.connection_info.edge_length_dict.get(edge_id, 0.0))
+            >= self.marginal_cost_min_edge_length
+        )
         self.route_helper = TrainingRouteHelper(self.connection_info)
         self.decision_engine = JunctionDecisionEngine(
             self.connection_info,
@@ -331,6 +368,16 @@ class RLTrainingPipeline:
         # every edge and so hits BOTH forks (on `stage` before diamond 1 and on
         # `link1` before diamond 2) with the freshest state. See braess sumocfg.
         self.reroute_epoch_edges = int(reroute_epoch_edges)
+        # When True, a route epoch that reaches a decision point with <=1 distinct immediate
+        # next edge (a forced continuation, no real fork) does NOT query the route actor or
+        # record a policy transition; the vehicle falls through to junction handling exactly
+        # like the no-feasible-candidate case. On the Braess funnel with reroute_epoch_edges=1
+        # most edges are forced single continuations, so those no-choice epochs otherwise
+        # record near-deterministic policy transitions that dilute the mean approx_kl and pad
+        # the batch. Skipping them concentrates the gradient on the genuine forks (stage,
+        # f_up*, link1) -- the real diamond up/down and braess/through decisions. Default off
+        # so legacy (NYC) training is byte-identical.
+        self.skip_forced_route_epochs = bool(skip_forced_route_epochs)
         self.state_size = self.shared_policy.compact_state_size + self.route_obs_dim
         self.central_observation_size = 18
         self.action_size = self.route_k            # policy picks a route index, not a direction
@@ -731,6 +778,7 @@ class RLTrainingPipeline:
         self._last_density_step = -10**9
         self._fleet_delay_rate = 0.0
         self._fleet_slowness_by_vehicle = {}
+        self._var_edge_behind_count = {}
         reservation_field = getattr(self, "_reservation_field", None)
         if reservation_field is not None:
             reservation_field.clear()
@@ -1978,6 +2026,34 @@ class RLTrainingPipeline:
         penalty = self.tail_arrival_penalty_per_25_steps * (overflow / 25.0)
         return float(min(penalty, self.tail_arrival_penalty_cap))
     
+    def _compute_var_edge_behind_counts(self, step_snapshots):
+        """Per-vehicle count of controlled vehicles queued BEHIND it on a VAR edge.
+
+        Used by the "marginal" team-reward mode. For each congestible (single-lane, long)
+        edge, vehicles are ordered by ``dist_to_end`` (distance remaining to the edge exit);
+        a larger ``dist_to_end`` means further back in the queue. A vehicle's "behind" count
+        is the number of same-edge vehicles further from the exit -- i.e. the followers whose
+        progress it caps on the single lane. Returns {} unless marginal mode is active.
+
+        The controlled fleet is the demand on the Braess map (background collapses to 1-edge
+        funnel routes), so controlled-vehicle counts are a faithful proxy for edge occupancy.
+        """
+        if self.team_reward_mode != "marginal" or not step_snapshots:
+            return {}
+        by_edge = defaultdict(list)
+        for vid, snap in step_snapshots.items():
+            if str(snap.edge_id) in self._congestible_edges:
+                by_edge[snap.edge_id].append((vid, float(snap.dist_to_end)))
+        counts = {}
+        for members in by_edge.values():
+            # Sort front-of-queue (small dist_to_end) first; vehicles behind a given rank
+            # are the (n - 1 - rank) entries with larger dist_to_end.
+            members.sort(key=lambda item: item[1])
+            n = len(members)
+            for rank, (vid, _dist) in enumerate(members):
+                counts[vid] = n - 1 - rank
+        return counts
+
     def _team_congestion_cost(self, elapsed, vehicle=None):
         """Fleet-congestion cost internalized by a controlled agent (travel-time units).
 
@@ -2000,6 +2076,28 @@ class RLTrainingPipeline:
         """
         if self.team_reward_alpha <= 0.0:
             return 0.0
+        elapsed = float(max(elapsed, 0.0))
+        if self.team_reward_mode == "marginal":
+            # Pigovian marginal-cost: charge the agent for the delay it imposes on the
+            # vehicles queued behind it on a congestible (VAR) edge. Zero unless the agent
+            # is on such an edge AND is itself slowed (own_slowness -> 0 at free flow), so
+            # it prices only genuine queueing, and grows with how many followers it blocks.
+            vid = getattr(vehicle, "vehicle_id", None)
+            behind = self._var_edge_behind_count.get(vid, 0)
+            if behind <= 0:
+                return 0.0
+            own_slowness = float(self._fleet_slowness_by_vehicle.get(vid, 0.0))
+            if own_slowness <= 0.0:
+                return 0.0
+            behind = min(int(behind), int(self.marginal_cost_behind_cap))
+            charge = (
+                float(self.team_reward_alpha)
+                * float(self.marginal_cost_scale)
+                * float(behind)
+                * own_slowness
+                * elapsed
+            )
+            return float(min(charge, float(self.marginal_cost_per_step_cap) * elapsed))
         if self.team_reward_mode == "difference":
             own = self._fleet_slowness_by_vehicle.get(
                 getattr(vehicle, "vehicle_id", None), self._fleet_delay_rate
@@ -2015,7 +2113,7 @@ class RLTrainingPipeline:
             float(self.team_reward_alpha)
             * float(self.team_reward_scale)
             * signal
-            * float(max(elapsed, 0.0))
+            * elapsed
         )
 
     def compute_reward(
@@ -3157,6 +3255,9 @@ class RLTrainingPipeline:
                             0.0,
                             1.0,
                         ))
+                        # Marginal-cost mode: per-vehicle count of followers queued behind on
+                        # a VAR edge (empty for other modes; the reward term reads this cache).
+                        self._var_edge_behind_count = self._compute_var_edge_behind_counts(step_snapshots)
                         if (
                             mean_controlled_edge_density >= self.congestion_density_threshold
                             and mean_controlled_speed <= self.congestion_low_speed_threshold
@@ -3165,6 +3266,7 @@ class RLTrainingPipeline:
                     else:
                         self._fleet_delay_rate = 0.0
                         self._fleet_slowness_by_vehicle = {}
+                        self._var_edge_behind_count = {}
 
                     step_transition_central_observation = self._build_central_observation(
                         step=step,
@@ -3836,14 +3938,27 @@ class RLTrainingPipeline:
                                 allowed_first_edges,
                             )
                             decision_metrics["route_feasible_candidate_count"] += len(feasible_candidates)
-                            if feasible_candidates:
+                            # A route epoch only carries a learning signal when there is a genuine
+                            # fork: >=2 distinct immediate next edges. With skip_forced_route_epochs
+                            # on, a forced single-continuation epoch is treated exactly like the
+                            # no-feasible-candidate case (no policy query/transition; fall through to
+                            # junction handling) so it does not record a near-deterministic transition
+                            # that dilutes approx_kl. Off => legacy behaviour (any feasible candidate
+                            # is a decision).
+                            route_epoch_has_choice = bool(feasible_candidates) and (
+                                (not self.skip_forced_route_epochs) or len(allowed_first_edges) >= 2
+                            )
+                            if route_epoch_has_choice:
                                 self._episode_route_obs[vehicle_id] = pack_route_candidate_features(
                                     feasible_candidates,
                                     self.route_k,
                                     self.route_feature_dim,
                                 )
                             else:
-                                decision_metrics["route_no_feasible_candidates"] += 1
+                                if feasible_candidates:
+                                    decision_metrics["route_epoch_forced_single_edge_skipped"] += 1
+                                else:
+                                    decision_metrics["route_no_feasible_candidates"] += 1
                                 self._episode_route_obs.pop(vehicle_id, None)
 
                             for key in [key for key in step_state_cache if key[0] == vehicle_id]:
@@ -3880,7 +3995,7 @@ class RLTrainingPipeline:
                                 )
 
                             vehicle_edges_since_reroute[vehicle_id] = 0
-                            if feasible_candidates:
+                            if route_epoch_has_choice:
                                 valid_route_indices = list(range(len(feasible_candidates)))
                                 route_selection = self.trainer.select_action(
                                     state,
