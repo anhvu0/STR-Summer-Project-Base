@@ -1,0 +1,68 @@
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+	<vehicle depart="0.0" id="0">
+		<route edges="E0 E1 E7 E2"/>
+	</vehicle>
+	<vehicle depart="0.0" id="20">
+		<route edges="E0 E1 E7 E2"/>
+	</vehicle>
+	<vehicle depart="0.0" id="21">
+		<route edges="E0"/>
+	</vehicle>
+	<vehicle depart="1.0" id="1">
+		<route edges="E0 E1 E7 E2"/>
+	</vehicle>
+	<vehicle depart="2.0" id="2">
+		<route edges="E0"/>
+	</vehicle>
+	<vehicle depart="3.0" id="3">
+		<route edges="E0 E1 E7 E2"/>
+	</vehicle>
+	<vehicle depart="4.0" id="4">
+		<route edges="E0"/>
+	</vehicle>
+	<vehicle depart="5.0" id="5">
+		<route edges="E0 E1 E7 E2"/>
+	</vehicle>
+	<vehicle depart="6.0" id="6">
+		<route edges="E0"/>
+	</vehicle>
+	<vehicle depart="7.0" id="7">
+		<route edges="E0 E1 E7 E2"/>
+	</vehicle>
+	<vehicle depart="8.0" id="8">
+		<route edges="E0"/>
+	</vehicle>
+	<vehicle depart="9.0" id="9">
+		<route edges="E0 E1 E7 E2"/>
+	</vehicle>
+	<vehicle depart="10.0" id="10">
+		<route edges="E0"/>
+	</vehicle>
+	<vehicle depart="11.0" id="11">
+		<route edges="E0 E1 E7 E2"/>
+	</vehicle>
+	<vehicle depart="12.0" id="12">
+		<route edges="E0"/>
+	</vehicle>
+	<vehicle depart="13.0" id="13">
+		<route edges="E0 E1 E7 E2"/>
+	</vehicle>
+	<vehicle depart="14.0" id="14">
+		<route edges="E0"/>
+	</vehicle>
+	<vehicle depart="15.0" id="15">
+		<route edges="E0 E1 E7 E2"/>
+	</vehicle>
+	<vehicle depart="16.0" id="16">
+		<route edges="E0"/>
+	</vehicle>
+	<vehicle depart="17.0" id="17">
+		<route edges="E0 E1 E7 E2"/>
+	</vehicle>
+	<vehicle depart="18.0" id="18">
+		<route edges="E0"/>
+	</vehicle>
+	<vehicle depart="19.0" id="19">
+		<route edges="E0 E1 E7 E2"/>
+	</vehicle>
+</routes>

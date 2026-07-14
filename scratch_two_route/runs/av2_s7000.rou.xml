@@ -1,0 +1,27 @@
+<routes>
+  <vType id="car"/>
+  <route id="r0" edges="E0 E1 E7 E2"/>
+  <route id="r1" edges="E0 E3 E4 E5 E2"/>
+  <vehicle id="v0" type="car" route="r0" depart="0.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v20" type="car" route="r0" depart="0.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v21" type="car" route="r1" depart="0.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v1" type="car" route="r0" depart="1.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v2" type="car" route="r1" depart="2.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v3" type="car" route="r0" depart="3.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v4" type="car" route="r0" depart="4.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v5" type="car" route="r0" depart="5.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v6" type="car" route="r0" depart="6.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v7" type="car" route="r0" depart="7.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v8" type="car" route="r0" depart="8.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v9" type="car" route="r0" depart="9.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v10" type="car" route="r0" depart="10.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v11" type="car" route="r0" depart="11.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v12" type="car" route="r0" depart="12.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v13" type="car" route="r0" depart="13.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v14" type="car" route="r0" depart="14.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v15" type="car" route="r0" depart="15.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v16" type="car" route="r0" depart="16.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v17" type="car" route="r0" depart="17.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v18" type="car" route="r0" depart="18.0" departLane="best" departSpeed="max"/>
+  <vehicle id="v19" type="car" route="r0" depart="19.0" departLane="best" departSpeed="max"/>
+</routes>
