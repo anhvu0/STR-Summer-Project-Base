@@ -1,12 +1,26 @@
-# Ignore specific files
+# Virtualenvs
+/.venv/
+/Lib/
+/Scripts/
 
-# Ignore specific directories (and everything inside them)
+# Python caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Regenerable simulation outputs (kept on disk, not in git)
+/scratch_braess/*/
+/main_output/
+
+# Paper working dir (has its own reproduce/ inside)
 Selfless_routing/
 
-# Ignore all files of a specific extension
+# Logs, env, OS cruft
 *.log
 *.env
-*.md
-
-# Ignore system/editor files
 .DS_Store
+
+# Docs are untracked by default, EXCEPT the reproduce guide and archive index
+*.md
+!reproduce/*.md
+!archive/README.md
