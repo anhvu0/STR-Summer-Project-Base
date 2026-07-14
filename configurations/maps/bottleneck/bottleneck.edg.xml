@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- All edges one-way west->east at 13.89 m/s (50 km/h); the route choice at nF is
+     the only decision that matters, which keeps credit assignment clean (one
+     macro decision per vehicle) and removes lane-control confounds (path A is
+     single-lane; detours need no forced lane changes).
+
+     Lane counts are chosen so every MERGE is lane-preserving (incoming lanes sum
+     to the outgoing lane count: 3x1 -> 3 at nS, 1+2+2 -> 5 at nM). SUMO then maps
+     each incoming lane to its own outgoing lane and junction conflicts vanish;
+     the ONLY capacity constraint on the map is path A's single lane (~0.5 veh/s).
+     Without this, merge-yielding at nS/nM throttled every path and masked the
+     designed bottleneck. -->
+<edges>
+    <!-- spawn ramps (sources: no incoming edges -> pattern-4 origins) -->
+    <edge id="in1" from="nIN1" to="nS" numLanes="1" speed="13.89"/>
+    <edge id="in2" from="nIN2" to="nS" numLanes="1" speed="13.89"/>
+    <edge id="in3" from="nIN3" to="nS" numLanes="1" speed="13.89"/>
+
+    <!-- staging edge: shared approach, gives queue storage ahead of the fork -->
+    <edge id="stage" from="nS" to="nF" numLanes="3" speed="13.89"/>
+
+    <!-- path A: the bottleneck. Individually fastest (~72s free flow) but 1 lane
+         (~0.5 veh/s saturation). This is the road everyone selfishly wants. -->
+    <edge id="a1" from="nF" to="nA1" numLanes="1" speed="13.89"/>
+    <edge id="a2" from="nA1" to="nM" numLanes="1" speed="13.89"/>
+
+    <!-- path B: north detour, ~1360m (~98s free flow), 2 lanes (~1.0 veh/s) -->
+    <edge id="b1" from="nF" to="nB1" numLanes="2" speed="13.89"/>
+    <edge id="b2" from="nB1" to="nB2" numLanes="2" speed="13.89"/>
+    <edge id="b3" from="nB2" to="nM" numLanes="2" speed="13.89"/>
+
+    <!-- path C: south detour, ~1440m (~104s free flow), 2 lanes (~1.0 veh/s) -->
+    <edge id="c1" from="nF" to="nC1" numLanes="2" speed="13.89"/>
+    <edge id="c2" from="nC1" to="nC2" numLanes="2" speed="13.89"/>
+    <edge id="c3" from="nC2" to="nM" numLanes="2" speed="13.89"/>
+
+    <!-- exit (sink: no outgoing edges -> pattern-4 destination). 5 lanes so the
+         a2/b3/c3 merge at nM is conflict-free (1+2+2 dedicated lanes). -->
+    <edge id="out" from="nM" to="nOUT" numLanes="5" speed="13.89"/>
+</edges>

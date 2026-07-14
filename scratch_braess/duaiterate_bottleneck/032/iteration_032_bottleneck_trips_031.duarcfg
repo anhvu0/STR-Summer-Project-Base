@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2026-07-13T19:18:15.433181-06:00 by Eclipse SUMO duarouter 1.27.0
+-->
+
+<duarouterConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/duarouterConfiguration.xsd">
+
+    <input>
+        <net-file value="/home/anh/Code/STR/STR-Summer-Project-Base/configurations/maps/bottleneck.net.xml"/>
+        <route-files value="../031/bottleneck_trips_031.rou.alt.xml.gz"/>
+        <weight-files value="../031/dump_900.xml.gz"/>
+    </input>
+
+    <output>
+        <output-file value="bottleneck_trips_032.rou.xml.gz"/>
+        <exit-times value="False"/>
+    </output>
+
+    <processing>
+        <max-alternatives value="5"/>
+        <with-taz value="False"/>
+        <routing-threads value="4"/>
+        <routing-algorithm value="dijkstra"/>
+        <weights.expand value="true"/>
+        <gawron.beta value="0.9"/>
+        <gawron.a value="0.5"/>
+        <keep-all-routes value="False"/>
+        <logit.beta value="0.15"/>
+        <logit.gamma value="1.0"/>
+    </processing>
+
+    <time>
+        <begin value="0"/>
+    </time>
+
+    <report>
+        <verbose value="False"/>
+        <no-warnings value="False"/>
+        <ignore-errors value="False"/>
+        <no-step-log value="true"/>
+    </report>
+
+    <random_number>
+        <random value="False"/>
+        <seed value="1"/>
+    </random_number>
+
+</duarouterConfiguration>

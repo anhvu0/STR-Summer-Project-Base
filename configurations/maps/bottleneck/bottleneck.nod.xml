@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Bottleneck / Pigou-style demonstration network for the selfless-routing study.
+
+     Topology (west -> east, one-way):
+
+         nIN1 \
+         nIN2 = nS == nF ==(A: 1 lane, short)== nM == nOUT
+         nIN3 /        \                        /
+                        \== (B: 2 lanes, north detour)
+                         \= (C: 2 lanes, south detour)
+
+     Path A is the individually-fastest route but has ~0.5 veh/s capacity; B and C
+     are ~26-32s slower at free flow but carry ~1.0 veh/s each. Selfish routing
+     herds onto A and collapses it (high price of anarchy); the system optimum
+     keeps A at capacity and detours the rest -> selfless detours are measurably
+     fleet-positive here, unlike the NYC grid (see docs/selfless_routing_analysis.md §4.3).
+-->
+<nodes>
+    <node id="nIN1" x="0"    y="250"  type="priority"/>
+    <node id="nIN2" x="0"    y="0"    type="priority"/>
+    <node id="nIN3" x="0"    y="-250" type="priority"/>
+    <node id="nS"   x="250"  y="0"    type="priority"/>
+    <node id="nF"   x="550"  y="0"    type="priority"/>
+    <node id="nA1"  x="1050" y="0"    type="priority"/>
+    <node id="nB1"  x="800"  y="350"  type="priority"/>
+    <node id="nB2"  x="1300" y="350"  type="priority"/>
+    <node id="nC1"  x="800"  y="-400" type="priority"/>
+    <node id="nC2"  x="1300" y="-400" type="priority"/>
+    <node id="nM"   x="1550" y="0"    type="priority"/>
+    <node id="nOUT" x="1850" y="0"    type="priority"/>
+</nodes>
