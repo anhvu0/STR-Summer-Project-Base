@@ -127,6 +127,9 @@ def main():
     ap.add_argument("--disable-route-balance", action="store_true")
     ap.add_argument("--disable-merge-pricing", action="store_true")
     ap.add_argument("--merge-cost-scale", type=float, default=0.10)
+    ap.add_argument("--eval-every", type=int, default=5,
+                    help="Frozen held-out eval cadence. Raise for long (6000-ep) "
+                         "matched-budget runs so eval overhead stays bounded.")
     args = ap.parse_args()
 
     import random
@@ -160,7 +163,7 @@ def main():
         episodes=args.episodes,
         spawn_interval=1.0,
         mappo_config=cfg,
-        eval_every=5,
+        eval_every=args.eval_every,
         frozen_eval_seeds=[6000, 6001, 6002],
         eval_spawn_interval=1.0,
         fast_training_profile=False,

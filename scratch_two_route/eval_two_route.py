@@ -60,6 +60,9 @@ except ImportError:
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "configurations/model/mappo_two_route_marginal.best.pt"
 N_SEEDS = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+# Optional 3rd arg: artifact tag, so matched-budget reward-form runs write to
+# distinct CSVs (two_route_eval_<tag>.csv) that two_route_numbers.py reads.
+ART_TAG = sys.argv[3] if len(sys.argv) > 3 else ""
 SEEDS = TEST_SUMO_SEEDS[:N_SEEDS]
 DEST = "E2"
 ALL_IDS = {v for v, _ in DEPARTS}
@@ -167,7 +170,8 @@ for seed in SEEDS:
         line += f"  {arm[:12]}={m_all:5.1f}"
     print(line, flush=True)
 
-ART = "Selfless_routing/reproduce/artifacts/two_route_eval.csv"
+_suffix = f"_{ART_TAG}" if ART_TAG else ""
+ART = f"Selfless_routing/reproduce/artifacts/two_route_eval{_suffix}.csv"
 with open(ART, "w", newline="") as fh:
     w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
     w.writeheader()

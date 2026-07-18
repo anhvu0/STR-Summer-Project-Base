@@ -18,6 +18,7 @@ All are Braess-specific in route construction (edge names of the chained-Braess
 net) but harness-generic in interface: make_decisions returns complete edge
 routes, which StrSumo applies via vehicle_set_route.
 """
+import copy
 import hashlib
 import math
 
@@ -25,6 +26,7 @@ import traci
 
 from controller.DijkstraController import DijkstraPolicy
 from controller.RouteController import RouteController
+from core.coordination_throttle import ReservationField, ReservationFieldConfig
 
 _LEG = {
     ("braess", 1): ["f_up1", "cross1", "g_dn1"],
@@ -103,6 +105,102 @@ class RandomSplitPolicy(_AssignedRoutePolicy):
         h = hashlib.md5(str(vehicle_id).encode()).digest()
         return (["braess", "up", "down"][h[0] % 3],
                 ["braess", "up", "down"][h[1] % 3])
+
+
+class ReservationDijkstraPolicy(DijkstraPolicy):
+    """Dijkstra-dynamic that also reads the anticipatory route-reservation field.
+
+    This isolates the reservation channel from learning. It is the live-travel-time
+    replanner (weight_mode="traveltime") plus the SAME decaying booking field the
+    MAPPO controller uses (core.coordination_throttle.ReservationField): within one
+    decision round the vehicles are routed in a fixed order, each committed route
+    books its leading edges, and a later decider pays a penalty on an edge in
+    proportion to how many earlier vehicles just committed to it. So simultaneous
+    deciders no longer all pile onto the momentarily fastest alternative.
+
+    The reservation ablation (Table on Braess) is the only stack component whose
+    removal significantly hurts MAPPO; this arm answers whether a non-learning
+    replanner reading the same field matches the learned policy or not.
+
+    Penalty units: the field stores a decaying reserved count per edge (a freshly
+    booked leading edge contributes ~1.0). We convert that to seconds by
+    ``reservation_toll_s`` per reserved unit, in the spirit of TollDijkstra's
+    queue toll, and add it to the live edge travel time used by Dijkstra.
+    """
+
+    def __init__(self, connection_info, reservation_toll_s=6.0,
+                 route_horizon=4, route_decay=0.7, time_decay=0.85):
+        super().__init__(connection_info, weight_mode="traveltime")
+        self.reservation_toll_s = float(reservation_toll_s)
+        self._field = ReservationField(ReservationFieldConfig(
+            enabled=True, route_horizon=int(route_horizon),
+            route_decay=float(route_decay), time_decay=float(time_decay)))
+
+    def _edge_weight(self, edge_id):
+        weight = super()._edge_weight(edge_id)
+        reserved = self._field.reserved_count(edge_id)
+        if reserved > 0.0:
+            toll = self.reservation_toll_s * reserved
+            if math.isfinite(toll) and toll > 0.0:
+                weight += toll
+        return weight
+
+    def _edges_from_directions(self, current_edge, directions):
+        edges = [current_edge]
+        edge = current_edge
+        for direction in directions:
+            outgoing = self.connection_info.outgoing_edges_dict.get(edge, {})
+            if direction not in outgoing:
+                break
+            edge = outgoing[direction]
+            edges.append(edge)
+        return edges
+
+    def _shortest_path_directions(self, vehicle):
+        """One-vehicle Dijkstra on reservation-penalized live travel time. Returns
+        the list of SUMO directions to the destination (same encoding the parent
+        make_decisions builds)."""
+        unvisited = {edge: 1000000000 for edge in self.connection_info.edge_list}
+        current_edge = vehicle.current_edge
+        current_distance = self._edge_weight(current_edge)
+        unvisited[current_edge] = current_distance
+        path_lists = {edge: [] for edge in self.connection_info.edge_list}
+        while True:
+            if current_edge not in self.connection_info.outgoing_edges_dict:
+                break
+            for direction, outgoing_edge in \
+                    self.connection_info.outgoing_edges_dict[current_edge].items():
+                if outgoing_edge not in unvisited:
+                    continue
+                new_distance = current_distance + self._edge_weight(outgoing_edge)
+                if new_distance < unvisited[outgoing_edge]:
+                    unvisited[outgoing_edge] = new_distance
+                    current_path = copy.deepcopy(path_lists[current_edge])
+                    current_path.append(direction)
+                    path_lists[outgoing_edge] = current_path
+            if current_edge in unvisited:
+                del unvisited[current_edge]
+            if not unvisited:
+                break
+            if current_edge == vehicle.destination:
+                break
+            possible = [e for e in unvisited.items() if e[1]]
+            if not possible:
+                break
+            current_edge, current_distance = sorted(possible, key=lambda x: x[1])[0]
+        return path_lists.get(vehicle.destination, [])
+
+    def make_decisions(self, vehicles, connection_info):
+        # Fade last round's books before this round's deciders read the field.
+        self._field.decay()
+        local_targets = {}
+        # Deterministic decision order so the booking sequence is reproducible.
+        for vehicle in sorted(vehicles, key=lambda v: str(v.vehicle_id)):
+            directions = self._shortest_path_directions(vehicle)
+            route_edges = self._edges_from_directions(vehicle.current_edge, directions)
+            self._field.seed_route(route_edges)
+            local_targets[vehicle.vehicle_id] = self.compute_local_target(directions, vehicle)
+        return local_targets
 
 
 class TollDijkstraPolicy(DijkstraPolicy):

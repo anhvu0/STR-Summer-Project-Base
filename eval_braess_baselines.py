@@ -47,7 +47,8 @@ from core.STR_SUMO import StrSumo
 from controller.MAPPOController import MAPPOPolicy
 from controller.DijkstraController import DijkstraPolicy
 from controller.SplitAndTollControllers import (
-    FixedSplitPolicy, RandomSplitPolicy, TollDijkstraPolicy)
+    FixedSplitPolicy, RandomSplitPolicy, TollDijkstraPolicy,
+    ReservationDijkstraPolicy)
 
 try:
     from scipy.stats import wilcoxon
@@ -125,6 +126,7 @@ def build_arms():
         "FixedSplit": lambda veh: FixedSplitPolicy(pipe.connection_info, N_VEH),
         "RandomSplit": lambda veh: RandomSplitPolicy(pipe.connection_info),
         "TollDijkstra": lambda veh: TollDijkstraPolicy(pipe.connection_info),
+        "ResvDijkstra": lambda veh: ReservationDijkstraPolicy(pipe.connection_info),
         "Dijkstra-static": lambda veh: DijkstraPolicy(pipe.connection_info, weight_mode="distance"),
         "Dijkstra-dynamic": lambda veh: DijkstraPolicy(pipe.connection_info, weight_mode="traveltime"),
     }
